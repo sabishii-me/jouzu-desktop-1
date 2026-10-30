@@ -454,6 +454,9 @@ impl Session {
                 self.request_messages();
             }
             "get_messages" => {
+                if let Some(data) = value.get("data") {
+                    self.import_history(data);
+                }
                 *self
                     .handshake
                     .lock()
@@ -463,6 +466,64 @@ impl Session {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn import_history(&self, data: &Value) {
+        let messages = data
+            .as_array()
+            .or_else(|| data.get("messages").and_then(Value::as_array));
+        let Some(messages) = messages else {
+            return;
+        };
+        let mut rows = Vec::new();
+        for (index, message) in messages.iter().enumerate() {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if role != "user" && role != "assistant" {
+                continue;
+            }
+            let text = message
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|content| {
+                    content
+                        .iter()
+                        .filter_map(|block| block.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            if text.is_empty() {
+                continue;
+            }
+            rows.push(json!({
+                "kind": role,
+                "id": message
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("import-{index}")),
+                "text": text,
+                "createdAt": message
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(Self::now_iso),
+            }));
+        }
+        if rows.is_empty() {
+            return;
+        }
+        self.history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.history_seq.store(0, Ordering::Relaxed);
+        for row in rows {
+            self.push_history(row);
         }
     }
 
