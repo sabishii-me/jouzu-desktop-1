@@ -1,12 +1,12 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     time::Instant,
 };
 
 use jouzu_host::{
-    host_home, log, new_token, remove_host_file, router, session::RuntimeSpec,
+    host_home, log, new_token, remove_host_file, router, session::find_bash, session::RuntimeSpec,
     session::SessionManager, write_host_file, AppState, HostLock,
 };
 use serde_json::json;
@@ -82,15 +82,28 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let runtime = arg_value(&args, "--runtime").map(|program| RuntimeSpec {
-        program: PathBuf::from(program),
-        args: arg_values(&args, "--runtime-arg"),
-        env: Vec::new(),
-    });
-    let runtime = runtime.or_else(|| RuntimeSpec::from_managed(&home));
+    let runtime_home = arg_value(&args, "--runtime-home")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("data"));
+    let managed = runtime_home
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home.clone());
+    let runtime = arg_value(&args, "--runtime")
+        .map(|program| RuntimeSpec {
+            program: PathBuf::from(program),
+            args: arg_values(&args, "--runtime-arg"),
+            env: Vec::new(),
+        })
+        .or_else(|| RuntimeSpec::from_managed(&managed));
+    let bash = arg_value(&args, "--bash")
+        .map(PathBuf::from)
+        .or_else(|| find_bash(&managed));
     let sessions = std::sync::Arc::new(SessionManager::new(
         runtime,
         home.clone(),
+        runtime_home,
+        bash,
         jouzu_host::session::DEFAULT_REPLAY_LIMIT,
     ));
 

@@ -1,11 +1,10 @@
-//! Session ownership for the host. One runtime process per session, a bounded
-//! event log, and an exclusive lifecycle independent of any page.
+//! Session ownership for the host. One pi RPC runtime process per session, a
+//! bounded event log, and an exclusive lifecycle independent of any page.
 
 use std::{
     collections::{HashMap, VecDeque},
-    io::{BufRead, BufReader, Write},
+    ffi::OsString,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -19,6 +18,9 @@ use tokio::sync::broadcast;
 
 use crate::log;
 
+#[cfg(windows)]
+use crate::runtime_process::ChatProcess;
+
 pub const DEFAULT_REPLAY_LIMIT: usize = 5_000;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
 
@@ -30,12 +32,12 @@ pub struct RuntimeSpec {
 }
 
 impl RuntimeSpec {
-    /// The provisioned runtime, when the managed root has one.
-    pub fn from_managed(home: &Path) -> Option<Self> {
+    /// The provisioned runtime rooted at the managed directory.
+    pub fn from_managed(managed: &Path) -> Option<Self> {
         let node = std::env::var_os("JOUZU_HOST_NODE")
             .map(PathBuf::from)
-            .unwrap_or_else(|| home.join("runtime").join("node").join("node.exe"));
-        let bootstrap = home.join("app").join("bootstrap.mjs");
+            .unwrap_or_else(|| managed.join("runtime").join("node").join("node.exe"));
+        let bootstrap = managed.join("app").join("bootstrap.mjs");
         if !node.is_file() || !bootstrap.is_file() {
             return None;
         }
@@ -52,11 +54,19 @@ impl RuntimeSpec {
 
     pub fn node_script(script: &Path) -> Self {
         Self {
-            program: PathBuf::from("node"),
+            program: find_program("node.exe").unwrap_or_else(|| PathBuf::from("node")),
             args: vec![script.to_string_lossy().into_owned()],
             env: Vec::new(),
         }
     }
+}
+
+pub struct SessionConfig {
+    pub spec: RuntimeSpec,
+    pub home: PathBuf,
+    pub runtime_home: PathBuf,
+    pub bash: Option<PathBuf>,
+    pub replay_limit: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -142,6 +152,13 @@ impl EventLog {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Handshake {
+    Switch,
+    Messages,
+    Ready,
+}
+
 struct SentMessage {
     message_id: String,
     text: String,
@@ -155,12 +172,14 @@ pub struct Session {
     status: Mutex<Status>,
     events: Mutex<EventLog>,
     tx: broadcast::Sender<SessionEvent>,
-    stdin: Mutex<Option<ChildStdin>>,
-    child: Arc<Mutex<Option<Child>>>,
-    #[cfg(windows)]
-    job: Option<Job>,
+    process: Arc<Mutex<ChatProcess>>,
+    lease_path: PathBuf,
     messages: Mutex<HashMap<String, SentMessage>>,
     next_message: AtomicU64,
+    next_request: AtomicU64,
+    active_message: Mutex<Option<String>>,
+    handshake: Mutex<Handshake>,
+    home: PathBuf,
 }
 
 impl Session {
@@ -199,7 +218,6 @@ impl Session {
         }
     }
 
-    /// Snapshot on an initial attach or when the cursor is older than the log.
     pub fn events_after(&self, after: u64) -> (Vec<SessionEvent>, u64) {
         let log = self
             .events
@@ -251,41 +269,252 @@ impl Session {
         }
     }
 
+    fn request_id(&self) -> String {
+        format!(
+            "r-{}",
+            self.next_request.fetch_add(1, Ordering::Relaxed) + 1
+        )
+    }
+
+    fn write_command(&self, value: Value) -> Result<(), ApiError> {
+        let line = format!("{}\n", value);
+        let mut process = self
+            .process
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut offset = 0;
+        let bytes = line.as_bytes();
+        while offset < bytes.len() {
+            match process.write_stdin(&bytes[offset..]) {
+                Ok(0) => return Err(ApiError::unavailable("runtime input is closed")),
+                Ok(count) => offset += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => return Err(ApiError::unavailable("runtime input is closed")),
+            }
+        }
+        Ok(())
+    }
+
+    fn request_messages(&self) {
+        let id = self.request_id();
+        if let Err(error) = self.write_command(json!({ "id": id, "type": "get_messages" })) {
+            self.publish(
+                "error",
+                json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
+            );
+            self.set_status(Status::Error);
+        }
+    }
+
+    fn start_handshake(&self) {
+        match &self.session_path {
+            Some(path) => {
+                let id = self.request_id();
+                let result = self.write_command(json!({
+                    "id": id,
+                    "type": "switch_session",
+                    "sessionPath": path,
+                }));
+                if let Err(error) = result {
+                    self.publish(
+                        "error",
+                        json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
+                    );
+                    self.set_status(Status::Error);
+                    return;
+                }
+                *self
+                    .handshake
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Handshake::Switch;
+            }
+            None => {
+                self.request_messages();
+                *self
+                    .handshake
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Handshake::Messages;
+            }
+        }
+    }
+
+    fn handle_response(&self, value: &Value) {
+        let command = value.get("command").and_then(Value::as_str).unwrap_or("");
+        let success = value
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !success {
+            let message = value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("runtime request failed");
+            log(
+                &self.home,
+                "warn",
+                "runtime.response_failed",
+                json!({ "command": command, "message": message }),
+            );
+            self.publish(
+                "error",
+                json!({ "code": "runtime-error", "message": message, "retryable": false }),
+            );
+            self.set_status(Status::Error);
+            return;
+        }
+        match command {
+            "switch_session" => {
+                let cancelled = value
+                    .get("data")
+                    .and_then(|data| data.get("cancelled"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if cancelled {
+                    self.publish(
+                        "error",
+                        json!({ "code": "session-switch-cancelled", "message": "The runtime cancelled the session switch", "retryable": false }),
+                    );
+                    self.set_status(Status::Error);
+                    return;
+                }
+                *self
+                    .handshake
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Handshake::Messages;
+                self.request_messages();
+            }
+            "get_messages" => {
+                *self
+                    .handshake
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Handshake::Ready;
+                if matches!(self.status(), Status::Starting) {
+                    self.set_status(Status::Idle);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_runtime_line(&self, value: Value) {
         match value.get("type").and_then(Value::as_str) {
-            Some("ready") => self.set_status(Status::Idle),
-            Some("delta") => {
-                let message_id = value
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let text = value.get("text").and_then(Value::as_str).unwrap_or("");
-                self.set_status(Status::Running);
+            Some("response") => self.handle_response(&value),
+            Some("agent_start") => self.set_status(Status::Running),
+            Some("message_update") => {
+                let Some(update) = value
+                    .get("assistantMessageEvent")
+                    .and_then(Value::as_object)
+                else {
+                    return;
+                };
+                let Some(kind) = update.get("type").and_then(Value::as_str) else {
+                    return;
+                };
+                let active = self
+                    .active_message
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let Some(message_id) = active else {
+                    return;
+                };
+                match kind {
+                    "text_delta" => {
+                        let text = update.get("delta").and_then(Value::as_str).unwrap_or("");
+                        if !text.is_empty() {
+                            self.publish(
+                                "message.delta",
+                                json!({ "messageId": message_id, "text": text }),
+                            );
+                        }
+                    }
+                    "thinking_delta" => {
+                        let text = update.get("delta").and_then(Value::as_str).unwrap_or("");
+                        if !text.is_empty() {
+                            self.publish(
+                                "message.delta",
+                                json!({ "messageId": message_id, "text": text, "kind": "thinking" }),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("tool_execution_start") => {
                 self.publish(
-                    "message.delta",
-                    json!({ "messageId": message_id, "text": text }),
+                    "tool.start",
+                    json!({
+                        "toolCallId": value.get("toolCallId"),
+                        "toolName": value.get("toolName"),
+                        "args": value.get("args"),
+                    }),
                 );
             }
-            Some("done") => {
-                let message_id = value
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let stop_reason = value
-                    .get("stopReason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("completed");
+            Some("tool_execution_update") => {
                 self.publish(
-                    "message.done",
-                    json!({ "messageId": message_id, "stopReason": stop_reason }),
+                    "tool.update",
+                    json!({
+                        "toolCallId": value.get("toolCallId"),
+                        "partialResult": value.get("partialResult"),
+                    }),
                 );
+            }
+            Some("tool_execution_end") => {
                 self.publish(
-                    "turn.end",
-                    json!({ "turnId": message_id, "status": stop_reason }),
+                    "tool.result",
+                    json!({
+                        "toolCallId": value.get("toolCallId"),
+                        "ok": value.get("isError").and_then(Value::as_bool) != Some(true),
+                        "result": value.get("result"),
+                    }),
                 );
+            }
+            Some("agent_settled") => {
+                let aborted = value
+                    .get("aborted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let active = self
+                    .active_message
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if let Some(message_id) = active {
+                    let stop_reason = if aborted { "interrupted" } else { "completed" };
+                    self.publish(
+                        "message.done",
+                        json!({ "messageId": message_id, "stopReason": stop_reason }),
+                    );
+                    self.publish(
+                        "turn.end",
+                        json!({ "turnId": message_id, "status": stop_reason }),
+                    );
+                }
                 self.set_status(Status::Idle);
+            }
+            Some("extension_ui_request") => {
+                let method = value
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                log(
+                    &self.home,
+                    "warn",
+                    "runtime.ui_request",
+                    json!({ "method": method }),
+                );
+            }
+            Some("extension_error") => {
+                let message = value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("extension error");
+                self.publish(
+                    "error",
+                    json!({ "code": "extension-error", "message": message, "retryable": false }),
+                );
             }
             Some("error") => {
                 let message = value
@@ -338,35 +567,38 @@ impl Session {
                 "receipt": "queued",
             }));
         }
+        if matches!(self.status(), Status::Running) {
+            return Err(ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "session-busy",
+                "Wait for the current turn to settle",
+                true,
+            ));
+        }
         let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
         let message_id = format!("m-{counter}");
-        let frame = json!({ "type": "prompt", "id": message_id.clone(), "text": text });
-        let line = format!("{frame}\n");
-        // Publish admission before the runtime can produce a delta, so a client
-        // never sees message.delta before message.accepted.
+        *self
+            .active_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message_id.clone());
         self.publish(
             "message.accepted",
             json!({ "messageId": message_id.clone(), "receipt": "queued" }),
         );
         self.publish("turn.start", json!({ "turnId": message_id.clone() }));
         self.set_status(Status::Running);
-        let mut stdin = self
-            .stdin
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(input) = stdin.as_mut() else {
+        let result = self.write_command(json!({
+            "id": message_id.clone(),
+            "type": "prompt",
+            "message": text,
+        }));
+        if let Err(error) = result {
             self.publish(
                 "error",
-                json!({ "code": "runtime-unavailable", "message": "runtime input is closed", "retryable": true }),
+                json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
             );
-            return Err(ApiError::unavailable("runtime input is closed"));
-        };
-        if input.write_all(line.as_bytes()).is_err() || input.flush().is_err() {
-            self.publish(
-                "error",
-                json!({ "code": "runtime-unavailable", "message": "runtime input is closed", "retryable": true }),
-            );
-            return Err(ApiError::unavailable("runtime input is closed"));
+            self.set_status(Status::Error);
+            return Err(error);
         }
         messages.insert(
             client_message_id.to_string(),
@@ -375,12 +607,13 @@ impl Session {
                 text: text.to_string(),
             },
         );
-        drop(stdin);
+        drop(messages);
         Ok(json!({ "messageId": message_id, "receipt": "queued" }))
     }
 
     pub fn interrupt(&self) -> Result<(), ApiError> {
-        self.write_command(json!({ "type": "interrupt" }))
+        let id = self.request_id();
+        self.write_command(json!({ "id": id, "type": "abort" }))
     }
 
     pub fn stop(&self) {
@@ -388,51 +621,233 @@ impl Session {
             return;
         }
         self.set_status(Status::Stopped);
-        if let Ok(mut stdin) = self.stdin.lock() {
-            stdin.take();
+        if let Ok(mut process) = self.process.lock() {
+            process.close_stdin();
+            let _ = process.stop();
         }
-        #[cfg(windows)]
-        if let Some(job) = &self.job {
-            job.terminate();
-        }
-        if let Ok(mut child) = self.child.lock() {
-            if let Some(child) = child.as_mut() {
-                let _ = child.kill();
-            }
-        }
+        let _ = std::fs::remove_file(&self.lease_path);
     }
 
-    fn write_command(&self, value: Value) -> Result<(), ApiError> {
-        let mut stdin = self
-            .stdin
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(input) = stdin.as_mut() else {
-            return Err(ApiError::unavailable("runtime input is closed"));
+    pub fn info(&self) -> Value {
+        json!({
+            "sessionId": self.id,
+            "workspacePath": self.workspace_path,
+            "sessionPath": self.session_path,
+            "status": self.status().as_str(),
+            "running": self.status() == Status::Running,
+            "cursor": self.cursor(),
+            "pendingApprovalCount": 0,
+            "pendingQuestionCount": 0,
+        })
+    }
+
+    fn spawn(
+        id: String,
+        workspace_path: String,
+        session_path: Option<String>,
+        key: String,
+        config: &SessionConfig,
+    ) -> Result<Arc<Session>, ApiError> {
+        let workspace = PathBuf::from(&workspace_path);
+        let mut environment: HashMap<String, (OsString, OsString)> = std::env::vars_os()
+            .filter(|(name, _)| {
+                let text = name.to_string_lossy();
+                !text.is_empty() && !text.contains('=') && !text.contains('\0')
+            })
+            .map(|(key, value)| (key.to_string_lossy().to_ascii_uppercase(), (key, value)))
+            .collect();
+        for name in ["NODE_OPTIONS", "NODE_PATH"] {
+            environment.remove(name);
+        }
+        let mut set = |name: &str, value: OsString| {
+            environment.insert(name.to_ascii_uppercase(), (OsString::from(name), value));
         };
-        let line = format!("{value}\n");
-        input
-            .write_all(line.as_bytes())
-            .map_err(|_| ApiError::unavailable("runtime input is closed"))?;
-        input
-            .flush()
-            .map_err(|_| ApiError::unavailable("runtime input is closed"))
+        set("JOUZU_HOME", config.runtime_home.as_os_str().to_os_string());
+        set("JOUZU_NO_UPDATE", OsString::from("1"));
+        set("PI_SKIP_VERSION_CHECK", OsString::from("1"));
+        set("JOUZU_TEXTGUARD_DESKTOP", OsString::from("1"));
+        set("JOUZU_HOST_SESSION_ID", OsString::from(&id));
+        if let Some(bash) = &config.bash {
+            set("JOUZU_LAUNCHER_BASH", bash.as_os_str().to_os_string());
+        }
+        if let Some(path) = &session_path {
+            set("JOUZU_SESSION_PATH", OsString::from(path));
+        }
+        for (key, value) in &config.spec.env {
+            set(key, OsString::from(value));
+        }
+        let env: Vec<(OsString, OsString)> = environment.into_values().collect();
+        let lease_path = config.home.join(format!("session-{id}.lease"));
+        let lease = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lease_path)
+            .map_err(|error| {
+                ApiError::new(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    format!("Could not create the runtime lease: {error}"),
+                    false,
+                )
+            })?;
+        let args: Vec<OsString> = config.spec.args.iter().map(OsString::from).collect();
+        let process = ChatProcess::spawn(&config.spec.program, &args, &workspace, &env, lease)
+            .map_err(|error| {
+                ApiError::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "runtime-unavailable",
+                    format!("Could not start the runtime: {error}"),
+                    false,
+                )
+            })?;
+        let process = Arc::new(Mutex::new(process));
+        let (tx, _) = broadcast::channel(1024);
+        let session = Arc::new(Session {
+            id,
+            workspace_path,
+            session_path,
+            key,
+            status: Mutex::new(Status::Starting),
+            events: Mutex::new(EventLog::new(config.replay_limit)),
+            tx,
+            process: process.clone(),
+            lease_path,
+            messages: Mutex::new(HashMap::new()),
+            next_message: AtomicU64::new(0),
+            next_request: AtomicU64::new(0),
+            active_message: Mutex::new(None),
+            handshake: Mutex::new(Handshake::Messages),
+            home: config.home.clone(),
+        });
+
+        {
+            let session = session.clone();
+            let process = process.clone();
+            std::thread::spawn(move || {
+                let mut buffer: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let result = {
+                        let mut process = process
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        process.read_stdout(&mut chunk)
+                    };
+                    match result {
+                        Ok(0) => {
+                            if exited(&process) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Ok(count) => {
+                            buffer.extend_from_slice(&chunk[..count]);
+                            while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+                                let line: Vec<u8> = buffer.drain(..=index).collect();
+                                let text = String::from_utf8_lossy(&line);
+                                let text = text.trim_end_matches(['\r', '\n']);
+                                if text.is_empty() {
+                                    continue;
+                                }
+                                if let Ok(value) = serde_json::from_str::<Value>(text) {
+                                    session.handle_runtime_line(value);
+                                }
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        {
+            let process = process.clone();
+            let home = config.home.clone();
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let result = {
+                        let mut process = process
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        process.read_stderr(&mut chunk)
+                    };
+                    match result {
+                        Ok(0) => {
+                            if exited(&process) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Ok(count) => {
+                            let line = String::from_utf8_lossy(&chunk[..count]).trim().to_string();
+                            if !line.is_empty() {
+                                log(&home, "debug", "runtime.stderr", json!({ "line": line }));
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        {
+            let session = session.clone();
+            let process = process.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(50));
+                let exited = {
+                    let mut process = process
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    matches!(process.try_wait(), Ok(Some(_)))
+                };
+                if exited {
+                    if !matches!(session.status(), Status::Stopped) {
+                        session.set_status(Status::Stopped);
+                    }
+                    break;
+                }
+            });
+        }
+        session.start_handshake();
+        Ok(session)
     }
 }
 
+fn exited(process: &Arc<Mutex<ChatProcess>>) -> bool {
+    let mut process = process
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    matches!(process.try_wait(), Ok(Some(_)))
+}
+
 pub struct SessionManager {
-    spec: Option<RuntimeSpec>,
-    home: PathBuf,
-    replay_limit: usize,
+    config: Option<SessionConfig>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
 }
 
 impl SessionManager {
-    pub fn new(spec: Option<RuntimeSpec>, home: PathBuf, replay_limit: usize) -> Self {
-        Self {
+    pub fn new(
+        spec: Option<RuntimeSpec>,
+        home: PathBuf,
+        runtime_home: PathBuf,
+        bash: Option<PathBuf>,
+        replay_limit: usize,
+    ) -> Self {
+        let config = spec.map(|spec| SessionConfig {
             spec,
             home,
+            runtime_home,
+            bash,
             replay_limit,
+        });
+        Self {
+            config,
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -489,7 +904,7 @@ impl SessionManager {
             }
             sessions.remove(&existing.id);
         }
-        let spec = self.spec.clone().ok_or_else(|| {
+        let config = self.config.as_ref().ok_or_else(|| {
             ApiError::new(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "runtime-unavailable",
@@ -497,16 +912,14 @@ impl SessionManager {
                 false,
             )
         })?;
-        std::fs::create_dir_all(self.home.join("data")).ok();
+        std::fs::create_dir_all(&config.home.join("data")).ok();
         let id = format!("h-{}", random_id());
         let session = Session::spawn(
             id,
             workspace.to_string_lossy().into_owned(),
             session_path,
             key.clone(),
-            spec,
-            self.home.clone(),
-            self.replay_limit,
+            config,
         )?;
         sessions.insert(session.id.clone(), session.clone());
         Ok(session)
@@ -526,150 +939,21 @@ impl SessionManager {
     }
 }
 
-impl Session {
-    pub fn info(&self) -> Value {
-        json!({
-            "sessionId": self.id,
-            "workspacePath": self.workspace_path,
-            "sessionPath": self.session_path,
-            "status": self.status().as_str(),
-            "running": self.status() == Status::Running,
-            "cursor": self.cursor(),
-            "pendingApprovalCount": 0,
-            "pendingQuestionCount": 0,
-        })
+/// Git Bash discovery for the runtime environment.
+pub fn find_bash(managed: &Path) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("JOUZU_LAUNCHER_BASH") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
     }
-
-    #[allow(clippy::too_many_arguments)]
-    fn spawn(
-        id: String,
-        workspace_path: String,
-        session_path: Option<String>,
-        key: String,
-        spec: RuntimeSpec,
-        home: PathBuf,
-        replay_limit: usize,
-    ) -> Result<Arc<Session>, ApiError> {
-        let mut command = Command::new(&spec.program);
-        command
-            .args(&spec.args)
-            .current_dir(&workspace_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("JOUZU_HOME", home.join("data"))
-            .env("JOUZU_HOST_SESSION_ID", &id)
-            .env("JOUZU_NO_UPDATE", "1")
-            .envs(spec.env.iter().cloned())
-            .env_remove("NODE_OPTIONS")
-            .env_remove("NODE_PATH");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        if let Some(session_path) = &session_path {
-            command.env("JOUZU_SESSION_PATH", session_path);
-        }
-        let mut child = command.spawn().map_err(|error| {
-            ApiError::new(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "runtime-unavailable",
-                format!("Could not start the runtime: {error}"),
-                false,
-            )
-        })?;
-        #[cfg(windows)]
-        let job = match Job::create().and_then(|job| job.assign(&child).map(|_| job)) {
-            Ok(job) => Some(job),
-            Err(error) => {
-                let _ = child.kill();
-                return Err(ApiError::new(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    format!("Could not create the runtime job: {error}"),
-                    false,
-                ));
-            }
-        };
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let child = Arc::new(Mutex::new(Some(child)));
-        let (tx, _) = broadcast::channel(1024);
-        let session = Arc::new(Session {
-            id,
-            workspace_path,
-            session_path,
-            key,
-            status: Mutex::new(Status::Starting),
-            events: Mutex::new(EventLog::new(replay_limit)),
-            tx,
-            stdin: Mutex::new(stdin),
-            child: child.clone(),
-            #[cfg(windows)]
-            job,
-            messages: Mutex::new(HashMap::new()),
-            next_message: AtomicU64::new(0),
-        });
-
-        if let Some(stdout) = stdout {
-            let session = session.clone();
-            std::thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines() {
-                    let Ok(line) = line else { break };
-                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                        continue;
-                    };
-                    session.handle_runtime_line(value);
-                }
-            });
-        }
-        if let Some(stderr) = stderr {
-            let home = home.clone();
-            std::thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    let Ok(line) = line else { break };
-                    log(&home, "debug", "runtime.stderr", json!({ "line": line }));
-                }
-            });
-        }
-
-        let waiter_child = child;
-        let waiter_session = session.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(50));
-            let exited = {
-                let mut guard = waiter_child
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                match guard.as_mut() {
-                    Some(child) => match child.try_wait() {
-                        Ok(Some(_)) => {
-                            guard.take();
-                            true
-                        }
-                        Ok(None) => false,
-                        Err(_) => {
-                            guard.take();
-                            true
-                        }
-                    },
-                    None => true,
-                }
-            };
-            if exited {
-                if !matches!(waiter_session.status(), Status::Stopped) {
-                    waiter_session.set_status(Status::Stopped);
-                }
-                break;
-            }
-        });
-
-        Ok(session)
-    }
+    let candidates = [
+        managed.join("runtime/git/installed/bin/bash.exe"),
+        managed.join("runtime/git/PortableGit/bin/bash.exe"),
+        managed.join("runtime/git/bin/bash.exe"),
+        PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+    ];
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 #[derive(Debug, Deserialize)]
@@ -720,10 +1004,6 @@ impl ApiError {
         )
     }
 
-    pub fn conflict(message: impl Into<String>) -> Self {
-        Self::new(axum::http::StatusCode::CONFLICT, "sessions", message, false)
-    }
-
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -756,64 +1036,9 @@ fn random_id() -> String {
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-
-#[cfg(windows)]
-struct Job(windows::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-unsafe impl Send for Job {}
-#[cfg(windows)]
-unsafe impl Sync for Job {}
-
-#[cfg(windows)]
-impl Job {
-    fn create() -> std::io::Result<Self> {
-        use std::mem::size_of;
-        use windows::Win32::System::JobObjects::{
-            JobObjectExtendedLimitInformation, SetInformationJobObject,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        };
-        unsafe {
-            let handle = windows::Win32::System::JobObjects::CreateJobObjectW(
-                None,
-                windows::core::PCWSTR::null(),
-            )
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-            Ok(Self(handle))
-        }
-    }
-
-    fn assign(&self, child: &Child) -> std::io::Result<()> {
-        use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::System::JobObjects::AssignProcessToJobObject;
-        unsafe {
-            AssignProcessToJobObject(self.0, HANDLE(child.as_raw_handle()))
-                .map_err(|error| std::io::Error::other(error.to_string()))
-        }
-    }
-
-    fn terminate(&self) {
-        unsafe {
-            let _ = windows::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for Job {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(self.0);
-        }
-    }
+fn find_program(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
 }

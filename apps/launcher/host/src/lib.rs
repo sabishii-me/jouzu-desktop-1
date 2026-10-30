@@ -12,6 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(windows)]
+mod runtime_process;
 pub mod session;
 
 use session::{ApiError, CreateRequest, SendRequest, SessionManager};
@@ -632,7 +634,7 @@ mod tests {
             dist: dist.clone(),
             started: Instant::now(),
             version: "0.1.0".to_string(),
-            sessions: Arc::new(SessionManager::new(None, dist, 10)),
+            sessions: Arc::new(SessionManager::new(None, dist.clone(), dist, None, 10)),
         }
     }
 
@@ -945,6 +947,8 @@ mod session_tests {
         let manager = Arc::new(SessionManager::new(
             Some(spec),
             home.path().to_path_buf(),
+            home.path().join("data"),
+            None,
             replay,
         ));
         (manager, home, workspace)
@@ -1103,7 +1107,7 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn create_send_stream_and_detach_keeps_the_session() {
+    async fn pi_rpc_create_send_stream_and_detach() {
         let (manager, _home, workspace) = manager(50);
         let session = manager
             .create(workspace.path().to_str().unwrap(), None, None)
@@ -1242,6 +1246,8 @@ mod session_tests {
         let manager = Arc::new(SessionManager::new(
             Some(spec),
             home.path().to_path_buf(),
+            home.path().join("data"),
+            None,
             50,
         ));
         let session = manager

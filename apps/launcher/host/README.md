@@ -40,7 +40,7 @@ a stale lock from a dead process is reused. Clean exit removes both files.
 On Windows the lock is an exclusive file handle (no read/write sharing,
 FILE_SHARE_DELETE for self-removal); on non-Windows the lock is not enforced yet.
 
-## Phase 2a: sessions and SSE
+## Phase 2a: sessions and SSE (pi RPC)
 
 Endpoints (all under `/v1`, bearer/cookie auth):
 
@@ -58,15 +58,22 @@ The host owns one runtime process per session and kills its Windows job tree on
 stop or host exit. Detaching an SSE stream never stops a session.
 
 Runtime selection: the provisioned runtime is used when
-`<home>/runtime/node/node.exe` and `<home>/app/bootstrap.mjs` exist. For local
-tests, pass an explicit command:
+`<home>/runtime/node/node.exe` and `<home>/app/bootstrap.mjs` exist (the default is
+derived from `--runtime-home`). The host speaks pi RPC (`bootstrap.mjs --mode
+rpc`): `get_messages` handshake, `prompt`, `abort`, `switch_session`, and the
+`agent_*`/`message_*`/`tool_execution_*` events.
+
+Real runtime (host metadata in a temp home, runtime data from managed):
 
 ```powershell
-cargo run --manifest-path host/Cargo.toml -- --dist dist `
-  --runtime node --runtime-arg C:\path\to\fake-runtime.mjs
+cargo run --manifest-path host/Cargo.toml -- --dist dist --home $env:TEMP\jouzu-host `
+  --runtime-home "$env:LOCALAPPDATA\Shisa.ai\JouzuDesktop\data"
 ```
 
-The fake runtime (`tests/fixtures/fake-runtime.mjs`) speaks the host's minimal
-JSONL subset (`ready`, `prompt`, `delta`, `done`, `interrupt`); adapting the real
-pi RPC runtime is a later phase. Replay is bounded by 5,000 events per session;
-the 2 MiB byte cap and idle reaping are not implemented yet.
+`--runtime-home` sets `JOUZU_HOME` (credentials/session state); `--bash` overrides
+Git Bash discovery. Tests use `tests/fixtures/fake-runtime.mjs`, which speaks the
+same pi RPC wire shapes (`{id,type:"response"}` plus `agent_*`/`message_*` events),
+not a private protocol.
+
+Replay is bounded by 5,000 events per session; the 2 MiB byte cap and idle
+reaping are not implemented yet.
