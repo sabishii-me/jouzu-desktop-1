@@ -463,7 +463,12 @@ async fn root(State(state): State<AppState>, uri: Uri) -> Response {
     if let Some(token) = query.get("token").filter(|value| !value.is_empty()) {
         if token == state.token.as_str() {
             let cookie = format!("{COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/");
-            let mut response = Redirect::to("/").into_response();
+            let target = if query.get("ui").map(String::as_str) == Some("host") {
+                "/host"
+            } else {
+                "/"
+            };
+            let mut response = Redirect::to(target).into_response();
             match HeaderValue::from_str(&cookie) {
                 Ok(value) => {
                     response.headers_mut().insert(header::SET_COOKIE, value);
@@ -489,13 +494,27 @@ async fn health(State(state): State<AppState>) -> Response {
 }
 
 async fn capabilities(State(state): State<AppState>) -> Json<Value> {
+    let default_workspace = default_workspace();
     Json(json!({
         "contract": "2026-10-30",
         "hostVersion": state.version,
         "features": ["sse", "replay", "prompts", "history-paging"],
         "scopes": ["loopback"],
         "limits": { "maxMessageBytes": 32768, "maxUploadBytes": 26214400 },
+        "defaultWorkspace": default_workspace,
     }))
+}
+
+fn default_workspace() -> Option<String> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let base = if cfg!(windows) {
+        PathBuf::from(home).join("Documents")
+    } else {
+        PathBuf::from(home)
+    };
+    let path = base.join("Jouzu").join("default-workspace");
+    std::fs::create_dir_all(&path).ok()?;
+    Some(path.to_string_lossy().into_owned())
 }
 
 #[derive(Deserialize)]
