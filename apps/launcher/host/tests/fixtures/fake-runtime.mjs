@@ -1,10 +1,12 @@
 // Fake pi RPC runtime for host tests. It speaks the real wire shapes:
-// {id,type:"response",...} and agent/message/tool events.
+// {id,type:"response",...}, extension_ui_request, and agent/message events.
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import readline from "node:readline";
 
 const delay = Number(process.env.FAKE_RUNTIME_DELAY_MS ?? 15);
+const uiMethod = process.env.FAKE_RUNTIME_UI ?? "";
+const uiTimeout = Number(process.env.FAKE_RUNTIME_UI_TIMEOUT_MS ?? 0);
 const out = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 const response = (id, command, data) =>
   out({ id, type: "response", command, success: true, data });
@@ -15,6 +17,7 @@ let busy = false;
 let interrupted = false;
 let timer = null;
 let current = null;
+let pendingUi = null;
 
 if (process.env.FAKE_RUNTIME_CHILD_PID_FILE) {
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
@@ -27,6 +30,7 @@ function settled(aborted) {
   busy = false;
   clearTimeout(timer);
   current = null;
+  pendingUi = null;
   out({ type: "agent_settled", aborted });
 }
 
@@ -58,15 +62,54 @@ function tick() {
   settled(false);
 }
 
+function beginTurn(text) {
+  current = { parts: Array.from(String(text)), index: 0 };
+  tick();
+}
+
+function requestUi(text) {
+  const id = "ui-1";
+  pendingUi = { text };
+  const request = { type: "extension_ui_request", id };
+  if (uiMethod === "confirm") {
+    request.method = "confirm";
+    request.title = "Allow test?";
+    request.message = "Run the test tool?";
+  } else if (uiMethod === "select") {
+    request.method = "select";
+    request.title = "Pick one";
+    request.options = ["A", "B"];
+  } else if (uiMethod === "input") {
+    request.method = "input";
+    request.title = "Name";
+    request.placeholder = "type here";
+  } else if (uiMethod === "editor") {
+    request.method = "editor";
+    request.title = "Edit";
+    request.prefill = "seed";
+  }
+  if (uiTimeout > 0) request.timeout = uiTimeout;
+  out(request);
+}
+
 function prompt(id, text) {
   busy = true;
   interrupted = false;
-  current = { id, parts: Array.from(text), index: 0 };
   response(id, "prompt", { disposition: "handled" });
   out({ type: "agent_start" });
   out({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
   out({ type: "message_start", message: { role: "assistant", content: [] } });
-  tick();
+  if (uiMethod === "noise") {
+    out({ type: "extension_ui_request", id: "noise-1", method: "setWidget", widgetKey: "x" });
+    out({ type: "extension_ui_request", id: "noise-2", method: "setStatus", statusKey: "x" });
+    beginTurn(text);
+    return;
+  }
+  if (uiMethod) {
+    requestUi(text);
+    return;
+  }
+  beginTurn(text);
 }
 
 const lines = readline.createInterface({ input: process.stdin });
@@ -75,6 +118,17 @@ lines.on("line", line => {
   try {
     value = JSON.parse(line);
   } catch {
+    return;
+  }
+  if (value.type === "extension_ui_response") {
+    if (!pendingUi) return;
+    const pending = pendingUi;
+    pendingUi = null;
+    let label = "cancelled";
+    if (value.cancelled) label = "cancelled";
+    else if ("confirmed" in value) label = value.confirmed ? "approved" : "denied";
+    else if ("value" in value) label = String(value.value ?? "");
+    beginTurn(label);
     return;
   }
   switch (value.type) {

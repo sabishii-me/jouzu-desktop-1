@@ -77,3 +77,33 @@ not a private protocol.
 
 Replay is bounded by 5,000 events per session; the 2 MiB byte cap and idle
 reaping are not implemented yet.
+
+## Phase 2b: approvals and questions
+
+Interactive pi `extension_ui_request` methods now become prompts:
+
+```text
+confirm                         -> approval.requested / approval.resolved
+select | input | editor         -> question.requested / question.answered / question.cancelled
+setWidget, setStatus, notify... -> logged and ignored (not prompts)
+```
+
+```text
+POST /v1/approvals/{approvalId}/decision
+{ "clientId": "phone", "decision": "Approve" }
+
+POST /v1/questions/{questionId}/answer
+{ "clientId": "phone", "answers": { "q1": "A" } }
+```
+
+The answering client must have declared the `prompts` capability on its SSE
+attach (`?clientId=...&capabilities=view,control,prompts`). Pending prompts appear
+in `GET /v1/sessions/{id}` and `session.snapshot` as `pendingApprovals` /
+`pendingQuestions`. Answers are written back to pi as
+`{type:"extension_ui_response",id,...,confirmed|value|cancelled}`. Runtime timeout
+is used when present, otherwise 120 s; expiry emits `approval.resolved` with
+state `expired` or `question.cancelled` with reason `expired`. Duplicate answers
+are `409 prompt-resolved`; late answers are `409 prompt-expired`.
+
+The test fixture (`FAKE_RUNTIME_UI=confirm|select|input|editor|noise`) emits the
+real pi wire shapes and waits for the host's response.

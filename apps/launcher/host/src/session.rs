@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -75,6 +76,8 @@ pub enum Status {
     Starting,
     Idle,
     Running,
+    WaitingApproval,
+    WaitingQuestion,
     Stopped,
     Error,
 }
@@ -85,6 +88,8 @@ impl Status {
             Status::Starting => "starting",
             Status::Idle => "idle",
             Status::Running => "running",
+            Status::WaitingApproval => "waiting_approval",
+            Status::WaitingQuestion => "waiting_question",
             Status::Stopped => "stopped",
             Status::Error => "error",
         }
@@ -164,6 +169,18 @@ struct SentMessage {
     text: String,
 }
 
+struct PendingApproval {
+    pi_id: String,
+    data: Value,
+}
+
+struct PendingQuestion {
+    pi_id: String,
+    data: Value,
+    question_ids: Vec<String>,
+    options: std::collections::HashMap<String, Vec<String>>,
+}
+
 pub struct Session {
     pub id: String,
     pub workspace_path: String,
@@ -179,6 +196,11 @@ pub struct Session {
     next_request: AtomicU64,
     active_message: Mutex<Option<String>>,
     handshake: Mutex<Handshake>,
+    pending_approvals: Mutex<HashMap<String, PendingApproval>>,
+    pending_questions: Mutex<HashMap<String, PendingQuestion>>,
+    approval_outcomes: Mutex<HashMap<String, String>>,
+    question_outcomes: Mutex<HashMap<String, String>>,
+    next_prompt: AtomicU64,
     home: PathBuf,
 }
 
@@ -212,8 +234,8 @@ impl Session {
                 "cursor": cursor,
                 "workspacePath": self.workspace_path,
                 "sessionPath": self.session_path,
-                "pendingApprovals": [],
-                "pendingQuestions": [],
+                "pendingApprovals": self.pending_approvals(),
+                "pendingQuestions": self.pending_questions(),
             }),
         }
     }
@@ -398,7 +420,7 @@ impl Session {
         }
     }
 
-    fn handle_runtime_line(&self, value: Value) {
+    fn handle_runtime_line(self: &Arc<Self>, value: Value) {
         match value.get("type").and_then(Value::as_str) {
             Some("response") => self.handle_response(&value),
             Some("agent_start") => self.set_status(Status::Running),
@@ -492,20 +514,10 @@ impl Session {
                         json!({ "turnId": message_id, "status": stop_reason }),
                     );
                 }
+                self.cancel_pending("turn-ended");
                 self.set_status(Status::Idle);
             }
-            Some("extension_ui_request") => {
-                let method = value
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                log(
-                    &self.home,
-                    "warn",
-                    "runtime.ui_request",
-                    json!({ "method": method }),
-                );
-            }
+            Some("extension_ui_request") => self.handle_extension_ui_request(&value),
             Some("extension_error") => {
                 let message = value
                     .get("error")
@@ -531,6 +543,471 @@ impl Session {
         }
     }
 
+    fn handle_extension_ui_request(self: &Arc<Self>, value: &Value) {
+        match value.get("method").and_then(Value::as_str).unwrap_or("") {
+            "confirm" => self.request_approval(value),
+            "select" | "input" | "editor" => self.request_question(value),
+            method => log(
+                &self.home,
+                "debug",
+                "runtime.noninteractive_ui",
+                json!({ "method": method }),
+            ),
+        }
+    }
+
+    fn prompt_timeout(value: &Value) -> (Duration, String) {
+        let millis = value
+            .get("timeout")
+            .and_then(Value::as_u64)
+            .filter(|timeout| *timeout > 0)
+            .unwrap_or(120_000)
+            .min(86_400_000);
+        (
+            Duration::from_millis(millis),
+            (Utc::now() + chrono::Duration::milliseconds(millis as i64))
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+    }
+
+    fn request_approval(self: &Arc<Self>, value: &Value) {
+        let pi_id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if pi_id.is_empty() {
+            return;
+        }
+        let (timeout, expires_at) = Self::prompt_timeout(value);
+        let counter = self.next_prompt.fetch_add(1, Ordering::Relaxed) + 1;
+        let approval_id = format!("a-{}-{counter}", self.id);
+        let title = value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Confirm");
+        let message = value.get("message").and_then(Value::as_str).unwrap_or("");
+        let mut data = json!({
+            "approvalId": approval_id,
+            "tool": title,
+            "args": { "title": title, "message": message },
+            "options": ["Approve", "Deny"],
+            "expiresAt": expires_at,
+        });
+        if let Some(turn_id) = self.active_turn() {
+            data["turnId"] = Value::String(turn_id);
+        }
+        let entry = PendingApproval {
+            pi_id,
+            data: data.clone(),
+        };
+        self.pending_approvals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(approval_id.clone(), entry);
+        self.set_status(Status::WaitingApproval);
+        self.publish("approval.requested", data);
+        self.schedule_approval_expiry(approval_id, timeout);
+    }
+
+    fn request_question(self: &Arc<Self>, value: &Value) {
+        let pi_id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if pi_id.is_empty() {
+            return;
+        }
+        let (timeout, expires_at) = Self::prompt_timeout(value);
+        let counter = self.next_prompt.fetch_add(1, Ordering::Relaxed) + 1;
+        let question_id = format!("q-{}-{counter}", self.id);
+        let title = value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Question");
+        let detail = value
+            .get("placeholder")
+            .or_else(|| value.get("prefill"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let options: Vec<String> = value
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let item_id = "q1".to_string();
+        let mut item = json!({
+            "id": item_id,
+            "header": title,
+            "question": title,
+        });
+        if !detail.is_empty() {
+            item["detail"] = Value::String(detail.to_string());
+        }
+        if !options.is_empty() {
+            item["options"] = json!(options);
+        }
+        let mut data = json!({
+            "questionId": question_id,
+            "questions": [item],
+            "expiresAt": expires_at,
+        });
+        if let Some(turn_id) = self.active_turn() {
+            data["turnId"] = Value::String(turn_id);
+        }
+        let mut option_map = std::collections::HashMap::new();
+        option_map.insert(item_id.clone(), options);
+        let entry = PendingQuestion {
+            pi_id,
+            data: data.clone(),
+            question_ids: vec![item_id],
+            options: option_map,
+        };
+        self.pending_questions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(question_id.clone(), entry);
+        self.set_status(Status::WaitingQuestion);
+        self.publish("question.requested", data);
+        self.schedule_question_expiry(question_id, timeout);
+    }
+
+    fn active_turn(&self) -> Option<String> {
+        self.active_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn schedule_approval_expiry(self: &Arc<Self>, approval_id: String, timeout: Duration) {
+        let session = self.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            session.expire_approval(&approval_id);
+        });
+    }
+
+    fn schedule_question_expiry(self: &Arc<Self>, question_id: String, timeout: Duration) {
+        let session = self.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            session.expire_question(&question_id);
+        });
+    }
+
+    fn expire_approval(&self, approval_id: &str) {
+        let entry = self
+            .pending_approvals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(approval_id);
+        let Some(entry) = entry else { return };
+        self.approval_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(approval_id.to_string(), "expired".to_string());
+        let mut data = entry.data;
+        data["state"] = Value::String("expired".to_string());
+        data["decision"] = Value::String("expired".to_string());
+        data["answeredBy"] = Value::Null;
+        let _ = self.write_command(json!({
+            "type": "extension_ui_response",
+            "id": entry.pi_id,
+            "cancelled": true,
+        }));
+        self.publish("approval.resolved", data);
+        self.restore_running_status();
+    }
+
+    fn expire_question(&self, question_id: &str) {
+        let entry = self
+            .pending_questions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(question_id);
+        let Some(entry) = entry else { return };
+        self.question_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(question_id.to_string(), "expired".to_string());
+        let _ = self.write_command(json!({
+            "type": "extension_ui_response",
+            "id": entry.pi_id,
+            "cancelled": true,
+        }));
+        self.publish(
+            "question.cancelled",
+            json!({ "questionId": question_id, "reason": "expired" }),
+        );
+        self.restore_running_status();
+    }
+
+    fn restore_running_status(&self) {
+        if self.active_turn().is_some() {
+            self.set_status(Status::Running);
+        } else {
+            self.set_status(Status::Idle);
+        }
+    }
+
+    pub fn has_approval(&self, approval_id: &str) -> bool {
+        self.pending_approvals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(approval_id)
+            || self
+                .approval_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(approval_id)
+    }
+
+    pub fn has_question(&self, question_id: &str) -> bool {
+        self.pending_questions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(question_id)
+            || self
+                .question_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(question_id)
+    }
+
+    pub fn pending_approvals(&self) -> Vec<Value> {
+        let pending = self
+            .pending_approvals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.values().map(|entry| entry.data.clone()).collect()
+    }
+
+    pub fn pending_questions(&self) -> Vec<Value> {
+        let pending = self
+            .pending_questions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.values().map(|entry| entry.data.clone()).collect()
+    }
+
+    fn prompt_error(&self, id: &str, question: bool) -> ApiError {
+        let outcome = if question {
+            self.question_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(id)
+                .cloned()
+        } else {
+            self.approval_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(id)
+                .cloned()
+        };
+        match outcome.as_deref() {
+            Some("expired") => ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "prompt-expired",
+                "Prompt has expired",
+                false,
+            ),
+            Some(_) => ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "prompt-resolved",
+                "Prompt is already resolved",
+                false,
+            ),
+            None => ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "prompt-not-found",
+                "Prompt does not exist",
+                false,
+            ),
+        }
+    }
+
+    pub fn decide_approval(
+        &self,
+        approval_id: &str,
+        client_id: &str,
+        decision: &str,
+    ) -> Result<Value, ApiError> {
+        let entry = self
+            .pending_approvals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(approval_id);
+        let Some(entry) = entry else {
+            return Err(self.prompt_error(approval_id, false));
+        };
+        let options: Vec<String> = entry
+            .data
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !options.iter().any(|option| option == decision) {
+            self.pending_approvals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(approval_id.to_string(), entry);
+            return Err(ApiError::bad_request(
+                "decision must be one of the offered options",
+            ));
+        }
+        let confirmed = decision == "Approve";
+        let response = json!({
+            "type": "extension_ui_response",
+            "id": entry.pi_id,
+            "confirmed": confirmed,
+        });
+        if let Err(error) = self.write_command(response) {
+            self.pending_approvals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(approval_id.to_string(), entry);
+            return Err(error);
+        }
+        let state = if confirmed { "allowed" } else { "denied" };
+        self.approval_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(approval_id.to_string(), state.to_string());
+        let mut data = entry.data;
+        data["state"] = Value::String(state.to_string());
+        data["decision"] = Value::String(decision.to_string());
+        data["answeredBy"] = Value::String(client_id.to_string());
+        self.publish("approval.resolved", data);
+        self.restore_running_status();
+        Ok(json!({
+            "approvalId": approval_id,
+            "state": state,
+            "decision": decision,
+            "answeredBy": client_id,
+        }))
+    }
+
+    pub fn answer_question(
+        &self,
+        question_id: &str,
+        client_id: &str,
+        answers: &std::collections::HashMap<String, String>,
+    ) -> Result<Value, ApiError> {
+        let entry = self
+            .pending_questions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(question_id);
+        let Some(entry) = entry else {
+            return Err(self.prompt_error(question_id, true));
+        };
+        for item_id in &entry.question_ids {
+            let Some(answer) = answers.get(item_id) else {
+                self.pending_questions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(question_id.to_string(), entry);
+                return Err(ApiError::bad_request("every question needs an answer"));
+            };
+            if let Some(options) = entry.options.get(item_id) {
+                if !options.is_empty() && !options.iter().any(|option| option == answer) {
+                    self.pending_questions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(question_id.to_string(), entry);
+                    return Err(ApiError::bad_request(
+                        "answer must be one of the offered options",
+                    ));
+                }
+            }
+        }
+        let value = entry
+            .question_ids
+            .first()
+            .and_then(|item_id| answers.get(item_id))
+            .cloned()
+            .unwrap_or_default();
+        let response = json!({
+            "type": "extension_ui_response",
+            "id": entry.pi_id,
+            "value": value,
+        });
+        if let Err(error) = self.write_command(response) {
+            self.pending_questions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(question_id.to_string(), entry);
+            return Err(error);
+        }
+        self.question_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(question_id.to_string(), "answered".to_string());
+        self.publish(
+            "question.answered",
+            json!({
+                "questionId": question_id,
+                "answers": answers,
+                "answeredBy": client_id,
+            }),
+        );
+        self.restore_running_status();
+        Ok(json!({
+            "questionId": question_id,
+            "state": "answered",
+            "answers": answers,
+            "answeredBy": client_id,
+        }))
+    }
+
+    fn cancel_pending(&self, reason: &str) {
+        let approvals: Vec<(String, PendingApproval)> = self
+            .pending_approvals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .collect();
+        for (approval_id, entry) in approvals {
+            self.approval_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(approval_id.clone(), "expired".to_string());
+            let mut data = entry.data;
+            data["state"] = Value::String("expired".to_string());
+            data["decision"] = Value::String("expired".to_string());
+            data["answeredBy"] = Value::Null;
+            self.publish("approval.resolved", data);
+        }
+        let questions: Vec<(String, PendingQuestion)> = self
+            .pending_questions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .collect();
+        for (question_id, _) in questions {
+            self.question_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(question_id.clone(), "cancelled".to_string());
+            self.publish(
+                "question.cancelled",
+                json!({ "questionId": question_id, "reason": reason }),
+            );
+        }
+    }
     pub fn send(&self, client_message_id: &str, text: &str) -> Result<Value, ApiError> {
         if client_message_id.is_empty() || client_message_id.len() > 200 {
             return Err(ApiError::bad_request("clientMessageId is required"));
@@ -621,6 +1098,7 @@ impl Session {
             return;
         }
         self.set_status(Status::Stopped);
+        self.cancel_pending("session-stopped");
         if let Ok(mut process) = self.process.lock() {
             process.close_stdin();
             let _ = process.stop();
@@ -636,8 +1114,10 @@ impl Session {
             "status": self.status().as_str(),
             "running": self.status() == Status::Running,
             "cursor": self.cursor(),
-            "pendingApprovalCount": 0,
-            "pendingQuestionCount": 0,
+            "pendingApprovals": self.pending_approvals(),
+            "pendingQuestions": self.pending_questions(),
+            "pendingApprovalCount": self.pending_approvals().len(),
+            "pendingQuestionCount": self.pending_questions().len(),
         })
     }
 
@@ -717,6 +1197,11 @@ impl Session {
             next_request: AtomicU64::new(0),
             active_message: Mutex::new(None),
             handshake: Mutex::new(Handshake::Messages),
+            pending_approvals: Mutex::new(HashMap::new()),
+            pending_questions: Mutex::new(HashMap::new()),
+            approval_outcomes: Mutex::new(HashMap::new()),
+            question_outcomes: Mutex::new(HashMap::new()),
+            next_prompt: AtomicU64::new(0),
             home: config.home.clone(),
         });
 
@@ -829,6 +1314,7 @@ fn exited(process: &Arc<Mutex<ChatProcess>>) -> bool {
 pub struct SessionManager {
     config: Option<SessionConfig>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    clients: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl SessionManager {
@@ -849,6 +1335,7 @@ impl SessionManager {
         Self {
             config,
             sessions: Mutex::new(HashMap::new()),
+            clients: Mutex::new(HashMap::new()),
         }
     }
 
@@ -864,6 +1351,79 @@ impl SessionManager {
                 .cmp(&b.get("sessionId").and_then(Value::as_str))
         });
         values
+    }
+
+    pub fn register_client(&self, client_id: &str, capabilities: &[String]) {
+        let mut clients = self
+            .clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = clients.entry(client_id.to_string()).or_default();
+        for capability in capabilities {
+            if !entry.iter().any(|existing| existing == capability) {
+                entry.push(capability.clone());
+            }
+        }
+    }
+
+    pub fn client_can_prompt(&self, client_id: &str) -> bool {
+        self.clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(client_id)
+            .is_some_and(|capabilities| capabilities.iter().any(|value| value == "prompts"))
+    }
+
+    pub fn decide_approval(
+        &self,
+        approval_id: &str,
+        client_id: &str,
+        decision: &str,
+    ) -> Result<Value, ApiError> {
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for session in sessions {
+            if session.has_approval(approval_id) {
+                return session.decide_approval(approval_id, client_id, decision);
+            }
+        }
+        Err(ApiError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "prompt-not-found",
+            "Approval does not exist",
+            false,
+        ))
+    }
+
+    pub fn answer_question(
+        &self,
+        question_id: &str,
+        client_id: &str,
+        answers: &HashMap<String, String>,
+    ) -> Result<Value, ApiError> {
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for session in sessions {
+            if session.has_question(question_id) {
+                return session.answer_question(question_id, client_id, answers);
+            }
+        }
+        Err(ApiError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "prompt-not-found",
+            "Question does not exist",
+            false,
+        ))
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {

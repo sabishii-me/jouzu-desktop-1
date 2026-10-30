@@ -226,6 +226,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/sessions/{id}/stop", axum::routing::post(stop_session))
         .route("/sessions/{id}/events", get(session_events))
+        .route(
+            "/approvals/{id}/decision",
+            axum::routing::post(decide_approval),
+        )
+        .route(
+            "/questions/{id}/answer",
+            axum::routing::post(answer_question),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_auth,
@@ -315,23 +323,86 @@ struct EventsQuery {
     after: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct DecisionRequest {
+    #[serde(rename = "clientId")]
+    client_id: String,
+    decision: String,
+}
+
+#[derive(Deserialize)]
+struct AnswerRequest {
+    #[serde(rename = "clientId")]
+    client_id: String,
+    answers: HashMap<String, String>,
+}
+
+async fn decide_approval(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<DecisionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if request.client_id.trim().is_empty() {
+        return Err(ApiError::bad_request("clientId is required"));
+    }
+    if !state.sessions.client_can_prompt(&request.client_id) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "prompt-forbidden",
+            "Client lacks the prompts capability",
+            false,
+        ));
+    }
+    let value = state
+        .sessions
+        .decide_approval(&id, &request.client_id, &request.decision)?;
+    Ok(Json(value))
+}
+
+async fn answer_question(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<AnswerRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if request.client_id.trim().is_empty() {
+        return Err(ApiError::bad_request("clientId is required"));
+    }
+    if !state.sessions.client_can_prompt(&request.client_id) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "prompt-forbidden",
+            "Client lacks the prompts capability",
+            false,
+        ));
+    }
+    let value = state
+        .sessions
+        .answer_question(&id, &request.client_id, &request.answers)?;
+    Ok(Json(value))
+}
+
 async fn session_events(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    if query
+    let client_id = query
         .client_id
         .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .is_none()
-    {
-        return Err(ApiError::bad_request("clientId is required"));
-    }
-    let _capabilities = query
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("clientId is required"))?
+        .to_string();
+    let capabilities: Vec<String> = query
         .capabilities
-        .unwrap_or_else(|| "view,control".to_string());
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    state.sessions.register_client(&client_id, &capabilities);
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
     let after = headers
         .get("last-event-id")
@@ -1106,6 +1177,90 @@ mod session_tests {
         panic!("no {name} event");
     }
 
+    fn manager_with_ui(
+        method: &str,
+        timeout_ms: Option<u64>,
+    ) -> (Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir) {
+        let mut spec = RuntimeSpec::node_script(&fixture());
+        spec.env
+            .push(("FAKE_RUNTIME_UI".to_string(), method.to_string()));
+        if let Some(timeout_ms) = timeout_ms {
+            spec.env.push((
+                "FAKE_RUNTIME_UI_TIMEOUT_MS".to_string(),
+                timeout_ms.to_string(),
+            ));
+        }
+        manager_with_spec(spec, 100)
+    }
+
+    async fn subscribe_as(
+        app: Router,
+        session_id: &str,
+        client_id: &str,
+        capabilities: &str,
+    ) -> (
+        mpsc::UnboundedReceiver<(String, Value)>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let response = app
+            .oneshot(
+                request(
+                    Method::GET,
+                    &format!(
+                        "/v1/sessions/{session_id}/events?clientId={client_id}&capabilities={capabilities}"
+                    ),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (tx, rx) = mpsc::unbounded_channel();
+        (rx, tokio::spawn(read_sse(response, tx)))
+    }
+
+    async fn post_json(app: Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let response = call(
+            app,
+            request(Method::POST, uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        (
+            response.0,
+            serde_json::from_str(&response.2).unwrap_or(Value::Null),
+        )
+    }
+
+    async fn session_info(app: &Router, session_id: &str) -> Value {
+        let response = call(
+            app.clone(),
+            request(Method::GET, &format!("/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK);
+        serde_json::from_str(&response.2).unwrap()
+    }
+    async fn text_until_done(rx: &mut mpsc::UnboundedReceiver<(String, Value)>) -> String {
+        let mut text = String::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timed out waiting for done")
+                .expect("stream closed");
+            match event.0.as_str() {
+                "message.delta" => text.push_str(event.1["text"].as_str().unwrap()),
+                "message.done" => return text,
+                _ => {}
+            }
+        }
+    }
+
     #[tokio::test]
     async fn pi_rpc_create_send_stream_and_detach() {
         let (manager, _home, workspace) = manager(50);
@@ -1395,5 +1550,301 @@ mod session_tests {
         )
         .await;
         assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    }
+    #[tokio::test]
+    async fn approval_confirm_decision_resumes_and_duplicate_is_resolved() {
+        let (manager, _home, workspace) = manager_with_ui("confirm", None);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let (mut rx, reader) =
+            subscribe_as(app.clone(), &session.id, "answerer", "view,control,prompts").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        session.send("client-1", "go").unwrap();
+        let requested = next_event(&mut rx, "approval.requested").await;
+        let approval_id = requested["approvalId"].as_str().unwrap().to_string();
+        assert_eq!(requested["options"], json!(["Approve", "Deny"]));
+        assert_eq!(requested["turnId"], "m-1");
+        assert!(requested["expiresAt"].is_string());
+
+        let (mut snap_rx, snap_reader) =
+            subscribe_as(app.clone(), &session.id, "snap", "view").await;
+        let snapshot = next_event(&mut snap_rx, "session.snapshot").await;
+        assert_eq!(snapshot["pendingApprovals"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["pendingQuestions"].as_array().unwrap().len(), 0);
+        snap_reader.abort();
+        let info = session_info(&app, &session.id).await;
+        assert_eq!(info["pendingApprovalCount"], 1);
+        assert_eq!(info["status"], "waiting_approval");
+
+        let unauthenticated = call(
+            app.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/approvals/{approval_id}/decision"))
+                .header(header::HOST, "127.0.0.1:40123")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "clientId": "answerer", "decision": "Approve" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(unauthenticated.0, StatusCode::UNAUTHORIZED);
+
+        let (status, body) = post_json(
+            app.clone(),
+            &format!("/v1/approvals/{approval_id}/decision"),
+            json!({ "clientId": "answerer", "decision": "Approve" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "allowed");
+
+        let resolved = next_event(&mut rx, "approval.resolved").await;
+        assert_eq!(resolved["approvalId"], approval_id);
+        assert_eq!(resolved["state"], "allowed");
+        assert_eq!(resolved["answeredBy"], "answerer");
+        assert_eq!(text_until_done(&mut rx).await, "approved");
+        wait_status(&session, Status::Idle).await;
+
+        let (status, body) = post_json(
+            app.clone(),
+            &format!("/v1/approvals/{approval_id}/decision"),
+            json!({ "clientId": "answerer", "decision": "Deny" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "prompt-resolved");
+        assert_eq!(
+            session_info(&app, &session.id).await["pendingApprovalCount"],
+            0
+        );
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn select_question_answer_resumes_and_duplicate_is_resolved() {
+        let (manager, _home, workspace) = manager_with_ui("select", None);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let (mut rx, reader) =
+            subscribe_as(app.clone(), &session.id, "answerer", "view,control,prompts").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        session.send("client-1", "go").unwrap();
+        let requested = next_event(&mut rx, "question.requested").await;
+        let question_id = requested["questionId"].as_str().unwrap().to_string();
+        let item = &requested["questions"][0];
+        assert_eq!(item["id"], "q1");
+        assert_eq!(item["options"], json!(["A", "B"]));
+        assert_eq!(info_status(&app, &session.id).await, "waiting_question");
+        assert_eq!(
+            session_info(&app, &session.id).await["pendingQuestionCount"],
+            1
+        );
+
+        let (status, body) = post_json(
+            app.clone(),
+            &format!("/v1/questions/{question_id}/answer"),
+            json!({ "clientId": "answerer", "answers": { "q1": "B" } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "answered");
+        let answered = next_event(&mut rx, "question.answered").await;
+        assert_eq!(answered["questionId"], question_id);
+        assert_eq!(answered["answers"]["q1"], "B");
+        assert_eq!(text_until_done(&mut rx).await, "B");
+
+        let (status, body) = post_json(
+            app,
+            &format!("/v1/questions/{question_id}/answer"),
+            json!({ "clientId": "answerer", "answers": { "q1": "A" } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "prompt-resolved");
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn input_and_editor_questions_map_to_questions() {
+        for (method, answer) in [("input", "typed"), ("editor", "edited")] {
+            let (manager, _home, workspace) = manager_with_ui(method, None);
+            let session = manager
+                .create(workspace.path().to_str().unwrap(), None, None)
+                .unwrap();
+            wait_status(&session, Status::Idle).await;
+            let app = app(manager.clone());
+            let (mut rx, reader) =
+                subscribe_as(app.clone(), &session.id, "answerer", "view,control,prompts").await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            session.send("client-1", "go").unwrap();
+            let requested = next_event(&mut rx, "question.requested").await;
+            let question_id = requested["questionId"].as_str().unwrap().to_string();
+            assert_eq!(
+                requested["questions"][0]["header"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty(),
+                false
+            );
+            let (status, body) = post_json(
+                app,
+                &format!("/v1/questions/{question_id}/answer"),
+                json!({ "clientId": "answerer", "answers": { "q1": answer } }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{method}: {body}");
+            assert_eq!(text_until_done(&mut rx).await, answer);
+            reader.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_answer_requires_prompts_capability() {
+        let (manager, _home, workspace) = manager_with_ui("confirm", None);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let (mut rx, reader) =
+            subscribe_as(app.clone(), &session.id, "viewer", "view,control").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        session.send("client-1", "go").unwrap();
+        let requested = next_event(&mut rx, "approval.requested").await;
+        let approval_id = requested["approvalId"].as_str().unwrap().to_string();
+
+        let (status, body) = post_json(
+            app.clone(),
+            &format!("/v1/approvals/{approval_id}/decision"),
+            json!({ "clientId": "viewer", "decision": "Approve" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "prompt-forbidden");
+        assert_eq!(info_count(&app, &session.id).await, 1);
+
+        let (mut answer_rx, answer_reader) =
+            subscribe_as(app.clone(), &session.id, "answerer", "view,control,prompts").await;
+        let (status, _) = post_json(
+            app,
+            &format!("/v1/approvals/{approval_id}/decision"),
+            json!({ "clientId": "answerer", "decision": "Approve" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let _ = next_event(&mut answer_rx, "approval.resolved").await;
+        answer_reader.abort();
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn expired_prompts_resolve_and_reject_late_answers() {
+        let (manager, _home, workspace) = manager_with_ui("confirm", Some(200));
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let (mut rx, reader) =
+            subscribe_as(app.clone(), &session.id, "answerer", "view,control,prompts").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        session.send("client-1", "go").unwrap();
+        let requested = next_event(&mut rx, "approval.requested").await;
+        let approval_id = requested["approvalId"].as_str().unwrap().to_string();
+        let resolved = next_event(&mut rx, "approval.resolved").await;
+        assert_eq!(resolved["state"], "expired");
+        assert_eq!(resolved["decision"], "expired");
+        let (status, body) = post_json(
+            app.clone(),
+            &format!("/v1/approvals/{approval_id}/decision"),
+            json!({ "clientId": "answerer", "decision": "Approve" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "prompt-expired");
+        assert_eq!(info_count(&app, &session.id).await, 0);
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn question_expiry_emits_cancelled() {
+        let (manager, _home, workspace) = manager_with_ui("select", Some(200));
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let (mut rx, reader) =
+            subscribe_as(app.clone(), &session.id, "answerer", "view,control,prompts").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        session.send("client-1", "go").unwrap();
+        let requested = next_event(&mut rx, "question.requested").await;
+        let question_id = requested["questionId"].as_str().unwrap().to_string();
+        let cancelled = next_event(&mut rx, "question.cancelled").await;
+        assert_eq!(cancelled["reason"], "expired");
+        let (status, body) = post_json(
+            app,
+            &format!("/v1/questions/{question_id}/answer"),
+            json!({ "clientId": "answerer", "answers": { "q1": "A" } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "prompt-expired");
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn noninteractive_ui_methods_are_ignored() {
+        let (manager, _home, workspace) = manager_with_ui("noise", None);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let (mut rx, reader) = subscribe_as(app.clone(), &session.id, "viewer", "view").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        session.send("client-1", "hi").unwrap();
+        let mut saw_prompt = false;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if event.0.starts_with("approval.") || event.0.starts_with("question.") {
+                saw_prompt = true;
+            }
+            if event.0 == "message.done" {
+                break;
+            }
+        }
+        assert!(!saw_prompt);
+        assert_eq!(info_count(&app, &session.id).await, 0);
+        reader.abort();
+    }
+
+    async fn info_status(app: &Router, session_id: &str) -> String {
+        session_info(app, session_id).await["status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn info_count(app: &Router, session_id: &str) -> u64 {
+        session_info(app, session_id).await["pendingApprovalCount"]
+            .as_u64()
+            .unwrap()
+            + session_info(app, session_id).await["pendingQuestionCount"]
+                .as_u64()
+                .unwrap()
     }
 }
