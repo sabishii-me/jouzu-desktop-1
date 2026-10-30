@@ -6,25 +6,33 @@
 
 use std::{
     collections::HashMap,
+    convert::Infallible,
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
+
+pub mod session;
+
+use session::{ApiError, CreateRequest, SendRequest, SessionManager};
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{Path as AxumPath, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::Next,
-    response::{IntoResponse, Redirect, Response},
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse, Redirect, Response,
+    },
     routing::get,
     Json, Router,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use percent_encoding::percent_decode_str;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, sync::broadcast};
 
 pub const COOKIE_NAME: &str = "jouzu_host";
 pub const HOST_SCHEMA: u32 = 1;
@@ -36,6 +44,7 @@ pub struct AppState {
     pub dist: PathBuf,
     pub started: Instant,
     pub version: String,
+    pub sessions: Arc<SessionManager>,
 }
 
 #[derive(Debug, Serialize)]
@@ -206,7 +215,15 @@ pub fn new_token() -> String {
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(health))
-        .route("/sessions", get(sessions))
+        .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/{id}", get(get_session))
+        .route("/sessions/{id}/messages", axum::routing::post(send_message))
+        .route(
+            "/sessions/{id}/interrupt",
+            axum::routing::post(interrupt_session),
+        )
+        .route("/sessions/{id}/stop", axum::routing::post(stop_session))
+        .route("/sessions/{id}/events", get(session_events))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_auth,
@@ -221,6 +238,147 @@ pub fn router(state: AppState) -> Router {
             host_origin_guard,
         ))
         .with_state(state)
+}
+
+async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "sessions": state.sessions.list() }))
+}
+
+async fn create_session(
+    State(state): State<AppState>,
+    Json(request): Json<CreateRequest>,
+) -> Result<Response, ApiError> {
+    let session =
+        state
+            .sessions
+            .create(&request.workspace_path, request.session_path, request.key)?;
+    let mut response = (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "sessionId": session.id,
+            "status": session.status().as_str(),
+            "cursor": session.cursor(),
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(&format!("/v1/sessions/{}", session.id))
+            .unwrap_or_else(|_| HeaderValue::from_static("/v1/sessions")),
+    );
+    Ok(response)
+}
+
+async fn get_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    Ok(Json(session.info()))
+}
+
+async fn send_message(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<SendRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    let value = session.send(&request.client_message_id, &request.text)?;
+    Ok((StatusCode::ACCEPTED, Json(value)))
+}
+
+async fn interrupt_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    session.interrupt()?;
+    Ok(Json(json!({ "status": session.status().as_str() })))
+}
+
+async fn stop_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    session.stop();
+    Ok(Json(json!({ "status": "stopped" })))
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    #[serde(rename = "clientId")]
+    client_id: Option<String>,
+    capabilities: Option<String>,
+    after: Option<u64>,
+}
+
+async fn session_events(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if query
+        .client_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .is_none()
+    {
+        return Err(ApiError::bad_request("clientId is required"));
+    }
+    let _capabilities = query
+        .capabilities
+        .unwrap_or_else(|| "view,control".to_string());
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    let after = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(query.after)
+        .unwrap_or(0);
+    let mut receiver = session.subscribe();
+    let (initial, mut last) = session.events_after(after);
+    let stream = async_stream::stream! {
+        for event in initial {
+            last = event.id;
+            yield Ok::<_, Infallible>(sse_event(event));
+        }
+        loop {
+            match receiver.recv().await {
+                Ok(event) if event.id > last => {
+                    last = event.id;
+                    yield Ok::<_, Infallible>(sse_event(event));
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let snapshot = session.snapshot_event();
+                    last = snapshot.id;
+                    yield Ok::<_, Infallible>(sse_event(snapshot));
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response())
+}
+
+fn sse_event(event: session::SessionEvent) -> SseEvent {
+    SseEvent::default()
+        .id(event.id.to_string())
+        .event(event.event)
+        .data(serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string()))
+}
+
+fn session_not_found() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "session-not-found",
+        "No such session",
+        false,
+    )
 }
 
 async fn root(State(state): State<AppState>, uri: Uri) -> Response {
@@ -251,10 +409,6 @@ async fn health(State(state): State<AppState>) -> Response {
         "uptimeSeconds": state.started.elapsed().as_secs(),
     }))
     .into_response()
-}
-
-async fn sessions() -> Response {
-    Json(json!({ "sessions": [] })).into_response()
 }
 
 async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -475,9 +629,10 @@ mod tests {
         AppState {
             token: Arc::new("a".repeat(64)),
             port: 40123,
-            dist,
+            dist: dist.clone(),
             started: Instant::now(),
             version: "0.1.0".to_string(),
+            sessions: Arc::new(SessionManager::new(None, dist, 10)),
         }
     }
 
@@ -757,5 +912,430 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
         drop(results);
         let _ = std::fs::remove_dir_all(home.as_path());
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::session::{RuntimeSpec, SessionManager, Status};
+    use axum::http::{Method, Request};
+    use http_body_util::BodyExt;
+    use std::{
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+    use tokio::sync::mpsc;
+    use tower::ServiceExt;
+
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("fake-runtime.mjs")
+    }
+
+    fn manager_with_spec(
+        spec: RuntimeSpec,
+        replay: usize,
+    ) -> (Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir) {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::new(
+            Some(spec),
+            home.path().to_path_buf(),
+            replay,
+        ));
+        (manager, home, workspace)
+    }
+
+    fn manager(replay: usize) -> (Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir) {
+        manager_with_spec(RuntimeSpec::node_script(&fixture()), replay)
+    }
+
+    fn app(manager: Arc<SessionManager>) -> Router {
+        AppState {
+            token: Arc::new("a".repeat(64)),
+            port: 40123,
+            dist: std::env::temp_dir(),
+            started: Instant::now(),
+            version: "0.1.0".to_string(),
+            sessions: manager,
+        }
+        .pipe(router)
+    }
+
+    trait Pipe: Sized {
+        fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
+            f(self)
+        }
+    }
+    impl Pipe for AppState {}
+
+    fn request(method: Method, uri: &str) -> axum::http::request::Builder {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:40123")
+            .header(header::AUTHORIZATION, format!("Bearer {}", "a".repeat(64)))
+    }
+
+    async fn call(app: Router, request: Request<Body>) -> (StatusCode, HeaderMap, String) {
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn wait_status(session: &crate::session::Session, expected: Status) {
+        for _ in 0..100 {
+            if session.status() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("status was {:?}, expected {:?}", session.status(), expected);
+    }
+
+    fn sse_event(block: &str) -> Option<(String, Value)> {
+        let mut event = String::new();
+        let mut data = String::new();
+        for line in block.lines() {
+            if let Some(value) = line.strip_prefix("event:") {
+                event = value.trim().to_string();
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data.push_str(value.trim());
+            }
+        }
+        if event.is_empty() || data.is_empty() {
+            return None;
+        }
+        Some((event, serde_json::from_str(&data).ok()?))
+    }
+
+    async fn read_sse(response: Response, tx: mpsc::UnboundedSender<(String, Value)>) {
+        let mut body = response.into_body();
+        let mut buffer = String::new();
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), body.frame()).await;
+            let Ok(Some(Ok(frame))) = frame else { break };
+            let Some(data) = frame.data_ref() else {
+                continue;
+            };
+            buffer.push_str(&String::from_utf8_lossy(data));
+            while let Some(index) = buffer.find("\n\n") {
+                let block: String = buffer.drain(..index + 2).collect();
+                if let Some(event) = sse_event(&block) {
+                    if tx.send(event).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn subscribe(
+        app: Router,
+        session_id: &str,
+    ) -> (
+        mpsc::UnboundedReceiver<(String, Value)>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let response = app
+            .oneshot(
+                request(
+                    Method::GET,
+                    &format!("/v1/sessions/{session_id}/events?clientId=test"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+        let (tx, rx) = mpsc::unbounded_channel();
+        (rx, tokio::spawn(read_sse(response, tx)))
+    }
+
+    async fn next_event(rx: &mut mpsc::UnboundedReceiver<(String, Value)>, name: &str) -> Value {
+        for _ in 0..100 {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {name}"))
+                .expect("stream closed");
+            if event.0 == name {
+                return event.1;
+            }
+        }
+        panic!("no {name} event");
+    }
+
+    #[tokio::test]
+    async fn create_send_stream_and_detach_keeps_the_session() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let (mut rx, reader) = subscribe(app.clone(), &session.id).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        session.send("client-1", "hello").unwrap();
+        let mut deltas = String::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event.0.as_str() {
+                "message.delta" => deltas.push_str(event.1["text"].as_str().unwrap()),
+                "message.done" => {
+                    assert_eq!(event.1["stopReason"], "completed");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(deltas, "hello");
+        reader.abort();
+
+        assert_ne!(session.status(), Status::Stopped);
+        session.send("client-2", "again").unwrap();
+        wait_status(&session, Status::Idle).await;
+        assert_eq!(session.status(), Status::Idle);
+    }
+
+    #[tokio::test]
+    async fn replay_returns_events_and_gap_returns_snapshot() {
+        let (manager, _home, workspace) = manager(2);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("client-1", "abcdefgh").unwrap();
+        wait_status(&session, Status::Idle).await;
+        let cursor = session.cursor();
+
+        let (snapshot, snapshot_cursor) = session.events_after(0);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].event, "session.snapshot");
+        assert_eq!(snapshot[0].id, snapshot_cursor);
+
+        let (replay, _) = session.events_after(cursor - 1);
+        assert!(!replay.is_empty());
+        assert!(replay.iter().all(|event| event.id > cursor - 1));
+
+        let (gap, gap_cursor) = session.events_after(1);
+        assert_eq!(gap.len(), 1);
+        assert_eq!(gap[0].event, "session.snapshot");
+        assert_eq!(gap[0].id, gap_cursor);
+    }
+
+    #[tokio::test]
+    async fn events_require_auth_and_client_id() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager);
+        let path = format!("/v1/sessions/{}/events?clientId=test", session.id);
+        let no_auth = Request::builder()
+            .uri(&path)
+            .header(header::HOST, "127.0.0.1:40123")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(app.clone(), no_auth).await.0, StatusCode::UNAUTHORIZED);
+
+        let no_client = request(Method::GET, &format!("/v1/sessions/{}/events", session.id))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            call(app.clone(), no_client).await.0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let (mut rx, reader) = subscribe(app, &session.id).await;
+        let event = next_event(&mut rx, "session.snapshot").await;
+        assert_eq!(event["sessionId"], session.id);
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn interrupt_ends_the_turn_as_interrupted() {
+        let (manager, _home, workspace) = manager(100);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let (mut rx, reader) = subscribe(app, &session.id).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        session.send("client-1", &"x".repeat(200)).unwrap();
+        let _ = next_event(&mut rx, "message.delta").await;
+        session.interrupt().unwrap();
+        let done = next_event(&mut rx, "message.done").await;
+        assert_eq!(done["stopReason"], "interrupted");
+        wait_status(&session, Status::Idle).await;
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn idempotent_send_and_conflict() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let first = session.send("same", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        let again = session.send("same", "hello").unwrap();
+        assert_eq!(first["messageId"], again["messageId"]);
+        let conflict = session.send("same", "different").unwrap_err();
+        assert_eq!(conflict.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn stop_terminates_the_job_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let pid_file = home.path().join("child.pid");
+        let mut spec = RuntimeSpec::node_script(&fixture());
+        spec.env.push((
+            "FAKE_RUNTIME_CHILD_PID_FILE".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        ));
+        let manager = Arc::new(SessionManager::new(
+            Some(spec),
+            home.path().to_path_buf(),
+            50,
+        ));
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let mut child_pid = None;
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    child_pid = Some(pid);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let child_pid = child_pid.expect("fixture child pid");
+        session.stop();
+        wait_status(&session, Status::Stopped).await;
+        for _ in 0..50 {
+            if !pid_running(child_pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("fixture child {child_pid} survived stop");
+    }
+
+    fn pid_running(pid: u32) -> bool {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output();
+        output
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn create_attaches_by_session_path() {
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().to_str().unwrap();
+        let first = manager
+            .create(path, Some("one.jsonl".to_string()), None)
+            .unwrap();
+        let second = manager
+            .create(path, Some("one.jsonl".to_string()), None)
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        let third = manager
+            .create(path, Some("two.jsonl".to_string()), None)
+            .unwrap();
+        assert_ne!(first.id, third.id);
+    }
+
+    #[tokio::test]
+    async fn http_stop_marks_the_session_stopped() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager);
+        let response = call(
+            app,
+            request(Method::POST, &format!("/v1/sessions/{}/stop", session.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(session.status(), Status::Stopped);
+    }
+    #[tokio::test]
+    async fn http_create_list_get_and_send() {
+        let (manager, _home, workspace) = manager(50);
+        let app = app(manager.clone());
+        let body = json!({ "workspacePath": workspace.path() });
+        let response = call(
+            app.clone(),
+            request(Method::POST, "/v1/sessions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::ACCEPTED, "{}", response.2);
+        let value: Value = serde_json::from_str(&response.2).unwrap();
+        let session_id = value["sessionId"].as_str().unwrap().to_string();
+        assert!(response.1.contains_key(header::LOCATION));
+
+        let list = call(
+            app.clone(),
+            request(Method::GET, "/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(list.0, StatusCode::OK);
+        assert!(list.2.contains(&session_id));
+
+        let get = call(
+            app.clone(),
+            request(Method::GET, &format!("/v1/sessions/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(get.0, StatusCode::OK);
+        assert!(get.2.contains(&session_id));
+
+        let missing = call(
+            app,
+            request(Method::GET, "/v1/sessions/nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
     }
 }

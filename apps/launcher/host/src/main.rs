@@ -6,7 +6,8 @@ use std::{
 };
 
 use jouzu_host::{
-    host_home, log, new_token, remove_host_file, router, write_host_file, AppState, HostLock,
+    host_home, log, new_token, remove_host_file, router, session::RuntimeSpec,
+    session::SessionManager, write_host_file, AppState, HostLock,
 };
 use serde_json::json;
 
@@ -17,6 +18,14 @@ fn arg_value(args: &[String], name: &str) -> Option<String> {
         .position(|value| value == name)
         .and_then(|index| args.get(index + 1))
         .cloned()
+}
+
+fn arg_values(args: &[String], name: &str) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, value)| value.as_str() == name)
+        .filter_map(|(index, _)| args.get(index + 1).cloned())
+        .collect()
 }
 
 fn usage() {
@@ -73,6 +82,18 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let runtime = arg_value(&args, "--runtime").map(|program| RuntimeSpec {
+        program: PathBuf::from(program),
+        args: arg_values(&args, "--runtime-arg"),
+        env: Vec::new(),
+    });
+    let runtime = runtime.or_else(|| RuntimeSpec::from_managed(&home));
+    let sessions = std::sync::Arc::new(SessionManager::new(
+        runtime,
+        home.clone(),
+        jouzu_host::session::DEFAULT_REPLAY_LIMIT,
+    ));
+
     let token = new_token();
     let listener =
         match tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await {
@@ -110,6 +131,7 @@ async fn main() -> ExitCode {
         dist,
         started: Instant::now(),
         version: VERSION.to_string(),
+        sessions: sessions.clone(),
     };
     let app = router(state);
 
@@ -119,6 +141,7 @@ async fn main() -> ExitCode {
         })
         .await;
 
+    sessions.stop_all();
     remove_host_file(&home, &token);
     log(
         &home,
