@@ -313,7 +313,11 @@ async fn send_message(
     Json(request): Json<SendRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
-    let value = session.send(&request.client_message_id, &request.text)?;
+    let value = session.send_with_client(
+        &request.client_message_id,
+        &request.text,
+        request.client_id.as_deref(),
+    )?;
     Ok((StatusCode::ACCEPTED, Json(value)))
 }
 
@@ -401,6 +405,18 @@ async fn answer_question(
     Ok(Json(value))
 }
 
+struct SseClientGuard {
+    session: Arc<session::Session>,
+    attach: u64,
+    client_id: String,
+}
+
+impl Drop for SseClientGuard {
+    fn drop(&mut self) {
+        self.session.leave_client(self.attach, &self.client_id);
+    }
+}
+
 async fn session_events(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -424,6 +440,12 @@ async fn session_events(
         .collect();
     state.sessions.register_client(&client_id, &capabilities);
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    let attach = session.join_client(&client_id, &capabilities);
+    let guard = SseClientGuard {
+        session: session.clone(),
+        attach,
+        client_id: client_id.clone(),
+    };
     let after = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
@@ -433,6 +455,7 @@ async fn session_events(
     let mut receiver = session.subscribe();
     let (initial, mut last) = session.events_after(after);
     let stream = async_stream::stream! {
+        let _guard = guard;
         for event in initial {
             last = event.id;
             yield Ok::<_, Infallible>(sse_event(event));

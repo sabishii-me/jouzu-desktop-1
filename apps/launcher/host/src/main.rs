@@ -106,6 +106,15 @@ async fn main() -> ExitCode {
         bash,
         jouzu_host::session::DEFAULT_REPLAY_LIMIT,
     ));
+    {
+        let sessions = sessions.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                sessions.reap_idle(std::time::Duration::from_secs(15 * 60));
+            }
+        });
+    }
 
     let token = new_token();
     let listener =

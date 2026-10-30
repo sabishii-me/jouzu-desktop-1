@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -112,6 +112,7 @@ struct EventLog {
     next: u64,
     events: VecDeque<SessionEvent>,
     limit: usize,
+    bytes: usize,
 }
 
 impl EventLog {
@@ -120,6 +121,7 @@ impl EventLog {
             next: 1,
             events: VecDeque::new(),
             limit: limit.max(1),
+            bytes: 0,
         }
     }
 
@@ -137,9 +139,18 @@ impl EventLog {
             event: event.to_string(),
             data,
         };
+        self.bytes += serde_json::to_vec(&stored).map(|value| value.len()).unwrap_or(0);
         self.events.push_back(stored.clone());
-        while self.events.len() > self.limit {
-            self.events.pop_front();
+        while (self.events.len() > self.limit || self.bytes > 2 * 1024 * 1024)
+            && self.events.len() > 1
+        {
+            if let Some(removed) = self.events.pop_front() {
+                self.bytes = self.bytes.saturating_sub(
+                    serde_json::to_vec(&removed)
+                        .map(|value| value.len())
+                        .unwrap_or(0),
+                );
+            }
         }
         stored
     }
@@ -209,6 +220,10 @@ pub struct Session {
     history: Mutex<Vec<Value>>,
     history_seq: AtomicU64,
     assistant_text: Mutex<String>,
+    active_client: Mutex<Option<String>>,
+    subscribers: AtomicU64,
+    next_client: AtomicU64,
+    last_activity: Mutex<Instant>,
 }
 
 impl Session {
@@ -224,6 +239,53 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .last_id()
+    }
+
+    fn touch(&self) {
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    }
+
+    pub fn subscriber_count(&self) -> u64 {
+        self.subscribers.load(Ordering::Relaxed)
+    }
+
+    pub fn last_activity(&self) -> Instant {
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn join_client(&self, client_id: &str, capabilities: &[String]) -> u64 {
+        let attach = self.next_client.fetch_add(1, Ordering::Relaxed) + 1;
+        self.subscribers.fetch_add(1, Ordering::Relaxed);
+        self.publish(
+            "client.joined",
+            json!({
+                "attachId": attach,
+                "clientId": client_id,
+                "capabilities": capabilities,
+            }),
+        );
+        attach
+    }
+
+    pub fn leave_client(&self, attach: u64, client_id: &str) {
+        self.subscribers.fetch_sub(1, Ordering::Relaxed);
+        self.publish(
+            "client.left",
+            json!({ "attachId": attach, "clientId": client_id }),
+        );
+    }
+
+    fn active_client(&self) -> Option<String> {
+        self.active_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn history(&self, limit: usize, before: Option<u64>) -> Value {
@@ -308,6 +370,7 @@ impl Session {
     }
 
     fn publish(&self, event: &str, data: Value) -> SessionEvent {
+        self.touch();
         let stored = {
             let mut log_guard = self
                 .events
@@ -614,6 +677,10 @@ impl Session {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .take();
+                self.active_client
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
                 if let Some(message_id) = active {
                     let stop_reason = if aborted { "interrupted" } else { "completed" };
                     let text = std::mem::take(
@@ -721,6 +788,9 @@ impl Session {
         if let Some(turn_id) = self.active_turn() {
             data["turnId"] = Value::String(turn_id);
         }
+        if let Some(client) = self.active_client() {
+            data["initiatorClientId"] = Value::String(client);
+        }
         let entry = PendingApproval {
             pi_id,
             data: data.clone(),
@@ -785,6 +855,9 @@ impl Session {
         });
         if let Some(turn_id) = self.active_turn() {
             data["turnId"] = Value::String(turn_id);
+        }
+        if let Some(client) = self.active_client() {
+            data["initiatorClientId"] = Value::String(client);
         }
         let mut option_map = std::collections::HashMap::new();
         option_map.insert(item_id.clone(), options);
@@ -1133,6 +1206,15 @@ impl Session {
         }
     }
     pub fn send(&self, client_message_id: &str, text: &str) -> Result<Value, ApiError> {
+        self.send_with_client(client_message_id, text, None)
+    }
+
+    pub fn send_with_client(
+        &self,
+        client_message_id: &str,
+        text: &str,
+        client_id: Option<&str>,
+    ) -> Result<Value, ApiError> {
         if client_message_id.is_empty() || client_message_id.len() > 200 {
             return Err(ApiError::bad_request("clientMessageId is required"));
         }
@@ -1182,6 +1264,10 @@ impl Session {
             .active_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message_id.clone());
+        *self
+            .active_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = client_id.map(str::to_string);
         *self
             .assistant_text
             .lock()
@@ -1341,6 +1427,10 @@ impl Session {
             history: Mutex::new(Vec::new()),
             history_seq: AtomicU64::new(0),
             assistant_text: Mutex::new(String::new()),
+            active_client: Mutex::new(None),
+            subscribers: AtomicU64::new(0),
+            next_client: AtomicU64::new(0),
+            last_activity: Mutex::new(Instant::now()),
         });
 
         {
@@ -1496,8 +1586,28 @@ impl SessionManager {
     /// Session files live in the runtime home owned by the host. This index is
     /// metadata-only: it never starts a runtime and never returns transcript
     /// bodies.
-    pub fn persisted(&self, workspace: Option<&str>) -> Vec<Value> {
-        let directory = self.runtime_home.join("state").join("sessions");
+    pub fn reap_idle(&self, ttl: Duration) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stale: Vec<String> = sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.status() == Status::Idle
+                    && session.subscriber_count() == 0
+                    && session.last_activity().elapsed() >= ttl
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            if let Some(session) = sessions.remove(&id) {
+                session.stop();
+            }
+        }
+    }
+
+    pub fn persisted(&self, workspace: Option<&str>) -> Vec<Value> {        let directory = self.runtime_home.join("state").join("sessions");
         let mut files: Vec<(PathBuf, std::time::SystemTime)> = std::fs::read_dir(&directory)
             .map(|entries| {
                 entries
@@ -1761,6 +1871,8 @@ pub struct SendRequest {
     #[serde(rename = "clientMessageId")]
     pub client_message_id: String,
     pub text: String,
+    #[serde(rename = "clientId", default)]
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug)]
