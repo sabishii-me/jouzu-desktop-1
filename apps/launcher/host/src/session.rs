@@ -334,25 +334,38 @@ impl Session {
                 ));
             }
             return Ok(json!({
-                "messageId": existing.message_id,
+                "messageId": existing.message_id.clone(),
                 "receipt": "queued",
             }));
         }
         let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
         let message_id = format!("m-{counter}");
-        let frame = json!({ "type": "prompt", "id": message_id, "text": text });
+        let frame = json!({ "type": "prompt", "id": message_id.clone(), "text": text });
         let line = format!("{frame}\n");
+        // Publish admission before the runtime can produce a delta, so a client
+        // never sees message.delta before message.accepted.
+        self.publish(
+            "message.accepted",
+            json!({ "messageId": message_id.clone(), "receipt": "queued" }),
+        );
+        self.publish("turn.start", json!({ "turnId": message_id.clone() }));
+        self.set_status(Status::Running);
         let mut stdin = self
             .stdin
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(input) = stdin.as_mut() else {
+            self.publish(
+                "error",
+                json!({ "code": "runtime-unavailable", "message": "runtime input is closed", "retryable": true }),
+            );
             return Err(ApiError::unavailable("runtime input is closed"));
         };
-        if input.write_all(line.as_bytes()).is_err() {
-            return Err(ApiError::unavailable("runtime input is closed"));
-        }
-        if input.flush().is_err() {
+        if input.write_all(line.as_bytes()).is_err() || input.flush().is_err() {
+            self.publish(
+                "error",
+                json!({ "code": "runtime-unavailable", "message": "runtime input is closed", "retryable": true }),
+            );
             return Err(ApiError::unavailable("runtime input is closed"));
         }
         messages.insert(
@@ -363,12 +376,6 @@ impl Session {
             },
         );
         drop(stdin);
-        self.publish(
-            "message.accepted",
-            json!({ "messageId": message_id, "receipt": "queued" }),
-        );
-        self.publish("turn.start", json!({ "turnId": message_id }));
-        self.set_status(Status::Running);
         Ok(json!({ "messageId": message_id, "receipt": "queued" }))
     }
 

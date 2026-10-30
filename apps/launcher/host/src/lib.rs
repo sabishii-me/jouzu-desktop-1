@@ -1066,6 +1066,29 @@ mod session_tests {
         (rx, tokio::spawn(read_sse(response, tx)))
     }
 
+    async fn subscribe_after(
+        app: Router,
+        session_id: &str,
+        last_event_id: Option<u64>,
+    ) -> (
+        mpsc::UnboundedReceiver<(String, Value)>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut builder = request(
+            Method::GET,
+            &format!("/v1/sessions/{session_id}/events?clientId=test"),
+        );
+        if let Some(id) = last_event_id {
+            builder = builder.header("last-event-id", id.to_string());
+        }
+        let response = app
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (tx, rx) = mpsc::unbounded_channel();
+        (rx, tokio::spawn(read_sse(response, tx)))
+    }
     async fn next_event(rx: &mut mpsc::UnboundedReceiver<(String, Value)>, name: &str) -> Value {
         for _ in 0..100 {
             let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -1290,6 +1313,35 @@ mod session_tests {
         .await;
         assert_eq!(response.0, StatusCode::OK);
         assert_eq!(session.status(), Status::Stopped);
+    }
+    #[tokio::test]
+    async fn sse_resumes_from_last_event_id_and_snapshots_on_gap() {
+        let (manager, _home, workspace) = manager(2);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("client-1", "abcdef").unwrap();
+        wait_status(&session, Status::Idle).await;
+        let cursor = session.cursor();
+
+        let app = app(manager.clone());
+        let (mut rx, reader) =
+            subscribe_after(app.clone(), &session.id, Some(cursor.saturating_sub(1))).await;
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.0, "session.snapshot");
+        reader.abort();
+
+        let (mut rx, reader) = subscribe_after(app, &session.id, Some(1)).await;
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.0, "session.snapshot");
+        reader.abort();
     }
     #[tokio::test]
     async fn http_create_list_get_and_send() {
