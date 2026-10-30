@@ -217,9 +217,13 @@ pub fn new_token() -> String {
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(health))
+        .route("/capabilities", get(capabilities))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session))
-        .route("/sessions/{id}/messages", axum::routing::post(send_message))
+        .route(
+            "/sessions/{id}/messages",
+            get(history).post(send_message),
+        )
         .route(
             "/sessions/{id}/interrupt",
             axum::routing::post(interrupt_session),
@@ -482,6 +486,31 @@ async fn health(State(state): State<AppState>) -> Response {
         "uptimeSeconds": state.started.elapsed().as_secs(),
     }))
     .into_response()
+}
+
+async fn capabilities(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "contract": "2026-10-30",
+        "hostVersion": state.version,
+        "features": ["sse", "replay", "prompts", "history-paging"],
+        "scopes": ["loopback"],
+        "limits": { "maxMessageBytes": 32768, "maxUploadBytes": 26214400 },
+    }))
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    limit: Option<usize>,
+    before: Option<u64>,
+}
+
+async fn history(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    Ok(Json(session.history(query.limit.unwrap_or(200), query.before)))
 }
 
 async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {

@@ -202,6 +202,9 @@ pub struct Session {
     question_outcomes: Mutex<HashMap<String, String>>,
     next_prompt: AtomicU64,
     home: PathBuf,
+    history: Mutex<Vec<Value>>,
+    history_seq: AtomicU64,
+    assistant_text: Mutex<String>,
 }
 
 impl Session {
@@ -217,6 +220,45 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .last_id()
+    }
+
+    pub fn history(&self, limit: usize, before: Option<u64>) -> Value {
+        let limit = limit.clamp(1, 1000);
+        let history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut rows: Vec<&Value> = history
+            .iter()
+            .filter(|row| {
+                before.is_none_or(|before| {
+                    row.get("cursor").and_then(Value::as_u64).unwrap_or(0) < before
+                })
+            })
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.get("cursor").and_then(Value::as_u64).unwrap_or(0)));
+        let page: Vec<Value> = rows.into_iter().take(limit).cloned().collect();
+        let next_before = if page.len() == limit {
+            page.last().and_then(|row| row.get("cursor")).and_then(Value::as_u64)
+        } else {
+            None
+        };
+        json!({ "messages": page, "nextBefore": next_before })
+    }
+
+    fn push_history(&self, mut row: Value) {
+        let cursor = self.history_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(object) = row.as_object_mut() {
+            object.insert("cursor".to_string(), json!(cursor));
+        }
+        self.history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(row);
+    }
+
+    fn now_iso() -> String {
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
@@ -446,6 +488,10 @@ impl Session {
                     "text_delta" => {
                         let text = update.get("delta").and_then(Value::as_str).unwrap_or("");
                         if !text.is_empty() {
+                            self.assistant_text
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .push_str(text);
                             self.publish(
                                 "message.delta",
                                 json!({ "messageId": message_id, "text": text }),
@@ -505,6 +551,19 @@ impl Session {
                     .take();
                 if let Some(message_id) = active {
                     let stop_reason = if aborted { "interrupted" } else { "completed" };
+                    let text = std::mem::take(
+                        &mut *self
+                            .assistant_text
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    );
+                    self.push_history(json!({
+                        "kind": "assistant",
+                        "id": format!("{message_id}:assistant"),
+                        "turnId": message_id.clone(),
+                        "text": text,
+                        "createdAt": Self::now_iso(),
+                    }));
                     self.publish(
                         "message.done",
                         json!({ "messageId": message_id, "stopReason": stop_reason }),
@@ -1058,6 +1117,17 @@ impl Session {
             .active_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message_id.clone());
+        *self
+            .assistant_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = String::new();
+        self.push_history(json!({
+            "kind": "user",
+            "id": format!("{message_id}:user"),
+            "turnId": message_id,
+            "text": text,
+            "createdAt": Self::now_iso(),
+        }));
         self.publish(
             "message.accepted",
             json!({ "messageId": message_id.clone(), "receipt": "queued" }),
@@ -1203,6 +1273,9 @@ impl Session {
             question_outcomes: Mutex::new(HashMap::new()),
             next_prompt: AtomicU64::new(0),
             home: config.home.clone(),
+            history: Mutex::new(Vec::new()),
+            history_seq: AtomicU64::new(0),
+            assistant_text: Mutex::new(String::new()),
         });
 
         {
