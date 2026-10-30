@@ -6,7 +6,7 @@ use std::{
 };
 
 use jouzu_host::{
-    host_home, log, new_token, remove_host_file, router, write_host_file, AppState,
+    host_home, log, new_token, remove_host_file, router, write_host_file, AppState, HostLock,
 };
 use serde_json::json;
 
@@ -65,15 +65,23 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let token = new_token();
-    let listener = match tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await
-    {
-        Ok(listener) => listener,
+    // One live host per home. Refuse before binding or touching host.json.
+    let _lock = match HostLock::acquire(&home) {
+        Ok(lock) => lock,
         Err(error) => {
-            eprintln!("cannot bind 127.0.0.1: {error}");
+            eprintln!("{error}");
             return ExitCode::FAILURE;
         }
     };
+    let token = new_token();
+    let listener =
+        match tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("cannot bind 127.0.0.1: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
     let port = match listener.local_addr() {
         Ok(address) => address.port(),
         Err(error) => {

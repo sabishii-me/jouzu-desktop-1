@@ -58,16 +58,89 @@ pub fn host_home() -> Result<PathBuf, String> {
         }
     }
     let local = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unavailable")?;
-    Ok(PathBuf::from(local)
-        .join("Shisa.ai")
-        .join("JouzuDesktop"))
+    Ok(PathBuf::from(local).join("Shisa.ai").join("JouzuDesktop"))
 }
 
+pub fn host_lock_path(home: &Path) -> PathBuf {
+    home.join("host.lock")
+}
+
+/// An exclusively held marker for the process lifetime. The handle is opened
+/// without read/write sharing on Windows, so a second host cannot acquire it;
+/// FILE_SHARE_DELETE lets this process remove the file on clean exit.
+#[derive(Debug)]
+pub struct HostLock {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl HostLock {
+    pub fn acquire(home: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(home)
+            .map_err(|error| format!("Cannot create host home: {error}"))?;
+        let path = host_lock_path(home);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_SHARE_DELETE only: no other process may read or write it.
+            options.share_mode(0x00000004);
+        }
+        match options.open(&path) {
+            Ok(file) => Ok(Self {
+                path,
+                file: Some(file),
+            }),
+            Err(error) if is_locked(&error) => Err(live_host_message(home)),
+            Err(error) => Err(format!("Cannot lock {}: {error}", path.display())),
+        }
+    }
+}
+
+impl Drop for HostLock {
+    fn drop(&mut self) {
+        // The file is open with FILE_SHARE_DELETE, so removing it while held is safe.
+        let _ = std::fs::remove_file(&self.path);
+        self.file.take();
+    }
+}
+
+fn is_locked(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(32) | Some(33))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn live_host_message(home: &Path) -> String {
+    let info = std::fs::read(host_file_path(home))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    match info {
+        Some(value) => format!(
+            "Another jouzu-host is already running (pid {}, port {}). Stop it before starting a new one.",
+            value.get("pid").and_then(Value::as_u64).unwrap_or(0),
+            value.get("port").and_then(Value::as_u64).unwrap_or(0)
+        ),
+        None => "Another jouzu-host is already starting. Stop it before starting a new one.".to_string(),
+    }
+}
 pub fn host_file_path(home: &Path) -> PathBuf {
     home.join("host.json")
 }
 
-pub fn write_host_file(home: &Path, port: u16, token: &str, version: &str) -> Result<PathBuf, String> {
+pub fn write_host_file(
+    home: &Path,
+    port: u16,
+    token: &str,
+    version: &str,
+) -> Result<PathBuf, String> {
     std::fs::create_dir_all(home).map_err(|error| format!("Cannot create host home: {error}"))?;
     let info = HostInfo {
         schema: HOST_SCHEMA,
@@ -86,8 +159,12 @@ pub fn write_host_file(home: &Path, port: u16, token: &str, version: &str) -> Re
 /// Removes the discovery file only when it still names this process and token.
 pub fn remove_host_file(home: &Path, token: &str) {
     let path = host_file_path(home);
-    let Ok(bytes) = std::fs::read(&path) else { return };
-    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { return };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return;
+    };
     if value.get("pid").and_then(Value::as_u64) != Some(std::process::id() as u64) {
         return;
     }
@@ -232,7 +309,10 @@ async fn host_origin_guard(
 }
 
 fn allowed_host(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(host) = headers.get(header::HOST).and_then(|value| value.to_str().ok()) else {
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
         return false;
     };
     let host = host.to_ascii_lowercase();
@@ -242,7 +322,10 @@ fn allowed_host(state: &AppState, headers: &HeaderMap) -> bool {
 }
 
 fn allowed_origin(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(origin) = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()) else {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
         return true;
     };
     let origin = origin.to_ascii_lowercase();
@@ -559,5 +642,120 @@ mod tests {
         let text = std::fs::read_to_string(home.path().join("logs/host.log")).unwrap();
         assert!(text.contains("\"event\":\"start\""));
         assert!(!text.contains(&"a".repeat(64)));
+    }
+
+    #[tokio::test]
+    async fn wrong_bearer_is_rejected() {
+        let dir = dist();
+        let app = router(state(dir.path().to_path_buf()));
+        let request = Request::builder()
+            .uri("/v1/health")
+            .header(header::HOST, "127.0.0.1:40123")
+            .header(header::AUTHORIZATION, format!("Bearer {}", "b".repeat(64)))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = call(app, request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn a_bad_query_token_sets_no_cookie() {
+        let dir = dist();
+        let app = router(state(dir.path().to_path_buf()));
+        let (status, headers, _) = call(app, get("/?token=wrong", "127.0.0.1:40123")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(headers.get(header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn path_traversal_never_serves_files_outside_dist() {
+        let dir = dist();
+        let app = router(state(dir.path().to_path_buf()));
+        for path in [
+            "/../host.json",
+            "/%2e%2e/host.json",
+            "/assets/%2e%2e/%2e%2e/host.json",
+            "/assets/..%2f..%2fhost.json",
+        ] {
+            let (status, _, body) = call(app.clone(), get(path, "127.0.0.1:40123")).await;
+            assert!(
+                status == StatusCode::NOT_FOUND || status == StatusCode::FORBIDDEN,
+                "{path} returned {status}"
+            );
+            assert!(!body.contains("hostVersion"), "{path} leaked a file");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_asset_is_404_but_the_spa_still_falls_back() {
+        let dir = dist();
+        let app = router(state(dir.path().to_path_buf()));
+        let (status, _, _) = call(app.clone(), get("/assets/missing.js", "127.0.0.1:40123")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, body) = call(app, get("/no/such/route", "127.0.0.1:40123")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Jouzu Host"));
+    }
+
+    #[test]
+    fn a_live_lock_refuses_a_second_host_and_keeps_host_json() {
+        let home = tempfile::tempdir().unwrap();
+        write_host_file(home.path(), 40123, &"b".repeat(64), "0.1.0").unwrap();
+        let first = HostLock::acquire(home.path()).unwrap();
+        let before = std::fs::read(host_file_path(home.path())).unwrap();
+        let error = HostLock::acquire(home.path()).unwrap_err();
+        assert!(error.contains("already running"), "{error}");
+        assert!(error.contains("40123"), "{error}");
+        let after = std::fs::read(host_file_path(home.path())).unwrap();
+        assert_eq!(before, after);
+        drop(first);
+        assert!(!host_lock_path(home.path()).exists());
+    }
+
+    #[test]
+    fn a_stale_lock_is_replaced_and_removed_on_exit() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(host_lock_path(home.path()), b"").unwrap();
+        let lock = HostLock::acquire(home.path()).unwrap();
+        assert!(host_lock_path(home.path()).exists());
+        drop(lock);
+        assert!(!host_lock_path(home.path()).exists());
+    }
+
+    #[test]
+    fn clean_exit_removes_host_json_and_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let token = "c".repeat(64);
+        write_host_file(home.path(), 40124, &token, "0.1.0").unwrap();
+        let lock = HostLock::acquire(home.path()).unwrap();
+        assert!(host_file_path(home.path()).exists());
+        assert!(host_lock_path(home.path()).exists());
+        remove_host_file(home.path(), &token);
+        assert!(!host_file_path(home.path()).exists());
+        drop(lock);
+        assert!(!host_lock_path(home.path()).exists());
+    }
+    #[test]
+    fn only_one_of_two_concurrent_acquires_wins() {
+        let home = std::sync::Arc::new(tempfile::tempdir().unwrap().keep());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let home = home.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                HostLock::acquire(&home)
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        drop(results);
+        let _ = std::fs::remove_dir_all(home.as_path());
     }
 }
