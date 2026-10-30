@@ -219,6 +219,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/capabilities", get(capabilities))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/persisted", get(persisted_sessions))
         .route("/sessions/{id}", get(get_session))
         .route(
             "/sessions/{id}/messages",
@@ -256,6 +257,21 @@ pub fn router(state: AppState) -> Router {
 
 async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "sessions": state.sessions.list() }))
+}
+
+#[derive(Deserialize)]
+struct PersistedQuery {
+    #[serde(rename = "workspacePath")]
+    workspace_path: Option<String>,
+}
+
+async fn persisted_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<PersistedQuery>,
+) -> Json<Value> {
+    Json(json!({
+        "sessions": state.sessions.persisted(query.workspace_path.as_deref()),
+    }))
 }
 
 async fn create_session(
