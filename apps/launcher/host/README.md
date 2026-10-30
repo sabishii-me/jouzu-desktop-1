@@ -30,3 +30,12 @@ cargo test --manifest-path host/Cargo.toml
 Phase 1 intentionally does not include session ownership, SSE, prompts, remote
 pairing, packaging or the Tauri shell switch. The contract is
 `docs/contracts/host-ui-v1.md` in the docs repository.
+
+## Single instance
+
+A per-home exclusive lock (`host.lock`) is acquired before the listener binds.
+A second start exits 1 with the live pid/port and leaves `host.json` untouched;
+a stale lock from a dead process is reused. Clean exit removes both files.
+
+On Windows the lock is an exclusive file handle (no read/write sharing,
+FILE_SHARE_DELETE for self-removal); on non-Windows the lock is not enforced yet.
