@@ -1,0 +1,563 @@
+//! Phase 1 of the runtime host: HTTP/SPA skeleton only.
+//!
+//! The contract lives in `docs/contracts/host-ui-v1.md` of the docs repository.
+//! This crate deliberately owns no chat session yet; the old Tauri commands stay
+//! untouched until the host can take them over.
+
+use std::{
+    collections::HashMap,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+
+use axum::{
+    body::Body,
+    extract::{Request, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
+    middleware::Next,
+    response::{IntoResponse, Redirect, Response},
+    routing::get,
+    Json, Router,
+};
+use chrono::{DateTime, SecondsFormat, Utc};
+use percent_encoding::percent_decode_str;
+use serde::Serialize;
+use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
+
+pub const COOKIE_NAME: &str = "jouzu_host";
+pub const HOST_SCHEMA: u32 = 1;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub token: Arc<String>,
+    pub port: u16,
+    pub dist: PathBuf,
+    pub started: Instant,
+    pub version: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HostInfo {
+    pub schema: u32,
+    #[serde(rename = "hostVersion")]
+    pub host_version: String,
+    pub pid: u32,
+    pub port: u16,
+    pub token: String,
+    #[serde(rename = "startedAt")]
+    pub started_at: String,
+}
+
+/// The directory the host writes `host.json` and logs into.
+pub fn host_home() -> Result<PathBuf, String> {
+    if let Some(value) = std::env::var_os("JOUZU_HOST_HOME") {
+        if !value.is_empty() {
+            return Ok(PathBuf::from(value));
+        }
+    }
+    let local = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unavailable")?;
+    Ok(PathBuf::from(local)
+        .join("Shisa.ai")
+        .join("JouzuDesktop"))
+}
+
+pub fn host_file_path(home: &Path) -> PathBuf {
+    home.join("host.json")
+}
+
+pub fn write_host_file(home: &Path, port: u16, token: &str, version: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(home).map_err(|error| format!("Cannot create host home: {error}"))?;
+    let info = HostInfo {
+        schema: HOST_SCHEMA,
+        host_version: version.to_string(),
+        pid: std::process::id(),
+        port,
+        token: token.to_string(),
+        started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    };
+    let path = host_file_path(home);
+    let bytes = serde_json::to_vec_pretty(&info).map_err(|error| error.to_string())?;
+    std::fs::write(&path, bytes).map_err(|error| format!("Cannot write host.json: {error}"))?;
+    Ok(path)
+}
+
+/// Removes the discovery file only when it still names this process and token.
+pub fn remove_host_file(home: &Path, token: &str) {
+    let path = host_file_path(home);
+    let Ok(bytes) = std::fs::read(&path) else { return };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { return };
+    if value.get("pid").and_then(Value::as_u64) != Some(std::process::id() as u64) {
+        return;
+    }
+    if value.get("token").and_then(Value::as_str) != Some(token) {
+        return;
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// One JSON line per event. Callers never pass secrets (the token is not logged).
+pub fn log(home: &Path, level: &str, event: &str, fields: Value) {
+    let path = home.join("logs");
+    if std::fs::create_dir_all(&path).is_err() {
+        return;
+    }
+    let record = json!({
+        "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "level": level,
+        "event": event,
+        "fields": fields,
+    });
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path.join("host.log"))
+    {
+        let _ = writeln!(file, "{record}");
+    }
+}
+
+pub fn new_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub fn router(state: AppState) -> Router {
+    let api = Router::new()
+        .route("/health", get(health))
+        .route("/sessions", get(sessions))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ));
+
+    Router::new()
+        .route("/", get(root))
+        .nest("/v1", api)
+        .fallback(get(static_file))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            host_origin_guard,
+        ))
+        .with_state(state)
+}
+
+async fn root(State(state): State<AppState>, uri: Uri) -> Response {
+    let query = query_map(uri.query().unwrap_or(""));
+    if let Some(token) = query.get("token").filter(|value| !value.is_empty()) {
+        if token == state.token.as_str() {
+            let cookie = format!("{COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/");
+            let mut response = Redirect::to("/").into_response();
+            match HeaderValue::from_str(&cookie) {
+                Ok(value) => {
+                    response.headers_mut().insert(header::SET_COOKIE, value);
+                    response
+                }
+                Err(_) => unauthorized("Invalid token").into_response(),
+            }
+        } else {
+            unauthorized("Invalid token").into_response()
+        }
+    } else {
+        serve_index(&state).await
+    }
+}
+
+async fn health(State(state): State<AppState>) -> Response {
+    Json(json!({
+        "status": "ok",
+        "hostVersion": state.version,
+        "uptimeSeconds": state.started.elapsed().as_secs(),
+    }))
+    .into_response()
+}
+
+async fn sessions() -> Response {
+    Json(json!({ "sessions": [] })).into_response()
+}
+
+async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if authorized(&state, request.headers()) {
+        next.run(request).await
+    } else {
+        unauthorized("A valid host token is required").into_response()
+    }
+}
+
+fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    if let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        if let Some(token) = value.strip_prefix("Bearer ") {
+            if token == state.token.as_str() {
+                return true;
+            }
+        }
+    }
+    cookie_token(headers).is_some_and(|token| token == *state.token)
+}
+
+fn cookie_token(headers: &HeaderMap) -> Option<String> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    for part in cookies.split(';') {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix(&format!("{COOKIE_NAME}=")) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+async fn host_origin_guard(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if allowed_host(&state, request.headers()) && allowed_origin(&state, request.headers()) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": { "code": "forbidden", "message": "Unknown Host or Origin", "retryable": false }
+            })),
+        )
+            .into_response()
+    }
+}
+
+fn allowed_host(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    host == format!("127.0.0.1:{}", state.port)
+        || host == format!("localhost:{}", state.port)
+        || host == format!("[::1]:{}", state.port)
+}
+
+fn allowed_origin(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()) else {
+        return true;
+    };
+    let origin = origin.to_ascii_lowercase();
+    let allowed = [
+        format!("http://127.0.0.1:{}", state.port),
+        format!("http://localhost:{}", state.port),
+        format!("http://[::1]:{}", state.port),
+    ];
+    allowed.iter().any(|value| value == &origin)
+}
+
+struct Unauthorized(&'static str);
+
+impl IntoResponse for Unauthorized {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": { "code": "unauthorized", "message": self.0, "retryable": true }
+            })),
+        )
+            .into_response()
+    }
+}
+
+fn unauthorized(message: &'static str) -> Unauthorized {
+    Unauthorized(message)
+}
+
+async fn serve_index(state: &AppState) -> Response {
+    match tokio::fs::read(state.dist.join("index.html")).await {
+        Ok(bytes) => (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            [(header::CACHE_CONTROL, "no-cache")],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "index.html is missing from the dist directory",
+        )
+            .into_response(),
+    }
+}
+
+async fn static_file(State(state): State<AppState>, uri: Uri) -> Response {
+    let path = uri.path();
+    let relative = percent_decode_str(path.trim_start_matches('/'))
+        .decode_utf8_lossy()
+        .into_owned();
+    if relative.is_empty() || relative.ends_with('/') {
+        return serve_index(&state).await;
+    }
+    let Some(file) = safe_join(&state.dist, &relative) else {
+        // A client-side route has no extension; anything with one must be a real file.
+        if Path::new(&relative).extension().is_none() {
+            return serve_index(&state).await;
+        }
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    };
+    if let Ok(mut handle) = tokio::fs::File::open(&file).await {
+        let mut bytes = Vec::new();
+        if handle.read_to_end(&mut bytes).await.is_ok() {
+            return (
+                [(header::CONTENT_TYPE, content_type(&file))],
+                [(header::CACHE_CONTROL, "no-cache")],
+                bytes,
+            )
+                .into_response();
+        }
+    }
+    if Path::new(&relative).extension().is_none() {
+        serve_index(&state).await
+    } else {
+        (StatusCode::NOT_FOUND, "Not found").into_response()
+    }
+}
+
+fn safe_join(base: &Path, relative: &str) -> Option<PathBuf> {
+    let candidate = Path::new(relative);
+    if candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    let file = base.join(candidate);
+    let base = base.canonicalize().ok()?;
+    let file = file.canonicalize().ok()?;
+    file.starts_with(&base).then_some(file)
+}
+
+fn content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+fn query_map(query: &str) -> HashMap<String, String> {
+    query
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            Some((
+                percent_decode_str(key).decode_utf8_lossy().into_owned(),
+                percent_decode_str(value).decode_utf8_lossy().into_owned(),
+            ))
+        })
+        .collect()
+}
+
+/// RFC3339 timestamp for the discovery file; exported for tests.
+pub fn now_rfc3339() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+#[allow(dead_code)]
+fn _keep_imports(_: DateTime<Utc>, _: Body) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn state(dist: PathBuf) -> AppState {
+        AppState {
+            token: Arc::new("a".repeat(64)),
+            port: 40123,
+            dist,
+            started: Instant::now(),
+            version: "0.1.0".to_string(),
+        }
+    }
+
+    fn dist() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<html>Jouzu Host</html>").unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), "console.log(1)").unwrap();
+        dir
+    }
+
+    async fn call(app: Router, request: Request<Body>) -> (StatusCode, HeaderMap, String) {
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn get(path: &str, host: &str) -> Request<Body> {
+        Request::builder()
+            .uri(path)
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_requires_a_token() {
+        let dir = dist();
+        let app = router(state(dir.path().to_path_buf()));
+        let (status, _, body) = call(app, get("/v1/health", "127.0.0.1:40123")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn bearer_and_cookie_are_accepted() {
+        let dir = dist();
+        let app = router(state(dir.path().to_path_buf()));
+        let request = Request::builder()
+            .uri("/v1/health")
+            .header(header::HOST, "127.0.0.1:40123")
+            .header(header::AUTHORIZATION, format!("Bearer {}", "a".repeat(64)))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = call(app.clone(), request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"status\":\"ok\""));
+
+        let request = Request::builder()
+            .uri("/v1/sessions")
+            .header(header::HOST, "127.0.0.1:40123")
+            .header(header::COOKIE, format!("{COOKIE_NAME}={}", "a".repeat(64)))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = call(app, request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"sessions\":[]"));
+    }
+
+    #[tokio::test]
+    async fn token_is_exchanged_for_a_cookie_and_redirect() {
+        let dir = dist();
+        let app = router(state(dir.path().to_path_buf()));
+        let path = format!("/?token={}", "a".repeat(64));
+        let (status, headers, _) = call(app.clone(), get(&path, "127.0.0.1:40123")).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers.get(header::LOCATION).unwrap(), "/");
+        let cookie = headers.get(header::SET_COOKIE).unwrap().to_str().unwrap();
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+
+        let bad = call(app, get("/?token=wrong", "127.0.0.1:40123")).await;
+        assert_eq!(bad.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn spa_and_assets_are_served() {
+        let dir = dist();
+        let app = router(state(dir.path().to_path_buf()));
+        let (status, headers, body) = call(app.clone(), get("/", "127.0.0.1:40123")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Jouzu Host"));
+        assert!(headers
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+
+        let (status, headers, body) =
+            call(app.clone(), get("/assets/app.js", "127.0.0.1:40123")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("console.log"));
+        assert!(headers
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/javascript"));
+
+        let (status, _, body) =
+            call(app, get("/sessions/some-client-route", "127.0.0.1:40123")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Jouzu Host"));
+    }
+
+    #[tokio::test]
+    async fn unknown_host_and_origin_are_rejected() {
+        let dir = dist();
+        let app = router(state(dir.path().to_path_buf()));
+        let (status, _, body) = call(app.clone(), get("/", "evil.example:40123")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("forbidden"));
+
+        let request = Request::builder()
+            .uri("/v1/health")
+            .header(header::HOST, "127.0.0.1:40123")
+            .header(header::ORIGIN, "http://evil.example")
+            .header(header::AUTHORIZATION, format!("Bearer {}", "a".repeat(64)))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, _) = call(app.clone(), request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let request = Request::builder()
+            .uri("/v1/health")
+            .header(header::HOST, "127.0.0.1:40123")
+            .header(header::ORIGIN, "http://127.0.0.1:40123")
+            .header(header::AUTHORIZATION, format!("Bearer {}", "a".repeat(64)))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, _) = call(app, request).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn host_file_has_the_contract_shape_and_replaces_a_stale_file() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            host_file_path(home.path()),
+            r#"{"schema":1,"hostVersion":"0.0.0","pid":1,"port":1,"token":"old","startedAt":"x"}"#,
+        )
+        .unwrap();
+        let path = write_host_file(home.path(), 40123, &"a".repeat(64), "0.1.0").unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["schema"], 1);
+        assert_eq!(value["hostVersion"], "0.1.0");
+        assert_eq!(value["port"], 40123);
+        assert_eq!(value["token"], "a".repeat(64));
+        assert!(value["startedAt"].as_str().unwrap().contains('T'));
+
+        remove_host_file(home.path(), &"a".repeat(64));
+        assert!(!host_file_path(home.path()).exists());
+    }
+
+    #[test]
+    fn logging_never_contains_the_token() {
+        let home = tempfile::tempdir().unwrap();
+        log(home.path(), "info", "start", json!({ "port": 40123 }));
+        let text = std::fs::read_to_string(home.path().join("logs/host.log")).unwrap();
+        assert!(text.contains("\"event\":\"start\""));
+        assert!(!text.contains(&"a".repeat(64)));
+    }
+}
