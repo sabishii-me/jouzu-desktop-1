@@ -3012,3 +3012,35 @@ fn find_program(name: &str) -> Option<PathBuf> {
         .map(|directory| directory.join(name))
         .find(|candidate| candidate.is_file())
 }
+
+#[cfg(test)]
+mod model_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn models_reads_cached_catalog_without_creating_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let documents = root
+            .path()
+            .join("cache/model-catalog/account/documents");
+        std::fs::create_dir_all(&documents).unwrap();
+        std::fs::write(
+            documents.join("catalog.json"),
+            r#"{"format":"jouzu.model-catalog","modelOfferings":[
+                {"providerId":"Shisa AI","modelId":"qwen3.7-max","name":"Qwen 3.7 Max"},
+                {"providerId":"Shisa AI","modelId":"glm-5.2","name":"GLM 5.2"}
+            ]}"#,
+        )
+        .unwrap();
+        let manager = SessionManager::new(
+            None,
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            None,
+            5000,
+        );
+        let value = manager.models().unwrap();
+        assert_eq!(value["models"].as_array().unwrap().len(), 2);
+        assert!(!root.path().join("state/sessions").exists());
+    }
+}
