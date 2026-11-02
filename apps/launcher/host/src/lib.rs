@@ -15,6 +15,7 @@ use std::{
 #[cfg(windows)]
 mod runtime_process;
 mod artifacts;
+mod environment;
 mod files;
 pub mod session;
 
@@ -220,6 +221,10 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/status", get(host_status))
+        .route(
+            "/environment",
+            get(read_environment).put(save_environment),
+        )
         .route("/capabilities", get(capabilities))
         .route(
             "/workspaces",
@@ -776,6 +781,23 @@ async fn health(State(state): State<AppState>) -> Response {
 
 async fn host_status(State(state): State<AppState>) -> Json<Value> {
     Json(state.sessions.status())
+}
+
+async fn read_environment(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    environment::read(state.sessions.runtime_home())
+        .map(|entries| Json(json!({ "entries": entries })))
+        .map_err(ApiError::bad_request)
+}
+
+async fn save_environment(
+    State(state): State<AppState>,
+    Json(entries): Json<Vec<environment::Entry>>,
+) -> Result<Json<Value>, ApiError> {
+    environment::save(state.sessions.runtime_home(), &entries)
+        .map(|()| Json(json!({ "entries": entries })))
+        .map_err(ApiError::bad_request)
 }
 
 async fn capabilities(State(state): State<AppState>) -> Json<Value> {
