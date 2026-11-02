@@ -195,6 +195,23 @@ fn ensure_node(managed: &Path, progress: Progress) -> Result<PathBuf, String> {
     Ok(executable)
 }
 
+/// npm lifecycle scripts invoke `node` by name. On a clean machine the Node we
+/// just unpacked is not on the user's PATH, and npm does not add it for the
+/// scripts it spawns, so the installer child gets the same PATH the runtime
+/// bootstrap gives a session: the bundled Node first, then the app's shims.
+fn installer_path(node: &Path, app: &Path) -> Result<std::ffi::OsString, String> {
+    let node_directory = node.parent().ok_or("The Node executable has no directory.")?;
+    let mut paths = vec![
+        node_directory.to_path_buf(),
+        app.join("node_modules").join(".bin"),
+    ];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths)
+        .map_err(|error| format!("Could not prepare the package installer environment: {error}"))
+}
+
 fn npm_install(node: &Path, app: &Path, progress: Progress) -> Result<(), String> {
     let npm = node
         .parent()
@@ -211,6 +228,7 @@ fn npm_install(node: &Path, app: &Path, progress: Progress) -> Result<(), String
         std::fs::write(app.join("package.json"), APP_MANIFEST).map_err(|error| error.to_string())?;
     }
     progress(serde_json::json!({ "phase": "packages" }));
+    let path = installer_path(node, app)?;
     let output = Command::new(node)
         .arg(&npm)
         .arg("install")
@@ -219,6 +237,7 @@ fn npm_install(node: &Path, app: &Path, progress: Progress) -> Result<(), String
         .arg("--omit=dev")
         .arg("--no-audit")
         .arg("--no-fund")
+        .env("PATH", path)
         .current_dir(app)
         .output()
         .map_err(|_| "Could not start the package installation.".to_string())?;
@@ -417,6 +436,17 @@ mod tests {
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
         assert_eq!(digest_for(text, "missing.zip"), None);
+    }
+
+    #[test]
+    fn the_package_installer_puts_the_bundled_node_before_the_existing_path() {
+        let root = tempfile::tempdir().unwrap();
+        let node = root.path().join("runtime/node/node.exe");
+        let app = root.path().join("app");
+        let path = installer_path(&node, &app).unwrap();
+        let entries: Vec<_> = std::env::split_paths(&path).collect();
+        assert_eq!(entries[0], node.parent().unwrap());
+        assert_eq!(entries[1], app.join("node_modules/.bin"));
     }
 
     #[test]

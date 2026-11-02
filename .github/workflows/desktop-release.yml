@@ -92,6 +92,19 @@ jobs:
       - name: Native tests
         working-directory: apps/launcher/src-tauri
         run: cargo test --locked --bins
+      - name: Provision the runtime without a system Node
+        working-directory: apps/launcher/src-tauri
+        shell: pwsh
+        run: |
+          # npm lifecycle scripts invoke `node` by name. Remove every Node directory
+          # from PATH so this proves the installer puts its own Node there.
+          $nodeDirs = @(Get-Command node -All -ErrorAction SilentlyContinue | ForEach-Object { (Split-Path -Parent $_.Source).TrimEnd('\') })
+          $env:PATH = (($env:PATH -split ';') | Where-Object {
+            $directory = $_.TrimEnd('\')
+            $directory -and -not ($nodeDirs | Where-Object { $directory -ieq $_ })
+          }) -join ';'
+          if (Get-Command node -ErrorAction SilentlyContinue) { throw 'Node is still on PATH; this gate would not prove the fix.' }
+          cargo test --locked --bins installs_the_official_runtime -- --ignored
       - name: Build the installer
         working-directory: apps/launcher
         env:
