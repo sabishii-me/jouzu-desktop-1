@@ -1,5 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
 import { emptyProjection, historyProjection, interruptUnfinishedTools, object, projectEvent, type ChatProjection, type WireObject } from "./chat-projection";
+import { defaultChatTransport, type ChatTransport } from "./chat-transport";
 
 /** One id per page load: handles from an older page are released by chat_release_generation. */
 export const pageGeneration = globalThis.crypto.randomUUID();
@@ -56,7 +56,6 @@ export interface ChatSnapshot {  projection: ChatProjection;
   thinkingLevel?: string;
   thinkingLevels?: string[];
 }
-interface Poll { records: WireObject[]; closed: boolean; error?: string }
 // A response watchdog, not a request deadline: the released runtime owns how long a command
 // takes, and a lost answer is only distinguishable from a slow one by waiting a long time.
 const RESPONSE_WATCHDOG = 5 * 60_000;
@@ -77,7 +76,11 @@ export class ChatConnection {
   private requests = new Map<string, { command: string; resolve: (value: unknown) => void; reject: (error: Error) => void; deadline: number }>();
   snapshot: ChatSnapshot = { projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [] };
   private subscribers = new Set<(state: ChatSnapshot) => void>();
-  constructor(publish: (state: ChatSnapshot) => void, private dialog: (request: WireObject, client: ChatConnection) => void) {
+  constructor(
+    publish: (state: ChatSnapshot) => void,
+    private dialog: (request: WireObject, client: ChatConnection) => void,
+    private transport: ChatTransport = defaultChatTransport,
+  ) {
     this.subscribers.add(publish);
   }
   /** A pool-owned connection can outlive one view; views subscribe instead of owning the callback. */
@@ -97,9 +100,9 @@ export class ChatConnection {
     // the authoritative transcript, so opening a saved session never animates it.
     this.replaying = true;
     try {
-      await invoke("chat_release_generation", { generation: pageGeneration });
-      const handle = await invoke<string>("chat_start", { path, generation: pageGeneration, key });
-      if (this.disposed) { await invoke("chat_stop", { handle }); return; }
+      await this.transport.releaseGeneration(pageGeneration);
+      const handle = await this.transport.start(path, pageGeneration, key);
+      if (this.disposed) { await this.transport.stop(handle); return; }
       this.handle = handle;
       this.update({ transportReady: true });
       this.poll();
@@ -189,9 +192,9 @@ export class ChatConnection {
     if (this.disposed || this.failed || !this.handle || this.polling) return;
     this.polling = true;
     try {
-      const batch = await invoke<Poll>("chat_poll", { handle: this.handle });
+      const batch = await this.transport.poll(this.handle);
       if (this.disposed || this.failed) return;
-      this.ingest(batch.records);
+      this.ingest(batch.records as WireObject[]);
       if (batch.closed) throw new Error(batch.error || "Runtime disconnected. The outcome may be incomplete; no work was replayed.");
       this.tick();
       this.polling = false;
@@ -211,7 +214,7 @@ export class ChatConnection {
     const id = `desktop-${++this.nextId}`;
     return new Promise((resolve, reject) => {
       this.requests.set(id, { command, resolve, reject, deadline: Date.now() + RESPONSE_WATCHDOG });
-      void invoke("chat_send", { handle: this.handle, request: { ...fields, type: command, id } })
+      void this.transport.send(this.handle!, { ...fields, type: command, id })
         .then(() => this.wakePoll())
         .catch(error => { this.requests.delete(id); reject(new Error(String(error))); });
     });
@@ -356,7 +359,7 @@ export class ChatConnection {
   }
   async reply(id: string, fields: WireObject) {
     if (!this.handle || this.disposed || this.failed) throw new Error("Chat is not connected.");
-    await invoke("chat_send", { handle: this.handle, request: { type: "extension_ui_response", id, ...fields } });
+    await this.transport.send(this.handle, { type: "extension_ui_response", id, ...fields });
     this.dialogs.delete(id);
   }
   private fail(error: unknown) {
@@ -367,7 +370,7 @@ export class ChatConnection {
     for (const request of this.requests.values()) request.reject(new Error(String(error)));
     this.requests.clear();
     if (this.timer) clearTimeout(this.timer);
-    if (this.handle) void invoke("chat_stop", { handle: this.handle }).catch(() => {});
+    if (this.handle) void this.transport.stop(this.handle).catch(() => {});
   }
   async close() {
     this.disposed = true;
@@ -376,6 +379,6 @@ export class ChatConnection {
     if (this.timer) clearTimeout(this.timer);
     for (const request of this.requests.values()) request.reject(new Error("Conversation closed."));
     this.requests.clear();
-    if (this.handle) await invoke("chat_stop", { handle: this.handle });
+    if (this.handle) await this.transport.stop(this.handle);
   }
 }

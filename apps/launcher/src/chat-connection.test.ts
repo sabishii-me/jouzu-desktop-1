@@ -239,6 +239,8 @@ describe("desktop RPC connection", () => {
     vi.mocked(invoke).mockImplementation(command => command === "chat_start" ? new Promise(resolve => { finish = resolve as (value: string) => void; }) : Promise.resolve(undefined as never));
     const client = new ChatConnection(() => {}, () => {});
     const starting = client.start("folder");
+    await Promise.resolve();
+    await Promise.resolve();
     await client.close(); finish("late"); await starting;
     expect(invoke).toHaveBeenCalledWith("chat_stop", { handle: "late" });
     expect(invoke).not.toHaveBeenCalledWith("chat_poll", expect.anything());
