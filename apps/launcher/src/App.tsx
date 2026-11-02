@@ -37,12 +37,14 @@ import { messages, locales, resolveLocale, type Locale } from "./i18n";
 import { type Workspace } from "./history";
 import { parseDiagnostics, type Diagnostics } from "./diagnostics";
 import { useApi } from "./api/context";
+import { CapabilityUnavailable } from "./api/jouzu-api";
 interface LauncherState { platform: "windows" | "macos" | "linux"; recent: Workspace[]; ready: boolean; bash: boolean; bundled_git: boolean }
 interface Components { jouzu: string | null; development: boolean; launcherUpdaterConfigured?: boolean; jouzuUpdaterConfigured?: boolean }
 interface RuntimeReport { status?: string; version: string | null; root: string | null; app: string | null; node: boolean; nodeVersion: string | null; nodeCurrent: boolean; git: boolean; terminal: boolean }
 
 export function App() {
   const api = useApi();
+  const hostMode = api.capabilities.host && !api.capabilities.native;
   const [locale, setLocale] = useState<Locale>(() => resolveLocale(localStorage.getItem("jouzu.ui.language") ?? navigator.language));
   const t = messages[locale];
   const [activePath, setActivePath] = useState<string | null>(null);
@@ -101,7 +103,7 @@ export function App() {
   const needsSetup = modelReady === false;
   const [device, setDevice] = useState<{url:string;code:string} | null>(null);
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || hostMode) return;
     let disposed = false;
     const window = getCurrentWindow();
     const sync = () => { void window.isMaximized().then(value => { if (!disposed) setMaximized(value); }).catch(() => {}); };
@@ -110,12 +112,12 @@ export function App() {
     return () => { disposed = true; void unlisten.then(remove => remove()).catch(() => {}); };
   }, []);
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || hostMode) return;
     const unlisten = listen("new-session", () => setNewSession(true));
     return () => { void unlisten.then(remove => remove()).catch(() => {}); };
   }, []);
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || hostMode) return;
     const pending = listen<{url:string;code:string}>("control-device", event => setDevice(event.payload));
     return () => { pending.then(unlisten => unlisten()).catch(() => {}); };
   }, []);
@@ -168,7 +170,7 @@ export function App() {
     finally { setOperation(null); }
   }
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || hostMode) return;
     let disposed = false;
     const subscription = getCurrentWindow().onDragDropEvent(event => {
       const payload = event.payload;
@@ -269,7 +271,14 @@ export function App() {
   }
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(null), 4000); return () => clearTimeout(timer); }, [notice]);
   useEffect(() => { if (settingsOpen && isTauri()) { if (!setup && !busyRef.current) void configure({ action: "status" }); void readEnvironment(); } }, [settingsOpen]);
-  const refresh = async () => setState(await invoke<LauncherState>("launcher_state"));
+  const refresh = async () => {
+    if (hostMode) {
+      const recent = await api.workspaces.list();
+      setState({ platform: "windows", recent: recent as Workspace[], ready: true, bash: false, bundled_git: false });
+      return;
+    }
+    setState(await invoke<LauncherState>("launcher_state"));
+  };
   const loadComponents = () => invoke<Components>("component_versions")
     .then(setComponents)
     .catch(error => setError(String(error)));
@@ -279,8 +288,13 @@ export function App() {
     catch { setDiagnostics(null); }
   };
   useEffect(() => {
-    if (!isTauri()) return;
-    refresh().catch(error => setError(String(error)));
+    if (hostMode) {
+      setRuntimePresent(true);
+      setVersion("host");
+      void refresh().catch(error => setError(String(error)));
+      return;
+    }
+    if (!isTauri() || hostMode) return;
     void refreshDiagnostics();
     getVersion().then(setVersion).catch(error => setError(String(error)));
     // The runtime decides whether the setup service exists; probing it first keeps a
@@ -300,7 +314,7 @@ export function App() {
   }, []);
   // The prepare screen only mirrors the installer's own events; it never guesses progress.
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || hostMode) return;
     const pending = listen<{ phase: string; downloaded?: number; total?: number | null }>("runtime-install-progress", event => {
       setRuntimeUpdating(current => current && !current.error ? { phase: event.payload.phase, error: null } : current);
       setPrepare(current => ({
@@ -356,14 +370,21 @@ export function App() {
   async function chooseFolder() {
     setOperation("choosing"); setError(null);
     try {
-      const path = await open({ directory: true, multiple: false, title: t.picker });
-      if (typeof path === "string") { await addFolders([path]); setActivePath(path); }
+      let path: string | null = null;
+      try {
+        path = await api.native.pickFolder();
+      } catch (error) {
+        if (!(error instanceof CapabilityUnavailable)) throw error;
+        path = window.prompt("Workspace folder path", "");
+      }
+      if (path) { await addFolders([path]); setActivePath(path); }
     } catch (error) { setError(String(error)); } finally { setOperation(null); }
   }
   async function forget(workspace: Workspace) {
     setOperation("saving"); setError(null);
     try {
-      await invoke("forget_workspace", { id: workspace.id });
+      if (hostMode) await api.workspaces.forget(workspace.id);
+      else await invoke("forget_workspace", { id: workspace.id });
       const next = state?.recent.find(item => item.id !== workspace.id)?.path ?? null;
       if (activePath === workspace.path) setActivePath(next);
       await refresh();

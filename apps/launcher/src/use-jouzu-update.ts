@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { createUpdateSchedule, startUpdateChecks } from './update-schedule';
+import { isHostOrigin } from './api/platform-mode';
 import { logEvent } from './log-event';
 export function useJouzuUpdate(configured:boolean, onInstalled:()=>void) {
  const [version,setVersion]=useState<string|null>(null);
@@ -11,7 +12,7 @@ export function useJouzuUpdate(configured:boolean, onInstalled:()=>void) {
  const [error,setError]=useState<string|null>(null);
  const [progress,setProgress]=useState<number|undefined>();
  const lock=useRef(false);
- useEffect(()=>{const event=listen<{phase:string;downloaded?:number;total?:number}>('jouzu-update-progress',({payload})=>{
+ useEffect(()=>{if(isHostOrigin())return;const event=listen<{phase:string;downloaded?:number;total?:number}>('jouzu-update-progress',({payload})=>{
   if(!lock.current)return;
   setPhase(payload.phase);setProgress(payload.total ? (payload.downloaded??0)/payload.total*100:undefined);
  });return ()=>{void event.then(unlisten=>unlisten()).catch(()=>{});};},[]);

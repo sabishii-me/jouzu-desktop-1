@@ -18,6 +18,7 @@ mod bug_report;
 mod command_path;
 mod managed_paths;
 mod migration;
+mod host_bootstrap;
 mod recovery;
 mod runtime_install;
 mod node_path;
@@ -550,6 +551,10 @@ fn main() {
                 .map_err(std::io::Error::other)?
                 .join("cache/webview");
             std::fs::create_dir_all(&data)?;
+            let host_url = host_bootstrap::start(app.handle()).map_err(std::io::Error::other)?;
+            let host_url: url::Url = host_url
+                .parse()
+                .map_err(|error| std::io::Error::other(format!("Invalid host URL: {error}")))?;
             let config = app
                 .config()
                 .app
@@ -559,6 +564,21 @@ fn main() {
             let window = tauri::WebviewWindowBuilder::from_config(app, config)?
                 .data_directory(data)
                 .build()?;
+            window.navigate(host_url.clone()).map_err(std::io::Error::other)?;
+            // WebView2 can drop the first navigation while it is still creating the
+            // webview; retry on the main thread after the window has settled.
+            let retry_handle = app.handle().clone();
+            let retry_url = host_url.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                let handle_for_main = retry_handle.clone();
+                let _ = retry_handle.run_on_main_thread(move || {
+                    if let Some(window) = tauri::Manager::get_webview_window(&handle_for_main, "main") {
+                        let _ = window.navigate(retry_url);
+                    }
+                });
+            });
+            let _ = window.set_title("Jouzu Host UI");
             renderer::watch(&window, runtime::managed_root().ok());
             let close_window = window.clone();
             window.on_window_event(move |event| {
@@ -667,6 +687,7 @@ fn main() {
             if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
                 use tauri::Manager;
                 app.state::<chat::ChatService>().shutdown();
+                host_bootstrap::stop(app);
             }
         });
 }
