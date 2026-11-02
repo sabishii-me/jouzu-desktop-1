@@ -10,6 +10,7 @@ import {
   type Artifact,
   type ArtifactBody,
   type Attachment,
+  type EnvironmentEntry,
   type FileEntry,
   type HistoryPage,
   type Receipt,
@@ -149,6 +150,18 @@ export class HostClient {
 
   status(): Promise<RuntimeStatus> {
     return this.request<RuntimeStatus>("/v1/status");
+  }
+
+  environment(): Promise<EnvironmentEntry[]> {
+    return this.request<{ entries: EnvironmentEntry[] }>("/v1/environment")
+      .then(body => body.entries);
+  }
+
+  saveEnvironment(entries: EnvironmentEntry[]): Promise<EnvironmentEntry[]> {
+    return this.request<{ entries: EnvironmentEntry[] }>("/v1/environment", {
+      method: "PUT",
+      body: JSON.stringify(entries),
+    }).then(body => body.entries);
   }
 
   async sessions(): Promise<SessionSummary[]> {

@@ -132,11 +132,9 @@ function hostGroups(client: HostClient) {
 
   const settings: SettingsApi = {
     environment: {
-      async read() {
-        unsupported();
-      },
-      async save() {
-        unsupported();
+      read: () => client.environment(),
+      async save(entries) {
+        await client.saveEnvironment(entries);
       },
     },
     async control() {
