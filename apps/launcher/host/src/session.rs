@@ -1754,6 +1754,10 @@ impl SessionManager {
         }
     }
 
+    pub fn runtime_home(&self) -> &Path {
+        &self.runtime_home
+    }
+
     fn preferences_path(&self) -> PathBuf {
         self.runtime_home.join("state").join("session-preferences.json")
     }

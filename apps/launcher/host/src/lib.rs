@@ -14,6 +14,7 @@ use std::{
 
 #[cfg(windows)]
 mod runtime_process;
+mod artifacts;
 pub mod session;
 
 use session::{ApiError, CreateRequest, SendRequest, SessionManager};
@@ -232,6 +233,12 @@ pub fn router(state: AppState) -> Router {
             "/sessions/update",
             axum::routing::post(update_session),
         )
+        .route("/artifacts", get(list_artifacts))
+        .route("/artifacts/counts", get(artifact_counts))
+        .route(
+            "/artifacts/{id}",
+            get(read_artifact).delete(delete_artifact),
+        )
         .route("/sessions/{id}", get(get_session))
         .route(
             "/sessions/{id}/messages",
@@ -269,6 +276,46 @@ pub fn router(state: AppState) -> Router {
             host_origin_guard,
         ))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+struct ArtifactQuery {
+    kind: Option<String>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+}
+
+async fn list_artifacts(
+    State(state): State<AppState>,
+    Query(query): Query<ArtifactQuery>,
+) -> Json<Value> {
+    Json(artifacts::list(
+        state.sessions.runtime_home(),
+        query.kind.as_deref(),
+        query.session_id.as_deref(),
+    ))
+}
+
+async fn artifact_counts(State(state): State<AppState>) -> Json<Value> {
+    Json(artifacts::counts(state.sessions.runtime_home()))
+}
+
+async fn read_artifact(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    artifacts::read(state.sessions.runtime_home(), &id)
+        .map(Json)
+        .map_err(|message| ApiError::new(StatusCode::NOT_FOUND, "artifact-not-found", message, false))
+}
+
+async fn delete_artifact(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    artifacts::delete(state.sessions.runtime_home(), &id)
+        .map(|()| Json(json!({ "status": "deleted" })))
+        .map_err(|message| ApiError::new(StatusCode::NOT_FOUND, "artifact-not-found", message, false))
 }
 
 async fn list_workspaces(State(state): State<AppState>) -> Json<Value> {
