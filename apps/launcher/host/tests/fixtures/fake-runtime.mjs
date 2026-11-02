@@ -99,6 +99,7 @@ function prompt(id, text) {
   out({ type: "agent_start" });
   out({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
   out({ type: "message_start", message: { role: "assistant", content: [] } });
+  out({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_start", contentIndex: 0 } });
   if (uiMethod === "noise") {
     out({ type: "extension_ui_request", id: "noise-1", method: "setWidget", widgetKey: "x" });
     out({ type: "extension_ui_request", id: "noise-2", method: "setStatus", statusKey: "x" });
