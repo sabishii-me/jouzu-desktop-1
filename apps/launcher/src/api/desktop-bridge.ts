@@ -15,6 +15,8 @@ import type {
   NativeApi,
   SettingsApi,
   EnvironmentEntry,
+  Workspace,
+  WorkspaceApi,
 } from "./jouzu-api";
 
 export interface DesktopBridge {
@@ -22,6 +24,7 @@ export interface DesktopBridge {
   files: FileApi;
   settings: SettingsApi;
   native: NativeApi;
+  workspaces: WorkspaceApi;
 }
 
 async function unavailable(): Promise<never> {
@@ -29,6 +32,23 @@ async function unavailable(): Promise<never> {
 }
 
 export function createDesktopBridge(): DesktopBridge {
+  async function launcherWorkspaces(): Promise<Workspace[]> {
+    const state = await invoke<{ recent?: Workspace[] }>("launcher_state");
+    return state.recent ?? [];
+  }
+
+  const workspaces: WorkspaceApi = {
+    list: launcherWorkspaces,
+    async add(paths) {
+      await invoke("add_workspaces", { paths });
+      return launcherWorkspaces();
+    },
+    async forget(id) {
+      await invoke("forget_workspace", { id });
+      return launcherWorkspaces();
+    },
+  };
+
   const artifacts: ArtifactApi = {
     async list(options = {}) {
       const result = await invoke<{ artifacts: Artifact[] }>("artifact_list", {
@@ -91,5 +111,5 @@ export function createDesktopBridge(): DesktopBridge {
     },
   };
 
-  return { artifacts, files, settings, native };
+  return { artifacts, files, settings, native, workspaces };
 }
