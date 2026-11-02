@@ -96,6 +96,9 @@ export interface HistoryRow {
   createdAt?: string;
   attachments?: Attachment[];
   tool?: { name: string; callId: string; status: string };
+  model?: string;
+  provider?: string;
+  usage?: unknown;
   args?: unknown;
   result?: unknown;
 }

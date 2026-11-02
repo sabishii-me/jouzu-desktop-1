@@ -232,6 +232,7 @@ pub struct Session {
     history_seq: AtomicU64,
     assistant_text: Mutex<String>,
     active_client: Mutex<Option<String>>,
+    model: Mutex<Option<Value>>,
     subscribers: AtomicU64,
     next_client: AtomicU64,
     last_activity: Mutex<Instant>,
@@ -522,15 +523,19 @@ impl Session {
     fn handle_response(&self, value: &Value) {
         let command = value.get("command").and_then(Value::as_str).unwrap_or("");
         if command == "get_state" {
-            if let Some(path) = value
-                .get("data")
-                .and_then(|data| data.get("sessionFile"))
-                .and_then(Value::as_str)
-            {
-                *self
-                    .session_path
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.to_string());
+            if let Some(data) = value.get("data") {
+                if let Some(path) = data.get("sessionFile").and_then(Value::as_str) {
+                    *self
+                        .session_path
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.to_string());
+                }
+                if let Some(model) = data.get("model") {
+                    *self
+                        .model
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(model.clone());
+                }
             }
         }
         let id = value.get("id").and_then(Value::as_str).unwrap_or("");
@@ -838,13 +843,38 @@ impl Session {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()),
                     );
-                    self.push_history(json!({
+                    let mut row = json!({
                         "kind": "assistant",
                         "id": format!("{message_id}:assistant"),
                         "turnId": message_id.clone(),
                         "text": text,
                         "createdAt": Self::now_iso(),
-                    }));
+                    });
+                    if let Some(message) = value.get("message") {
+                        for field in ["model", "provider", "usage"] {
+                            if let Some(field_value) = message.get(field) {
+                                row[field] = field_value.clone();
+                            }
+                        }
+                    }
+                    if row.get("model").map(Value::is_null).unwrap_or(true) {
+                        if let Some(model) = self
+                            .model
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone()
+                        {
+                            row["model"] = model
+                                .get("name")
+                                .or_else(|| model.get("id"))
+                                .cloned()
+                                .unwrap_or(Value::Null);
+                            if let Some(provider) = model.get("provider") {
+                                row["provider"] = provider.clone();
+                            }
+                        }
+                    }
+                    self.push_history(row);
                     self.publish(
                         "message.done",
                         json!({ "messageId": message_id, "stopReason": stop_reason }),
@@ -1719,6 +1749,7 @@ impl Session {
             history_seq: AtomicU64::new(0),
             assistant_text: Mutex::new(String::new()),
             active_client: Mutex::new(None),
+            model: Mutex::new(None),
             subscribers: AtomicU64::new(0),
             next_client: AtomicU64::new(0),
             last_activity: Mutex::new(Instant::now()),
