@@ -19,6 +19,28 @@ fn canonical_path(path: &str) -> String {
     path.strip_prefix("\\\\?\\").unwrap_or(path).to_string()
 }
 
+fn catalog_documents(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut documents = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|value| value.to_str()) == Some("json")
+                && path.parent().and_then(|parent| parent.file_name()).and_then(|name| name.to_str())
+                    == Some("documents")
+            {
+                documents.push(path);
+            }
+        }
+    }
+    documents
+}
+
 fn is_scratch_workspace(path: &str) -> bool {
     path.split(|character| character == '\\' || character == '/')
         .any(|part| part.starts_with("jouzu-warm-"))
@@ -2654,6 +2676,45 @@ impl SessionManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(id)
             .cloned()
+    }
+
+    /// Read the host's cached model catalog. This never starts a runtime and
+    /// never writes a session file.
+    pub fn models(&self) -> Result<Value, ApiError> {
+        let root = self.runtime_home.join("cache").join("model-catalog");
+        let mut documents = catalog_documents(&root);
+        documents.sort_by_key(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok());
+        let mut models = Vec::new();
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for document in documents.into_iter().rev() {
+            let Ok(text) = std::fs::read_to_string(&document) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if value.get("format").and_then(Value::as_str) != Some("jouzu.model-catalog") {
+                continue;
+            }
+            let Some(offerings) = value.get("modelOfferings").and_then(Value::as_array) else {
+                continue;
+            };
+            for offering in offerings {
+                let provider = offering.get("providerId").and_then(Value::as_str);
+                let id = offering.get("modelId").and_then(Value::as_str);
+                let name = offering.get("name").and_then(Value::as_str);
+                let (Some(provider), Some(id), Some(name)) = (provider, id, name) else {
+                    continue;
+                };
+                let key = (provider.to_string(), id.to_string());
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
+                models.push(json!({ "provider": provider, "id": id, "name": name }));
+            }
+        }
+        Ok(json!({ "models": models }))
     }
 
     pub fn create(

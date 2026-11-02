@@ -226,6 +226,7 @@ pub fn router(state: AppState) -> Router {
             get(read_environment).put(save_environment),
         )
         .route("/capabilities", get(capabilities))
+        .route("/models", get(models))
         .route(
             "/workspaces",
             get(list_workspaces).post(add_workspaces),
@@ -798,6 +799,10 @@ async fn save_environment(
     environment::save(state.sessions.runtime_home(), &entries)
         .map(|()| Json(json!({ "entries": entries })))
         .map_err(ApiError::bad_request)
+}
+
+async fn models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(state.sessions.models()?))
 }
 
 async fn capabilities(State(state): State<AppState>) -> Json<Value> {
