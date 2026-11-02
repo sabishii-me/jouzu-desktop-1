@@ -643,6 +643,7 @@ impl Session {
     }
 
     fn handle_runtime_line(self: &Arc<Self>, value: Value) {
+        self.publish("runtime.event", value.clone());
         match value.get("type").and_then(Value::as_str) {
             Some("response") => self.handle_response(&value),
             Some("agent_start") => self.set_status(Status::Running),
@@ -1469,6 +1470,7 @@ impl Session {
         if !matches!(
             kind,
             "get_state"
+                | "get_messages"
                 | "get_available_models"
                 | "get_available_thinking_levels"
                 | "get_session_stats"

@@ -106,6 +106,7 @@ function hostGroups(client: HostClient) {
     async run(sessionId, command) {
       await client.send(sessionId, command, `cmd-${crypto.randomUUID()}`);
     },
+    raw: (sessionId, command) => client.command(sessionId, command),
     async compact(sessionId) {
       await client.command(sessionId, { type: "compact" });
     },

@@ -205,6 +205,7 @@ export interface ModelApi {
 
 export interface CommandApi {
   run(sessionId: string, command: string): Promise<void>;
+  raw(sessionId: string, command: Record<string, unknown>): Promise<unknown>;
   compact(sessionId: string): Promise<void>;
   exportHtml(sessionId: string, outputPath: string): Promise<void>;
   reload(sessionId: string): Promise<void>;
