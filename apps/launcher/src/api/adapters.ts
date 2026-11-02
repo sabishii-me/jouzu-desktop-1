@@ -191,7 +191,9 @@ export class WebApi extends JouzuApi {
   }
 
   async start(): Promise<void> {
-    await this.client.capabilities();
+    const capabilities = await this.client.capabilities();
+    this.capabilities.features = capabilities.features ?? this.capabilities.features;
+    this.capabilities.scopes = capabilities.scopes ?? this.capabilities.scopes;
   }
 
   async dispose(): Promise<void> {}
@@ -232,7 +234,9 @@ export class RemoteApi extends JouzuApi {
   }
 
   async start(): Promise<void> {
-    await this.client.capabilities();
+    const capabilities = await this.client.capabilities();
+    this.capabilities.features = capabilities.features ?? this.capabilities.features;
+    this.capabilities.scopes = capabilities.scopes ?? this.capabilities.scopes;
   }
 
   async dispose(): Promise<void> {}
@@ -279,7 +283,9 @@ export class DesktopApi extends JouzuApi {
   }
 
   async start(): Promise<void> {
-    await this.client.capabilities();
+    const capabilities = await this.client.capabilities();
+    this.capabilities.features = capabilities.features ?? this.capabilities.features;
+    this.capabilities.scopes = capabilities.scopes ?? this.capabilities.scopes;
   }
 
   async dispose(): Promise<void> {}

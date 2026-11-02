@@ -2493,7 +2493,7 @@ impl SessionManager {
                 let reader = std::io::BufReader::new(file);
                 let mut cwd = None;
                 let mut title = None;
-                for line in std::io::BufRead::lines(reader).take(80) {
+                for line in std::io::BufRead::lines(reader) {
                     let line = line.ok()?;
                     let value: Value = serde_json::from_str(&line).ok()?;
                     if value.get("type").and_then(Value::as_str) == Some("session") {

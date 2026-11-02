@@ -8,7 +8,7 @@ use std::{
 use serde_json::Value;
 use tauri::Manager;
 
-pub struct HostProcess(pub Mutex<Option<Child>>);
+pub struct HostProcess(pub Mutex<Option<(Child, isize)>>);
 
 pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
     let managed = crate::runtime::managed_root()?;
@@ -31,6 +31,14 @@ pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("Could not start the host: {error}"))?;
+    let job = match create_job(child.id()) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -43,7 +51,7 @@ pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
                 let port = value.get("port").and_then(Value::as_u64);
                 let token = value.get("token").and_then(Value::as_str);
                 if let (Some(port), Some(token)) = (port, token) {
-                    app.manage(HostProcess(Mutex::new(Some(child))));
+                    app.manage(HostProcess(Mutex::new(Some((child, job)))));
                     return Ok(format!("http://127.0.0.1:{port}/?token={token}"));
                 }
             }
@@ -59,12 +67,63 @@ pub fn stop(app: &tauri::AppHandle) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        if let Some(child) = child.as_mut() {
+        if let Some((child, job)) = child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
+            close_job(*job);
         }
     }
 }
+
+#[cfg(windows)]
+fn create_job(pid: u32) -> Result<isize, String> {
+    use std::mem::size_of;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    unsafe {
+        let job = CreateJobObjectW(None, None)
+            .map_err(|error| format!("Could not create the host job: {error}"))?;
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const std::ffi::c_void,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .map_err(|error| format!("Could not configure the host job: {error}"))?;
+        let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid)
+            .map_err(|error| format!("Could not open the host process: {error}"))?;
+        let assigned = AssignProcessToJobObject(job, process);
+        let _ = CloseHandle(process);
+        assigned.map_err(|error| format!("Could not assign the host to its job: {error}"))?;
+        Ok(job.0 as isize)
+    }
+}
+
+#[cfg(windows)]
+fn close_job(job: isize) {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    unsafe {
+        let _ = CloseHandle(HANDLE(job as *mut std::ffi::c_void));
+    }
+}
+
+#[cfg(not(windows))]
+fn create_job(_pid: u32) -> Result<isize, String> {
+    Ok(0)
+}
+
+#[cfg(not(windows))]
+fn close_job(_job: isize) {}
 
 fn dist_dir() -> Result<PathBuf, String> {
     let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist");

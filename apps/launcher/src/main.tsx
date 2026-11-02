@@ -7,8 +7,12 @@ import "./styles.css";
 // double mount starts a second process while the first is still closing, which
 // can leave a Flow branch attached. The desktop app mounts once.
 const api = createJouzuApi();
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <ApiProvider api={api}>
-    <App />
-  </ApiProvider>,
-);
+async function boot() {
+  try { await api.start(); } catch { /* The App surfaces the host error; it never falls back. */ }
+  ReactDOM.createRoot(document.getElementById("root")!).render(
+    <ApiProvider api={api}>
+      <App />
+    </ApiProvider>,
+  );
+}
+void boot();
