@@ -234,6 +234,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(interrupt_session),
         )
         .route("/sessions/{id}/stop", axum::routing::post(stop_session))
+        .route(
+            "/sessions/{id}/command",
+            axum::routing::post(session_command),
+        )
         .route("/sessions/{id}/events", get(session_events))
         .route(
             "/approvals/{id}/decision",
@@ -345,6 +349,18 @@ async fn send_message(
         &request.attachments,
     )?;
     Ok((StatusCode::ACCEPTED, Json(value)))
+}
+
+async fn session_command(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(command): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    let data = session
+        .request(command, Duration::from_secs(30))
+        .await?;
+    Ok(Json(json!({ "data": data })))
 }
 
 async fn interrupt_session(

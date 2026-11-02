@@ -234,6 +234,7 @@ pub struct Session {
     subscribers: AtomicU64,
     next_client: AtomicU64,
     last_activity: Mutex<Instant>,
+    pending_requests: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
 }
 
 impl Session {
@@ -498,6 +499,32 @@ impl Session {
 
     fn handle_response(&self, value: &Value) {
         let command = value.get("command").and_then(Value::as_str).unwrap_or("");
+        let id = value.get("id").and_then(Value::as_str).unwrap_or("");
+        let waiter = if id.is_empty() {
+            None
+        } else {
+            self.pending_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(id)
+        };
+        if let Some(waiter) = waiter {
+            let success = value
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let result = if success {
+                Ok(value.get("data").cloned().unwrap_or(Value::Null))
+            } else {
+                Err(value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("runtime request failed")
+                    .to_string())
+            };
+            let _ = waiter.send(result);
+            return;
+        }
         let success = value
             .get("success")
             .and_then(Value::as_bool)
@@ -1404,6 +1431,71 @@ impl Session {
         self.write_command(json!({ "id": id, "type": "abort" }))
     }
 
+    pub async fn request(&self, mut command: Value, timeout: Duration) -> Result<Value, ApiError> {
+        let kind = command
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::bad_request("type is required"))?;
+        if !matches!(
+            kind,
+            "get_state"
+                | "get_available_models"
+                | "get_available_thinking_levels"
+                | "get_session_stats"
+                | "get_fork_messages"
+                | "set_model"
+                | "set_thinking_level"
+                | "compact"
+                | "export_html"
+                | "fork"
+        ) {
+            return Err(ApiError::bad_request("Unsupported session command"));
+        }
+        let id = self.request_id();
+        if let Some(object) = command.as_object_mut() {
+            object.insert("id".to_string(), Value::String(id.clone()));
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id.clone(), tx);
+        if let Err(error) = self.write_command(command) {
+            self.pending_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&id);
+            return Err(error);
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(data))) => Ok(data),
+            Ok(Ok(Err(message))) => Err(ApiError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "runtime-error",
+                message,
+                false,
+            )),
+            Ok(Err(_)) => Err(ApiError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "runtime-error",
+                "The runtime response was dropped",
+                true,
+            )),
+            Err(_) => {
+                self.pending_requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&id);
+                Err(ApiError::new(
+                    axum::http::StatusCode::GATEWAY_TIMEOUT,
+                    "runtime-timeout",
+                    "The runtime did not answer in time",
+                    true,
+                ))
+            }
+        }
+    }
+
     pub fn stop(&self) {
         if matches!(self.status(), Status::Stopped) {
             return;
@@ -1521,6 +1613,7 @@ impl Session {
             subscribers: AtomicU64::new(0),
             next_client: AtomicU64::new(0),
             last_activity: Mutex::new(Instant::now()),
+            pending_requests: Mutex::new(HashMap::new()),
         });
 
         {
