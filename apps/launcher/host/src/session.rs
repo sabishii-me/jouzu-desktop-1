@@ -1747,7 +1747,7 @@ impl SessionManager {
             let Some(path) = value.get("sessionPath").and_then(Value::as_str) else {
                 continue;
             };
-            if let Some(preference) = preferences.get(path) {
+            if let Some(preference) = preferences.get(&canonical_path(path)) {
                 if let Some(title) = &preference.title {
                     value["title"] = Value::String(title.clone());
                 }
