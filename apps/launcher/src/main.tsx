@@ -1,5 +1,6 @@
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
+import { HostDesktop } from "./HostDesktop";
 import { ApiProvider } from "./api/context";
 import { createJouzuApi } from "./api/adapters";
 import { HostChatTransport } from "./host-chat-transport";
@@ -14,6 +15,6 @@ if (!("__TAURI_INTERNALS__" in window)) {
 }
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <ApiProvider api={api}>
-    <App />
+    {api.capabilities.host && !api.capabilities.native ? <HostDesktop /> : <App />}
   </ApiProvider>,
 );

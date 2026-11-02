@@ -273,6 +273,7 @@ export class DesktopApi extends JouzuApi {
         files: bridge.files,
         settings: bridge.settings,
         native: bridge.native,
+        capabilities: { ...this.capabilities, native: true },
       });
     }
   }

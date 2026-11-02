@@ -40,7 +40,7 @@ export class HostClient {
 
   constructor(options: HostClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? "").replace(/\/+$/u, "");
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.token = options.token;
     this.clientId = options.clientId ?? `web-${Math.random().toString(36).slice(2, 10)}`;
   }
