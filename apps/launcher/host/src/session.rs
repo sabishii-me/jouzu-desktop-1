@@ -1724,6 +1724,7 @@ fn exited(process: &Arc<Mutex<ChatProcess>>) -> bool {
 
 pub struct SessionManager {
     config: Option<SessionConfig>,
+    home: PathBuf,
     runtime_home: PathBuf,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     clients: Mutex<HashMap<String, Vec<String>>>,
@@ -1739,13 +1740,14 @@ impl SessionManager {
     ) -> Self {
         let config = spec.map(|spec| SessionConfig {
             spec,
-            home,
+            home: home.clone(),
             runtime_home: runtime_home.clone(),
             bash,
             replay_limit,
         });
         Self {
             config,
+            home,
             runtime_home,
             sessions: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
@@ -1754,6 +1756,93 @@ impl SessionManager {
 
     fn preferences_path(&self) -> PathBuf {
         self.runtime_home.join("state").join("session-preferences.json")
+    }
+
+    fn recent_path(&self) -> PathBuf {
+        self.home.join("recent.json")
+    }
+
+    fn default_workspace(&self) -> Option<PathBuf> {
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+        let base = if cfg!(windows) {
+            PathBuf::from(home).join("Documents")
+        } else {
+            PathBuf::from(home)
+        };
+        let path = base.join("Jouzu").join("default-workspace");
+        std::fs::create_dir_all(&path).ok()?;
+        Some(path)
+    }
+
+    fn workspace_value(&self, path: &str) -> Value {
+        json!({
+            "id": format!("windows:{path}"),
+            "path": path,
+            "environment": { "kind": "windows" },
+        })
+    }
+
+    pub fn workspaces(&self) -> Vec<Value> {
+        let mut values: Vec<Value> = std::fs::read(self.recent_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|value| {
+                value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| Path::new(path).is_dir())
+            })
+            .collect();
+        if values.is_empty() {
+            if let Some(path) = self.default_workspace() {
+                values.push(self.workspace_value(&path.to_string_lossy()));
+                let _ = self.write_workspaces(&values);
+            }
+        }
+        values
+    }
+
+    fn write_workspaces(&self, workspaces: &[Value]) -> Result<(), ApiError> {
+        if let Some(parent) = self.recent_path().parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+        let bytes = serde_json::to_vec_pretty(workspaces)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        std::fs::write(self.recent_path(), bytes)
+            .map_err(|error| ApiError::internal(error.to_string()))
+    }
+
+    pub fn add_workspaces(&self, paths: &[String]) -> Result<Vec<Value>, ApiError> {
+        let mut workspaces = self.workspaces();
+        for path in paths {
+            let path = path.trim();
+            if path.is_empty() || !Path::new(path).is_dir() {
+                continue;
+            }
+            let lower = path.replace('\\', "/").to_lowercase();
+            if workspaces.iter().any(|value| {
+                value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(|existing| existing.replace('\\', "/").to_lowercase() == lower)
+                    .unwrap_or(false)
+            }) {
+                continue;
+            }
+            workspaces.push(self.workspace_value(path));
+        }
+        self.write_workspaces(&workspaces)?;
+        Ok(workspaces)
+    }
+
+    pub fn forget_workspace(&self, id: &str) -> Result<Vec<Value>, ApiError> {
+        let mut workspaces = self.workspaces();
+        workspaces.retain(|value| value.get("id").and_then(Value::as_str) != Some(id));
+        self.write_workspaces(&workspaces)?;
+        Ok(workspaces)
     }
 
     fn read_preferences(&self) -> HashMap<String, SessionPreference> {

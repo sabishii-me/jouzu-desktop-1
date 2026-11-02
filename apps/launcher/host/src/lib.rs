@@ -218,6 +218,14 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/capabilities", get(capabilities))
+        .route(
+            "/workspaces",
+            get(list_workspaces).post(add_workspaces),
+        )
+        .route(
+            "/workspaces/forget",
+            axum::routing::post(forget_workspace),
+        )
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/persisted", get(persisted_sessions))
         .route(
@@ -261,6 +269,39 @@ pub fn router(state: AppState) -> Router {
             host_origin_guard,
         ))
         .with_state(state)
+}
+
+async fn list_workspaces(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "workspaces": state.sessions.workspaces() }))
+}
+
+#[derive(Deserialize)]
+struct AddWorkspacesRequest {
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+async fn add_workspaces(
+    State(state): State<AppState>,
+    Json(request): Json<AddWorkspacesRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "workspaces": state.sessions.add_workspaces(&request.paths)?,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ForgetWorkspaceRequest {
+    id: String,
+}
+
+async fn forget_workspace(
+    State(state): State<AppState>,
+    Json(request): Json<ForgetWorkspaceRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "workspaces": state.sessions.forget_workspace(&request.id)?,
+    })))
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
