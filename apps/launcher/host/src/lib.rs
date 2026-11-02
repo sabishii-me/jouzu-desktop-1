@@ -234,6 +234,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/flow", get(session_flow))
         .route("/sessions/timing", get(session_timing))
         .route(
+            "/sessions/branch",
+            axum::routing::post(branch_session),
+        )
+        .route(
             "/sessions/update",
             axum::routing::post(update_session),
         )
@@ -439,6 +443,25 @@ async fn session_timing(
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({
         "timing": state.sessions.timing(&query.session_path)?,
+    })))
+}
+
+#[derive(Deserialize)]
+struct BranchRequest {
+    #[serde(rename = "sessionPath")]
+    session_path: String,
+    #[serde(rename = "messageIndex")]
+    message_index: usize,
+}
+
+async fn branch_session(
+    State(state): State<AppState>,
+    Json(request): Json<BranchRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "sessionPath": state
+            .sessions
+            .branch_session(&request.session_path, request.message_index)?,
     })))
 }
 

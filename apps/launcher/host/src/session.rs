@@ -1804,8 +1804,71 @@ impl SessionManager {
         Ok(path)
     }
 
-    pub fn timing(&self, session_path: &str) -> Result<Value, ApiError> {
-        let path = self.session_file(session_path)?;
+    pub fn branch_session(&self, session_path: &str, message_index: usize) -> Result<String, ApiError> {
+        let source = self.session_file(session_path)?;
+        let text = std::fs::read_to_string(&source)
+            .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
+        let mut lines = text.lines();
+        let header_line = lines
+            .next()
+            .ok_or_else(|| ApiError::bad_request("Session is empty"))?;
+        let header: Value = serde_json::from_str(header_line)
+            .map_err(|_| ApiError::bad_request("Session header is invalid"))?;
+        let cwd = header
+            .get("cwd")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::bad_request("Session has no workspace"))?;
+        let mut kept = Vec::new();
+        let mut seen = 0usize;
+        let mut found = false;
+        for line in lines {
+            let Ok(entry) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            kept.push(line);
+            if entry.get("type").and_then(Value::as_str) == Some("message") {
+                if seen == message_index {
+                    found = true;
+                    break;
+                }
+                seen += 1;
+            }
+        }
+        if !found {
+            return Err(ApiError::bad_request("Message not found in session"));
+        }
+        let directory = source
+            .parent()
+            .ok_or_else(|| ApiError::bad_request("Session directory is missing"))?;
+        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let target = directory.join(format!(
+            "{}_{}.jsonl",
+            timestamp.replace([':', '.'], "-"),
+            random_id()
+        ));
+        let mut output = String::new();
+        output.push_str(
+            &json!({
+                "type": "session",
+                "version": 3,
+                "id": random_id(),
+                "timestamp": timestamp,
+                "cwd": cwd,
+                "parentSession": source.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        output.push('\n');
+        for line in kept {
+            output.push_str(line);
+            output.push('\n');
+        }
+        std::fs::write(&target, output)
+            .map_err(|error| ApiError::internal(format!("Session branch write failed: {error}")))?;
+        Ok(canonical_path(&target.to_string_lossy()))
+    }
+
+    pub fn timing(&self, session_path: &str) -> Result<Value, ApiError> {        let path = self.session_file(session_path)?;
         let file = std::fs::File::open(path)
             .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
         let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
