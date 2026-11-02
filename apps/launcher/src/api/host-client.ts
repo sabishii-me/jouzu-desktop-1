@@ -23,6 +23,7 @@ import {
 export interface HostClientOptions {
   baseUrl?: string;
   clientId?: string;
+  token?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -33,18 +34,25 @@ interface ErrorEnvelope {
 export class HostClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly token?: string;
   readonly clientId: string;
 
   constructor(options: HostClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? "").replace(/\/+$/u, "");
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.token = options.token;
     this.clientId = options.clientId ?? `web-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  private authHeaders(): Record<string, string> {
+    return this.token ? { authorization: `Bearer ${this.token}` } : {};
   }
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
       ...init,
       headers: {
+        ...this.authHeaders(),
         ...(init.body ? { "content-type": "application/json" } : {}),
         ...(init.headers ?? {}),
       },
@@ -88,7 +96,10 @@ export class HostClient {
         const response = await this.fetchImpl(
           `${this.baseUrl}/v1/sessions/${encodeURIComponent(sessionId)}/events?${query}`,
           {
-            headers: cursor ? { "last-event-id": String(cursor) } : {},
+            headers: {
+              ...this.authHeaders(),
+              ...(cursor ? { "last-event-id": String(cursor) } : {}),
+            },
             signal: controller.signal,
           },
         );
