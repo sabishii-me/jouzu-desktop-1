@@ -2202,4 +2202,132 @@ mod session_tests {
                 .as_u64()
                 .unwrap()
     }
+
+    #[tokio::test]
+    async fn command_models_thinking_and_state_are_available() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+
+        let models = session
+            .request(json!({ "type": "get_available_models" }), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(models["models"].as_array().unwrap().is_empty());
+
+        let levels = session
+            .request(
+                json!({ "type": "get_available_thinking_levels" }),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(levels["levels"], json!(["off"]));
+
+        let state = session
+            .request(json!({ "type": "get_state" }), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(state["model"]["id"], "model");
+        assert_eq!(state["thinkingLevel"], "off");
+    }
+
+    #[tokio::test]
+    async fn assistant_history_records_model_and_provider() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("model-history", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+
+        let history = session.history(10, None);
+        let assistant = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "assistant")
+            .unwrap();
+        assert_eq!(assistant["model"], "fixture-model");
+        assert_eq!(assistant["provider"], "fixture");
+    }
+
+    #[tokio::test]
+    async fn reload_current_session_is_accepted_and_other_paths_are_rejected() {
+        let (manager, home, workspace) = manager(50);
+        let directory = home.path().join("data").join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("reload.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({ "type": "session", "version": 3, "id": "reload", "cwd": workspace.path() }),
+                json!({ "type": "message", "message": { "role": "user", "content": "old" } })
+            ),
+        )
+        .unwrap();
+        let session = manager
+            .create(
+                workspace.path().to_str().unwrap(),
+                Some(path.to_string_lossy().into_owned()),
+                None,
+            )
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+
+        let result = session
+            .request(
+                json!({ "type": "switch_session", "sessionPath": path }),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["cancelled"], false);
+
+        let other = directory.join("other.jsonl");
+        std::fs::write(&other, "{}\n").unwrap();
+        let error = session
+            .request(
+                json!({ "type": "switch_session", "sessionPath": other }),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "invalid-request");
+    }
+
+    #[test]
+    fn flow_reports_filter_hidden_and_keep_displayed_reports() {
+        let (manager, home, _workspace) = manager(50);
+        let directory = home.path().join("data").join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("flow.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                json!({ "type": "session", "version": 3, "id": "flow", "cwd": "C:/work" }),
+                json!({
+                    "type": "custom_message",
+                    "customType": "jouzu-flow",
+                    "display": true,
+                    "content": [{ "type": "text", "text": "{\"kind\":\"work\",\"content\":\"Continue\"}" }]
+                }),
+                json!({
+                    "type": "custom_message",
+                    "customType": "jouzu-flow",
+                    "display": false,
+                    "content": [{ "type": "text", "text": "{\"kind\":\"hidden\"}" }]
+                })
+            ),
+        )
+        .unwrap();
+        let reports = manager.flow_reports(path.to_str().unwrap()).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0]["kind"], "work");
+    }
 }

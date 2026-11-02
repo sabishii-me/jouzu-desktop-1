@@ -57,7 +57,7 @@ function tick() {
   }
   out({
     type: "message_end",
-    message: { role: "assistant", content: [{ type: "text", text: parts.join("") }] },
+    message: { role: "assistant", content: [{ type: "text", text: parts.join("") }], model: "fixture-model", provider: "fixture" },
   });
   settled(false);
 }
@@ -137,7 +137,7 @@ lines.on("line", line => {
       response(value.id, "get_messages", { messages: [] });
       break;
     case "get_state":
-      response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: { name: "fixture/model", provider: "fixture", id: "model" }, thinkingLevel: "off", sessionFile: null });
+      response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: { name: "fixture-model", provider: "fixture", id: "model" }, thinkingLevel: "off", sessionFile: null });
       break;
     case "get_available_models":
       response(value.id, "get_available_models", { models: [] });
