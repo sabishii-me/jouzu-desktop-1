@@ -219,6 +219,7 @@ pub fn new_token() -> String {
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(health))
+        .route("/status", get(host_status))
         .route("/capabilities", get(capabilities))
         .route(
             "/workspaces",
@@ -710,6 +711,10 @@ async fn health(State(state): State<AppState>) -> Response {
         "uptimeSeconds": state.started.elapsed().as_secs(),
     }))
     .into_response()
+}
+
+async fn host_status(State(state): State<AppState>) -> Json<Value> {
+    Json(state.sessions.status())
 }
 
 async fn capabilities(State(state): State<AppState>) -> Json<Value> {

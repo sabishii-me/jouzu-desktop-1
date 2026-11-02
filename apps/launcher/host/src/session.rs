@@ -1911,7 +1911,25 @@ impl SessionManager {
         Ok(reports)
     }
 
-    pub fn workspace_allowed(&self, path: &str) -> bool {        let Ok(candidate) = Path::new(path).canonicalize() else {
+    pub fn status(&self) -> Value {
+        let app_version = std::fs::read(self.home.join("app").join("package.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value.get("version").and_then(Value::as_str).map(str::to_string));
+        json!({
+            "hostVersion": env!("CARGO_PKG_VERSION"),
+            "runtimeHome": self.runtime_home.to_string_lossy(),
+            "appVersion": app_version,
+            "node": self.home.join("runtime").join("node").join("node.exe").is_file(),
+            "app": self.home.join("app").join("bootstrap.mjs").is_file(),
+            "bash": self.home.join("runtime").join("git").join("bin").join("bash.exe").is_file(),
+            "git": self.home.join("runtime").join("git").exists(),
+            "terminal": self.home.join("runtime").join("terminal").exists(),
+        })
+    }
+
+    pub fn workspace_allowed(&self, path: &str) -> bool {
+        let Ok(candidate) = Path::new(path).canonicalize() else {
             return false;
         };
         let allowed = self
