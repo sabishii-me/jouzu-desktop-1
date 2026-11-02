@@ -233,6 +233,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/persisted", get(persisted_sessions))
         .route("/sessions/flow", get(session_flow))
         .route("/sessions/timing", get(session_timing))
+        .route("/sessions/messages", get(raw_messages))
         .route(
             "/sessions/branch",
             axum::routing::post(branch_session),
@@ -443,6 +444,24 @@ async fn session_timing(
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({
         "timing": state.sessions.timing(&query.session_path)?,
+    })))
+}
+
+#[derive(Deserialize)]
+struct MessagesQuery {
+    #[serde(rename = "sessionPath")]
+    session_path: String,
+    limit: Option<usize>,
+}
+
+async fn raw_messages(
+    State(state): State<AppState>,
+    Query(query): Query<MessagesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "messages": state
+            .sessions
+            .messages(&query.session_path, query.limit)?,
     })))
 }
 

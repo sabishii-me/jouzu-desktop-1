@@ -1868,7 +1868,37 @@ impl SessionManager {
         Ok(canonical_path(&target.to_string_lossy()))
     }
 
-    pub fn timing(&self, session_path: &str) -> Result<Value, ApiError> {        let path = self.session_file(session_path)?;
+    pub fn messages(
+        &self,
+        session_path: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<Value>, ApiError> {
+        let path = self.session_file(session_path)?;
+        let file = std::fs::File::open(path)
+            .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
+        let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
+        let mut messages = Vec::new();
+        for line in std::io::BufRead::lines(reader) {
+            let Ok(line) = line else { break };
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value.get("type").and_then(Value::as_str) == Some("message") {
+                if let Some(message) = value.get("message") {
+                    messages.push(message.clone());
+                }
+            }
+        }
+        if let Some(limit) = limit {
+            if messages.len() > limit {
+                messages.drain(..messages.len() - limit);
+            }
+        }
+        Ok(messages)
+    }
+
+    pub fn timing(&self, session_path: &str) -> Result<Value, ApiError> {
+        let path = self.session_file(session_path)?;
         let file = std::fs::File::open(path)
             .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
         let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
