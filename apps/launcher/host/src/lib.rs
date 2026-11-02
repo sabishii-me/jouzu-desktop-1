@@ -15,6 +15,7 @@ use std::{
 #[cfg(windows)]
 mod runtime_process;
 mod artifacts;
+mod files;
 pub mod session;
 
 use session::{ApiError, CreateRequest, SendRequest, SessionManager};
@@ -239,6 +240,7 @@ pub fn router(state: AppState) -> Router {
             "/artifacts/{id}",
             get(read_artifact).delete(delete_artifact),
         )
+        .route("/files", get(list_files))
         .route("/sessions/{id}", get(get_session))
         .route(
             "/sessions/{id}/messages",
@@ -316,6 +318,28 @@ async fn delete_artifact(
     artifacts::delete(state.sessions.runtime_home(), &id)
         .map(|()| Json(json!({ "status": "deleted" })))
         .map_err(|message| ApiError::new(StatusCode::NOT_FOUND, "artifact-not-found", message, false))
+}
+
+#[derive(Deserialize)]
+struct FilesQuery {
+    path: String,
+}
+
+async fn list_files(
+    State(state): State<AppState>,
+    Query(query): Query<FilesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !state.sessions.workspace_allowed(&query.path) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "That folder is outside the allowed workspaces",
+            false,
+        ));
+    }
+    files::list(&query.path)
+        .map(Json)
+        .map_err(|message| ApiError::bad_request(message))
 }
 
 async fn list_workspaces(State(state): State<AppState>) -> Json<Value> {

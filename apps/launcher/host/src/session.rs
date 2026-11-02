@@ -1786,8 +1786,27 @@ impl SessionManager {
         })
     }
 
-    pub fn workspaces(&self) -> Vec<Value> {
-        let mut values: Vec<Value> = std::fs::read(self.recent_path())
+    pub fn workspace_allowed(&self, path: &str) -> bool {
+        let Ok(candidate) = Path::new(path).canonicalize() else {
+            return false;
+        };
+        let allowed = self
+            .workspaces()
+            .into_iter()
+            .filter_map(|value| value.get("path").and_then(Value::as_str).map(PathBuf::from))
+            .chain(
+                self.sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .map(|session| PathBuf::from(&session.workspace_path)),
+            )
+            .filter_map(|path| path.canonicalize().ok())
+            .any(|root| candidate.starts_with(root));
+        allowed
+    }
+
+    pub fn workspaces(&self) -> Vec<Value> {        let mut values: Vec<Value> = std::fs::read(self.recent_path())
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).ok())
             .unwrap_or_default()
