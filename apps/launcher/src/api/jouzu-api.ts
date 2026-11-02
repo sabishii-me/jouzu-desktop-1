@@ -72,7 +72,10 @@ export interface SessionHandle {
 export interface Attachment {
   name: string;
   mimeType: string;
-  data: string;
+  data?: string;
+  id?: string;
+  bytes?: number;
+  path?: string;
 }
 
 export interface OutgoingMessage {

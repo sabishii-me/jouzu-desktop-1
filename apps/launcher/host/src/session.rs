@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, SecondsFormat, Utc};
 
 fn canonical_path(path: &str) -> String {
@@ -1384,6 +1385,43 @@ impl Session {
             );
         }
     }
+    fn store_attachments(&self, attachments: &[Attachment]) -> Result<Vec<Value>, ApiError> {
+        if attachments.is_empty() {
+            return Ok(Vec::new());
+        }
+        let directory = self.runtime_home.join("state").join("attachments");
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| ApiError::internal(format!("Could not store attachments: {error}")))?;
+        let mut stored = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let bytes = STANDARD.decode(&attachment.data).map_err(|_| {
+                ApiError::bad_request("Attachment data must be canonical base64")
+            })?;
+            if bytes.is_empty() {
+                return Err(ApiError::bad_request("Attachments must not be empty"));
+            }
+            let extension = match attachment.mime_type.as_str() {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/webp" => "webp",
+                "image/gif" => "gif",
+                _ => "bin",
+            };
+            let id = format!("att-{}", random_id());
+            let path = directory.join(format!("{id}.{extension}"));
+            std::fs::write(&path, &bytes)
+                .map_err(|error| ApiError::internal(format!("Could not store attachment: {error}")))?;
+            stored.push(json!({
+                "id": id,
+                "name": attachment.name,
+                "mimeType": attachment.mime_type,
+                "bytes": bytes.len(),
+                "path": path.to_string_lossy(),
+            }));
+        }
+        Ok(stored)
+    }
+
     pub fn send(&self, client_message_id: &str, text: &str) -> Result<Value, ApiError> {
         self.send_with_client(client_message_id, text, None, &[])
     }
@@ -1459,16 +1497,7 @@ impl Session {
             .assistant_text
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = String::new();
-        let attachment_rows: Vec<Value> = attachments
-            .iter()
-            .map(|attachment| {
-                json!({
-                    "name": attachment.name,
-                    "mimeType": attachment.mime_type,
-                    "data": attachment.data,
-                })
-            })
-            .collect();
+        let stored_attachments = self.store_attachments(attachments)?;
         let mut history_row = json!({
             "kind": "user",
             "id": format!("{message_id}:user"),
@@ -1476,8 +1505,8 @@ impl Session {
             "text": text,
             "createdAt": Self::now_iso(),
         });
-        if !attachment_rows.is_empty() {
-            history_row["attachments"] = json!(attachment_rows);
+        if !stored_attachments.is_empty() {
+            history_row["attachments"] = json!(stored_attachments);
         }
         self.push_history(history_row);
         self.publish(

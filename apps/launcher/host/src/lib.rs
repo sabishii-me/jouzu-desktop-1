@@ -1346,7 +1346,7 @@ mod tests {
 #[cfg(test)]
 mod session_tests {
     use super::*;
-    use crate::session::{RuntimeSpec, SessionManager, Status};
+    use crate::session::{Attachment, RuntimeSpec, SessionManager, Status};
     use axum::http::{Method, Request};
     use http_body_util::BodyExt;
     use std::{
@@ -2253,6 +2253,41 @@ mod session_tests {
             .unwrap();
         assert_eq!(assistant["model"], "fixture-model");
         assert_eq!(assistant["provider"], "fixture");
+    }
+
+    #[tokio::test]
+    async fn attachments_are_stored_and_history_has_no_base64() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session
+            .send_with_client(
+                "attachment-1",
+                "image",
+                None,
+                &[Attachment {
+                    name: "pixel.png".into(),
+                    mime_type: "image/png".into(),
+                    data: "AAEC".into(),
+                }],
+            )
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+
+        let history = session.history(10, None);
+        let user = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "user")
+            .unwrap();
+        let attachment = &user["attachments"][0];
+        assert!(attachment.get("data").is_none());
+        assert_eq!(attachment["mimeType"], "image/png");
+        assert!(attachment["path"].as_str().unwrap().ends_with(".png"));
+        assert!(std::path::Path::new(attachment["path"].as_str().unwrap()).is_file());
     }
 
     #[tokio::test]
