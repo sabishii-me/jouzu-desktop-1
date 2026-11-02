@@ -209,7 +209,7 @@ struct PendingQuestion {
 pub struct Session {
     pub id: String,
     pub workspace_path: String,
-    pub session_path: Option<String>,
+    pub session_path: Mutex<Option<String>>,
     pub key: String,
     status: Mutex<Status>,
     events: Mutex<EventLog>,
@@ -227,6 +227,7 @@ pub struct Session {
     question_outcomes: Mutex<HashMap<String, String>>,
     next_prompt: AtomicU64,
     home: PathBuf,
+    runtime_home: PathBuf,
     history: Mutex<Vec<Value>>,
     history_seq: AtomicU64,
     assistant_text: Mutex<String>,
@@ -367,7 +368,11 @@ impl Session {
                 "status": self.status().as_str(),
                 "cursor": cursor,
                 "workspacePath": canonical_path(&self.workspace_path),
-                "sessionPath": self.session_path,
+                "sessionPath": self
+                    .session_path
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
                 "pendingApprovals": self.pending_approvals(),
                 "pendingQuestions": self.pending_questions(),
             }),
@@ -465,8 +470,24 @@ impl Session {
         }
     }
 
+    fn request_state(&self) {
+        let id = self.request_id();
+        if let Err(error) = self.write_command(json!({ "id": id, "type": "get_state" })) {
+            self.publish(
+                "error",
+                json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
+            );
+            self.set_status(Status::Error);
+        }
+    }
+
     fn start_handshake(&self) {
-        match &self.session_path {
+        let existing = self
+            .session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match existing {
             Some(path) => {
                 let id = self.request_id();
                 let result = self.write_command(json!({
@@ -489,6 +510,7 @@ impl Session {
             }
             None => {
                 self.request_messages();
+                self.request_state();
                 *self
                     .handshake
                     .lock()
@@ -499,6 +521,18 @@ impl Session {
 
     fn handle_response(&self, value: &Value) {
         let command = value.get("command").and_then(Value::as_str).unwrap_or("");
+        if command == "get_state" {
+            if let Some(path) = value
+                .get("data")
+                .and_then(|data| data.get("sessionFile"))
+                .and_then(Value::as_str)
+            {
+                *self
+                    .session_path
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.to_string());
+            }
+        }
         let id = value.get("id").and_then(Value::as_str).unwrap_or("");
         let waiter = if id.is_empty() {
             None
@@ -1490,8 +1524,7 @@ impl Session {
                 .and_then(Value::as_str)
                 .ok_or_else(|| ApiError::bad_request("sessionPath is required"))?;
             let root = self
-                .home
-                .join("data")
+                .runtime_home
                 .join("state")
                 .join("sessions")
                 .canonicalize()
@@ -1503,6 +1536,17 @@ impl Session {
                 || candidate.extension().and_then(|value| value.to_str()) != Some("jsonl")
             {
                 return Err(ApiError::bad_request("Unknown session path"));
+            }
+            let current = self
+                .session_path
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .and_then(|value| std::path::Path::new(&value).canonicalize().ok());
+            if current.as_ref() != Some(&candidate) {
+                return Err(ApiError::bad_request(
+                    "Only the current saved session can be reloaded",
+                ));
             }
         }
         let id = command
@@ -1573,7 +1617,11 @@ impl Session {
         json!({
             "sessionId": self.id,
             "workspacePath": canonical_path(&self.workspace_path),
-            "sessionPath": self.session_path,
+            "sessionPath": self
+                .session_path
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
             "status": self.status().as_str(),
             "running": self.status() == Status::Running,
             "cursor": self.cursor(),
@@ -1648,7 +1696,7 @@ impl Session {
         let session = Arc::new(Session {
             id,
             workspace_path,
-            session_path,
+            session_path: Mutex::new(session_path),
             key,
             status: Mutex::new(Status::Starting),
             events: Mutex::new(EventLog::new(config.replay_limit)),
@@ -1666,6 +1714,7 @@ impl Session {
             question_outcomes: Mutex::new(HashMap::new()),
             next_prompt: AtomicU64::new(0),
             home: config.home.clone(),
+            runtime_home: config.runtime_home.clone(),
             history: Mutex::new(Vec::new()),
             history_seq: AtomicU64::new(0),
             assistant_text: Mutex::new(String::new()),
