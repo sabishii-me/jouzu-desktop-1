@@ -220,6 +220,10 @@ pub fn router(state: AppState) -> Router {
         .route("/capabilities", get(capabilities))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/persisted", get(persisted_sessions))
+        .route(
+            "/sessions/update",
+            axum::routing::post(update_session),
+        )
         .route("/sessions/{id}", get(get_session))
         .route(
             "/sessions/{id}/messages",
@@ -272,6 +276,27 @@ async fn persisted_sessions(
     Json(json!({
         "sessions": state.sessions.persisted(query.workspace_path.as_deref()),
     }))
+}
+
+#[derive(Deserialize)]
+struct UpdateSessionRequest {
+    #[serde(rename = "sessionPath")]
+    session_path: String,
+    pinned: Option<bool>,
+    archived: Option<bool>,
+    title: Option<String>,
+}
+
+async fn update_session(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateSessionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(state.sessions.update_session(
+        &request.session_path,
+        request.pinned,
+        request.archived,
+        request.title,
+    )?))
 }
 
 async fn create_session(

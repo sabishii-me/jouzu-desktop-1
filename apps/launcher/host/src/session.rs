@@ -23,6 +23,16 @@ use tokio::sync::broadcast;
 
 use crate::log;
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct SessionPreference {
+    #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
+    archived: bool,
+    #[serde(default)]
+    title: Option<String>,
+}
+
 #[cfg(windows)]
 use crate::runtime_process::ChatProcess;
 
@@ -325,6 +335,21 @@ impl Session {
 
     fn now_iso() -> String {
         Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+
+    fn update_history_tool(&self, call_id: &str, status: &str, result: Value) {
+        if call_id.is_empty() {
+            return;
+        }
+        let id = format!("tool:{call_id}");
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = history.iter_mut().rev().find(|entry| entry["id"] == id) {
+            entry["tool"]["status"] = Value::String(status.to_string());
+            entry["result"] = result;
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
@@ -639,6 +664,24 @@ impl Session {
                 }
             }
             Some("tool_execution_start") => {
+                let call_id = value
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !call_id.is_empty() {
+                    self.push_history(json!({
+                        "kind": "tool",
+                        "id": format!("tool:{call_id}"),
+                        "tool": {
+                            "name": value.get("toolName").and_then(Value::as_str).unwrap_or("tool"),
+                            "callId": call_id,
+                            "status": "running",
+                        },
+                        "args": value.get("args"),
+                        "createdAt": Self::now_iso(),
+                    }));
+                }
                 self.publish(
                     "tool.start",
                     json!({
@@ -658,6 +701,20 @@ impl Session {
                 );
             }
             Some("tool_execution_end") => {
+                let call_id = value
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.update_history_tool(
+                    &call_id,
+                    if value.get("isError").and_then(Value::as_bool) == Some(true) {
+                        "error"
+                    } else {
+                        "complete"
+                    },
+                    value.get("result").cloned().unwrap_or(Value::Null),
+                );
                 self.publish(
                     "tool.result",
                     json!({
@@ -1569,12 +1626,102 @@ impl SessionManager {
         }
     }
 
+    fn preferences_path(&self) -> PathBuf {
+        self.runtime_home.join("state").join("session-preferences.json")
+    }
+
+    fn read_preferences(&self) -> HashMap<String, SessionPreference> {
+        let Ok(bytes) = std::fs::read(self.preferences_path()) else {
+            return HashMap::new();
+        };
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    }
+
+    fn write_preferences(
+        &self,
+        preferences: &HashMap<String, SessionPreference>,
+    ) -> Result<(), ApiError> {
+        let path = self.preferences_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                ApiError::internal(format!("Could not write session preferences: {error}"))
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(preferences)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let temp = path.with_extension("json.tmp");
+        std::fs::write(&temp, bytes)
+            .and_then(|_| std::fs::rename(&temp, &path))
+            .map_err(|error| ApiError::internal(format!("Could not write session preferences: {error}")))
+    }
+
+    pub fn update_session(
+        &self,
+        session_path: &str,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        title: Option<String>,
+    ) -> Result<Value, ApiError> {
+        let root = self
+            .runtime_home
+            .join("state")
+            .join("sessions")
+            .canonicalize()
+            .unwrap_or_else(|_| self.runtime_home.join("state").join("sessions"));
+        let path = PathBuf::from(session_path)
+            .canonicalize()
+            .map_err(|_| ApiError::bad_request("Unknown session path"))?;
+        if !path.starts_with(&root) || path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            return Err(ApiError::bad_request("Unknown session path"));
+        }
+        let key = canonical_path(&path.to_string_lossy());
+        let mut preferences = self.read_preferences();
+        let (pinned, archived, title) = {
+            let preference = preferences.entry(key.clone()).or_default();
+            if let Some(value) = pinned {
+                preference.pinned = value;
+            }
+            if let Some(value) = archived {
+                preference.archived = value;
+            }
+            if let Some(value) = title {
+                let value = value.trim();
+                preference.title = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.chars().take(80).collect())
+                };
+            }
+            (preference.pinned, preference.archived, preference.title.clone())
+        };
+        self.write_preferences(&preferences)?;
+        Ok(json!({
+            "sessionPath": key,
+            "pinned": pinned,
+            "archived": archived,
+            "title": title,
+        }))
+    }
+
     pub fn list(&self) -> Vec<Value> {
+        let preferences = self.read_preferences();
         let sessions = self
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut values: Vec<Value> = sessions.values().map(|session| session.info()).collect();
+        for value in &mut values {
+            let Some(path) = value.get("sessionPath").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(preference) = preferences.get(path) {
+                if let Some(title) = &preference.title {
+                    value["title"] = Value::String(title.clone());
+                }
+                value["pinned"] = Value::Bool(preference.pinned);
+                value["archived"] = Value::Bool(preference.archived);
+            }
+        }
         values.sort_by(|a, b| {
             a.get("sessionId")
                 .and_then(Value::as_str)
@@ -1607,7 +1754,9 @@ impl SessionManager {
         }
     }
 
-    pub fn persisted(&self, workspace: Option<&str>) -> Vec<Value> {        let directory = self.runtime_home.join("state").join("sessions");
+    pub fn persisted(&self, workspace: Option<&str>) -> Vec<Value> {
+        let preferences = self.read_preferences();
+        let directory = self.runtime_home.join("state").join("sessions");
         let mut files: Vec<(PathBuf, std::time::SystemTime)> = std::fs::read_dir(&directory)
             .map(|entries| {
                 entries
@@ -1675,19 +1824,27 @@ impl SessionManager {
                 if wanted.as_deref().is_some_and(|wanted| wanted != normalized) {
                     return None;
                 }
-                let title = title.unwrap_or_else(|| {
-                    path.file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("Session")
-                        .to_string()
-                });
+                let key = canonical_path(&path.to_string_lossy());
+                let preference = preferences.get(&key);
+                let title = preference
+                    .and_then(|preference| preference.title.clone())
+                    .unwrap_or_else(|| {
+                        title.unwrap_or_else(|| {
+                            path.file_stem()
+                                .and_then(|value| value.to_str())
+                                .unwrap_or("Session")
+                                .to_string()
+                        })
+                    });
                 Some(json!({
-                    "sessionPath": path.to_string_lossy(),
+                    "sessionPath": key,
                     "workspacePath": canonical_path(&cwd),
                     "title": title.chars().take(120).collect::<String>(),
                     "updatedAt": DateTime::<Utc>::from(modified).to_rfc3339_opts(SecondsFormat::Millis, true),
                     "status": "stopped",
                     "running": false,
+                    "pinned": preference.map(|value| value.pinned).unwrap_or(false),
+                    "archived": preference.map(|value| value.archived).unwrap_or(false),
                 }))
             })
             .take(300)
@@ -1902,6 +2059,15 @@ impl ApiError {
         Self::new(
             axum::http::StatusCode::BAD_REQUEST,
             "invalid-request",
+            message,
+            false,
+        )
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
             message,
             false,
         )
