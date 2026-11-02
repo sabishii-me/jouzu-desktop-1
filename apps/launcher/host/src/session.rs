@@ -751,6 +751,36 @@ impl Session {
                     }),
                 );
             }
+            Some("custom_message") => {
+                let custom_type = value
+                    .get("customType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("custom");
+                let text = value
+                    .get("content")
+                    .and_then(|content| {
+                        content.as_str().map(str::to_string).or_else(|| {
+                            content.as_array().map(|blocks| {
+                                blocks
+                                    .iter()
+                                    .filter_map(|block| {
+                                        block.get("text").and_then(Value::as_str)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("")
+                            })
+                        })
+                    })
+                    .unwrap_or_default();
+                self.publish(
+                    "message.custom",
+                    json!({
+                        "customType": custom_type,
+                        "display": value.get("display"),
+                        "text": text,
+                    }),
+                );
+            }
             Some("agent_settled") => {
                 let aborted = value
                     .get("aborted")
