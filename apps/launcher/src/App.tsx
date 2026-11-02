@@ -36,11 +36,13 @@ import { Progress } from "./components/ui/progress";
 import { messages, locales, resolveLocale, type Locale } from "./i18n";
 import { type Workspace } from "./history";
 import { parseDiagnostics, type Diagnostics } from "./diagnostics";
+import { useApi } from "./api/context";
 interface LauncherState { platform: "windows" | "macos" | "linux"; recent: Workspace[]; ready: boolean; bash: boolean; bundled_git: boolean }
 interface Components { jouzu: string | null; development: boolean; launcherUpdaterConfigured?: boolean; jouzuUpdaterConfigured?: boolean }
 interface RuntimeReport { status?: string; version: string | null; root: string | null; app: string | null; node: boolean; nodeVersion: string | null; nodeCurrent: boolean; git: boolean; terminal: boolean }
 
 export function App() {
+  const api = useApi();
   const [locale, setLocale] = useState<Locale>(() => resolveLocale(localStorage.getItem("jouzu.ui.language") ?? navigator.language));
   const t = messages[locale];
   const [activePath, setActivePath] = useState<string | null>(null);
@@ -121,12 +123,12 @@ export function App() {
   const [editingEnv, setEditingEnv] = useState<number | null>(null);
   const [envLoaded, setEnvLoaded] = useState(false);
   async function readEnvironment() {
-    try { setEnvRows(await invoke("environment_read")); setEnvLoaded(true); setEditingEnv(null); }
+    try { setEnvRows(await api.settings.environment.read()); setEnvLoaded(true); setEditingEnv(null); }
     catch (error) { setError(String(error)); }
   }
   async function saveEnvironment() {
     setOperation("saving"); setError(null);
-    try { await invoke("environment_save", { entries: envRows }); setEditingEnv(null); setSetup(parseControlState(await invoke<unknown>("control_request", {request:{action:"status"}}))); }
+    try { await api.settings.environment.save(envRows); setEditingEnv(null); setSetup(parseControlState(await api.settings.control({action:"status"}))); }
     catch (error) { setError(String(error)); }
     finally { setOperation(null); }
   }
@@ -157,7 +159,7 @@ export function App() {
   async function addFolders(paths: string[]) {
     setOperation("saving"); setError(null);
     try {
-      await invoke("add_workspaces", { paths });
+      await api.workspaces.add(paths);
       setQuery("");
       await refresh();
       if (paths.length && !activePath) setActivePath(paths[0]);
