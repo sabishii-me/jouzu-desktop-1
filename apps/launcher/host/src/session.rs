@@ -18,6 +18,11 @@ use chrono::{DateTime, SecondsFormat, Utc};
 fn canonical_path(path: &str) -> String {
     path.strip_prefix("\\\\?\\").unwrap_or(path).to_string()
 }
+
+fn is_scratch_workspace(path: &str) -> bool {
+    path.split(|character| character == '\\' || character == '/')
+        .any(|part| part.starts_with("jouzu-warm-"))
+}
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -2406,7 +2411,11 @@ impl SessionManager {
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut values: Vec<Value> = sessions.values().map(|session| session.info()).collect();
+        let mut values: Vec<Value> = sessions
+            .values()
+            .filter(|session| !is_scratch_workspace(&session.workspace_path))
+            .map(|session| session.info())
+            .collect();
         for value in &mut values {
             let Some(path) = value.get("sessionPath").and_then(Value::as_str) else {
                 continue;
@@ -2513,6 +2522,9 @@ impl SessionManager {
                     }
                 }
                 let cwd = cwd?;
+                if is_scratch_workspace(&cwd) {
+                    return None;
+                }
                 let normalized = cwd
                     .replace('\\', "/")
                     .trim_start_matches("//?/")
