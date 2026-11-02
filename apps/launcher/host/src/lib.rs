@@ -230,6 +230,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/persisted", get(persisted_sessions))
+        .route("/sessions/flow", get(session_flow))
         .route(
             "/sessions/update",
             axum::routing::post(update_session),
@@ -413,6 +414,21 @@ async fn update_session(
         request.archived,
         request.title,
     )?))
+}
+
+#[derive(Deserialize)]
+struct SessionPathQuery {
+    #[serde(rename = "sessionPath")]
+    session_path: String,
+}
+
+async fn session_flow(
+    State(state): State<AppState>,
+    Query(query): Query<SessionPathQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "reports": state.sessions.flow_reports(&query.session_path)?,
+    })))
 }
 
 async fn create_session(

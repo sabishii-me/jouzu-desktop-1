@@ -1786,8 +1786,69 @@ impl SessionManager {
         })
     }
 
-    pub fn workspace_allowed(&self, path: &str) -> bool {
-        let Ok(candidate) = Path::new(path).canonicalize() else {
+    fn session_file(&self, session_path: &str) -> Result<PathBuf, ApiError> {
+        let root = self
+            .runtime_home
+            .join("state")
+            .join("sessions")
+            .canonicalize()
+            .unwrap_or_else(|_| self.runtime_home.join("state").join("sessions"));
+        let path = PathBuf::from(session_path)
+            .canonicalize()
+            .map_err(|_| ApiError::bad_request("Unknown session path"))?;
+        if !path.starts_with(&root)
+            || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+        {
+            return Err(ApiError::bad_request("Unknown session path"));
+        }
+        Ok(path)
+    }
+
+    pub fn flow_reports(&self, session_path: &str) -> Result<Vec<Value>, ApiError> {
+        let path = self.session_file(session_path)?;
+        let file = std::fs::File::open(path)
+            .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
+        let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
+        let mut reports = Vec::new();
+        for line in std::io::BufRead::lines(reader) {
+            let Ok(line) = line else { break };
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value.get("type").and_then(Value::as_str) != Some("custom_message")
+                || value.get("display").and_then(Value::as_bool) == Some(false)
+            {
+                continue;
+            }
+            let Some(custom_type) = value.get("customType").and_then(Value::as_str) else {
+                continue;
+            };
+            if !custom_type.starts_with("jouzu-flow") {
+                continue;
+            }
+            let Some(content) = value.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            let text = content
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let Some(kind) = parsed.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            reports.push(json!({ "kind": kind, "text": text }));
+        }
+        if reports.len() > 30 {
+            reports.drain(0..reports.len() - 30);
+        }
+        Ok(reports)
+    }
+
+    pub fn workspace_allowed(&self, path: &str) -> bool {        let Ok(candidate) = Path::new(path).canonicalize() else {
             return false;
         };
         let allowed = self
