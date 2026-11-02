@@ -208,7 +208,7 @@ export interface CommandApi {
   raw(sessionId: string, command: Record<string, unknown>): Promise<unknown>;
   compact(sessionId: string): Promise<void>;
   exportHtml(sessionId: string, outputPath: string): Promise<void>;
-  reload(sessionId: string): Promise<void>;
+  reload(sessionId: string, sessionPath?: string): Promise<void>;
 }
 
 export interface ArtifactApi {

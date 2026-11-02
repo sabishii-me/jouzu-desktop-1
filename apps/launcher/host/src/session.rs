@@ -1480,8 +1480,30 @@ impl Session {
                 | "compact"
                 | "export_html"
                 | "fork"
+                | "switch_session"
         ) {
             return Err(ApiError::bad_request("Unsupported session command"));
+        }
+        if kind == "switch_session" {
+            let path = command
+                .get("sessionPath")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApiError::bad_request("sessionPath is required"))?;
+            let root = self
+                .home
+                .join("data")
+                .join("state")
+                .join("sessions")
+                .canonicalize()
+                .map_err(|_| ApiError::bad_request("Unknown session path"))?;
+            let candidate = std::path::Path::new(path)
+                .canonicalize()
+                .map_err(|_| ApiError::bad_request("Unknown session path"))?;
+            if !candidate.starts_with(&root)
+                || candidate.extension().and_then(|value| value.to_str()) != Some("jsonl")
+            {
+                return Err(ApiError::bad_request("Unknown session path"));
+            }
         }
         let id = command
             .get("id")

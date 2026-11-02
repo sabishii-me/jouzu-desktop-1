@@ -146,6 +146,7 @@ describe("A-API contract suite", () => {
     await expect(api.settings.environment.read()).resolves.toBeDefined();
     await expect(api.commands.compact("h1")).resolves.toBeUndefined();
     await expect(api.commands.exportHtml("h1", "C:/out.html")).resolves.toBeUndefined();
+    await expect(api.commands.reload("h1", "C:/sessions/h1.jsonl")).resolves.toBeUndefined();
     const unsubscribe = api.subscribe("h1", "c", ["view"], 0, () => {});
     expect(typeof unsubscribe).toBe("function");
     unsubscribe();

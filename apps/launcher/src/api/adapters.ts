@@ -113,8 +113,11 @@ function hostGroups(client: HostClient) {
     async exportHtml(sessionId, outputPath) {
       await client.command(sessionId, { type: "export_html", outputPath });
     },
-    async reload() {
-      unsupported();
+    async reload(sessionId, sessionPath) {
+      if (!sessionPath) {
+        throw new ApiError("invalid-request", "sessionPath is required to reload a session.", false);
+      }
+      await client.command(sessionId, { type: "switch_session", sessionPath });
     },
   };
 
