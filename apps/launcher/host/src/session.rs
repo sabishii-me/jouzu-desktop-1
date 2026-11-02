@@ -1804,8 +1804,71 @@ impl SessionManager {
         Ok(path)
     }
 
-    pub fn flow_reports(&self, session_path: &str) -> Result<Vec<Value>, ApiError> {
+    pub fn timing(&self, session_path: &str) -> Result<Value, ApiError> {
         let path = self.session_file(session_path)?;
+        let file = std::fs::File::open(path)
+            .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
+        let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
+        let mut model_ms = 0u64;
+        let mut tool_ms = 0u64;
+        let mut turns = 0u64;
+        let mut steps = 0u64;
+        let mut output_tokens = 0u64;
+        let mut previous: Option<i64> = None;
+        for line in std::io::BufRead::lines(reader) {
+            let Ok(line) = line else { break };
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let entry_ts = value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.timestamp_millis());
+            if value.get("type").and_then(Value::as_str) != Some("message") {
+                if entry_ts.is_some() {
+                    previous = entry_ts;
+                }
+                continue;
+            }
+            let Some(message) = value.get("message") else {
+                continue;
+            };
+            let role = message.get("role").and_then(Value::as_str).unwrap_or_default();
+            if role == "toolResult" {
+                if let (Some(started), Some(ended)) = (previous, entry_ts) {
+                    tool_ms += ended.saturating_sub(started).max(0) as u64;
+                }
+            } else if role == "user" {
+                turns += 1;
+            } else if role == "assistant" {
+                steps += 1;
+                output_tokens += message
+                    .get("usage")
+                    .and_then(|usage| usage.get("output"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if let (Some(started), Some(ended)) = (
+                    message.get("timestamp").and_then(Value::as_i64),
+                    entry_ts,
+                ) {
+                    model_ms += ended.saturating_sub(started).max(0) as u64;
+                }
+            }
+            if entry_ts.is_some() {
+                previous = entry_ts;
+            }
+        }
+        Ok(json!({
+            "modelMs": model_ms,
+            "toolMs": tool_ms,
+            "turns": turns,
+            "steps": steps,
+            "outputTokens": output_tokens,
+        }))
+    }
+
+    pub fn flow_reports(&self, session_path: &str) -> Result<Vec<Value>, ApiError> {        let path = self.session_file(session_path)?;
         let file = std::fs::File::open(path)
             .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
         let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));

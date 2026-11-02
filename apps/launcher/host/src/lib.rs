@@ -231,6 +231,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/persisted", get(persisted_sessions))
         .route("/sessions/flow", get(session_flow))
+        .route("/sessions/timing", get(session_timing))
         .route(
             "/sessions/update",
             axum::routing::post(update_session),
@@ -428,6 +429,15 @@ async fn session_flow(
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({
         "reports": state.sessions.flow_reports(&query.session_path)?,
+    })))
+}
+
+async fn session_timing(
+    State(state): State<AppState>,
+    Query(query): Query<SessionPathQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "timing": state.sessions.timing(&query.session_path)?,
     })))
 }
 
