@@ -6,6 +6,7 @@
 import {
   ApiError,
   type ApiCapabilities,
+  type ApiEvent,
   type Artifact,
   type ArtifactBody,
   type Attachment,
@@ -16,6 +17,7 @@ import {
   type SessionHandle,
   type SessionSummary,
   type Workspace,
+  type Unsubscribe,
 } from "./jouzu-api";
 
 export interface HostClientOptions {
@@ -65,6 +67,69 @@ export class HostClient {
       );
     }
     return body as T;
+  }
+
+  subscribe(
+    sessionId: string,
+    clientId: string,
+    capabilities: string[],
+    cursor: number | undefined,
+    onEvent: (event: ApiEvent) => void,
+    onError?: (error: unknown) => void,
+  ): Unsubscribe {
+    const controller = new AbortController();
+    const query = new URLSearchParams({
+      clientId,
+      capabilities: capabilities.join(","),
+    });
+    if (cursor) query.set("after", String(cursor));
+    void (async () => {
+      try {
+        const response = await this.fetchImpl(
+          `${this.baseUrl}/v1/sessions/${encodeURIComponent(sessionId)}/events?${query}`,
+          {
+            headers: cursor ? { "last-event-id": String(cursor) } : {},
+            signal: controller.signal,
+          },
+        );
+        if (!response.ok) {
+          throw new ApiError("runtime-unavailable", `Event stream failed (${response.status})`, true, response.status);
+        }
+        const reader = response.body?.getReader();
+        if (!reader) return;
+        const decoder = new TextDecoder();
+        let buffer = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) return;
+          buffer += decoder.decode(value, { stream: true });
+          let index;
+          while ((index = buffer.indexOf("\n\n")) >= 0) {
+            const block = buffer.slice(0, index);
+            buffer = buffer.slice(index + 2);
+            let id = 0;
+            let event = "";
+            let data = "";
+            for (const line of block.split("\n")) {
+              if (line.startsWith("id:")) id = Number(line.slice(3).trim());
+              else if (line.startsWith("event:")) event = line.slice(6).trim();
+              else if (line.startsWith("data:")) data += line.slice(5).trim();
+            }
+            if (!event) continue;
+            let payload: Record<string, unknown> = {};
+            try {
+              payload = data ? JSON.parse(data) : {};
+            } catch {
+              payload = { raw: data };
+            }
+            onEvent({ id, event, data: payload });
+          }
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) onError?.(error);
+      }
+    })();
+    return () => controller.abort();
   }
 
   capabilities(): Promise<ApiCapabilities> {

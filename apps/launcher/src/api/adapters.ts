@@ -9,6 +9,7 @@ import {
   CapabilityUnavailable,
   JouzuApi,
   type ApiCapabilities,
+  type ApiEvent,
   type ArtifactApi,
   type CommandApi,
   type FileApi,
@@ -161,10 +162,6 @@ function assignHostGroups(api: JouzuApi, client: HostClient): void {
   Object.assign(api as unknown as Record<string, unknown>, hostGroups(client));
 }
 
-function notWired(): never {
-  throw new ApiError("internal", "The host event stream is not wired yet.", false);
-}
-
 export class WebApi extends JouzuApi {
   readonly capabilities: ApiCapabilities = {
     host: true,
@@ -194,8 +191,15 @@ export class WebApi extends JouzuApi {
 
   async dispose(): Promise<void> {}
 
-  subscribe(): Unsubscribe {
-    notWired();
+  subscribe(
+    sessionId: string,
+    clientId: string,
+    capabilities: string[],
+    cursor: number | undefined,
+    onEvent: (event: ApiEvent) => void,
+    onError?: (error: unknown) => void,
+  ): Unsubscribe {
+    return this.client.subscribe(sessionId, clientId, capabilities, cursor, onEvent, onError);
   }
 }
 
@@ -228,8 +232,15 @@ export class RemoteApi extends JouzuApi {
 
   async dispose(): Promise<void> {}
 
-  subscribe(): Unsubscribe {
-    notWired();
+  subscribe(
+    sessionId: string,
+    clientId: string,
+    capabilities: string[],
+    cursor: number | undefined,
+    onEvent: (event: ApiEvent) => void,
+    onError?: (error: unknown) => void,
+  ): Unsubscribe {
+    return this.client.subscribe(sessionId, clientId, capabilities, cursor, onEvent, onError);
   }
 }
 
@@ -262,8 +273,15 @@ export class DesktopApi extends JouzuApi {
 
   async dispose(): Promise<void> {}
 
-  subscribe(): Unsubscribe {
-    notWired();
+  subscribe(
+    sessionId: string,
+    clientId: string,
+    capabilities: string[],
+    cursor: number | undefined,
+    onEvent: (event: ApiEvent) => void,
+    onError?: (error: unknown) => void,
+  ): Unsubscribe {
+    return this.client.subscribe(sessionId, clientId, capabilities, cursor, onEvent, onError);
   }
 }
 

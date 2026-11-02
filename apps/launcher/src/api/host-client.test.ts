@@ -61,4 +61,33 @@ describe("HostClient", () => {
       status: 409,
     });
   });
+
+  test("streams SSE events and sends the cursor", async () => {
+    let url = "";
+    let cursor = "";
+    const encoder = new TextEncoder();
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode("id: 4\nevent: message.delta\ndata: {\"text\":\"h\"}\n\n"));
+        controller.enqueue(encoder.encode("id: 5\nevent: message.done\ndata: {\"stopReason\":\"completed\"}\n\n"));
+        controller.close();
+      },
+    });
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      url = String(input);
+      cursor = String((init?.headers as Record<string, string> | undefined)?.["last-event-id"] ?? "");
+      return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    const client = new HostClient({ baseUrl: "http://host", fetchImpl });
+    const events: Array<{ id: number; event: string }> = [];
+    client.subscribe("h1", "web-test", ["view", "prompts"], 3, event => events.push({ id: event.id, event: event.event }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(url).toContain("/v1/sessions/h1/events?");
+    expect(url).toContain("clientId=web-test");
+    expect(cursor).toBe("3");
+    expect(events).toEqual([
+      { id: 4, event: "message.delta" },
+      { id: 5, event: "message.done" },
+    ]);
+  });
 });

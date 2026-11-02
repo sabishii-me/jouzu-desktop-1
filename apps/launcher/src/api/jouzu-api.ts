@@ -242,6 +242,12 @@ export interface NativeApi {
   };
 }
 
+export interface ApiEvent {
+  id: number;
+  event: string;
+  data: Record<string, unknown>;
+}
+
 export abstract class JouzuApi {
   abstract readonly capabilities: ApiCapabilities;
   abstract readonly sessions: SessionApi;
@@ -261,6 +267,8 @@ export abstract class JouzuApi {
     sessionId: string,
     clientId: string,
     capabilities: string[],
-    cursor?: number,
+    cursor: number | undefined,
+    onEvent: (event: ApiEvent) => void,
+    onError?: (error: unknown) => void,
   ): Unsubscribe;
 }
