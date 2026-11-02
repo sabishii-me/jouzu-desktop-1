@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { ArrowUp, File, Folder, RefreshCw } from "lucide-react";
 import { Button } from "./components/ui/button";
+import { useApi } from "./api/context";
 
 interface Entry {
   name: string;
@@ -18,6 +18,7 @@ function parentOf(path: string) {
 
 /** Browse the session workspace from the pane. */
 export function FilesPanel({ path }: { path: string }) {
+  const api = useApi();
   const [current, setCurrent] = useState(path);
   const [entries, setEntries] = useState<Entry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -25,8 +26,8 @@ export function FilesPanel({ path }: { path: string }) {
   async function load(target: string) {
     try {
       setError(null);
-      const result = await invoke<{ entries: Entry[] }>("workspace_list", { path: target });
-      setEntries(result.entries ?? []);
+      const next = await api.files.list(target);
+      setEntries(next as Entry[]);
       setCurrent(target);
     } catch (failure) {
       setError(String(failure));
@@ -48,7 +49,7 @@ export function FilesPanel({ path }: { path: string }) {
         key={entry.path}
         type="button"
         className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-sm hover:bg-muted"
-        onClick={() => { if (entry.isDir) void load(entry.path); else void invoke("reveal_path", { path: entry.path }).catch(() => {}); }}
+        onClick={() => { if (entry.isDir) void load(entry.path); else void api.native.reveal(entry.path).catch(() => {}); }}
       >
         {entry.isDir ? <Folder className="size-4 shrink-0 text-muted-foreground" /> : <File className="size-4 shrink-0 text-muted-foreground" />}
         <span className="min-w-0 flex-1 truncate">{entry.name}</span>

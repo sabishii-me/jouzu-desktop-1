@@ -231,6 +231,7 @@ export interface SettingsApi {
 }
 
 export interface NativeApi {
+  confirm(options: { message: string; title?: string }): Promise<boolean>;
   pickFolder(): Promise<string | null>;
   reveal(path: string): Promise<void>;
   openExternal(url: string): Promise<void>;

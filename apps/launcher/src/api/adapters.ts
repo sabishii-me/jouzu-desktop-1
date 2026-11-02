@@ -4,6 +4,7 @@
  */
 
 import { HostClient } from "./host-client";
+import { createDesktopBridge, type DesktopBridge } from "./desktop-bridge";
 import {
   ApiError,
   CapabilityUnavailable,
@@ -33,6 +34,8 @@ function unavailableNative(): NativeApi {
     throw new CapabilityUnavailable();
   };
   return {
+    confirm: async options =>
+      typeof window !== "undefined" ? window.confirm(options.message) : false,
     pickFolder: fail,
     reveal: fail,
     openExternal: fail,
@@ -260,9 +263,17 @@ export class DesktopApi extends JouzuApi {
   readonly settings!: SettingsApi;
   readonly native!: NativeApi;
 
-  constructor(readonly client: HostClient) {
+  constructor(readonly client: HostClient, bridge?: DesktopBridge) {
     super();
     assignHostGroups(this, client);
+    if (bridge) {
+      Object.assign(this as unknown as Record<string, unknown>, {
+        artifacts: bridge.artifacts,
+        files: bridge.files,
+        settings: bridge.settings,
+        native: bridge.native,
+      });
+    }
   }
 
   async start(): Promise<void> {
@@ -284,8 +295,8 @@ export class DesktopApi extends JouzuApi {
 }
 
 export function createJouzuApi(client = new HostClient()): JouzuApi {
-  if (typeof window !== "undefined" && window.location.hostname === "127.0.0.1") {
-    return new DesktopApi(client);
+  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+    return new DesktopApi(client, createDesktopBridge());
   }
   return new WebApi(client);
 }
