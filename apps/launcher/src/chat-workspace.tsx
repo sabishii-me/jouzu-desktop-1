@@ -65,7 +65,7 @@ function relativeTime(updated: number) {
 
 export function ChatWorkspace({ path, revision = 0, newSession = true, locked = false, onStartSession, onRetry, onBusyChange, onBootChange, catalogRefreshing = false, canRefreshModels = false, onModelsMissing, workspaces, onSelect, onAddFolder, onRemove, onSettings, onUpdate, updateAvailable = false, updateBusy = false }: ChatWorkspaceProps) {
   const api = useApi();
-  const hostMode = api.capabilities.host && !api.capabilities.native;
+  const chatUnavailable = !api.capabilities.features.includes("chat");
   const [snapshot, setSnapshot] = useState<ChatSnapshot>({ projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [] });
   const [draft, setDraft] = useState("");
   const draftRef = useRef(draft);
@@ -188,10 +188,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     });
   }
   useEffect(() => {
-    if (hostMode) return;
+    if (chatUnavailable) return;
     if (newSession && !previousNewSession.current) void startNewSession();
     previousNewSession.current = newSession;
-  }, [newSession, hostMode]);
+  }, [newSession, chatUnavailable]);
   // A draft belongs to the workspace and the session (or its new-session slot).
   // Changing the key loads that draft; it never clears the one left behind.
   const activeDraftKey = draftKey(path, hero ? null : selectedSession ?? snapshot.sessionFile ?? null);
@@ -201,7 +201,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     applyDraft(readDraft(activeDraftKey));
   }, [activeDraftKey]);
   useEffect(() => {
-    if (hostMode) return;
+    if (chatUnavailable) return;
     const selected = selectedSessionRef.current;
     const keepPreview = !!selected && !!previewRef.current && normalizedPath(previewRef.current.path) === normalizedPath(selected);
     queuedSwitch.current = selected;
@@ -288,7 +288,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   useEffect(() => { onBusyChange?.(snapshot.pending || snapshot.projection.running || draft.trim().length > 0); }, [snapshot.pending, snapshot.projection.running, draft, onBusyChange]);
   // The app keeps its own loader up until the entry session is connected, so the
   // workspace never opens on a second, still-blocked "Starting session…" state.
-  useEffect(() => { onBootChange?.(!hostMode && !snapshot.connected); }, [snapshot.connected, onBootChange, hostMode]);
+  useEffect(() => { onBootChange?.(!chatUnavailable && !snapshot.connected); }, [snapshot.connected, onBootChange, chatUnavailable]);
   useEffect(() => {
     const key = normalizedPath(snapshot.sessionFile ?? "");
     if (!key) return;
@@ -336,22 +336,14 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
 
   async function refreshSessions() {
     try {
-      if (hostMode) {
-        const list = await api.sessions.list();
-        setSessions(list.map(fromApiSession).filter((value): value is SessionSummary => value !== null));
-      } else {
-        setSessions(await invoke<SessionSummary[]>("chat_sessions"));
-      }
+      const list = await api.sessions.list();
+      setSessions(list.map(fromApiSession).filter((value): value is SessionSummary => value !== null));
     } catch { /* Session history is ancillary; chat remains usable. */ }
   }
   async function updateSession(sessionPath: string, change: { pinned?: boolean; archived?: boolean; title?: string }) {
     try {
-      if (hostMode) {
-        await api.sessions.update(sessionPath, change);
-        await refreshSessions();
-      } else {
-        setSessions(await invoke<SessionSummary[]>("chat_session_update", { sessionPath, ...change }));
-      }
+      await api.sessions.update(sessionPath, change);
+      await refreshSessions();
     } catch (error) { setNotification(String(error)); }
   }
   async function renameSession(session: SessionSummary) {
@@ -389,21 +381,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (!file) { setDiskReports([]); setReportsSession(""); setTiming(undefined); return; }
     setDiskReports([]); setReportsSession(file);
     let disposed = false;
-    if (hostMode) {
-      void api.sessions.flowReports(file)
-        .then(reports => { if (!disposed) setDiskReports(reports as FlowReportRecord[]); })
-        .catch(() => { if (!disposed) setDiskReports([]); });
-      void api.sessions.timing(file)
-        .then(value => { if (!disposed && value && typeof value.modelMs === "number") setTiming(value); })
-        .catch(() => { if (!disposed) setTiming(undefined); });
-    } else {
-      void invoke<FlowReportRecord[]>("chat_flow_reports", { sessionPath: file })
-        .then(reports => { if (!disposed) setDiskReports(Array.isArray(reports) ? reports : []); })
-        .catch(() => { if (!disposed) setDiskReports([]); });
-      void invoke<SessionTiming>("chat_session_timing", { sessionPath: file })
-        .then(value => { if (!disposed && value && typeof value.modelMs === "number") setTiming(value); })
-        .catch(() => { if (!disposed) setTiming(undefined); });
-    }
+    void api.sessions.flowReports(file)
+      .then(reports => { if (!disposed) setDiskReports(reports as FlowReportRecord[]); })
+      .catch(() => { if (!disposed) setDiskReports([]); });
+    void api.sessions.timing(file)
+      .then(value => { if (!disposed && value && typeof value.modelMs === "number") setTiming(value); })
+      .catch(() => { if (!disposed) setTiming(undefined); });
     return () => { disposed = true; };
   }, [snapshot.sessionFile, snapshot.projection.messages.length]);
   async function reply(fields: DialogAnswer) {
@@ -674,9 +657,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const client = connection.current;
     const source = sourcePath ?? client?.snapshot.sessionFile;
     if (!client || !source) return false;
-    const recovered = hostMode
-      ? await api.sessions.recover(source)
-      : await invoke<string | null>("chat_session_recover", { sessionPath: source });
+    const recovered = await api.sessions.recover(source);
     if (!recovered || recovered === source) return false;
     setSelectedSession(recovered);
     await client.resumeSession(recovered);
@@ -751,9 +732,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       setPreview({ path: sessionPath, projection: cached });
       return;
     }
-    const previewMessages = hostMode
-      ? api.sessions.messages(sessionPath, 200)
-      : invoke<unknown[]>("chat_session_messages", { sessionPath, limit: 200 });
+    const previewMessages = api.sessions.messages(sessionPath, 200);
     void previewMessages.then(messages => {
       if (previewRequest.current !== request) return;
       if (normalizedPath(selectedSessionRef.current ?? "") !== normalizedPath(sessionPath)) return;
@@ -787,7 +766,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setAppView("chat");
     const client = connection.current;
     if (!client) {
-      if (!hostMode) return;
+      if (!chatUnavailable) return;
       selectedSessionRef.current = sessionPath;
       setSelectedSession(sessionPath);
       setHero(false);
@@ -849,9 +828,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!source) throw new Error("This session has no file to branch yet.");
       // Copy the session through the clicked message (the turn end) into a new
       // session, then switch the runtime to it. No runtime fork semantics change.
-      const branch = hostMode
-        ? await api.sessions.branch(source, messageIndex)
-        : await invoke<string>("chat_session_branch", { sessionPath: source, messageIndex });
+      const branch = await api.sessions.branch(source, messageIndex);
       await client.resumeSession(branch);
       await refreshSessions();
       setPreview(null);
@@ -974,8 +951,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   }, []);
   useEffect(() => {
     let alive = true;
-    void invoke<{ counts: Record<string, number> }>("artifact_counts")
-      .then(value => { if (alive) setArtifactCounts(value.counts ?? {}); })
+    void api.artifacts.counts()
+      .then(value => { if (alive) setArtifactCounts(value ?? {}); })
       .catch(() => {});
     return () => { alive = false; };
   }, [sessions, revision, snapshot.projection.messages.length]);
@@ -1028,10 +1005,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       <fieldset disabled={dialog.responding || !snapshot.transportReady} className="mt-3 flex flex-wrap justify-end gap-2"><Button variant="outline" onClick={() => void reply({ cancelled: true })}>Cancel</Button>{dialog.method === "confirm" ? <><Button variant="outline" onClick={() => void reply({ confirmed: false })}>No</Button><Button onClick={() => void reply({ confirmed: true })}>Yes</Button></> : dialog.method === "select" ? (dialog.options ?? []).map(option => <Button key={option} onClick={() => void reply({ value: option })}>{option}</Button>) : <Button onClick={() => void reply({ value: answer })}>Submit</Button>}</fieldset></section>;
   const selectedTitle = sessions.find(session => normalizedPath(session.path) === selectedKey)?.title;
   const activePreview = preview && normalizedPath(preview.path) === selectedKey ? preview : null;
-  const opening = !hostMode && !hero && !!selectedSession && selectedKey !== activeSession && !activePreview;
+  const opening = !chatUnavailable && !hero && !!selectedSession && selectedKey !== activeSession && !activePreview;
   // One gate: the entry session is connected before the chat UI appears, so the user
   // never sees a second, still-blocked "Connecting…" state.
-  const booting = !hostMode && !snapshot.connected && !sessionError;
+  const booting = !chatUnavailable && !snapshot.connected && !sessionError;
   const conversationProjection = activePreview?.projection ?? snapshot.projection;
   const conversationKey = selectedSession ?? snapshot.sessionId ?? path;
   const hasArchived = sessions.some(session => session.archived);
@@ -1163,7 +1140,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         <Button variant="ghost" className="size-8 shrink-0 p-0" aria-label={sidebar ? "Hide workspaces" : "Show workspaces"} title="Workspaces" aria-expanded={sidebar} onClick={() => setSidebar(value => !value)}><PanelLeft className="size-4" /></Button>
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <h2 className="max-w-60 min-w-0 shrink-0 truncate text-sm font-semibold" title={`${name} · ${path}${snapshot.model ? ` · ${snapshot.model}` : ""}`}>{selectedTitle ?? name}</h2>
-          {!hostMode && !snapshot.connected && <span className={`h-7 shrink-0 rounded-md border px-2 text-xs leading-7 ${workspaceError ? "border-destructive/30 text-destructive" : "border-border text-muted-foreground"}`}>{workspaceError ? "Offline" : "Starting…"}</span>}
+          {!chatUnavailable && !snapshot.connected && <span className={`h-7 shrink-0 rounded-md border px-2 text-xs leading-7 ${workspaceError ? "border-destructive/30 text-destructive" : "border-border text-muted-foreground"}`}>{workspaceError ? "Offline" : "Starting…"}</span>}
           <div className="hidden min-w-0 items-center gap-1.5 md:flex">
             <SubagentMenu agents={subagents} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} />
             <BackgroundMenu jobs={flow.background} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} />

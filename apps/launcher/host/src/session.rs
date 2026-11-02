@@ -2502,23 +2502,30 @@ impl SessionManager {
                             .and_then(Value::as_str)
                             .map(ToString::to_string);
                     }
-                    if title.is_none()
-                        && value.get("type").and_then(Value::as_str) == Some("message")
+                    if value.get("type").and_then(Value::as_str) == Some("message")
                         && value
                             .get("message")
                             .and_then(|message| message.get("role"))
                             .and_then(Value::as_str)
                             == Some("user")
                     {
-                        title = value
+                        if title.is_none() {
+                            title = value
                             .get("message")
                             .and_then(|message| message.get("content"))
-                            .and_then(Value::as_array)
                             .and_then(|content| {
-                                content.iter().find_map(|block| {
-                                    block.get("text").and_then(Value::as_str).map(str::to_string)
+                                content.as_str().map(str::to_string).or_else(|| {
+                                    content.as_array().and_then(|content| {
+                                        content.iter().find_map(|block| {
+                                            block
+                                                .get("text")
+                                                .and_then(Value::as_str)
+                                                .map(str::to_string)
+                                        })
+                                    })
                                 })
                             });
+                        }
                     }
                 }
                 let cwd = cwd?;
@@ -2545,6 +2552,14 @@ impl SessionManager {
                                 .to_string()
                         })
                     });
+                let title = if title.trim().is_empty() {
+                    path.file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("Session")
+                        .to_string()
+                } else {
+                    title
+                };
                 Some(json!({
                     "sessionPath": key,
                     "workspacePath": canonical_path(&cwd),

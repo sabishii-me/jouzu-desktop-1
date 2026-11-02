@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { createUpdateSchedule, startUpdateChecks } from "./update-schedule";
 import { logEvent } from "./log-event";
-export function useLauncherUpdate(configured: boolean) {
+export function useLauncherUpdate(configured: boolean, enabled = true) {
  const candidate = useRef<Update | null>(null);
  const [version,setVersion]=useState<string|null>(null);
  const [notes,setNotes]=useState<string|null>(null);
@@ -12,7 +12,7 @@ export function useLauncherUpdate(configured: boolean) {
  const lock=useRef(false);
  // A silent check runs on its own schedule and must not move the interface while it asks.
  async function refresh(silent=false) {
-  if(!configured || lock.current)return;
+  if(!configured || !enabled || lock.current)return;
   lock.current=true;if(!silent){setError(null);setPhase("checking");}
   try {
    await candidate.current?.close();candidate.current=null;setVersion(null);setNotes(null);
@@ -40,6 +40,6 @@ export function useLauncherUpdate(configured: boolean) {
  // render happens before the configuration arrives, and a captured refresh would answer from it.
  const refreshRef=useRef(refresh);refreshRef.current=refresh;
  const schedule=useRef(createUpdateSchedule(silent=>{void refreshRef.current(silent);}));
- useEffect(()=>{ if(!configured)return; return startUpdateChecks(schedule.current); },[configured]);
+ useEffect(()=>{ if(!configured || !enabled)return; return startUpdateChecks(schedule.current); },[configured,enabled]);
  return {version,notes,phase,progress,error,refresh:()=>refresh(),install,busy:phase==="checking"||phase==="downloading"||phase==="installing"};
 }

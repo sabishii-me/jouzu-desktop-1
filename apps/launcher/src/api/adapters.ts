@@ -272,11 +272,7 @@ export class DesktopApi extends JouzuApi {
     assignHostGroups(this, client);
     if (bridge) {
       Object.assign(this as unknown as Record<string, unknown>, {
-        artifacts: bridge.artifacts,
-        files: bridge.files,
-        settings: bridge.settings,
         native: bridge.native,
-        workspaces: bridge.workspaces,
         capabilities: { ...this.capabilities, native: true },
       });
     }
@@ -301,9 +297,6 @@ export class DesktopApi extends JouzuApi {
 }
 
 export function createJouzuApi(client = new HostClient()): JouzuApi {
-  if (typeof window !== "undefined" && /^https?:$/u.test(window.location.protocol)) {
-    return new WebApi(client);
-  }
   if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
     return new DesktopApi(client, createDesktopBridge());
   }

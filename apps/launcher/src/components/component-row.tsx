@@ -1,7 +1,6 @@
 import { LoaderCircle } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { isHostOrigin } from '../api/platform-mode';
 import { Button } from '../components/ui/button';
 
 /** One row of the System section: which copy a component uses, and what is still missing. */
@@ -37,7 +36,7 @@ export interface ComponentApi<State> {
 }
 
 /** Reads a component's state and keeps it in step with the actions its row offers. */
-export function useComponent<State>(command: string): ComponentApi<State> {
+export function useComponent<State>(command: string, enabled = true): ComponentApi<State> {
   const [state, setState] = useState<State | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -47,7 +46,7 @@ export function useComponent<State>(command: string): ComponentApi<State> {
       setState(value && typeof value === 'object' ? value : null);
     } catch (failure) { setError(String(failure)); }
   }, [command]);
-  useEffect(() => { if (isHostOrigin()) return; void read(); }, [read]);
+  useEffect(() => { if (!enabled) return; void read(); }, [read, enabled]);
   const run = useCallback(async (call: () => Promise<State>) => {
     setBusy(true); setError(null);
     try {

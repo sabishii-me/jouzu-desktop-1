@@ -1,7 +1,6 @@
 import { ChatWorkspace } from "./chat-workspace";
 import { ToolsPanel } from "./tools-panel";
 import { ArtifactsPanel } from "./artifacts-panel";
-import { LauncherPage } from "./components/launcher-page";
 import { ProviderPicker } from "./components/ui/provider-picker";
 import { recoveryText } from "./recovery-text";
 import { UpdatePreview } from "./update-preview";
@@ -19,7 +18,7 @@ import { Switch } from "./components/ui/switch";
 import { listen } from "@tauri-apps/api/event";
 import jouzuIcon from "./assets/jouzu.svg";
 import { useEffect, useState, useRef, type ReactNode } from "react";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Input } from "./components/ui/input";
 import { getVersion } from "@tauri-apps/api/app";
@@ -37,14 +36,13 @@ import { messages, locales, resolveLocale, type Locale } from "./i18n";
 import { type Workspace } from "./history";
 import { parseDiagnostics, type Diagnostics } from "./diagnostics";
 import { useApi } from "./api/context";
-import { CapabilityUnavailable } from "./api/jouzu-api";
 interface LauncherState { platform: "windows" | "macos" | "linux"; recent: Workspace[]; ready: boolean; bash: boolean; bundled_git: boolean }
 interface Components { jouzu: string | null; development: boolean; launcherUpdaterConfigured?: boolean; jouzuUpdaterConfigured?: boolean }
 interface RuntimeReport { status?: string; version: string | null; root: string | null; app: string | null; node: boolean; nodeVersion: string | null; nodeCurrent: boolean; git: boolean; terminal: boolean }
 
 export function App() {
   const api = useApi();
-  const hostMode = api.capabilities.host && !api.capabilities.native;
+  const native = api.capabilities.native;
   const [locale, setLocale] = useState<Locale>(() => resolveLocale(localStorage.getItem("jouzu.ui.language") ?? navigator.language));
   const t = messages[locale];
   const [activePath, setActivePath] = useState<string | null>(null);
@@ -76,10 +74,10 @@ export function App() {
     void invoke<Components>("component_versions").then(setComponents).catch(error => setError(String(error)));
     // A runtime update is only visible to a fresh supervised process.
     requestSessionRestart();
-  });
-  const updater = useLauncherUpdate(components?.launcherUpdaterConfigured === true);
+  }, api.capabilities.native);
+  const updater = useLauncherUpdate(components?.launcherUpdaterConfigured === true, native);
   const gitBash = useGitBash();
-  const runtime = useComponent<RuntimeReport>("runtime_report");
+  const runtime = useComponent<RuntimeReport>("runtime_report", api.capabilities.native);
   const [settingsTab,setSettingsTab] = useState("providers");
   // Where a header jump lands in the System list: the row that has something waiting.
   const [updateFocus,setUpdateFocus] = useState<number | null>(null);
@@ -103,7 +101,7 @@ export function App() {
   const needsSetup = modelReady === false;
   const [device, setDevice] = useState<{url:string;code:string} | null>(null);
   useEffect(() => {
-    if (!isTauri() || hostMode) return;
+    if (!native) return;
     let disposed = false;
     const window = getCurrentWindow();
     const sync = () => { void window.isMaximized().then(value => { if (!disposed) setMaximized(value); }).catch(() => {}); };
@@ -112,12 +110,12 @@ export function App() {
     return () => { disposed = true; void unlisten.then(remove => remove()).catch(() => {}); };
   }, []);
   useEffect(() => {
-    if (!isTauri() || hostMode) return;
+    if (!native) return;
     const unlisten = listen("new-session", () => setNewSession(true));
     return () => { void unlisten.then(remove => remove()).catch(() => {}); };
   }, []);
   useEffect(() => {
-    if (!isTauri() || hostMode) return;
+    if (!native) return;
     const pending = listen<{url:string;code:string}>("control-device", event => setDevice(event.payload));
     return () => { pending.then(unlisten => unlisten()).catch(() => {}); };
   }, []);
@@ -170,7 +168,7 @@ export function App() {
     finally { setOperation(null); }
   }
   useEffect(() => {
-    if (!isTauri() || hostMode) return;
+    if (!native) return;
     let disposed = false;
     const subscription = getCurrentWindow().onDragDropEvent(event => {
       const payload = event.payload;
@@ -270,14 +268,10 @@ export function App() {
     } catch (error) { setError(String(error)); }
   }
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(null), 4000); return () => clearTimeout(timer); }, [notice]);
-  useEffect(() => { if (settingsOpen && isTauri()) { if (!setup && !busyRef.current) void configure({ action: "status" }); void readEnvironment(); } }, [settingsOpen]);
+  useEffect(() => { if (settingsOpen && native) { if (!setup && !busyRef.current) void configure({ action: "status" }); void readEnvironment(); } }, [settingsOpen]);
   const refresh = async () => {
-    if (hostMode) {
-      const recent = await api.workspaces.list();
-      setState({ platform: "windows", recent: recent as Workspace[], ready: true, bash: false, bundled_git: false });
-      return;
-    }
-    setState(await invoke<LauncherState>("launcher_state"));
+    const recent = await api.workspaces.list();
+    setState({ platform: "windows", recent: recent as Workspace[], ready: true, bash: false, bundled_git: false });
   };
   const loadComponents = () => invoke<Components>("component_versions")
     .then(setComponents)
@@ -288,33 +282,13 @@ export function App() {
     catch { setDiagnostics(null); }
   };
   useEffect(() => {
-    if (hostMode) {
-      setRuntimePresent(true);
-      setVersion("host");
-      void refresh().catch(error => setError(String(error)));
-      return;
-    }
-    if (!isTauri() || hostMode) return;
-    void refreshDiagnostics();
-    getVersion().then(setVersion).catch(error => setError(String(error)));
-    // The runtime decides whether the setup service exists; probing it first keeps a
-    // clean machine out of the status call instead of turning its absence into an alert.
-    void invoke<RuntimeReport>("runtime_report").then(report => {
-      setRuntimePresent(true);
-      if (report && report.nodeCurrent === false) { void updateRuntime(); return; }
-      void (async () => { try { await invoke("image_tool_ensure"); } catch { /* the tool is optional on a fixture */ } })();
-      void loadComponents();
-      void readStatus();
-    }).catch(error => {
-      // Only a missing runtime belongs to onboarding; any other report failure
-      // (an unsupported probe, a broken fixture) must not hide the workspace.
-      if (String(error).includes("application files are missing")) setRuntimePresent(false);
-      else setRuntimePresent(true);
-    });
+    setRuntimePresent(true);
+    setVersion("host");
+    void refresh().catch(error => setError(String(error)));
   }, []);
   // The prepare screen only mirrors the installer's own events; it never guesses progress.
   useEffect(() => {
-    if (!isTauri() || hostMode) return;
+    if (!native) return;
     const pending = listen<{ phase: string; downloaded?: number; total?: number | null }>("runtime-install-progress", event => {
       setRuntimeUpdating(current => current && !current.error ? { phase: event.payload.phase, error: null } : current);
       setPrepare(current => ({
@@ -370,21 +344,14 @@ export function App() {
   async function chooseFolder() {
     setOperation("choosing"); setError(null);
     try {
-      let path: string | null = null;
-      try {
-        path = await api.native.pickFolder();
-      } catch (error) {
-        if (!(error instanceof CapabilityUnavailable)) throw error;
-        path = window.prompt("Workspace folder path", "");
-      }
+      const path = await api.native.pickFolder();
       if (path) { await addFolders([path]); setActivePath(path); }
     } catch (error) { setError(String(error)); } finally { setOperation(null); }
   }
   async function forget(workspace: Workspace) {
     setOperation("saving"); setError(null);
     try {
-      if (hostMode) await api.workspaces.forget(workspace.id);
-      else await invoke("forget_workspace", { id: workspace.id });
+      await api.workspaces.forget(workspace.id);
       const next = state?.recent.find(item => item.id !== workspace.id)?.path ?? null;
       if (activePath === workspace.path) setActivePath(next);
       await refresh();
@@ -425,7 +392,7 @@ export function App() {
   </div>;
   // The first-run pages have no titlebar of their own; without these a loading
   // window cannot be closed.
-  const firstRunControls = <div className="fixed right-2 top-2 z-50 flex items-center gap-1">{isTauri() && <>
+  const firstRunControls = <div className="fixed right-2 top-2 z-50 flex items-center gap-1">{native && <>
     <Button variant="ghost" aria-label={t.minimize} title={t.minimize} onClick={() => getCurrentWindow().minimize().catch(error => setError(String(error)))}><Minus /></Button>
     <Button variant="ghost" aria-label="Close launcher" title={t.dismiss} onClick={() => getCurrentWindow().close().catch(error => setError(String(error)))}><X /></Button>
   </>}</div>;
@@ -543,7 +510,7 @@ export function App() {
           <DialogClose asChild><Button variant="ghost" className="absolute right-2 top-2 px-3" aria-label={t.dismiss}><X /></Button></DialogClose>
         </DialogContent>
       </Dialog>
-      {isTauri() && <><Button variant="ghost" aria-label={t.minimize} onClick={() => getCurrentWindow().minimize().catch(error => setError(String(error)))}><Minus /></Button><Button variant="ghost" aria-label={maximized ? "Restore" : "Maximize"} onClick={() => getCurrentWindow().toggleMaximize().catch(error => setError(String(error)))}>{maximized ? <Minimize2 /> : <Maximize2 />}</Button><Button variant="ghost" aria-label="Hide to tray" title="Hide to tray" onClick={() => getCurrentWindow().close().catch(error => setError(String(error)))}><X /></Button></>}
+      {native && <><Button variant="ghost" aria-label={t.minimize} onClick={() => getCurrentWindow().minimize().catch(error => setError(String(error)))}><Minus /></Button><Button variant="ghost" aria-label={maximized ? "Restore" : "Maximize"} onClick={() => getCurrentWindow().toggleMaximize().catch(error => setError(String(error)))}>{maximized ? <Minimize2 /> : <Maximize2 />}</Button><Button variant="ghost" aria-label="Hide to tray" title="Hide to tray" onClick={() => getCurrentWindow().close().catch(error => setError(String(error)))}><X /></Button></>}
       </div>
     </header>
       <Dialog open={repair !== null} onOpenChange={open => { if (!open) setRepair(null); }}>
@@ -589,15 +556,13 @@ export function App() {
         workspaces={state?.recent ?? []}
         onSelect={setActivePath}
         onAddFolder={() => void chooseFolder()}
-        onRemove={id => { const workspace = state?.recent.find(item => item.id === id); if (workspace) void forget(workspace); }}
+        onRemove={id => { const workspace = state?.recent.find(item => item.id === id); if (workspace) void forget(workspace); }}
         onSettings={() => setSettingsOpen(true)}
         onUpdate={openUpdatePanel}
         updateAvailable={!!(updater.version || jouzuUpdater.version)}
         updateBusy={updater.busy || jouzuUpdater.busy}
       />
     </div>}
-    {!activePath && <LauncherPage title={t.heading} description={t.intro}>
-      <div className="flex min-h-0 flex-1 items-center justify-center gap-2 p-6"><Button onClick={() => void chooseFolder()} disabled={!state || busy}><Plus />{t.addFolder}</Button><Button variant="outline" onClick={() => setSettingsOpen(true)}>{t.settings}</Button></div>
-    </LauncherPage>}
+    {!activePath && <div role="status" aria-label="Loading" className="flex min-h-0 flex-1 items-center justify-center"><JouzuLoader /></div>}
     </main>;
 }
