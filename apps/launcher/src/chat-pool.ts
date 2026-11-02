@@ -1,6 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ChatConnection } from "./chat-connection";
 import type { WireObject } from "./chat-projection";
+import { defaultChatTransport, type ChatTransport } from "./chat-transport";
+
+let transportFactory: (() => ChatTransport) | undefined;
+
+export function setChatTransportFactory(factory: (() => ChatTransport) | undefined) {
+  transportFactory = factory;
+}
+
+function chatTransport(): ChatTransport {
+  return transportFactory ? transportFactory() : defaultChatTransport;
+}
 
 interface Slot {
   client: ChatConnection;
@@ -131,7 +142,7 @@ export class ChatPool {
   private async startSlot(): Promise<void> {
     if (this.disposed) return;
     const scratch = await invoke<string>("chat_scratch_dir");
-    const client = new ChatConnection(() => {}, () => {});
+    const client = new ChatConnection(() => {}, () => {}, chatTransport());
     this.slots.set(client, { client, scratch });
     try {
       await client.start(scratch, true, `slot:${crypto.randomUUID()}`, true);
@@ -156,7 +167,7 @@ export class ChatPool {
       client.attachView();
       await client.resumeSession(sessionPath!);
     } else {
-      client = new ChatConnection(() => {}, dialog ?? (() => {}));
+      client = new ChatConnection(() => {}, dialog ?? (() => {}), chatTransport());
       await client.start(path, fresh && !sessionPath, `slot:${crypto.randomUUID()}`);
       if (sessionPath) await client.resumeSession(sessionPath);
     }

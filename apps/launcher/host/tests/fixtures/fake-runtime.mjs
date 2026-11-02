@@ -135,6 +135,15 @@ lines.on("line", line => {
     case "get_messages":
       response(value.id, "get_messages", { messages: [] });
       break;
+    case "get_state":
+      response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: { name: "fixture/model", provider: "fixture", id: "model" }, thinkingLevel: "off", sessionFile: null });
+      break;
+    case "get_available_models":
+      response(value.id, "get_available_models", { models: [] });
+      break;
+    case "get_available_thinking_levels":
+      response(value.id, "get_available_thinking_levels", { levels: ["off"] });
+      break;
     case "switch_session":
       response(value.id, "switch_session", { cancelled: false });
       break;

@@ -11,7 +11,7 @@ export class HostChatTransport implements ChatTransport {
   private closed = false;
   private error: string | undefined;
 
-  constructor(private readonly api: JouzuApi, private readonly workspacePath: string) {}
+  constructor(private readonly api: JouzuApi, private readonly workspacePath = "") {}
 
   async releaseGeneration(): Promise<void> {}
 
@@ -23,7 +23,15 @@ export class HostChatTransport implements ChatTransport {
       ["view", "control", "prompts"],
       undefined,
       event => {
-        if (event.event === "runtime.event") this.queue.push(event.data);
+        if (event.event === "runtime.event") {
+          if (
+            event.data.type === "response" &&
+            !String(event.data.id ?? "").startsWith("desktop-")
+          ) {
+            return;
+          }
+          this.queue.push(event.data);
+        }
         if (event.event === "session.status") {
           const status = event.data.status;
           if (status === "stopped" || status === "error") this.closed = true;

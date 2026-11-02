@@ -1423,7 +1423,7 @@ impl Session {
         self.publish("turn.start", json!({ "turnId": message_id.clone() }));
         self.set_status(Status::Running);
         let mut prompt = json!({
-            "id": message_id.clone(),
+            "id": client_message_id,
             "type": "prompt",
             "message": text,
         });
@@ -1483,9 +1483,15 @@ impl Session {
         ) {
             return Err(ApiError::bad_request("Unsupported session command"));
         }
-        let id = self.request_id();
-        if let Some(object) = command.as_object_mut() {
-            object.insert("id".to_string(), Value::String(id.clone()));
+        let id = command
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.request_id());
+        if command.get("id").is_none() {
+            if let Some(object) = command.as_object_mut() {
+                object.insert("id".to_string(), Value::String(id.clone()));
+            }
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending_requests
