@@ -239,6 +239,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(branch_session),
         )
         .route(
+            "/sessions/recover",
+            axum::routing::post(recover_session),
+        )
+        .route(
             "/sessions/update",
             axum::routing::post(update_session),
         )
@@ -481,6 +485,21 @@ async fn branch_session(
         "sessionPath": state
             .sessions
             .branch_session(&request.session_path, request.message_index)?,
+    })))
+}
+
+#[derive(Deserialize)]
+struct RecoverRequest {
+    #[serde(rename = "sessionPath")]
+    session_path: String,
+}
+
+async fn recover_session(
+    State(state): State<AppState>,
+    Json(request): Json<RecoverRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "sessionPath": state.sessions.recover_session(&request.session_path)?,
     })))
 }
 

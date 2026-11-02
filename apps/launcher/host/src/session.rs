@@ -1804,6 +1804,61 @@ impl SessionManager {
         Ok(path)
     }
 
+    pub fn recover_session(&self, session_path: &str) -> Result<Option<String>, ApiError> {
+        let source = self.session_file(session_path)?;
+        let text = std::fs::read_to_string(&source)
+            .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
+        let entries: Vec<Value> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line)
+                    .map_err(|_| ApiError::bad_request("Invalid session entry"))
+            })
+            .collect::<Result<_, _>>()?;
+        let Some(repaired) = recover_entries(&entries)? else {
+            return Ok(None);
+        };
+        let directory = source
+            .parent()
+            .ok_or_else(|| ApiError::bad_request("Session directory unavailable"))?;
+        let stem = source
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| ApiError::bad_request("Invalid session filename"))?;
+        let prefix = format!("{stem}-recovered-");
+        if let Ok(existing) = std::fs::read_dir(directory) {
+            for entry in existing.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&prefix) && name.ends_with(".jsonl") && entry.path().is_file() {
+                    return Ok(Some(canonical_path(&entry.path().to_string_lossy())));
+                }
+            }
+        }
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map_err(|_| ApiError::internal("Clock unavailable"))?
+            .as_millis();
+        let mut destination = directory.join(format!("{stem}-recovered-{millis}.jsonl"));
+        let mut counter = 1;
+        while destination.exists() {
+            destination = directory.join(format!("{stem}-recovered-{millis}-{counter}.jsonl"));
+            counter += 1;
+        }
+        let mut output = String::new();
+        for entry in repaired {
+            output.push_str(
+                &serde_json::to_string(&entry)
+                    .map_err(|error| ApiError::internal(error.to_string()))?,
+            );
+            output.push('\n');
+        }
+        std::fs::write(&destination, output)
+            .map_err(|error| ApiError::internal(format!("Could not write recovery: {error}")))?;
+        Ok(Some(canonical_path(&destination.to_string_lossy())))
+    }
+
     pub fn branch_session(&self, session_path: &str, message_index: usize) -> Result<String, ApiError> {
         let source = self.session_file(session_path)?;
         let text = std::fs::read_to_string(&source)
@@ -2582,6 +2637,110 @@ impl axum::response::IntoResponse for ApiError {
         )
             .into_response()
     }
+}
+
+fn recover_entries(entries: &[Value]) -> Result<Option<Vec<Value>>, ApiError> {
+    let Some(header) = entries.first() else {
+        return Ok(None);
+    };
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return Err(ApiError::bad_request("Session header is invalid"));
+    }
+    let mut calls: Vec<(String, String)> = Vec::new();
+    let mut results = std::collections::HashSet::new();
+    for entry in entries {
+        let Some(message) = entry.get("message") else {
+            continue;
+        };
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                if let Some(content) = message.get("content").and_then(Value::as_array) {
+                    for block in content {
+                        if block.get("type").and_then(Value::as_str) == Some("toolCall") {
+                            if let (Some(id), Some(name)) = (
+                                block.get("id").and_then(Value::as_str),
+                                block.get("name").and_then(Value::as_str),
+                            ) {
+                                calls.push((id.to_string(), name.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+            Some("toolResult") => {
+                if let Some(id) = message.get("toolCallId").and_then(Value::as_str) {
+                    results.insert(id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    let pending: Vec<&(String, String)> = calls
+        .iter()
+        .filter(|(id, _)| !results.contains(id))
+        .collect();
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let mut repaired = entries.to_vec();
+    let original_id = header
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("session");
+    let mut parent = entries
+        .iter()
+        .rev()
+        .find_map(|entry| entry.get("id").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    let mut used: std::collections::HashSet<String> = entries
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let base = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_err(|_| ApiError::internal("Clock unavailable"))?
+        .as_millis();
+    for (index, (tool_call_id, tool_name)) in pending.iter().enumerate() {
+        let mut serial = base + index as u128;
+        let mut id = format!("{serial:08x}");
+        while used.contains(&id) {
+            serial += 1;
+            id = format!("{serial:08x}");
+        }
+        used.insert(id.clone());
+        let timestamp = entries
+            .last()
+            .and_then(|entry| entry.get("timestamp"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        repaired.push(json!({
+            "type": "message",
+            "id": id,
+            "parentId": parent,
+            "timestamp": timestamp,
+            "message": {
+                "role": "toolResult",
+                "toolCallId": tool_call_id,
+                "toolName": tool_name,
+                "content": [{ "type": "text", "text": "Interrupted: this tool call had no result. The recovered copy continued without it." }],
+                "details": {},
+                "isError": true,
+                "durationMs": 0,
+                "timestamp": base as u64
+            }
+        }));
+        parent = id;
+    }
+    let mut new_header = header.clone();
+    if let Some(object) = new_header.as_object_mut() {
+        object.insert(
+            "id".into(),
+            Value::String(format!("{original_id}-recovered-{base}")),
+        );
+    }
+    repaired[0] = new_header;
+    Ok(Some(repaired))
 }
 
 fn random_id() -> String {
