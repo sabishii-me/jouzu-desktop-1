@@ -1263,7 +1263,7 @@ impl Session {
         }
     }
     pub fn send(&self, client_message_id: &str, text: &str) -> Result<Value, ApiError> {
-        self.send_with_client(client_message_id, text, None)
+        self.send_with_client(client_message_id, text, None, &[])
     }
 
     pub fn send_with_client(
@@ -1271,12 +1271,20 @@ impl Session {
         client_message_id: &str,
         text: &str,
         client_id: Option<&str>,
+        attachments: &[Attachment],
     ) -> Result<Value, ApiError> {
         if client_message_id.is_empty() || client_message_id.len() > 200 {
             return Err(ApiError::bad_request("clientMessageId is required"));
         }
         if text.is_empty() || text.len() > MAX_TEXT_BYTES {
             return Err(ApiError::bad_request("text must be 1..32 KiB"));
+        }
+        if attachments.len() > 4 {
+            return Err(ApiError::bad_request("Attach at most 4 images"));
+        }
+        let total: usize = attachments.iter().map(|item| item.data.len()).sum();
+        if total > 20 * 1024 * 1024 {
+            return Err(ApiError::bad_request("Images must total 20 MB or less"));
         }
         match self.status() {
             Status::Stopped | Status::Error => {
@@ -1329,24 +1337,49 @@ impl Session {
             .assistant_text
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = String::new();
-        self.push_history(json!({
+        let attachment_rows: Vec<Value> = attachments
+            .iter()
+            .map(|attachment| {
+                json!({
+                    "name": attachment.name,
+                    "mimeType": attachment.mime_type,
+                    "data": attachment.data,
+                })
+            })
+            .collect();
+        let mut history_row = json!({
             "kind": "user",
             "id": format!("{message_id}:user"),
             "turnId": message_id,
             "text": text,
             "createdAt": Self::now_iso(),
-        }));
+        });
+        if !attachment_rows.is_empty() {
+            history_row["attachments"] = json!(attachment_rows);
+        }
+        self.push_history(history_row);
         self.publish(
             "message.accepted",
             json!({ "messageId": message_id.clone(), "receipt": "queued" }),
         );
         self.publish("turn.start", json!({ "turnId": message_id.clone() }));
         self.set_status(Status::Running);
-        let result = self.write_command(json!({
+        let mut prompt = json!({
             "id": message_id.clone(),
             "type": "prompt",
             "message": text,
-        }));
+        });
+        if !attachments.is_empty() {
+            prompt["images"] = json!(attachments
+                .iter()
+                .map(|attachment| json!({
+                    "type": "image",
+                    "data": attachment.data,
+                    "mimeType": attachment.mime_type,
+                }))
+                .collect::<Vec<_>>());
+        }
+        let result = self.write_command(prompt);
         if let Err(error) = result {
             self.publish(
                 "error",
@@ -2023,6 +2056,16 @@ pub struct CreateRequest {
     pub key: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct Attachment {
+    #[serde(default)]
+    pub name: String,
+    #[serde(rename = "mimeType", default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub data: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SendRequest {
     #[serde(rename = "clientMessageId")]
@@ -2030,6 +2073,8 @@ pub struct SendRequest {
     pub text: String,
     #[serde(rename = "clientId", default)]
     pub client_id: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug)]

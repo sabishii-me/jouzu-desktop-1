@@ -342,6 +342,7 @@ async fn send_message(
         &request.client_message_id,
         &request.text,
         request.client_id.as_deref(),
+        &request.attachments,
     )?;
     Ok((StatusCode::ACCEPTED, Json(value)))
 }
