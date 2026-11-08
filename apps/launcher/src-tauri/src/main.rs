@@ -397,6 +397,8 @@ fn runtime_report(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         .ok_or("Runtime version is missing")?;
     Ok(serde_json::json!({
         "version": version,
+        "expectedVersion": crate::runtime_install::expected_version(),
+        "versionCurrent": version == crate::runtime_install::expected_version(),
         "root": root.to_string_lossy(),
         "app": app_path.to_string_lossy(),
         "node": crate::runtime_install::node_executable(&root).is_file(),

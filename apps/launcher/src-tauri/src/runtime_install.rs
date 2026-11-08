@@ -438,14 +438,34 @@ fn install_runtime(managed: &Path, progress: Progress) -> Result<String, String>
     Ok(version)
 }
 
+/// The runtime version this desktop build requires.
+pub fn expected_version() -> &'static str {
+    JOUZU_VERSION
+}
+
 /// Install Node, the official npm package and the tools the workspace needs.
 pub fn install(managed: &Path, progress: Progress) -> Result<String, String> {
     // The app may already be installed while its Node is old; replace Node first.
-    ensure_node(managed, progress)?;
+    let node = ensure_node(managed, progress)?;
     let app = managed.join("app");
-    // A retry after a tool failure must not touch a runtime that is already there.
     let version = if app.join("bootstrap.mjs").is_file() {
-        installed_version(&app)?
+        let installed = installed_version(&app)?;
+        if installed == JOUZU_VERSION {
+            installed
+        } else {
+            // Desktop updates replace the launcher, not the managed runtime. Install the
+            // pinned package into the existing app so a launcher update can move 0.2.4 → 0.2.5.
+            progress(serde_json::json!({ "phase": "packages" }));
+            npm_install(&node, &app, progress)?;
+            if let Err(error) = check_health(managed, &node).and_then(|_| check_control(managed, &node)) {
+                return Err(error);
+            }
+            let updated = installed_version(&app)?;
+            if updated != JOUZU_VERSION {
+                return Err(format!("The runtime update left version {updated}; expected {JOUZU_VERSION}."));
+            }
+            updated
+        }
     } else {
         install_runtime(managed, progress)?
     };
