@@ -315,7 +315,7 @@ export function App() {
     // clean machine out of the status call instead of turning its absence into an alert.
     void invoke<RuntimeReport>("runtime_report").then(report => {
       setRuntimePresent(true);
-      if (report && (report.nodeCurrent === false || report.versionCurrent === false)) { void updateRuntime(); return; }
+      if (report && report.nodeCurrent === false) { void updateRuntime(); return; }
       void (async () => { try { await invoke("image_tool_ensure"); } catch { /* the tool is optional on a fixture */ } })();
       void loadComponents();
       void readStatus();
@@ -535,7 +535,7 @@ export function App() {
 
                 </TabsContent>
                 <TabsContent value="system" className="m-0 space-y-4">
-                  {runtime.state?.versionCurrent === false && <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/40 px-4 py-3 text-sm"><span>Runtime {runtime.state.version} → {runtime.state.expectedVersion ?? t.unavailable}</span><Button variant="outline" disabled={runtime.busy || runtimeUpdating !== null} onClick={() => void runtime.run(async () => { await updateRuntime(); return invoke<RuntimeReport>("runtime_report"); })}>Update runtime</Button></div>}
+                  
                   <UpdatePreview locale={locale} focusIndex={updateFocus} live={{
                     phases:[jouzuUpdater.phase === 'preparing' || jouzuUpdater.phase === 'verifying' || jouzuUpdater.phase === 'activating' || jouzuUpdater.phase === 'staged' ? 'installing' : jouzuUpdater.phase as 'idle'|'checking'|'available'|'current'|'downloading'|'installing'|'complete'|'error', updater.phase],
                     versions:[components?.jouzu ?? t.unavailable, version ?? t.unavailable],
@@ -631,6 +631,7 @@ export function App() {
     </LauncherPage>}
     </main>;
 }
+
 
 
 
