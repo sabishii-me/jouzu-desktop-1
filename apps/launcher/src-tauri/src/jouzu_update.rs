@@ -23,7 +23,11 @@ pub async fn jouzu_update(app: tauri::AppHandle, chat: tauri::State<'_, crate::c
   let package:serde_json::Value=serde_json::from_slice(&std::fs::read(current_app.join("node_modules/jouzu/package.json")).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
   let current=semver::Version::parse(package["version"].as_str().ok_or("Missing current version")?).map_err(|e|e.to_string())?;
   if action=="install" {
-   let target=semver::Version::parse(version.as_deref().ok_or("Missing update version")?).map_err(|e|e.to_string())?;
+   let target_text=version.as_deref().ok_or("Missing update version")?;
+   if !crate::runtime_policy::is_verified(target_text) {
+    return Err("This Jouzu version is not in the verified runtime list".into());
+   }
+   let target=semver::Version::parse(target_text).map_err(|e|e.to_string())?;
    if target<=current{return Err("Update must be newer than the active version".into());}
   }
   let mut command=Command::new(crate::runtime_install::node_executable(&root));
@@ -44,8 +48,9 @@ pub async fn jouzu_update(app: tauri::AppHandle, chat: tauri::State<'_, crate::c
   let _=reader.join();
   let mut value:serde_json::Value=serde_json::from_slice(&output.stdout).map_err(|_|"Invalid updater response")?;
   if !output.status.success(){return Err(value["error"].as_str().unwrap_or("Jouzu update failed").to_string());}
-  let candidate=semver::Version::parse(value["version"].as_str().ok_or("Missing candidate version")?).map_err(|_|"Invalid candidate version")?;
-  value["available"]=serde_json::json!(candidate>current);
+  let candidate_text=value["version"].as_str().ok_or("Missing candidate version")?;
+  let candidate=semver::Version::parse(candidate_text).map_err(|_|"Invalid candidate version")?;
+  value["available"]=serde_json::json!(candidate>current && crate::runtime_policy::is_verified(candidate_text));
   Ok(value)
  }).await.map_err(|e|e.to_string())?
 }

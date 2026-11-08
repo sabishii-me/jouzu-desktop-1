@@ -20,6 +20,8 @@ mod managed_paths;
 mod migration;
 mod recovery;
 mod runtime_install;
+mod runtime_policy;
+mod model_catalog;
 mod node_path;
 mod renderer;
 mod update_lock;
@@ -398,7 +400,10 @@ fn runtime_report(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
         "version": version,
         "expectedVersion": crate::runtime_install::expected_version(),
-        "versionCurrent": version == crate::runtime_install::expected_version(),
+        "versionCurrent": crate::runtime_policy::is_current(version),
+        "minimumVersion": crate::runtime_policy::MINIMUM_VERSION,
+        "verifiedVersions": crate::runtime_policy::VERIFIED_VERSIONS,
+        "mandatory": crate::runtime_policy::is_mandatory(version),
         "root": root.to_string_lossy(),
         "app": app_path.to_string_lossy(),
         "node": crate::runtime_install::node_executable(&root).is_file(),
@@ -410,8 +415,20 @@ fn runtime_report(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn runtime_install(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+fn model_catalog() -> Result<serde_json::Value, String> {
+    crate::model_catalog::load()
+}
+
+#[tauri::command]
+async fn runtime_install(
+    app: tauri::AppHandle,
+    chat: tauri::State<'_, crate::chat::ChatService>,
+) -> Result<serde_json::Value, String> {
     let managed = runtime::managed_root()?;
+    // An update replaces node_modules underneath every live runtime. Stop the
+    // sessions first; otherwise the old process keeps the old files mapped and
+    // the user has to quit the whole app before a session can start again.
+    chat.pause();
     let handle = app.clone();
     let version = tauri::async_runtime::spawn_blocking(move || {
         let emit = |value: serde_json::Value| { let _ = tauri::Emitter::emit(&handle, "runtime-install-progress", value); };
@@ -667,6 +684,7 @@ fn main() {
             forget_workspace,
             add_workspaces,
             component_versions,
+            model_catalog,
             runtime_report,
             runtime_install,
             mcp_config,
