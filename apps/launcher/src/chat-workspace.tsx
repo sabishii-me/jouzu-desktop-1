@@ -95,8 +95,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const attachmentRef = useRef(attachments);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [videoUrls, setVideoUrls] = useState<string[]>([]);
-  const [queuedSteers, setQueuedSteers] = useState<string[]>([]);
-  useEffect(() => { if (!snapshot.projection.running) setQueuedSteers([]); }, [snapshot.projection.running]);
+  const [queuedBySession, setQueuedBySession] = useState<Record<string, string[]>>({});
   const videoRef = useRef(videoUrls);
   videoRef.current = videoUrls;
   const [readingImages, setReadingImages] = useState(false);
@@ -104,8 +103,19 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [switching, setSwitching] = useState(false);
   const [commandBusy, setCommandBusy] = useState(false);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
-  // Queue visibility belongs to the session on screen, not the last running client.
-  useEffect(() => { setQueuedSteers([]); }, [path, selectedSession]);
+  const queueSessionKey = normalizedPath(selectedSession ?? snapshot.sessionFile ?? "");
+  const queuedSteers = queueSessionKey ? queuedBySession[queueSessionKey] ?? [] : [];
+  useEffect(() => {
+    if (snapshot.projection.running) return;
+    const key = normalizedPath(snapshot.sessionFile ?? "");
+    if (!key) return;
+    setQueuedBySession(previous => {
+      if (!previous[key]?.length) return previous;
+      const next = { ...previous };
+      delete next[key];
+      return next;
+    });
+  }, [snapshot.projection.running, snapshot.sessionFile]);
   const selectedRowRef = useRef<HTMLDivElement | null>(null);
   const switchingRef = useRef(false);
   const switchingTarget = useRef<string | "new" | null>(null);
@@ -520,9 +530,18 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       client = connection.current;
       if (!client) return;
       const running = client.snapshot.projection.running;
-      if (running) setQueuedSteers(current => [...current, value]);
+      const queueKey = normalizedPath(client.snapshot.sessionFile ?? queueSessionKey);
+      if (running && queueKey) setQueuedBySession(previous => ({ ...previous, [queueKey]: [...(previous[queueKey] ?? []), value] }));
       try { await client.sendOrSteer(value, submitted.map(item => item.image), running); }
-      catch (error) { if (running) setQueuedSteers(current => { const at = current.lastIndexOf(value); return at < 0 ? current : [...current.slice(0, at), ...current.slice(at + 1)]; }); throw error; }
+      catch (error) {
+        if (running && queueKey) setQueuedBySession(previous => {
+          const items = previous[queueKey] ?? [];
+          const at = items.lastIndexOf(value);
+          if (at < 0) return previous;
+          return { ...previous, [queueKey]: [...items.slice(0, at), ...items.slice(at + 1)] };
+        });
+        throw error;
+      }
       if (connection.current !== client) return;
       setPendingUser("");
       if (videoRef.current.join("\n") === submittedVideos.join("\n")) { videoRef.current = []; setVideoUrls([]); }
@@ -632,7 +651,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       const active = connection.current;
       if (!active) return;
       await active.runCommand(command);
-      if (command === "/flow clear") { setFlowNotice(""); setSessionError(null); setQueuedSteers([]); active.clearError(); }
+      if (command === "/flow clear") {
+        setFlowNotice("");
+        setSessionError(null);
+        const key = normalizedPath(active.snapshot.sessionFile ?? queueSessionKey);
+        if (key) setQueuedBySession(previous => { const next = { ...previous }; delete next[key]; return next; });
+        active.clearError();
+      }
     }
     catch (error) { setNotification(String(error).replace(/^Error:\s*/u, "")); }
     finally { setCommandBusy(false); }
