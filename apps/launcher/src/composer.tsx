@@ -11,6 +11,23 @@ function providerLabel(provider: string) {
   return id.replaceAll("-", " ").replaceAll("_", " ").replace(/\b\w/g, character => character.toUpperCase());
 }
 
+function tokenLabel(tokens: number) {
+  return tokens >= 1_000_000 ? `${Number((tokens / 1_000_000).toFixed(1))}M` : `${Number((tokens / 1000).toFixed(tokens >= 100_000 ? 0 : 1))}k`;
+}
+
+function priceLabel(value: number) {
+  return value === 0 ? "$0" : value < 0.01 ? `$${value.toFixed(4)}` : `$${value.toFixed(2)}`;
+}
+
+function modelDetails(model: ChatModel) {
+  const limits = [model.contextWindow ? `${tokenLabel(model.contextWindow)} ctx` : "", model.maxTokens ? `${tokenLabel(model.maxTokens)} out` : ""].filter(Boolean);
+  const cost = model.cost;
+  const prices = cost
+    ? [cost.input !== undefined ? `${priceLabel(cost.input)}/M in` : "", cost.output !== undefined ? `${priceLabel(cost.output)}/M out` : "", cost.cacheRead !== undefined ? `${priceLabel(cost.cacheRead)}/M cached` : ""].filter(Boolean)
+    : [];
+  return [...limits, ...prices].join(" · ");
+}
+
 function ModelMenu({ open, onOpenChange, models, model, onSelect, thinkingLevel, thinkingLevels, onThinking, onOpen, onRetry }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -49,8 +66,8 @@ function ModelMenu({ open, onOpenChange, models, model, onSelect, thinkingLevel,
         {providers.map(provider => <section key={provider} className="mb-2">
           <h3 className="px-2 pb-1 pt-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">{providerLabel(provider)}</h3>
           {visible.filter(item => item.provider === provider).map(item => <button key={`${item.provider}/${item.id}`} type="button" role="menuitemradio" aria-checked={item.name === model} onClick={() => { onSelect(item.provider, item.id); onOpenChange(false); }} className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent focus-visible:bg-accent">
-            <span className="truncate">{item.name}</span>
-            {item.name === model && <span className="text-xs text-primary">Current</span>}
+            <span className="min-w-0 flex-1"><span className="block truncate">{item.name}</span>{modelDetails(item) && <span className="block truncate text-[10px] text-muted-foreground">{modelDetails(item)}</span>}</span>
+            {item.name === model && <span className="shrink-0 text-xs text-primary">Current</span>}
           </button>)}
         </section>)}
       </div>

@@ -5,7 +5,14 @@ import { emptyProjection, historyProjection, interruptUnfinishedTools, object, p
 export const pageGeneration = globalThis.crypto.randomUUID();
 
 export interface ChatImage { type: "image"; data: string; mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif" }
-export interface ChatModel { provider: string; id: string; name: string }
+export interface ChatModel {
+  provider: string;
+  id: string;
+  name: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+}
 export interface SessionStats {
   userMessages?: number;
   assistantMessages?: number;
@@ -376,9 +383,19 @@ export class ChatConnection {
     try {
       const data = await this.request("get_available_models");
       const models = object(data) && Array.isArray(data.models)
-        ? data.models.flatMap(entry => object(entry) && typeof entry.provider === "string" && typeof entry.id === "string"
-          ? [{ provider: entry.provider, id: entry.id, name: typeof entry.name === "string" ? entry.name : entry.id }]
-          : [])
+        ? data.models.flatMap(entry => {
+          if (!object(entry) || typeof entry.provider !== "string" || typeof entry.id !== "string") return [];
+          const cost = object(entry.cost) ? entry.cost : undefined;
+          const rate = (key: string) => typeof cost?.[key] === "number" ? cost[key] as number : undefined;
+          return [{
+            provider: entry.provider,
+            id: entry.id,
+            name: typeof entry.name === "string" ? entry.name : entry.id,
+            contextWindow: typeof entry.contextWindow === "number" ? entry.contextWindow : undefined,
+            maxTokens: typeof entry.maxTokens === "number" ? entry.maxTokens : undefined,
+            cost: cost ? { input: rate("input"), output: rate("output"), cacheRead: rate("cacheRead"), cacheWrite: rate("cacheWrite") } : undefined,
+          }];
+        })
         : [];
       this.update({ models });
     } catch (error) { this.update({ error: `Could not read the model list. ${String(error)}` }); }
@@ -436,3 +453,4 @@ export class ChatConnection {
     if (this.handle) await invoke("chat_stop", { handle: this.handle });
   }
 }
+
