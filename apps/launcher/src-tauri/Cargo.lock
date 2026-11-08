@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "jouzu-desktop"
-version = "1.0.20"
+version = "1.0.21"
 dependencies = [
  "base64 0.22.1",
  "libc",
