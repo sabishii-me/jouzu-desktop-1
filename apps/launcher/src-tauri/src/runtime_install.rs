@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 /// The runtime is the official npm package, installed from the official registry.
 const NODE_VERSION: &str = "24.22.2";
-const JOUZU_VERSION: &str = "0.2.4";
+const JOUZU_VERSION: &str = "0.2.5";
 const NODE_BASE: &str = "https://nodejs.org/dist";
 const LOCKFILE: &str = "4.1.2";
 const MAX_ARCHIVE: u64 = 192 * 1024 * 1024;
@@ -537,4 +537,5 @@ mod tests {
         assert!(!version.is_empty(), "the installed package version is reported");
     }
 }
+
 
