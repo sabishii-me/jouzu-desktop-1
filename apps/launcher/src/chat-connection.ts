@@ -13,6 +13,15 @@ export interface ChatModel {
   maxTokens?: number;
   cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
 }
+interface CatalogModel {
+  id: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  cost?: ChatModel["cost"];
+}
+function hasCost(cost: ChatModel["cost"]): boolean {
+  return !!cost && Object.values(cost).some(value => typeof value === "number" && value !== 0);
+}
 export interface SessionStats {
   userMessages?: number;
   assistantMessages?: number;
@@ -382,19 +391,34 @@ export class ChatConnection {
   }
   async loadModels() {
     try {
-      const data = await this.request("get_available_models");
+      const [data, catalog] = await Promise.all([
+        this.request("get_available_models"),
+        invoke<{ models?: CatalogModel[] }>("model_catalog").catch(() => ({ models: [] })),
+      ]);
+      const catalogModels = object(catalog) && Array.isArray(catalog.models) ? catalog.models.filter(object) : [];
+      const catalogFor = (id: string) => {
+        const value = id.toLowerCase();
+        return catalogModels.find(model => typeof model.id === "string" && (value === model.id.toLowerCase() || value.endsWith(`/${model.id.toLowerCase()}`)));
+      };
       const models = object(data) && Array.isArray(data.models)
         ? data.models.flatMap(entry => {
           if (!object(entry) || typeof entry.provider !== "string" || typeof entry.id !== "string") return [];
-          const cost = object(entry.cost) ? entry.cost : undefined;
-          const rate = (key: string) => typeof cost?.[key] === "number" ? cost[key] as number : undefined;
+          const runtimeCost = object(entry.cost) ? {
+            input: typeof entry.cost.input === "number" ? entry.cost.input : undefined,
+            output: typeof entry.cost.output === "number" ? entry.cost.output : undefined,
+            cacheRead: typeof entry.cost.cacheRead === "number" ? entry.cost.cacheRead : undefined,
+            cacheWrite: typeof entry.cost.cacheWrite === "number" ? entry.cost.cacheWrite : undefined,
+          } : undefined;
+          const catalogModel = catalogFor(entry.id);
           return [{
             provider: entry.provider,
             id: entry.id,
             name: typeof entry.name === "string" ? entry.name : entry.id,
-            contextWindow: typeof entry.contextWindow === "number" ? entry.contextWindow : undefined,
-            maxTokens: typeof entry.maxTokens === "number" ? entry.maxTokens : undefined,
-            cost: cost ? { input: rate("input"), output: rate("output"), cacheRead: rate("cacheRead"), cacheWrite: rate("cacheWrite") } : undefined,
+            contextWindow: catalogModel?.contextWindow ?? (typeof entry.contextWindow === "number" ? entry.contextWindow : undefined),
+            maxTokens: catalogModel?.maxTokens ?? (typeof entry.maxTokens === "number" ? entry.maxTokens : undefined),
+            // The runtime projection uses zero as a placeholder. Show a price only
+            // when the catalog has one, or a provider supplied a real non-zero cost.
+            cost: catalogModel?.cost ?? (hasCost(runtimeCost) ? runtimeCost : undefined),
           }];
         })
         : [];
