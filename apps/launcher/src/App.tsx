@@ -315,7 +315,7 @@ export function App() {
     // clean machine out of the status call instead of turning its absence into an alert.
     void invoke<RuntimeReport>("runtime_report").then(report => {
       setRuntimePresent(true);
-      if (report && report.nodeCurrent === false) { void updateRuntime(); return; }
+      if (report && (report.nodeCurrent === false || report.versionCurrent === false)) { void updateRuntime(); return; }
       void (async () => { try { await invoke("image_tool_ensure"); } catch { /* the tool is optional on a fixture */ } })();
       void loadComponents();
       void readStatus();
@@ -631,6 +631,7 @@ export function App() {
     </LauncherPage>}
     </main>;
 }
+
 
 
 
