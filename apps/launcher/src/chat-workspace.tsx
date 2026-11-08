@@ -20,7 +20,7 @@ import { fitsSendBudget, readImageAttachment, removeSubmittedImages, validateIma
 import { normalizeVideoUrl, videoMarker } from "./video-url";
 import { emptyProjection, historyProjection, interruptUnfinishedTools, type ChatProjection, type FlowReportRecord, type WireObject } from "./chat-projection";
 import { clearDraft, draftKey, readDraft, writeDraft } from "./drafts";
-import { humanizeRuntimeError, isCapacityError } from "./runtime-errors";
+import { humanizeRuntimeError, isCapacityError, isFlowHistoryError } from "./runtime-errors";
 import { beginDialogResponse, emptyDialogQueue, enqueueDialog, expireDialogs, nextDialogDeadline, removeDialog, type DialogAnswer, type DialogQueue } from "./dialog-queue";
 import { BackgroundMenu, deriveFlow, deriveSubagents, FlowMenu, latestFlowError, SubagentMenu } from "./tool-renderers";
 import { SessionStatsBar } from "./session-stats-bar";
@@ -104,6 +104,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [switching, setSwitching] = useState(false);
   const [commandBusy, setCommandBusy] = useState(false);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
+  // Queue visibility belongs to the session on screen, not the last running client.
+  useEffect(() => { setQueuedSteers([]); }, [path, selectedSession]);
   const selectedRowRef = useRef<HTMLDivElement | null>(null);
   const switchingRef = useRef(false);
   const switchingTarget = useRef<string | "new" | null>(null);
@@ -504,6 +506,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   async function send() {
     let client = connection.current;
     if (!client || readingRef.current) return;
+    if (isFlowHistoryError(client.snapshot.error)) { setNotification("Clear Flow request history before sending again."); return; }
     const typed = draft;
     const submittedVideos = videoRef.current;
     const value = [...submittedVideos.map(videoMarker), typed].filter(Boolean).join("\n");
@@ -629,7 +632,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       const active = connection.current;
       if (!active) return;
       await active.runCommand(command);
-      if (command === "/flow clear") setFlowNotice("");
+      if (command === "/flow clear") { setFlowNotice(""); setSessionError(null); setQueuedSteers([]); active.clearError(); }
     }
     catch (error) { setNotification(String(error).replace(/^Error:\s*/u, "")); }
     finally { setCommandBusy(false); }
@@ -1109,6 +1112,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // The runtime's Flow submission budget is per session and never reclaimed; a full
   // store cannot be retried, so the banner offers the only way out.
   const capacityError = isCapacityError(sessionError) || isCapacityError(snapshot.error);
+  const flowHistoryError = isFlowHistoryError(sessionError) || isFlowHistoryError(snapshot.error);
   const readableError = (message: string) => humanizeRuntimeError(message);
   const textguardKey = snapshot.sessionId && selectedKey === activeSession ? snapshot.sessionId : "";
   const textguardView = textguardKey ? textguardBySession[textguardKey] : undefined;
@@ -1221,6 +1225,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       </div>}
       {notification && <div role="status" aria-live="polite" className="pointer-events-none fixed left-1/2 top-16 z-50 w-max max-w-[min(40rem,calc(100vw-2rem))] -translate-x-1/2 rounded-lg bg-popover px-4 py-2 text-xs text-foreground shadow-xl">{notification}</div>}
       {capacityError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">{humanizeRuntimeError(sessionError ?? snapshot.error ?? "")}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void startNewSession()}>New session</Button></div>}
+      {flowHistoryError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">Flow request history is full. Clear it before sending again.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void runExtensionCommand("/flow clear")}>Clear Flow history</Button></div>}
       {booting ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-8 sm:px-8">
         <div className="w-full max-w-3xl">
           <div className="mb-7 flex flex-col items-center gap-3 text-center">
@@ -1280,6 +1285,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
+
 
 
 

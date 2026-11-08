@@ -336,6 +336,7 @@ export class ChatConnection {
     } catch (error) { this.update({ error: String(error) }); throw error; }
     finally { this.update({ pending: false }); }
   }
+  clearError() { this.update({ error: null }); }
   async abort() {
     try { await this.request("clear_queue"); } catch { /* The queue may already be empty; abort still applies. */ }
     try { await this.request("abort"); } catch (error) { this.update({ error: String(error) }); }
@@ -436,3 +437,4 @@ export class ChatConnection {
     if (this.handle) await invoke("chat_stop", { handle: this.handle });
   }
 }
+
