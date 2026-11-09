@@ -147,7 +147,18 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [flowNotice, setFlowNotice] = useState("");
   const [dropActive, setDropActive] = useState(false);
   const chatRoot = useRef<HTMLDivElement>(null);
-  const [sidebar, setSidebar] = useState(true);
+  const [sidebar, setSidebarState] = useState(() => {
+    try { return localStorage.getItem("jouzu.ui.sidebar") !== "closed"; } catch { return true; }
+  });
+  // Persist the user's choice: the workspace remounts when the app moves through
+  // runtime/setup screens, and a local default would reopen it behind their back.
+  const setSidebar = (value: boolean | ((current: boolean) => boolean)) => {
+    setSidebarState(current => {
+      const next = typeof value === "function" ? value(current) : value;
+      try { localStorage.setItem("jouzu.ui.sidebar", next ? "open" : "closed"); } catch { /* UI preference only */ }
+      return next;
+    });
+  };
   const [hero, setHero] = useState(newSession);
   // The pool owns every live session, including the ones that are not on screen;
   // the list re-renders when one of them starts or stops a turn.
