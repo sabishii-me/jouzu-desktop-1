@@ -8,6 +8,10 @@ use std::{
 };
 
 const MAX_FRAME: usize = 32 * 1024 * 1024;
+/// How much of the runtime's own stderr is kept for one session. It stays in
+/// memory while the session runs and is written once when the session ends, so a
+/// healthy session persists nothing the runtime printed.
+const STDERR_TAIL: usize = 8 * 1024;
 const HARD_BYTES: usize = 64 * 1024 * 1024;
 // A slow consumer is a desktop problem. Crossing the soft limit compacts the
 // unread queue and keeps the turn alive; only a wedged runtime reaches the hard
@@ -196,6 +200,20 @@ pub struct Poll {
     compacted: usize,
 }
 impl ChatService {
+    /// Recover the session map even if a panic poisoned the mutex. Without this a
+    /// single panic while the lock is held makes every later command fail with
+    /// "Chat state unavailable", which disables every session until the app restarts.
+    fn locked(&self) -> std::sync::MutexGuard<'_, HashMap<String, Session>> {
+        match self.sessions.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                if let Ok(root) = crate::runtime::managed_root() {
+                    crate::logs::append(&root, "runtime.log", "sessions-lock-recovered");
+                }
+                poisoned.into_inner()
+            }
+        }
+    }
     pub fn shutdown(&self) {
         if let Ok(mut sessions) = self.sessions.lock() {
             stop_sessions(sessions.drain().map(|(_, session)| session).collect());
@@ -414,18 +432,12 @@ pub fn chat_start(
     // Legacy callers pass no generation and keep the single-runtime cleanup.
     if generation.is_none() {
         let stale: Vec<Session> = {
-            let mut previous = state
-                .sessions
-                .lock()
-                .map_err(|_| "Chat state unavailable")?;
+            let mut previous = state.locked();
             previous.drain().map(|(_, session)| session).collect()
         };
         stop_sessions(stale);
     }
-    let mut sessions = state
-        .sessions
-        .lock()
-        .map_err(|_| "Chat state unavailable")?;
+    let mut sessions = state.locked();
     let cwd = std::fs::canonicalize(&path).map_err(|_| "Workspace folder is unavailable")?;
     if !cwd.is_dir() {
         return Err("Workspace must be a folder".into());
@@ -445,10 +457,7 @@ pub fn chat_start(
     if !previous.is_empty() {
         drop(sessions);
         stop_sessions(previous);
-        sessions = state
-            .sessions
-            .lock()
-            .map_err(|_| "Chat state unavailable")?;
+        sessions = state.locked();
     }
     let root = crate::runtime::application_root(&app)?;
     let managed = crate::runtime::managed_root()?;
@@ -496,6 +505,13 @@ pub fn chat_start(
         lease,
     )
     .map_err(|e| format!("Could not start chat: {e}"))?;
+    let diagnostic_root = managed.clone();
+    let diagnostic_key = session_key.clone();
+    crate::logs::append(
+        &diagnostic_root,
+        "runtime.log",
+        &format!("start key={diagnostic_key} cwd={}", cwd.display()),
+    );
     static NEXT_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let handle = format!(
         "chat-{}",
@@ -511,13 +527,21 @@ pub fn chat_start(
         let mut pending: Option<(Vec<u8>, usize, Instant)> = None;
         let mut failure = None;
         let mut drain = ExitDrain::default();
+        let mut stderr_tail: Vec<u8> = Vec::new();
         let mut receive = Some(receive);
         'run: loop {
             if stopping.try_recv().is_ok() {
                 break;
             }
             match process.try_wait() {
-                Ok(Some(code)) => drain.observe_exit(code, Instant::now()),
+                Ok(Some(code)) => {
+                    crate::logs::append(
+                        &diagnostic_root,
+                        "runtime.log",
+                        &format!("exit key={diagnostic_key} code={code}"),
+                    );
+                    drain.observe_exit(code, Instant::now());
+                }
                 Ok(None) => {}
                 Err(e) => {
                     failure = Some(e.to_string());
@@ -550,6 +574,11 @@ pub fn chat_start(
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => match process.try_wait() {
                         Ok(Some(code)) => {
+                            crate::logs::append(
+                                &diagnostic_root,
+                                "runtime.log",
+                                &format!("exit key={diagnostic_key} code={code}"),
+                            );
                             drain.observe_exit(code, Instant::now());
                             receive.take();
                             pending = None;
@@ -595,11 +624,19 @@ pub fn chat_start(
                 );
                 break 'run;
             }
-            // Drain diagnostics without storing/logging potentially secret-bearing contents.
+            // Keep the runtime's own stderr in memory only. It is written to the log
+            // when the process exits, because a healthy session must not persist
+            // anything the runtime printed (diagnostics can carry credentials).
             for _ in 0..16 {
                 match process.read_stderr(&mut buffer) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                    Ok(count) => {
+                        stderr_tail.extend_from_slice(&buffer[..count]);
+                        let overflow = stderr_tail.len().saturating_sub(STDERR_TAIL);
+                        if overflow > 0 {
+                            stderr_tail.drain(..overflow);
+                        }
+                    }
                 }
             }
             if drain.done(Instant::now()) {
@@ -612,6 +649,21 @@ pub fn chat_start(
             .stop()
             .err()
             .map(|error| format!("Runtime cleanup failed: {error}"));
+        // One line per ended session. A clean stop records no stderr; an unexpected
+        // end records the tail so the next occurrence can be explained.
+        let stderr_text: String = String::from_utf8_lossy(&stderr_tail)
+            .chars()
+            .map(|character| if character.is_control() { ' ' } else { character })
+            .collect();
+        crate::logs::append(
+            &diagnostic_root,
+            "runtime.log",
+            &format!(
+                "end key={diagnostic_key} failure={} stderr={}",
+                failure.clone().unwrap_or_default(),
+                stderr_text.trim()
+            ),
+        );
         if let Some(error) = &cleanup_error {
             append_error(&mut failure, error.clone());
         }
@@ -645,10 +697,7 @@ pub fn chat_send(
 ) -> Result<(), String> {
     validate(&request)?;
     let frame = encode_command(&request, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
-    let sessions = state
-        .sessions
-        .lock()
-        .map_err(|_| "Chat state unavailable")?;
+    let sessions = state.locked();
     let session = sessions
         .get(&handle)
         .filter(|s| s.owner == window.label())
@@ -664,10 +713,7 @@ pub fn chat_poll(
     state: tauri::State<ChatService>,
     handle: String,
 ) -> Result<Poll, String> {
-    let mut sessions = state
-        .sessions
-        .lock()
-        .map_err(|_| "Chat state unavailable")?;
+    let mut sessions = state.locked();
     let session = sessions
         .get_mut(&handle)
         .filter(|s| s.owner == window.label())
@@ -680,6 +726,18 @@ pub fn chat_poll(
     let records = output.records.drain(..).collect();
     output.bytes = 0;
     let compacted = std::mem::take(&mut output.dropped);
+    if output.closed {
+        if let Ok(root) = crate::runtime::managed_root() {
+            crate::logs::append(
+                &root,
+                "runtime.log",
+                &format!(
+                    "poll-closed handle={handle} error={}",
+                    output.error.clone().unwrap_or_default()
+                ),
+            );
+        }
+    }
     Ok(Poll {
         records,
         closed: output.closed,
@@ -715,10 +773,7 @@ pub fn chat_poll_many(
     state: tauri::State<ChatService>,
     handles: Vec<String>,
 ) -> Result<Vec<PoolPoll>, String> {
-    let mut sessions = state
-        .sessions
-        .lock()
-        .map_err(|_| "Chat state unavailable")?;
+    let mut sessions = state.locked();
     let now = Instant::now();
     let mut polls = Vec::with_capacity(handles.len());
     for handle in &handles {
@@ -742,10 +797,31 @@ pub fn chat_poll_many(
             error: output.error.clone(),
             compacted: std::mem::take(&mut output.dropped),
         });
+        if output.closed {
+            if let Ok(root) = crate::runtime::managed_root() {
+                crate::logs::append(
+                    &root,
+                    "runtime.log",
+                    &format!(
+                        "poll-closed-many handle={handle} error={}",
+                        output.error.clone().unwrap_or_default()
+                    ),
+                );
+            }
+        }
     }
     // A page load releases the previous generation explicitly; the reaper is the
     // backstop for a closed page that never ran its cleanup.
     let reaped: Vec<String> = reaped_handles(&sessions, window.label(), &handles, Instant::now());
+    if !reaped.is_empty() {
+        if let Ok(root) = crate::runtime::managed_root() {
+            crate::logs::append(
+                &root,
+                "runtime.log",
+                &format!("reap handles={}", reaped.join(",")),
+            );
+        }
+    }
     let stopped: Vec<Session> = reaped
         .into_iter()
         .filter_map(|handle| sessions.remove(&handle))
@@ -764,10 +840,7 @@ pub fn chat_release_generation(
     state: tauri::State<ChatService>,
     generation: String,
 ) -> Result<(), String> {
-    let mut sessions = state
-        .sessions
-        .lock()
-        .map_err(|_| "Chat state unavailable")?;
+    let mut sessions = state.locked();
     let stale: Vec<String> = stale_generation_handles(&sessions, window.label(), &generation);
     let stopped: Vec<Session> = stale
         .into_iter()
@@ -787,10 +860,7 @@ pub fn chat_claim(
     handle: String,
     session_key: String,
 ) -> Result<(), String> {
-    let mut sessions = state
-        .sessions
-        .lock()
-        .map_err(|_| "Chat state unavailable")?;
+    let mut sessions = state.locked();
     if sessions
         .iter()
         .any(|(other, session)| other != &handle && session.owner == window.label() && session.key == session_key)
@@ -813,10 +883,7 @@ pub fn chat_stop_session(
     state: tauri::State<ChatService>,
     session_key: String,
 ) -> Result<(), String> {
-    let mut sessions = state
-        .sessions
-        .lock()
-        .map_err(|_| "Chat state unavailable")?;
+    let mut sessions = state.locked();
     let handles: Vec<String> = sessions
         .iter()
         .filter(|(_, session)| session.owner == window.label() && session.key == session_key)
@@ -838,10 +905,7 @@ pub fn chat_stop_all(
     window: tauri::WebviewWindow,
     state: tauri::State<ChatService>,
 ) -> Result<(), String> {
-    let mut sessions = state
-        .sessions
-        .lock()
-        .map_err(|_| "Chat state unavailable")?;
+    let mut sessions = state.locked();
     let handles: Vec<String> = sessions
         .iter()
         .filter(|(_, session)| session.owner == window.label())
@@ -864,10 +928,7 @@ pub fn chat_stop(
     state: tauri::State<ChatService>,
     handle: String,
 ) -> Result<(), String> {
-    let mut sessions = state
-        .sessions
-        .lock()
-        .map_err(|_| "Chat state unavailable")?;
+    let mut sessions = state.locked();
     if let Some(session) = sessions.get(&handle) {
         if session.owner != window.label() {
             return Err("Unknown chat connection".into());
@@ -885,6 +946,24 @@ mod tests {
 
     fn delta(index: usize) -> Value {
         serde_json::json!({ "type": "message_update", "assistantMessageEvent": { "type": "text_delta", "delta": format!("chunk-{index}") } })
+    }
+
+    /// One panic must not take the whole chat service down: every later command
+    /// would otherwise fail and no session could start until the app restarted.
+    #[test]
+    fn a_poisoned_session_map_still_serves_commands() {
+        let service = ChatService { sessions: Mutex::new(HashMap::new()) };
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = service.sessions.lock().unwrap();
+            panic!("poison the session map");
+        }));
+        std::panic::set_hook(hook);
+        assert!(poisoned.is_err());
+        assert!(service.sessions.is_poisoned());
+        let sessions = service.locked();
+        assert!(sessions.is_empty());
     }
 
     #[test]
@@ -1288,5 +1367,7 @@ mod tests {
         .is_ok());
     }
 }
+
+
 
 

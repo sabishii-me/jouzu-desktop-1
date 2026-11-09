@@ -9,6 +9,7 @@ import { McpMenu } from "./mcp-menu";
 import { ChatConversation } from "./chat-conversation";
 import { AgentAction } from "./chat-live";
 import { Composer } from "./composer";
+import { clearPending, pendingFor, setPending, type PendingBySession } from "./pending-prompt";
 import { ArtifactsPanel } from "./artifacts-panel";
 import { collectOutputReferences } from "./artifact-references";
 import { PanelStart } from "./panel-start";
@@ -62,6 +63,7 @@ export interface ChatWorkspaceProps {
 }
 const lastSegment = (path: string) => path.replaceAll("\\", "/").split("/").filter(Boolean).at(-1) ?? path;
 const workspaceLabel = (path: string) => lastSegment(path) === "default-workspace" ? "Default workspace" : lastSegment(path);
+const isDefaultWorkspace = (path: string) => lastSegment(path) === "default-workspace";
 const normalizedPath = (path: string) => path.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
 /** The UUID at the end of a session file stem; a preview has no live session state. */
 const sessionIdFromFile = (path?: string): string | undefined => {
@@ -79,7 +81,9 @@ function relativeTime(updated: number) {
 export function ChatWorkspace({ path, revision = 0, newSession = true, locked = false, onStartSession, onRetry, onBusyChange, onBootChange, catalogRefreshing = false, canRefreshModels = false, onModelsMissing, onRetryModels, workspaces, onSelect, onAddFolder, onRemove, onSettings, onUpdate, updateAvailable = false, updateBusy = false }: ChatWorkspaceProps) {
   const [snapshot, setSnapshot] = useState<ChatSnapshot>({ projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [] });
   const [workingStartedAt, setWorkingStartedAt] = useState<number>();
-  const [pendingUser, setPendingUser] = useState("");
+  // A pending prompt belongs to the session that accepted it. A single value made an
+  // unsettled message from one session render in every other session.
+  const [pendingBySession, setPendingBySession] = useState<PendingBySession>({});
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     if (!snapshot.projection.running) return;
@@ -105,6 +109,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const queueSessionKey = normalizedPath(selectedSession ?? snapshot.sessionFile ?? "");
   const queuedSteers = queueSessionKey ? queuedBySession[queueSessionKey] ?? [] : [];
+  const pendingUser = pendingFor(pendingBySession, queueSessionKey);
   useEffect(() => {
     if (snapshot.projection.running) return;
     const key = normalizedPath(snapshot.sessionFile ?? "");
@@ -132,6 +137,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const dialog = dialogs.items[0] ?? null;
   const [answer, setAnswer] = useState("");
   const [notification, setNotification] = useState("");
+  // The provider refused an image already in the history; the session stays usable only
+  // after the offending image is removed, so offer that instead of a dead end.
+  const [imageRepair, setImageRepair] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [textguardBySession, setTextguardBySession] = useState<Record<string, TextGuardView>>({});
   const textguardRef = useRef(textguardBySession);
@@ -146,7 +154,18 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [flowNotice, setFlowNotice] = useState("");
   const [dropActive, setDropActive] = useState(false);
   const chatRoot = useRef<HTMLDivElement>(null);
-  const [sidebar, setSidebar] = useState(true);
+  const [sidebar, setSidebarState] = useState(() => {
+    try { return localStorage.getItem("jouzu.ui.sidebar") !== "closed"; } catch { return true; }
+  });
+  // Persist the user's choice: the workspace remounts when the app moves through
+  // runtime/setup screens, and a local default would reopen it behind their back.
+  const setSidebar = (value: boolean | ((current: boolean) => boolean)) => {
+    setSidebarState(current => {
+      const next = typeof value === "function" ? value(current) : value;
+      try { localStorage.setItem("jouzu.ui.sidebar", next ? "open" : "closed"); } catch { /* UI preference only */ }
+      return next;
+    });
+  };
   const [hero, setHero] = useState(newSession);
   // The pool owns every live session, including the ones that are not on screen;
   // the list re-renders when one of them starts or stops a turn.
@@ -522,8 +541,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const value = [...submittedVideos.map(videoMarker), typed].filter(Boolean).join("\n");
     const submitted = attachmentRef.current;
     const wasHero = hero;
+    // Capture the owner of this send. Clearing must never depend on which session is
+    // on screen when it settles, and it must never touch another session's entry.
+    const pendingKey = normalizedPath(client.snapshot.sessionFile ?? queueSessionKey ?? path);
+    const submitDraftKey = draftKeyRef.current;
     setWorkingStartedAt(Date.now());
-    setPendingUser(value);
+    setPendingBySession(previous => setPending(previous, pendingKey, value));
     setCommandBusy(true);
     try {
       if (!await ensureSelectedSession(client)) { setNotification("The session is still opening."); return; }
@@ -543,12 +566,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         throw error;
       }
       if (connection.current !== client) return;
-      setPendingUser("");
       if (videoRef.current.join("\n") === submittedVideos.join("\n")) { videoRef.current = []; setVideoUrls([]); }
       // Only a successful send clears the sent key; text typed during the send and
-      // attachments that were not submitted stay.
-      if (draftRef.current === value) {
-        clearDraft(draftKeyRef.current);
+      // attachments that were not submitted stay. Clear the key that submitted, not
+      // whatever session happens to be on screen now.
+      if (draftRef.current === value && draftKeyRef.current === submitDraftKey) {
+        clearDraft(submitDraftKey);
         draftRef.current = "";
         setDraft("");
       }
@@ -556,14 +579,34 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       updateAttachments(removeSubmittedImages(attachmentRef.current, submitted));
       if (wasHero) { setHero(false); onStartSession?.(); }
     } catch (error) {
-      setPendingUser("");
       // Keep the draft and images available after rejection, but do not hide why it failed.
       const message = String(error).replace(/^Error:\s*/u, "");
       if (connection.current === client && /Flow attachment is closed|Flow session metadata is missing/u.test(message)) {
         try { if (await recoverSession()) return; } catch (recoveryError) { setNotification(String(recoveryError).replace(/^Error:\s*/u, "")); return; }
       }
-      if (connection.current === client) setNotification(humanizeRuntimeError(message));
-    } finally { setCommandBusy(false); }
+      if (connection.current === client) {
+        // A refused image lives in the history, so every later request fails the same
+        // way. Offer the repair rather than leaving a session that cannot continue.
+        if (/image[^.]{0,80}(must be larger|too small|minimum|below)|(must be larger|minimum)[^.]{0,40}image/iu.test(message)) setImageRepair(true);
+        setNotification(humanizeRuntimeError(message));
+      }
+    } finally {
+      setCommandBusy(false);
+      // Settling clears this send's own entry even after the user switched session.
+      setPendingBySession(previous => clearPending(previous, pendingKey));
+    }
+  }
+  /** Remove the images the provider refuses, keeping the original session file. */
+  async function repairSessionImages() {
+    const sessionPath = connection.current?.snapshot.sessionFile ?? snapshot.sessionFile;
+    if (!sessionPath) return;
+    setImageRepair(false);
+    try {
+      const result = await invoke<{ removed: number; backup: string }>("chat_session_sanitize_images", { sessionPath });
+      if (!result.removed) { setNotification("No image in this session is below the model's minimum."); return; }
+      setNotification(`Removed ${result.removed} image${result.removed === 1 ? "" : "s"} the model cannot read. The original file is kept as a backup.`);
+      await reloadSession();
+    } catch (error) { setNotification(String(error)); }
   }
   const name = workspaceLabel(path);
   function parkPrevious(previous: ChatConnection | null) {
@@ -980,6 +1023,39 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     else result.sort((left, right) => (right.sessions[0]?.updated ?? 0) - (left.sessions[0]?.updated ?? 0));
     return result;
   }, [workspaces, sessions, search, sort, showArchived]);
+  const defaultGroup = groups.find(group => isDefaultWorkspace(group.path));
+  const regularGroups = defaultGroup ? groups.filter(group => group !== defaultGroup) : groups;
+  const renderGroup = (group: (typeof groups)[number]) => {
+    const open = !!search.trim() || !collapsed.has(group.id);
+    return <section key={group.id} className="mb-1">
+      <div className={`group flex items-center gap-1 rounded-lg ${(selectedWorkspace ? normalizedPath(selectedWorkspace) === normalizedPath(group.path) : !selectedKey && normalizedPath(group.path) === normalizedPath(path)) ? "bg-accent/70" : "hover:bg-muted/60"}`}>
+        <button type="button" aria-label={`${open ? "Collapse" : "Expand"} ${group.name}`} onClick={() => setCollapsed(current => { const next = new Set(current); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next; })} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
+          {open ? <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" /> : <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />}
+          <FolderOpen className="size-4 shrink-0 text-muted-foreground" /><span className="truncate text-sm">{group.name}</span>
+        </button>
+        <Button variant="ghost" className="mr-1 size-6 p-0 opacity-0 group-hover:opacity-100 focus:opacity-100" aria-label={`Remove ${group.path}`} onClick={() => { const workspace = workspaces.find(item => normalizedPath(item.path) === normalizedPath(group.path)); if (workspace) onRemove(workspace.id); }}><X className="size-3" /></Button>
+      </div>
+      {open && <div className="ml-4 border-l border-border pl-1.5">
+        {group.sessions.map(session => <div key={session.path} ref={node => { if (selectedKey === normalizedPath(session.path)) selectedRowRef.current = node; }} data-session-selected={selectedKey === normalizedPath(session.path) || undefined} className={`group/session relative flex items-center rounded-md text-sm ${selectedKey === normalizedPath(session.path) ? "bg-accent text-foreground before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded-full before:bg-primary" : "hover:bg-muted/60"} ${session.archived ? "opacity-60" : ""}`}>
+          <button type="button" onClick={() => void openSession(session.path)} title={session.path} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left">
+            {session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label="Pinned" /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span className="min-w-0 flex-1 truncate">{session.title}</span>{chatPool.isRunning(session.path) && <span role="img" aria-label="Running" title="Running" data-session-running className="size-1.5 shrink-0 rounded-full bg-primary" />}<span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={`${artifactCount(session.path)} artifact${artifactCount(session.path) === 1 ? "" : "s"}`}>{artifactCount(session.path)}</span>}
+          </button>
+          <div className={`relative flex shrink-0 items-center gap-0.5 pr-1 transition-opacity focus-within:opacity-100 group-hover/session:opacity-100 ${sessionMenu === session.path ? "opacity-100" : "opacity-0"}`} data-session-menu>
+            <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={session.pinned ? "Unpin session" : "Pin session"} title={session.pinned ? "Unpin session" : "Pin session"} onClick={() => void updateSession(session.path, { pinned: !session.pinned })}><Pin className={`size-3.5 ${session.pinned ? "text-primary" : "text-muted-foreground"}`} /></button>
+            <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label="Session actions" title="Session actions" aria-haspopup="menu" aria-expanded={sessionMenu === session.path} onClick={() => setSessionMenu(value => value === session.path ? null : session.path)}><MoreHorizontal className="size-4 text-muted-foreground" /></button>
+            {sessionMenu === session.path && <div role="menu" aria-label={`Actions for ${session.title}`} className="absolute right-0 top-full z-40 mt-1 w-52 rounded-xl border border-border bg-popover p-1 text-sm shadow-xl">
+              <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { pinned: !session.pinned }); setSessionMenu(null); }}><Pin className="size-4 text-muted-foreground" />{session.pinned ? "Unpin session" : "Pin session"}</button>
+              <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void renameSession(session)}><Pencil className="size-4 text-muted-foreground" />Rename</button>
+              <button type="button" role="menuitem" disabled title="Fork is not available in the runtime yet" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent disabled:opacity-50"><GitFork className="size-4 text-muted-foreground" />Fork session</button>
+              <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { archived: !session.archived }); setSessionMenu(null); }}>{session.archived ? <ArchiveRestore className="size-4 text-muted-foreground" /> : <Archive className="size-4 text-muted-foreground" />}{session.archived ? "Restore session" : "Archive session"}</button>
+              <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void copySessionId(session)}><Copy className="size-4 text-muted-foreground" />Copy Session ID</button>
+            </div>}
+          </div>
+        </div>)}
+        {!group.sessions.length && <p className="px-2 py-1.5 text-xs text-muted-foreground">No sessions yet</p>}
+      </div>}
+    </section>;
+  };
   const activeSession = normalizedPath(snapshot.sessionFile ?? "");
   const selectedKey = normalizedPath(selectedSession ?? snapshot.sessionFile ?? "");
   const selectedSessionWorkspace = sessions.find(item => normalizedPath(item.path) === selectedKey)?.workspace ?? path;
@@ -1125,7 +1201,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       <FolderOpen className="size-4 shrink-0" aria-hidden="true" /><span className="truncate">{name}</span><ChevronDown className="size-3 shrink-0" aria-hidden="true" />
     </Button>
     {pickerOpen && <div role="menu" aria-label="Choose workspace" className="absolute left-0 top-full z-30 mt-1 w-80 max-w-[calc(100vw-2rem)] rounded-xl border border-border bg-popover p-2 shadow-xl">
-      {workspaces.map(workspace => <button key={workspace.id} type="button" role="menuitemradio" aria-checked={workspace.path === path} onClick={() => void switchWorkspace(workspace.path)} className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent">
+      {[...workspaces].sort((left, right) => Number(isDefaultWorkspace(left.path)) - Number(isDefaultWorkspace(right.path))).map(workspace => <button key={workspace.id} type="button" role="menuitemradio" aria-checked={workspace.path === path} onClick={() => void switchWorkspace(workspace.path)} className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent">
         <span className="min-w-0"><span className="block truncate">{workspaceLabel(workspace.path)}</span><span className="block truncate text-xs text-muted-foreground">{workspace.path}</span></span>
         {workspace.path === path && <span className="text-xs text-primary">Current</span>}
       </button>)}
@@ -1191,7 +1267,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       </div>
       {searchOpen && <div className="px-2 pb-2"><Input autoFocus aria-label="Search sessions" placeholder="Search sessions" value={search} onChange={event => setSearch(event.target.value)} /></div>}
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 pb-2">
-        {groups.map(group => {
+        {regularGroups.map(group => {
           const open = !!search.trim() || !collapsed.has(group.id);
           return <section key={group.id} className="mb-1">
             <div className={`group flex items-center gap-1 rounded-lg ${(selectedWorkspace ? normalizedPath(selectedWorkspace) === normalizedPath(group.path) : !selectedKey && normalizedPath(group.path) === normalizedPath(path)) ? "bg-accent/70" : "hover:bg-muted/60"}`}>
@@ -1224,6 +1300,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         })}
         {!groups.length && <p className="p-3 text-sm text-muted-foreground">{search ? "No matching sessions" : "No workspaces yet."}</p>}
       </div>
+      {defaultGroup && <div className="shrink-0 border-t border-border bg-background px-1.5 py-1">{renderGroup(defaultGroup)}</div>}
       <div className="mt-auto border-t border-border p-2">
         <div className="flex items-center gap-1">
           <Button variant="ghost" className="min-w-0 flex-1 justify-start gap-2" onClick={onSettings}><Settings className="size-4" />Settings</Button>
@@ -1249,6 +1326,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         </div>
       </div>}
       {notification && <div role="status" aria-live="polite" className="pointer-events-none fixed left-1/2 top-16 z-50 w-max max-w-[min(40rem,calc(100vw-2rem))] -translate-x-1/2 rounded-lg bg-popover px-4 py-2 text-xs text-foreground shadow-xl">{notification}</div>}
+      {imageRepair && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">This session contains an image the model refuses, so every request fails. Removing it keeps the rest of the transcript.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void repairSessionImages()}>Remove the image</Button></div>}
       {capacityError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">{humanizeRuntimeError(sessionError ?? snapshot.error ?? "")}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void startNewSession()}>New session</Button></div>}
       {flowHistoryError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">Flow request history is full. Clear it before sending again.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void runExtensionCommand("/flow clear")}>Clear Flow history</Button></div>}
       {booting ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-8 sm:px-8">
@@ -1266,7 +1344,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       </div> : !snapshot.sessionId ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
 {snapshot.gap && <p role="status" className="mx-auto mb-2 max-w-3xl text-xs text-muted-foreground">The transcript was refreshed after a display backlog.</p>}
-          <ChatConversation key={conversationKey} projection={conversationProjection} workspace={path} busy={snapshot.pending} pendingUser={pendingUser} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} />
+          <ChatConversation key={conversationKey} projection={conversationProjection} workspace={path} busy={snapshot.pending} pendingUser={pendingUser} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} onLoadEarlier={() => connection.current?.loadEarlier() ?? Promise.resolve(0)} historyLimited={snapshot.historyLimited === true} />
         </div>
         <div className="relative">
           <div className="mx-auto w-full max-w-3xl">
@@ -1310,6 +1388,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
+
+
 
 
 

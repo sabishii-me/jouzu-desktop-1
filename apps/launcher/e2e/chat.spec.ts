@@ -1,6 +1,43 @@
 import { test, expect } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { resolve, extname, sep } from "node:path";
+import { deflateSync } from "node:zlib";
+
+// A real PNG, produced here: the client now refuses images thinner than the model
+// minimum, so a 1x1 fixture would be rejected before the composer ever shows it.
+function pngOfSide(side: number): Buffer {
+  const crcTable = Array.from({ length: 256 }, (_, index) => {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    return value >>> 0;
+  });
+  const crc = (buffer: Buffer) => {
+    let value = 0xffffffff;
+    for (const byte of buffer) value = crcTable[(value ^ byte) & 0xff]! ^ (value >>> 8);
+    return (value ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type: string, data: Buffer) => {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const check = Buffer.alloc(4);
+    check.writeUInt32BE(crc(body));
+    return Buffer.concat([length, body, check]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(side, 0);
+  header.writeUInt32BE(side, 4);
+  header[8] = 8;
+  header[9] = 6;
+  const raw = Buffer.alloc((side * 4 + 1) * side);
+  for (let row = 0; row < side; row += 1) raw[row * (side * 4 + 1)] = 0;
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    chunk("IHDR", header),
+    chunk("IDAT", deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
 
 test.use({ channel: process.env.JOUZU_UI_TEST_BROWSER });
 
@@ -107,6 +144,7 @@ test("the last workspace opens and prewarms chat without a workspace click", asy
   await page.getByLabel("Message Jouzu").fill("Explain this project");
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect(page.getByRole("article", { name: "assistant message" })).toContainText("Hello from Jouzu");
+  await page.getByRole("button", { name: /^Completed/ }).last().click();
   await page.getByRole("button", { name: /Thinking/ }).last().click();
   await expect(page.getByText("Live thinking preview")).toBeVisible();
   const flow = page.getByRole("button", { name: "Flow", exact: true });
@@ -126,7 +164,7 @@ test("the last workspace opens and prewarms chat without a workspace click", asy
   await expect(page.getByRole("button", { name: "Open in terminal", exact: true })).toHaveCount(0);
   await expect(page.getByLabel("Message Jouzu")).toHaveValue("");
   await expect(page.getByRole("button", { name: "Model", exact: true })).toContainText("Fixture model");
-  await page.getByLabel("Choose images").setInputFiles({ name: "pixel.png", mimeType: "image/png", buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64") });
+  await page.getByLabel("Choose images").setInputFiles({ name: "pixel.png", mimeType: "image/png", buffer: pngOfSide(32) });
   await expect(page.getByRole("img", { name: "Preview of pixel.png" })).toBeVisible();
   await page.getByLabel("Message Jouzu").fill("Inspect this image");
   await page.getByRole("button", { name: "Send", exact: true }).click();
@@ -136,5 +174,6 @@ test("the last workspace opens and prewarms chat without a workspace click", asy
   await expect(page.getByRole("article")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Open in terminal", exact: true })).toHaveCount(0);
 });
+
 
 

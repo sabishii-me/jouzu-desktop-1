@@ -11,6 +11,27 @@ const load = name => import(pathToFileURL(join(appRoot, 'node_modules/jouzu/dist
 let action = "status";
 // Remote revocation is advisory: a saved sign-out still clears local credentials.
 let signOutRevocation;
+// A held catalog revision is a decision, not an error, and "nothing to refresh"
+// is a different answer from "the refresh failed". Both travel with the state so
+// the desktop can show its own confirmation instead of a generic failure.
+let catalog = null;
+const catalogOutcome = result => {
+  if (!result) return { status: 'unconfigured', sources: [], held: null };
+  const results = result.results ?? [];
+  const sources = results.map(({ source, result: each }) => ({ sourceId: source?.id ?? '', status: each?.status ?? 'unknown' }));
+  const held = results.find(({ result: each }) => each?.status === 'quarantined');
+  return {
+    status: held ? 'quarantined' : (result.status ?? 'unknown'),
+    sources,
+    held: held ? {
+      sourceId: held.source?.id ?? '',
+      revision: String(held.result.revision ?? ''),
+      digest: String(held.result.digest ?? ''),
+      reasons: Array.isArray(held.result.reasons) ? held.result.reasons.map(String) : [],
+      changes: held.result.changes ?? null,
+    } : null,
+  };
+};
 try {
   const request = JSON.parse(readFileSync(0, 'utf8'));
   action = request.action;
@@ -57,10 +78,24 @@ try {
       onPrompt: async () => { throw new Error('Unsupported interactive prompt'); },
     }, { paths, gatewayUrl: resolveShisaGatewayUrl(process.env), jouzuVersion: loadMetadata().jouzuVersion });
     // Signing in must make the account's models usable without a terminal /reload.
-    try { await refreshModelCatalogs(); } catch { /* The next explicit refresh can report it. */ }
+    try { catalog = catalogOutcome(await refreshModelCatalogs()); } catch { /* The next explicit refresh can report it. */ }
   } else if (request.action === 'refresh-catalogs') {
     const refreshed = await refreshModelCatalogs();
-    if (refreshed?.status !== 'complete') throw new Error('Catalog refresh failed');
+    catalog = catalogOutcome(refreshed);
+    // A held revision and an unconfigured install are answers, not failures. Only a
+    // refresh that could not read any source is an error the user must act on.
+    if (catalog.status === 'failed' || catalog.status === 'partial') throw new Error('Catalog refresh failed');
+  } else if (request.action === 'catalog-accept' || request.action === 'catalog-reject') {
+    const revision = typeof request.revision === 'string' ? request.revision : '';
+    const digest = typeof request.digest === 'string' ? request.digest : '';
+    if (!revision || !digest) throw new Error('Invalid catalog revision');
+    const sync = await load('model-catalog-sync');
+    const sourceId = typeof request.sourceId === 'string' && request.sourceId ? request.sourceId : undefined;
+    const decided = request.action === 'catalog-accept'
+      ? sync.acceptQuarantinedCatalog(paths, revision, digest, process.env, new Date(), sourceId)
+      : sync.rejectHeldCatalog(paths, revision, digest, process.env, new Date(), sourceId);
+    catalog = { status: decided?.status ?? 'unknown', sources: [], held: null };
+    if (catalog.status === 'failed') throw new Error('Catalog decision failed');
   } else if (request.action === 'shisa-logout') {
     const { logoutShisa } = await load('shisa-link/logout');
     const result = await logoutShisa({ paths });
@@ -176,7 +211,7 @@ try {
   // Readiness means the user has configured a usable model source, matching the
   // conditions Jouzu's own doctor reports as "provider.unconfigured".
   const modelReady = account.signedIn || credentials.length > 0 || customProviders.length > 0;
-  console.log(JSON.stringify({ schemaVersion: 1, modelReady, profile: readProfileChoice(profilePath)?.profile ?? null, account, customProviders, providers: runtime.getProviders().map(p => ({ id: p.id, name: p.id === 'openai-codex' ? 'Codex' : (p.name ?? p.id), oauth: !!p.auth?.oauth, oauthName: p.auth?.oauth?.name, apiKey: !!p.auth?.apiKey })), credentials, models: runtime.getModels().map(m => ({ provider: m.provider, id: m.id, name: m.name })), defaultProvider: settings.getDefaultProvider(), defaultModel: settings.getDefaultModel() }));
+  console.log(JSON.stringify({ schemaVersion: 1, modelReady, ...(catalog ? { catalog } : {}), profile: readProfileChoice(profilePath)?.profile ?? null, account, customProviders, providers: runtime.getProviders().map(p => ({ id: p.id, name: p.id === 'openai-codex' ? 'Codex' : (p.name ?? p.id), oauth: !!p.auth?.oauth, oauthName: p.auth?.oauth?.name, apiKey: !!p.auth?.apiKey })), credentials, models: runtime.getModels().map(m => ({ provider: m.provider, id: m.id, name: m.name })), defaultProvider: settings.getDefaultProvider(), defaultModel: settings.getDefaultModel() }));
 } catch {
   // Do not relay raw upstream errors: they can contain credentials or server input.
   const messages = {
@@ -189,11 +224,14 @@ try {
     'shisa-login': 'Shisa.AI sign-in did not complete. Refresh its state before retrying.',
     'provider-oauth': 'Provider sign-in did not complete. Refresh its state before retrying.',
     'refresh-catalogs': 'Models could not be refreshed. Sign in to Shisa.AI again or add a provider key.',
+    'catalog-accept': 'The held catalog could not be applied. Refresh the model list and retry.',
+    'catalog-reject': 'The held catalog could not be discarded. Refresh the model list and retry.',
     'shisa-logout': 'Shisa.AI sign-out could not be fully confirmed. Refresh its state and check the Shisa.AI dashboard.',
   };
   console.log(JSON.stringify({ error: messages[action] ?? 'Unsupported configuration operation.' }));
   process.exitCode = 1;
 }
+
 
 
 

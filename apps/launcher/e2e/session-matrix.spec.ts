@@ -179,7 +179,10 @@ test("matrix: every session shape opens without attaching the runtime", async ({
     if (index === 3) await expect(article.last()).toBeVisible();
     if (index === 4) await expect(page.getByRole("img", { name: "Conversation attachment" })).toBeVisible();
     if (index === 5) await expect(page.getByRole("alert")).toContainText("fixture failure");
-    if (index === 6) await expect(page.getByRole("button", { name: /read/i })).toBeVisible();
+    if (index === 6) {
+      await page.getByRole("button", { name: /^(Completed|Failed|Stopped|Interrupted)/ }).last().click();
+      await expect(page.getByRole("button", { name: /read/i })).toBeVisible();
+    }
     expect(await page.evaluate(() => (window as any).switchCalls)).toHaveLength(0);
   }
 });

@@ -65,6 +65,8 @@ export interface ChatSnapshot {  projection: ChatProjection;
   modelId?: string;
   models?: ChatModel[];
   modelsLoaded?: boolean;
+  /** The transcript starts at a recent page; older messages are loaded on demand. */
+  historyLimited?: boolean;
   widgets?: Record<string, string[]>;
   statuses?: Record<string, string>;
   flowNotice?: string;
@@ -94,7 +96,7 @@ export class ChatConnection {
   private lastPoll = Date.now();
   private preferredModel = readModelPreference();
   private requests = new Map<string, { command: string; resolve: (value: unknown) => void; reject: (error: Error) => void; deadline: number }>();
-  snapshot: ChatSnapshot = { projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [] };
+  snapshot: ChatSnapshot = { projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [], historyLimited: false };
   private subscribers = new Set<(state: ChatSnapshot) => void>();
   constructor(publish: (state: ChatSnapshot) => void, private dialog: (request: WireObject, client: ChatConnection) => void) {
     this.subscribers.add(publish);
@@ -273,7 +275,8 @@ export class ChatConnection {
     if (sessionPath) {
       try { bytes = await invoke<number>("chat_session_bytes", { sessionPath }); } catch { bytes = 0; }
     }
-    if (sessionPath && bytes > 20 * 1024 * 1024) {
+    const historyLimited = !!sessionPath && bytes > 20 * 1024 * 1024;
+    if (historyLimited) {
       // A full get_messages response for a large JSONL session exceeds the 32 MiB
       // transport frame and kills the connection. Read the recent page natively.
       messages = await invoke<unknown[]>("chat_session_messages", { sessionPath, limit: 200 });
@@ -285,7 +288,25 @@ export class ChatConnection {
     const projection = historyProjection(messages);
     projection.running = state.isStreaming as boolean;
     const reconciled = projection.running ? projection : interruptUnfinishedTools(projection);
-    this.update({ projection: reconciled });
+    this.update({ projection: reconciled, historyLimited });
+  }
+  /** Prepend the previous native page. Returns how many messages were added. */
+  async loadEarlier(limit = 200): Promise<number> {
+    const sessionPath = this.snapshot.sessionFile;
+    if (!sessionPath || !this.snapshot.historyLimited) return 0;
+    const current = this.snapshot.projection;
+    const older = await invoke<unknown[]>("chat_session_messages", { sessionPath, limit, before: current.messages.length });
+    if (!older.length) { this.update({ historyLimited: false }); return 0; }
+    const page = historyProjection(older);
+    const added = page.messages.length;
+    this.update({
+      projection: {
+        ...current,
+        messages: [...page.messages, ...current.messages],
+        activeMessage: current.activeMessage === null ? null : current.activeMessage + added,
+      },
+    });
+    return added;
   }
   private async applyPreferredModel() {
     const preferred = this.preferredModel;

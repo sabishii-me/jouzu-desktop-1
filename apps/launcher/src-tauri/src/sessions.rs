@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -243,6 +244,117 @@ fn validated_session_path(session_path: &str) -> Result<std::path::PathBuf, Stri
     Ok(path)
 }
 
+/// Smallest side a provider accepts. A strip thinner than this is refused at attach
+/// time; this is the repair path for a session that already contains one.
+const MIN_IMAGE_SIDE: u32 = 16;
+
+/// Pixel size from the container header, or None when this format's header does not
+/// carry it. Guessing here would delete images that are fine.
+fn image_size(mime: Option<&str>, data: &str) -> Option<(u32, u32)> {
+    let bytes = BASE64.decode(data).ok()?;
+    match mime.unwrap_or("") {
+        "image/png" if bytes.len() >= 24 && &bytes[12..16] == b"IHDR" => Some((
+            u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+            u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+        )),
+        "image/gif" if bytes.len() >= 10 => Some((
+            u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32,
+            u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32,
+        )),
+        "image/jpeg" => {
+            let mut offset = 2;
+            while offset + 9 < bytes.len() {
+                if bytes[offset] != 0xFF {
+                    offset += 1;
+                    continue;
+                }
+                let marker = bytes[offset + 1];
+                let frame = matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
+                if frame {
+                    let height = u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().ok()?) as u32;
+                    let width = u16::from_be_bytes(bytes[offset + 7..offset + 9].try_into().ok()?) as u32;
+                    return Some((width, height));
+                }
+                let length = u16::from_be_bytes(bytes[offset + 2..offset + 4].try_into().ok()?) as usize;
+                if length < 2 {
+                    return None;
+                }
+                offset += 2 + length;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Replace images the provider would refuse with a text placeholder. The original file
+/// is kept as `.jsonl.bak` and the rewrite is atomic, so a failed repair changes nothing.
+fn sanitize_session_images(path: &Path, min_side: u32) -> Result<(usize, std::path::PathBuf), String> {
+    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let mut removed = 0usize;
+    let mut output = String::with_capacity(text.len());
+    for line in text.lines() {
+        let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("message") {
+            if let Some(content) = value
+                .get_mut("message")
+                .and_then(|message| message.get_mut("content"))
+                .and_then(Value::as_array_mut)
+            {
+                for block in content.iter_mut() {
+                    if block.get("type").and_then(Value::as_str) != Some("image") {
+                        continue;
+                    }
+                    let mime = block.get("mimeType").and_then(Value::as_str);
+                    let Some((width, height)) = block
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .and_then(|data| image_size(mime, data))
+                    else {
+                        continue;
+                    };
+                    if width.min(height) >= min_side {
+                        continue;
+                    }
+                    *block = serde_json::json!({
+                        "type": "text",
+                        "text": format!("[image removed: {width}\u{00d7}{height}px is below the model's minimum of {min_side}px]")
+                    });
+                    removed += 1;
+                }
+            }
+        }
+        output.push_str(&serde_json::to_string(&value).map_err(|error| error.to_string())?);
+        output.push('\n');
+    }
+    if removed == 0 {
+        return Ok((0, path.to_path_buf()));
+    }
+    let backup = path.with_extension("jsonl.bak");
+    fs::copy(path, &backup).map_err(|error| error.to_string())?;
+    let staged = path.with_extension("jsonl.tmp");
+    fs::write(&staged, output).map_err(|error| error.to_string())?;
+    fs::rename(&staged, path).map_err(|error| error.to_string())?;
+    Ok((removed, backup))
+}
+
+/// Repair a session whose history holds an image the provider refuses. This is the
+/// path that makes a stuck session usable again instead of permanent.
+#[tauri::command]
+pub async fn chat_session_sanitize_images(session_path: String) -> Result<Value, String> {
+    let path = validated_session_path(&session_path)?;
+    let (removed, backup) = tauri::async_runtime::spawn_blocking(move || {
+        sanitize_session_images(&path, MIN_IMAGE_SIDE)
+    })
+    .await
+    .map_err(|_| "Session repair failed".to_string())??;
+    Ok(serde_json::json!({ "removed": removed, "backup": backup.to_string_lossy() }))
+}
+
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = year - if month <= 2 { 1 } else { 0 };
     let era = if year >= 0 { year } else { year - 399 } / 400;
@@ -307,9 +419,10 @@ fn read_session_timing(path: &Path) -> SessionTiming {
 pub async fn chat_session_messages(
     session_path: String,
     limit: Option<usize>,
+    before: Option<usize>,
 ) -> Result<Vec<Value>, String> {
     let path = validated_session_path(&session_path)?;
-    let messages = tauri::async_runtime::spawn_blocking(move || read_session_messages(&path, limit))
+    let messages = tauri::async_runtime::spawn_blocking(move || read_session_messages(&path, limit, before))
         .await
         .map_err(|_| "Session read failed".to_string())?;
     Ok(messages)
@@ -427,21 +540,24 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-fn read_session_messages(path: &Path, limit: Option<usize>) -> Vec<Value> {
+fn read_session_messages(path: &Path, limit: Option<usize>, before: Option<usize>) -> Vec<Value> {
     let Some(limit) = limit else { return read_all_session_messages(path) };
     if limit == 0 {
         return Vec::new();
     }
+    let before = before.unwrap_or(0);
+    let wanted = limit.saturating_add(before);
     let Ok(mut file) = File::open(path) else { return Vec::new() };
     let Ok(length) = file.metadata().map(|metadata| metadata.len()) else { return Vec::new() };
     const CHUNK: u64 = 2 * 1024 * 1024;
-    // A preview is a window, not a transcript import. Four megabytes is enough for the
-    // normal recent turns and caps memory/parse work even for a multi-gigabyte session.
-    const MAX_TAIL: u64 = 4 * 1024 * 1024;
+    // Page backwards until the requested window is available. The cap keeps a
+    // pathological file from being read entirely into memory; paging never reads
+    // the whole transcript for a large session.
+    const MAX_SCAN: u64 = 256 * 1024 * 1024;
     let mut tail = Vec::new();
     let mut start = length;
     let mut messages = Vec::new();
-    while start > 0 && (tail.len() as u64) < MAX_TAIL {
+    while start > 0 && (tail.len() as u64) < MAX_SCAN {
         let size = CHUNK.min(start);
         start -= size;
         if file.seek(SeekFrom::Start(start)).is_err() {
@@ -462,13 +578,18 @@ fn read_session_messages(path: &Path, limit: Option<usize>) -> Vec<Value> {
             .filter(|value| value.get("type").and_then(Value::as_str) == Some("message"))
             .filter_map(|value| value.get("message").cloned())
             .collect();
-        if messages.len() >= limit {
+        if messages.len() >= wanted {
             break;
         }
     }
-    if messages.len() > limit {
-        messages.drain(..messages.len() - limit);
+    let total = messages.len();
+    if total <= before {
+        return Vec::new();
     }
+    let end = total - before;
+    let begin = end.saturating_sub(limit);
+    messages.drain(..begin);
+    messages.truncate(end - begin);
     messages
 }
 
@@ -662,6 +783,54 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn png_of(width: u32, height: u32) -> String {
+        let mut header = vec![137u8, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13];
+        header.extend_from_slice(b"IHDR");
+        header.extend_from_slice(&width.to_be_bytes());
+        header.extend_from_slice(&height.to_be_bytes());
+        BASE64.encode(header)
+    }
+
+    #[test]
+    fn repairs_a_strip_that_the_provider_would_refuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("strip.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "{}", serde_json::json!({"type":"session","version":3,"id":"s","cwd":"C:/Work"})).unwrap();
+        writeln!(file, "{}", serde_json::json!({"type":"message","message":{"role":"user","content":[
+            {"type":"text","text":"look"},
+            {"type":"image","mimeType":"image/png","data":png_of(256, 1)},
+            {"type":"image","mimeType":"image/png","data":png_of(512, 512)}
+        ]}})).unwrap();
+        drop(file);
+
+        let (removed, backup) = sanitize_session_images(&path, MIN_IMAGE_SIDE).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(backup.exists());
+        let repaired = fs::read_to_string(&path).unwrap();
+        assert!(repaired.contains("below the model's minimum"));
+        // The acceptable image is untouched.
+        assert!(repaired.contains(&png_of(512, 512)));
+        let kept: Value = serde_json::from_str(repaired.lines().last().unwrap()).unwrap();
+        assert_eq!(kept["message"]["content"][1]["type"], "text");
+        assert_eq!(kept["message"]["content"][2]["type"], "image");
+    }
+
+    #[test]
+    fn leaves_a_session_with_only_acceptable_images_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fine.jsonl");
+        let original = serde_json::json!({"type":"message","message":{"role":"user","content":[{"type":"image","mimeType":"image/png","data":png_of(64, 64)}]}}).to_string();
+        fs::write(&path, format!("{original}\n")).unwrap();
+
+        let (removed, backup) = sanitize_session_images(&path, MIN_IMAGE_SIDE).unwrap();
+
+        assert_eq!(removed, 0);
+        assert_eq!(backup, path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{original}\n"));
+    }
+
     fn write_session(path: &Path, cwd: &str, title: &str) {
         let mut file = File::create(path).unwrap();
         writeln!(
@@ -679,16 +848,20 @@ mod tests {
     }
 
     #[test]
-    fn preview_reads_only_a_bounded_tail_of_a_large_session() {
+    fn pages_backwards_through_a_large_session() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("large.jsonl");
         let mut file = File::create(&path).unwrap();
         writeln!(file, "{}", serde_json::json!({"type":"session","version":3,"id":"s","cwd":"C:/Work"})).unwrap();
         writeln!(file, "{}", serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"x".repeat(5 * 1024 * 1024)}]}})).unwrap();
         writeln!(file, "{}", serde_json::json!({"type":"message","message":{"role":"user","content":[{"type":"text","text":"recent"}]}})).unwrap();
-        let messages = read_session_messages(&path, Some(200));
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["content"][0]["text"], "recent");
+        let newest = read_session_messages(&path, Some(1), None);
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0]["content"][0]["text"], "recent");
+        let older = read_session_messages(&path, Some(1), Some(1));
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0]["content"][0]["text"].as_str().unwrap().len(), 5 * 1024 * 1024);
+        assert!(read_session_messages(&path, Some(1), Some(2)).is_empty());
     }
 
     #[test]
@@ -772,7 +945,7 @@ mod tests {
         writeln!(file, "{}", serde_json::json!({"type":"message","message":{"role":"user","content":[{"type":"text","text":"hello"}]}})).unwrap();
         writeln!(file, "{}", serde_json::json!({"type":"custom_message","customType":"other","content":[]})).unwrap();
         writeln!(file, "{}", serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}})).unwrap();
-        let messages = read_session_messages(&path, None);
+        let messages = read_session_messages(&path, None, None);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[1]["role"], "assistant");
@@ -811,3 +984,5 @@ mod tests {
         assert!(list_sessions(directory.path()).is_empty());
     }
 }
+
+
