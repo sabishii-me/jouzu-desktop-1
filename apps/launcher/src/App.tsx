@@ -358,8 +358,9 @@ export function App() {
         if (next) {
           const outcome = next.catalog;
           if (outcome?.held) setHeldCatalog(outcome.held);
-          // Nothing changed on disk unless a source actually activated a revision.
-          if (outcome?.sources.some(source => source.status === "activated")) requestSessionRestart();
+          // Nothing changed on disk unless a source activated a revision. An adapter
+          // that reports no outcome keeps the older behaviour and rebinds.
+          if (!outcome || outcome.sources.some(source => source.status === "activated")) requestSessionRestart();
           return;
         }
         if (attempt < 2) await new Promise(resolve => window.setTimeout(resolve, 1000 * (attempt + 1)));
@@ -665,6 +666,7 @@ export function App() {
     </LauncherPage>}
     </main>;
 }
+
 
 
 
