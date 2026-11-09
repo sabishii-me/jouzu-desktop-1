@@ -9,6 +9,7 @@ import { McpMenu } from "./mcp-menu";
 import { ChatConversation } from "./chat-conversation";
 import { AgentAction } from "./chat-live";
 import { Composer } from "./composer";
+import { clearPending, pendingFor, setPending, type PendingBySession } from "./pending-prompt";
 import { ArtifactsPanel } from "./artifacts-panel";
 import { collectOutputReferences } from "./artifact-references";
 import { PanelStart } from "./panel-start";
@@ -80,7 +81,9 @@ function relativeTime(updated: number) {
 export function ChatWorkspace({ path, revision = 0, newSession = true, locked = false, onStartSession, onRetry, onBusyChange, onBootChange, catalogRefreshing = false, canRefreshModels = false, onModelsMissing, onRetryModels, workspaces, onSelect, onAddFolder, onRemove, onSettings, onUpdate, updateAvailable = false, updateBusy = false }: ChatWorkspaceProps) {
   const [snapshot, setSnapshot] = useState<ChatSnapshot>({ projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [] });
   const [workingStartedAt, setWorkingStartedAt] = useState<number>();
-  const [pendingUser, setPendingUser] = useState("");
+  // A pending prompt belongs to the session that accepted it. A single value made an
+  // unsettled message from one session render in every other session.
+  const [pendingBySession, setPendingBySession] = useState<PendingBySession>({});
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     if (!snapshot.projection.running) return;
@@ -106,6 +109,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const queueSessionKey = normalizedPath(selectedSession ?? snapshot.sessionFile ?? "");
   const queuedSteers = queueSessionKey ? queuedBySession[queueSessionKey] ?? [] : [];
+  const pendingUser = pendingFor(pendingBySession, queueSessionKey);
   useEffect(() => {
     if (snapshot.projection.running) return;
     const key = normalizedPath(snapshot.sessionFile ?? "");
@@ -534,8 +538,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const value = [...submittedVideos.map(videoMarker), typed].filter(Boolean).join("\n");
     const submitted = attachmentRef.current;
     const wasHero = hero;
+    // Capture the owner of this send. Clearing must never depend on which session is
+    // on screen when it settles, and it must never touch another session's entry.
+    const pendingKey = normalizedPath(client.snapshot.sessionFile ?? queueSessionKey ?? path);
+    const submitDraftKey = draftKeyRef.current;
     setWorkingStartedAt(Date.now());
-    setPendingUser(value);
+    setPendingBySession(previous => setPending(previous, pendingKey, value));
     setCommandBusy(true);
     try {
       if (!await ensureSelectedSession(client)) { setNotification("The session is still opening."); return; }
@@ -555,12 +563,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         throw error;
       }
       if (connection.current !== client) return;
-      setPendingUser("");
       if (videoRef.current.join("\n") === submittedVideos.join("\n")) { videoRef.current = []; setVideoUrls([]); }
       // Only a successful send clears the sent key; text typed during the send and
-      // attachments that were not submitted stay.
-      if (draftRef.current === value) {
-        clearDraft(draftKeyRef.current);
+      // attachments that were not submitted stay. Clear the key that submitted, not
+      // whatever session happens to be on screen now.
+      if (draftRef.current === value && draftKeyRef.current === submitDraftKey) {
+        clearDraft(submitDraftKey);
         draftRef.current = "";
         setDraft("");
       }
@@ -568,14 +576,17 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       updateAttachments(removeSubmittedImages(attachmentRef.current, submitted));
       if (wasHero) { setHero(false); onStartSession?.(); }
     } catch (error) {
-      setPendingUser("");
       // Keep the draft and images available after rejection, but do not hide why it failed.
       const message = String(error).replace(/^Error:\s*/u, "");
       if (connection.current === client && /Flow attachment is closed|Flow session metadata is missing/u.test(message)) {
         try { if (await recoverSession()) return; } catch (recoveryError) { setNotification(String(recoveryError).replace(/^Error:\s*/u, "")); return; }
       }
       if (connection.current === client) setNotification(humanizeRuntimeError(message));
-    } finally { setCommandBusy(false); }
+    } finally {
+      setCommandBusy(false);
+      // Settling clears this send's own entry even after the user switched session.
+      setPendingBySession(previous => clearPending(previous, pendingKey));
+    }
   }
   const name = workspaceLabel(path);
   function parkPrevious(previous: ChatConnection | null) {
@@ -1356,6 +1367,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
 
 
 
