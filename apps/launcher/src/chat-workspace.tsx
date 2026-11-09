@@ -137,6 +137,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const dialog = dialogs.items[0] ?? null;
   const [answer, setAnswer] = useState("");
   const [notification, setNotification] = useState("");
+  // The provider refused an image already in the history; the session stays usable only
+  // after the offending image is removed, so offer that instead of a dead end.
+  const [imageRepair, setImageRepair] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [textguardBySession, setTextguardBySession] = useState<Record<string, TextGuardView>>({});
   const textguardRef = useRef(textguardBySession);
@@ -581,12 +584,29 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (connection.current === client && /Flow attachment is closed|Flow session metadata is missing/u.test(message)) {
         try { if (await recoverSession()) return; } catch (recoveryError) { setNotification(String(recoveryError).replace(/^Error:\s*/u, "")); return; }
       }
-      if (connection.current === client) setNotification(humanizeRuntimeError(message));
+      if (connection.current === client) {
+        // A refused image lives in the history, so every later request fails the same
+        // way. Offer the repair rather than leaving a session that cannot continue.
+        if (/image[^.]{0,80}(must be larger|too small|minimum|below)|(must be larger|minimum)[^.]{0,40}image/iu.test(message)) setImageRepair(true);
+        setNotification(humanizeRuntimeError(message));
+      }
     } finally {
       setCommandBusy(false);
       // Settling clears this send's own entry even after the user switched session.
       setPendingBySession(previous => clearPending(previous, pendingKey));
     }
+  }
+  /** Remove the images the provider refuses, keeping the original session file. */
+  async function repairSessionImages() {
+    const sessionPath = connection.current?.snapshot.sessionFile ?? snapshot.sessionFile;
+    if (!sessionPath) return;
+    setImageRepair(false);
+    try {
+      const result = await invoke<{ removed: number; backup: string }>("chat_session_sanitize_images", { sessionPath });
+      if (!result.removed) { setNotification("No image in this session is below the model's minimum."); return; }
+      setNotification(`Removed ${result.removed} image${result.removed === 1 ? "" : "s"} the model cannot read. The original file is kept as a backup.`);
+      await reloadSession();
+    } catch (error) { setNotification(String(error)); }
   }
   const name = workspaceLabel(path);
   function parkPrevious(previous: ChatConnection | null) {
@@ -1306,6 +1326,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         </div>
       </div>}
       {notification && <div role="status" aria-live="polite" className="pointer-events-none fixed left-1/2 top-16 z-50 w-max max-w-[min(40rem,calc(100vw-2rem))] -translate-x-1/2 rounded-lg bg-popover px-4 py-2 text-xs text-foreground shadow-xl">{notification}</div>}
+      {imageRepair && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">This session contains an image the model refuses, so every request fails. Removing it keeps the rest of the transcript.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void repairSessionImages()}>Remove the image</Button></div>}
       {capacityError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">{humanizeRuntimeError(sessionError ?? snapshot.error ?? "")}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void startNewSession()}>New session</Button></div>}
       {flowHistoryError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">Flow request history is full. Clear it before sending again.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void runExtensionCommand("/flow clear")}>Clear Flow history</Button></div>}
       {booting ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-8 sm:px-8">
@@ -1367,6 +1388,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
+
 
 
 

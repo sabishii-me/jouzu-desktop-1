@@ -44,6 +44,51 @@ export function base64Length(bytes: number): number {
   return Math.ceil(bytes / 3) * 4;
 }
 
+/**
+ * Smallest side a provider accepts. A 256x1 strip passes every format check and then
+ * fails the request, which used to leave the session unusable, so the shape is checked
+ * here where it can still be refused.
+ */
+export const MIN_IMAGE_SIDE = 16;
+
+/** Pixel size from the container header. Undefined when the size cannot be read, in
+ *  which case the caller must not guess. */
+export function imageDimensions(bytes: Uint8Array, mimeType: string): { width: number; height: number } | undefined {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (mimeType === "image/png") {
+    if (bytes.length < 24 || bytes[12] !== 0x49 || bytes[13] !== 0x48 || bytes[14] !== 0x44 || bytes[15] !== 0x52) return undefined;
+    return { width: view.getUint32(16), height: view.getUint32(20) };
+  }
+  if (mimeType === "image/gif") {
+    if (bytes.length < 10) return undefined;
+    return { width: view.getUint16(6, true), height: view.getUint16(8, true) };
+  }
+  if (mimeType === "image/jpeg") {
+    let offset = 2;
+    while (offset + 9 < bytes.length) {
+      if (bytes[offset] !== 0xff) { offset += 1; continue; }
+      const marker = bytes[offset + 1];
+      const isStartOfFrame = (marker >= 0xc0 && marker <= 0xc3) || (marker >= 0xc5 && marker <= 0xc7) || (marker >= 0xc9 && marker <= 0xcb) || (marker >= 0xcd && marker <= 0xcf);
+      if (isStartOfFrame) return { height: view.getUint16(offset + 5), width: view.getUint16(offset + 7) };
+      const length = view.getUint16(offset + 2);
+      if (length < 2) return undefined;
+      offset += 2 + length;
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
+/** Refuse an image the provider would reject for its size. An unreadable size passes:
+ *  a false refusal is worse than the request's own error. */
+export function assertMinimumImageSide(bytes: Uint8Array, mimeType: string): void {
+  const size = imageDimensions(bytes, mimeType);
+  if (!size) return;
+  if (Math.min(size.width, size.height) < MIN_IMAGE_SIDE) {
+    throw new Error(`This image is ${size.width}\u00d7${size.height}px. Every side must be at least ${MIN_IMAGE_SIDE}px for the model to accept it.`);
+  }
+}
+
 export function fitsSendBudget(images: readonly ImageAttachment[]): boolean {
   const total = images.reduce((sum, item) => sum + item.image.data.length, 0);
   return total <= MAX_SEND_TOTAL_BASE64;
@@ -98,6 +143,7 @@ export async function readImageAttachment(file: File): Promise<ImageAttachment> 
   const bytes = new Uint8Array(await file.arrayBuffer());
   if (bytes.length !== file.size) throw new Error("Image size changed while reading.");
   const mimeType = validateImageBytes(bytes, file.type);
+  assertMinimumImageSide(bytes, mimeType);
   const prepared = await fitForSend(bytes, mimeType);
   return {
     id: crypto.randomUUID(),
@@ -111,3 +157,4 @@ export function removeSubmittedImages(current: readonly ImageAttachment[], submi
   const ids = new Set(submitted.map(image => image.id));
   return current.filter(image => !ids.has(image.id));
 }
+
