@@ -107,12 +107,13 @@ function UserContent({ message }: { message: ChatMessage }) {
   })}</>;
 }
 
-function ChatConversationView({ projection, workspace, busy = false, pendingUser = "", onFork, onOpenArtifacts }: { projection: ChatProjection; workspace?: string; busy?: boolean; pendingUser?: string; onFork?: (prompt: string, index: number) => void; onOpenArtifacts?: () => void }) {
+function ChatConversationView({ projection, workspace, busy = false, pendingUser = "", onFork, onOpenArtifacts, onLoadEarlier, historyLimited = false }: { projection: ChatProjection; workspace?: string; busy?: boolean; pendingUser?: string; onFork?: (prompt: string, index: number) => void; onOpenArtifacts?: () => void; onLoadEarlier?: () => Promise<number>; historyLimited?: boolean }) {
   const scroll = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const following = useRef(true);
   const [showLatest, setShowLatest] = useState(false);
   const [limit, setLimit] = useState(30);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const pinToBottom = () => { if (following.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; };
   useEffect(() => {
     // A session mounts with its newest turn visible. Markdown, images, and collapsed
@@ -226,6 +227,7 @@ function ChatConversationView({ projection, workspace, busy = false, pendingUser
     <div ref={scroll} className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-5 sm:px-8" onScroll={event => { const view = event.currentTarget; following.current = view.scrollHeight - view.scrollTop - view.clientHeight < 80; setShowLatest(!following.current); if (turnMarkers.length) { const max = view.scrollHeight - view.clientHeight; const ratio = max > 0 ? Math.min(1, Math.max(0, view.scrollTop / max)) : 0; setActiveTurn(Math.min(turnMarkers.length - 1, Math.round(ratio * (turnMarkers.length - 1)))); } }}>
       {!visible.length && <div className="mx-auto max-w-xl py-16 text-center"><h2 className="text-xl font-semibold">What would you like to work on?</h2><p className="mt-3 text-sm text-muted-foreground">Ask Jouzu to explore your workspace, explain code, or make a change.</p></div>}
       {visible.length > shown.length && <div className="mx-auto mb-4 flex max-w-3xl justify-center"><Button variant="outline" className="h-7 px-3 text-xs" onClick={() => setLimit(value => value + 50)}>Show {visible.length - shown.length} earlier message{visible.length - shown.length === 1 ? "" : "s"}</Button></div>}
+      {visible.length <= shown.length && historyLimited && onLoadEarlier && <div className="mx-auto mb-4 flex max-w-3xl justify-center"><Button variant="outline" className="h-7 px-3 text-xs" disabled={loadingEarlier} onClick={() => { setLoadingEarlier(true); void onLoadEarlier().finally(() => setLoadingEarlier(false)); }}>{loadingEarlier ? "Loading earlier messages…" : "Load earlier messages"}</Button></div>}
       <div ref={content} className="mx-auto max-w-3xl space-y-3">{rows}
         {pendingUser && <article aria-label="user message" className="ml-6 rounded-xl border border-border bg-muted/50 px-4 py-2 text-left opacity-70">
           <div className="mb-2 text-xs font-medium text-muted-foreground">You</div>

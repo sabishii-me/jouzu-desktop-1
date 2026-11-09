@@ -307,9 +307,10 @@ fn read_session_timing(path: &Path) -> SessionTiming {
 pub async fn chat_session_messages(
     session_path: String,
     limit: Option<usize>,
+    before: Option<usize>,
 ) -> Result<Vec<Value>, String> {
     let path = validated_session_path(&session_path)?;
-    let messages = tauri::async_runtime::spawn_blocking(move || read_session_messages(&path, limit))
+    let messages = tauri::async_runtime::spawn_blocking(move || read_session_messages(&path, limit, before))
         .await
         .map_err(|_| "Session read failed".to_string())?;
     Ok(messages)
@@ -427,21 +428,24 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-fn read_session_messages(path: &Path, limit: Option<usize>) -> Vec<Value> {
+fn read_session_messages(path: &Path, limit: Option<usize>, before: Option<usize>) -> Vec<Value> {
     let Some(limit) = limit else { return read_all_session_messages(path) };
     if limit == 0 {
         return Vec::new();
     }
+    let before = before.unwrap_or(0);
+    let wanted = limit.saturating_add(before);
     let Ok(mut file) = File::open(path) else { return Vec::new() };
     let Ok(length) = file.metadata().map(|metadata| metadata.len()) else { return Vec::new() };
     const CHUNK: u64 = 2 * 1024 * 1024;
-    // A preview is a window, not a transcript import. Four megabytes is enough for the
-    // normal recent turns and caps memory/parse work even for a multi-gigabyte session.
-    const MAX_TAIL: u64 = 4 * 1024 * 1024;
+    // Page backwards until the requested window is available. The cap keeps a
+    // pathological file from being read entirely into memory; paging never reads
+    // the whole transcript for a large session.
+    const MAX_SCAN: u64 = 256 * 1024 * 1024;
     let mut tail = Vec::new();
     let mut start = length;
     let mut messages = Vec::new();
-    while start > 0 && (tail.len() as u64) < MAX_TAIL {
+    while start > 0 && (tail.len() as u64) < MAX_SCAN {
         let size = CHUNK.min(start);
         start -= size;
         if file.seek(SeekFrom::Start(start)).is_err() {
@@ -462,13 +466,18 @@ fn read_session_messages(path: &Path, limit: Option<usize>) -> Vec<Value> {
             .filter(|value| value.get("type").and_then(Value::as_str) == Some("message"))
             .filter_map(|value| value.get("message").cloned())
             .collect();
-        if messages.len() >= limit {
+        if messages.len() >= wanted {
             break;
         }
     }
-    if messages.len() > limit {
-        messages.drain(..messages.len() - limit);
+    let total = messages.len();
+    if total <= before {
+        return Vec::new();
     }
+    let end = total - before;
+    let begin = end.saturating_sub(limit);
+    messages.drain(..begin);
+    messages.truncate(end - begin);
     messages
 }
 
@@ -679,16 +688,20 @@ mod tests {
     }
 
     #[test]
-    fn preview_reads_only_a_bounded_tail_of_a_large_session() {
+    fn pages_backwards_through_a_large_session() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("large.jsonl");
         let mut file = File::create(&path).unwrap();
         writeln!(file, "{}", serde_json::json!({"type":"session","version":3,"id":"s","cwd":"C:/Work"})).unwrap();
         writeln!(file, "{}", serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"x".repeat(5 * 1024 * 1024)}]}})).unwrap();
         writeln!(file, "{}", serde_json::json!({"type":"message","message":{"role":"user","content":[{"type":"text","text":"recent"}]}})).unwrap();
-        let messages = read_session_messages(&path, Some(200));
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["content"][0]["text"], "recent");
+        let newest = read_session_messages(&path, Some(1), None);
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0]["content"][0]["text"], "recent");
+        let older = read_session_messages(&path, Some(1), Some(1));
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0]["content"][0]["text"].as_str().unwrap().len(), 5 * 1024 * 1024);
+        assert!(read_session_messages(&path, Some(1), Some(2)).is_empty());
     }
 
     #[test]
@@ -772,7 +785,7 @@ mod tests {
         writeln!(file, "{}", serde_json::json!({"type":"message","message":{"role":"user","content":[{"type":"text","text":"hello"}]}})).unwrap();
         writeln!(file, "{}", serde_json::json!({"type":"custom_message","customType":"other","content":[]})).unwrap();
         writeln!(file, "{}", serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}})).unwrap();
-        let messages = read_session_messages(&path, None);
+        let messages = read_session_messages(&path, None, None);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[1]["role"], "assistant");
@@ -811,3 +824,4 @@ mod tests {
         assert!(list_sessions(directory.path()).is_empty());
     }
 }
+

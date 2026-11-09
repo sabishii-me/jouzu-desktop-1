@@ -150,6 +150,26 @@ describe("desktop RPC connection", () => {
     expect(request).not.toHaveBeenCalledWith("get_messages");
     expect(client.snapshot.projection.messages.at(-1)?.content[0]?.text).toBe("recent");
   });
+  it("prepends the previous native page and stops at the beginning", async () => {
+    const client = new ChatConnection(() => {}, () => {});
+    client.snapshot = {
+      ...client.snapshot,
+      connected: true,
+      sessionFile: "C:/sessions/big.jsonl",
+      historyLimited: true,
+      projection: { ...client.snapshot.projection, messages: [{ role: "user", content: [{ type: "text", text: "newer" }] }] },
+    };
+    vi.mocked(invoke).mockImplementation(async (command: string, args?: any) => {
+      if (command !== "chat_session_messages") return undefined;
+      if (args?.before === 1) return [{ role: "user", content: [{ type: "text", text: "older" }] }];
+      return [];
+    });
+
+    expect(await client.loadEarlier()).toBe(1);
+    expect(client.snapshot.projection.messages.map(message => message.content[0]?.text)).toEqual(["older", "newer"]);
+    expect(await client.loadEarlier(200)).toBe(0);
+    expect(client.snapshot.historyLimited).toBe(false);
+  });
   it("waits out a long released-runtime cold start", async () => {
     vi.useFakeTimers();
     const requests: Record<string, unknown>[] = [];
