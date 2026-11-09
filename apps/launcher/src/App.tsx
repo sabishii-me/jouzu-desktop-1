@@ -380,6 +380,16 @@ export function App() {
     }
     finally { setCatalogDeciding(false); }
   }
+  // The runtime's terminal build refreshes its catalogs at startup. The desktop spoke
+  // to the runtime in rpc mode, which skips that step, so a catalog published since the
+  // last launch never reached a session. Refresh once per launch and rebind only when a
+  // source actually activated a revision.
+  useEffect(() => {
+    if (!setup?.account.signedIn) return;
+    void refreshModelCatalog();
+    // refreshModelCatalog is stable for this purpose and self-gates with catalogAttempted.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setup?.account.signedIn]);
   useEffect(() => {
     if (restartPending && !chatBusy) { setRestartPending(false); setSessionRevision(value => value + 1); }
   }, [restartPending, chatBusy]);
