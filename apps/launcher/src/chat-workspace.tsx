@@ -66,6 +66,12 @@ const lastSegment = (path: string) => path.replaceAll("\\", "/").split("/").filt
 const workspaceLabel = (path: string) => lastSegment(path) === "default-workspace" ? "Default workspace" : lastSegment(path);
 const isDefaultWorkspace = (path: string) => lastSegment(path) === "default-workspace";
 const normalizedPath = (path: string) => path.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
+/**
+ * One identity for a session wherever it is stored. The runtime's session file is
+ * authoritative once attached; the selected row covers a session that is still
+ * opening. Queue, pending and draft state must all agree on this key.
+ */
+const sessionKeyOf = (sessionFile: string | undefined, selected: string | null | undefined) => normalizedPath(sessionFile ?? selected ?? "");
 /** The UUID at the end of a session file stem; a preview has no live session state. */
 const sessionIdFromFile = (path?: string): string | undefined => {
   const name = path?.replaceAll("\\", "/").split("/").filter(Boolean).at(-1)?.replace(/\.jsonl$/u, "") ?? "";
@@ -108,7 +114,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [switching, setSwitching] = useState(false);
   const [commandBusy, setCommandBusy] = useState(false);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
-  const queueSessionKey = normalizedPath(selectedSession ?? snapshot.sessionFile ?? "");
+  const queueSessionKey = sessionKeyOf(snapshot.sessionFile, selectedSession);
   const queuedSteers = queueSessionKey ? queuedBySession[queueSessionKey] ?? [] : [];
   const pendingUser = pendingFor(pendingBySession, queueSessionKey);
   useEffect(() => {
@@ -568,7 +574,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const wasHero = hero;
     // Capture the owner of this send. Clearing must never depend on which session is
     // on screen when it settles, and it must never touch another session's entry.
-    const pendingKey = normalizedPath(client.snapshot.sessionFile ?? queueSessionKey ?? path);
+    const pendingKey = sessionKeyOf(client.snapshot.sessionFile, selectedSession ?? path);
     const submitDraftKey = draftKeyRef.current;
     setWorkingStartedAt(Date.now());
     setPendingBySession(previous => setPending(previous, pendingKey, value));
@@ -578,7 +584,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       client = connection.current;
       if (!client) return;
       const running = client.snapshot.projection.running;
-      const queueKey = normalizedPath(client.snapshot.sessionFile ?? queueSessionKey);
+      const queueKey = sessionKeyOf(client.snapshot.sessionFile, selectedSession);
       if (running && queueKey) setQueuedBySession(previous => ({ ...previous, [queueKey]: [...(previous[queueKey] ?? []), value] }));
       try { await client.sendOrSteer(value, submitted.map(item => item.image), running); }
       catch (error) {
@@ -1414,6 +1420,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
 
 
 
