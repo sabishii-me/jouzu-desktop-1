@@ -33,4 +33,10 @@ test('settings keeps the view behind it unusable', async ({page}) => {
   // Escape still closes it.
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();
+
+  // The close control lives in the settings sidebar header and still closes the dialog.
+  await page.getByRole('button',{name:'Settings',exact:true}).click();
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole('button',{name:'Dismiss',exact:true}).click();
+  await expect(dialog).toBeHidden();
 });
