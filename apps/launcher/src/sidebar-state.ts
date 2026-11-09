@@ -1,11 +1,11 @@
 /**
- * Which workspace groups the user opened. The list is keyed by workspace id and
- * persisted, so a remount, a session switch or a restart never opens a group on its
- * own: only an explicit toggle changes the set, and the default is closed.
+ * Which workspace groups the user closed. A group is open by default so a session is
+ * reachable, but a group the user collapsed must stay collapsed: the list used to
+ * reset on every remount, which reopened groups on its own.
  */
-const KEY = "jouzu.ui.expanded-workspaces";
+const KEY = "jouzu.ui.collapsed-workspaces";
 
-export function loadExpanded(store: Pick<Storage, "getItem"> | null = typeof localStorage === "undefined" ? null : localStorage): Set<string> {
+export function loadCollapsed(store: Pick<Storage, "getItem"> | null = typeof localStorage === "undefined" ? null : localStorage): Set<string> {
   if (!store) return new Set();
   try {
     const raw = store.getItem(KEY);
@@ -17,7 +17,7 @@ export function loadExpanded(store: Pick<Storage, "getItem"> | null = typeof loc
   }
 }
 
-export function saveExpanded(next: Set<string>, store: Pick<Storage, "setItem"> | null = typeof localStorage === "undefined" ? null : localStorage): void {
+export function saveCollapsed(next: Set<string>, store: Pick<Storage, "setItem"> | null = typeof localStorage === "undefined" ? null : localStorage): void {
   if (!store) return;
   try {
     store.setItem(KEY, JSON.stringify([...next]));
@@ -26,7 +26,7 @@ export function saveExpanded(next: Set<string>, store: Pick<Storage, "setItem"> 
   }
 }
 
-export function toggleExpanded(current: Set<string>, id: string): Set<string> {
+export function toggleCollapsed(current: Set<string>, id: string): Set<string> {
   const next = new Set(current);
   if (next.has(id)) next.delete(id);
   else next.add(id);
