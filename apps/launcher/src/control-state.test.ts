@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseControlState } from "./control-state";
+import { catalogChangeSummary, parseControlState } from "./control-state";
 const valid = {schemaVersion:1,profile:null,account:{signedIn:false},credentials:[],customProviders:[],providers:[],models:[]};
 describe("configuration response boundary", () => {
  it("validates explicit model readiness", () => {
@@ -29,5 +29,22 @@ describe("configuration response boundary", () => {
    }
    expect(() => parseControlState({...valid,schemaVersion:2})).toThrow();
    expect(() => parseControlState({...valid,providers:[{id:"",name:"bad"}]})).toThrow();
+ });
+ it("carries a held catalog revision so the desktop can ask", () => {
+   const held = { sourceId: "ai.shisa.api-router", revision: "sha256:abc", digest: "abc", reasons: ["empty_catalog"], changes: { activeCount: 12, candidateCount: 0, added: 0, removed: 12 } };
+   const parsed = parseControlState({ ...valid, catalog: { status: "quarantined", sources: [{ sourceId: "ai.shisa.api-router", status: "quarantined" }], held } });
+   expect(parsed.catalog?.status).toBe("quarantined");
+   expect(parsed.catalog?.held?.digest).toBe("abc");
+   expect(parsed.catalog?.held?.reasons).toEqual(["empty_catalog"]);
+ });
+ it("rejects a malformed catalog outcome and a held revision without identity", () => {
+   expect(() => parseControlState({ ...valid, catalog: { status: "quarantined", sources: "no" } })).toThrow();
+   expect(() => parseControlState({ ...valid, catalog: { status: "quarantined", sources: [], held: { revision: "sha256:abc" } } })).toThrow();
+ });
+ it("summarizes a held revision from the runtime's own counts only", () => {
+   expect(catalogChangeSummary({ activeCount: 12, candidateCount: 0, added: 0, removed: 12 })).toBe("This revision has 0 models; 12 in use now. 12 removed");
+   expect(catalogChangeSummary({ activeCount: 1, candidateCount: 2, added: 1, removed: 0 })).toBe("This revision has 2 models; 1 in use now. 1 added");
+   expect(catalogChangeSummary(undefined)).toBe("");
+   expect(catalogChangeSummary({ activeCount: "12" })).toBe("");
  });
 });

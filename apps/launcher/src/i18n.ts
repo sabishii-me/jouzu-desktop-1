@@ -102,6 +102,14 @@ minimize: "最小化", maximize: "最大化或還原", closeWindow: "關閉啟�
  language: "啟動器介面語言", languageHint: "僅影響啟動器選單和按鈕，不決定 Jouzu 的回覆語言。", versionsHint: "啟動器與 Jouzu 是獨立的元件。", launcher: "啟動器", unavailable: "無法取得", noUpdates: "應用程式內更新暫不可用。", devHint: "這是開發版本，不是已安裝的發行版。", tools: "命令工具", available: "可用", firstUse: "需要時準備", back: "返回資料夾", count: "最近的資料夾", clear: "清除搜尋", preferences: "依照你的習慣設定啟動器。", refresh: "重新整理狀態", setupMake: "依照你的習慣設定 Jouzu", setupConnect: "連接模型", setupHint: "登入 Shisa.AI，或連接其他服務，即可開始使用。", setupPreferencesHint: "選擇介面語言和日文優先偏好，之後可隨時在設定中修改。", setupJapaneseHint: "優先使用日語說明和彙報。你仍可在對話中要求使用其他語言。", setupContinue: "繼續", setupBack: "返回", setupRuntime: "準備執行環境", setupRuntimeHint: "連接模型前，先準備 Jouzu Desktop 的執行環境和必要工具。", setupRuntimeReady: "執行環境和工具已就緒。", setupRuntimeMissing: "缺少執行環境檔案，請先安裝。", runtime: "Jouzu 執行環境", runtimePath: "位置", runtimeRepair: "修復執行環境", runtimeInstall: "安裝執行環境…", prepareTitle: "正在準備 Jouzu…", prepareNode: "正在下載 Node…", preparePackages: "正在安裝依賴…", prepareVerify: "正在校驗…", prepareFailed: "安裝失敗", prepareHint: "大約需要一分鐘，請保持視窗開啟。",  prepareTools: "正在安裝必需工具…", runtimeUpdating: "正在更新執行環境…", runtimeUpdateFailed: "執行環境更新未能完成。", setupWorkspaces: "返回工作區", setupModels: "返回模型設定", appearance: "外觀", appearanceHint: "選擇 Jouzu 的外觀。跟隨系統會使用作業系統的設定。", themeSystem: "跟隨系統", themeDark: "深色", themeLight: "淺色", imageInput: "圖像輸入", imageInputHint: "允許向支援視覺的模型附加圖片。", contextWindow: "上下文視窗", contextWindowHint: "模型可讀取的最大 token 數。", maxOutput: "最大輸出", maxOutputHint: "單次回覆生成的最大 token 數。"
 };
 export const messages: Record<Locale, Messages> = { en, ja, "zh-Hans": hans, "zh-Hant": hant };
+/** Copy for the held-catalog confirmation. Kept with the other strings so no locale
+ *  silently falls back to English. */
+export const catalogReview: Record<Locale, { title: string; hint: string; accept: string; reject: string }> = {
+  en: { title: "A catalog update is waiting", hint: "Jouzu is holding this update because it would remove every model. Review it before deciding.", accept: "Use this update", reject: "Discard it" },
+  ja: { title: "カタログの更新が保留されています", hint: "すべてのモデルが削除される内容のため、Jouzu はこの更新を保留しています。内容を確認してから決めてください。", accept: "この更新を使う", reject: "破棄する" },
+  "zh-Hans": { title: "有一个模型目录更新在等待处理", hint: "这次更新会移除所有模型，因此 Jouzu 暂时保留了它。请先确认内容再决定。", accept: "使用这次更新", reject: "丢弃" },
+  "zh-Hant": { title: "有一個模型目錄更新在等待處理", hint: "這次更新會移除所有模型，因此 Jouzu 暫時保留了它。請先確認內容再決定。", accept: "使用這次更新", reject: "捨棄" },
+};
 export function resolveLocale(value: string | null): Locale {
  if (value && value in locales) return value as Locale;
  const language = (value ?? "en").toLowerCase();

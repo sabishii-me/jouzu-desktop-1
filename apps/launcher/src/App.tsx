@@ -14,7 +14,7 @@ import { useJouzuUpdate } from "./use-jouzu-update";
 import { useLauncherUpdate } from "./use-launcher-update";
 import { Label } from "./components/ui/label";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { parseControlState, type ControlState } from "./control-state";
+import { catalogChangeSummary, parseControlState, type ControlState, type HeldCatalog } from "./control-state";
 import { Switch } from "./components/ui/switch";
 import { listen } from "@tauri-apps/api/event";
 import jouzuIcon from "./assets/jouzu.svg";
@@ -33,7 +33,7 @@ import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from ".
 import { Button } from "./components/ui/button";
 import { JouzuLoader } from "./components/ui/jouzu-loader";
 import { Progress } from "./components/ui/progress";
-import { messages, locales, resolveLocale, type Locale } from "./i18n";
+import { catalogReview, messages, locales, resolveLocale, type Locale } from "./i18n";
 import { type Workspace } from "./history";
 import { parseDiagnostics, type Diagnostics } from "./diagnostics";
 interface LauncherState { platform: "windows" | "macos" | "linux"; recent: Workspace[]; ready: boolean; bash: boolean; bundled_git: boolean }
@@ -61,6 +61,7 @@ export function App() {
     return () => media.removeEventListener("change", apply);
   }, [theme]);
   const t = messages[locale];
+  const review = catalogReview[locale];
   const [activePath, setActivePath] = useState<string | null>(null);
   const [newSession, setNewSession] = useState(true);
   const [maximized, setMaximized] = useState(false);
@@ -72,6 +73,9 @@ export function App() {
   const entryReady = useRef(false);
   const [restartPending, setRestartPending] = useState(false);
   const [catalogRefreshing, setCatalogRefreshing] = useState(false);
+  // A held revision waits for the user; nothing is applied until they decide.
+  const [heldCatalog, setHeldCatalog] = useState<HeldCatalog | null>(null);
+  const [catalogDeciding, setCatalogDeciding] = useState(false);
   const catalogAttempted = useRef(false);
   const [japaneseOverride, setJapaneseOverride] = useState<boolean | null>(null);
   const japaneseChoice = japaneseOverride ?? locale === "ja";
@@ -230,7 +234,7 @@ export function App() {
     prepareStarted.current = true;
     void runPrepare();
   }, [runtimePresent]);
-  async function configure(request: Record<string, unknown>) {
+  async function configure(request: Record<string, unknown>, options: { restart?: boolean } = {}) {
     // A status read is not a user-visible change; only mutations show progress.
     const mutates = request.action !== "status";
     const run = controlQueue.current.then(async () => {
@@ -240,10 +244,11 @@ export function App() {
         const next = parseControlState(await invoke<unknown>("control_request", { request }));
         setSetup(next);
         // Provider, credential and model changes only take effect in a fresh runtime process.
-        if (request.action !== "status" && request.action !== "import" && request.action !== "profile") requestSessionRestart();
-        return true;
+        // A catalog refresh decides for itself: only an activated revision needs a new runtime.
+        if (options.restart !== false && request.action !== "status" && request.action !== "import" && request.action !== "profile" && request.action !== "refresh-catalogs") requestSessionRestart();
+        return next;
       }
-      catch (error) { setError(String(error)); return false; }
+      catch (error) { setError(String(error)); return null; }
       finally { if (mutates) setOperation(null); setDevice(null); setProviderDevice(null); }
     });
     controlQueue.current = run.catch(() => {});
@@ -338,6 +343,9 @@ export function App() {
   // A signed-in account supplies models through Jouzu's published catalog. The chat shell
   // asks for a refresh only when the connected runtime has no models, so warm starts do not
   // pay a network round trip. A successful refresh restarts the session with the new catalog.
+  // A refresh is cheap and the runtime's own terminal build does it at startup, so the
+  // desktop does it too. Only an activated revision needs a new runtime; a held revision
+  // waits for the user's decision in the catalog dialog.
   async function refreshModelCatalog(force = false) {
     if (catalogAttempted.current && !force) return;
     catalogAttempted.current = true;
@@ -346,11 +354,31 @@ export function App() {
       // A newly issued account key can lag its catalog by a moment. Retry the
       // refresh before leaving a signed-in install with an empty model list.
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (await configure({ action: "refresh-catalogs" })) return;
+        const next = await configure({ action: "refresh-catalogs" });
+        if (next) {
+          const outcome = next.catalog;
+          if (outcome?.held) setHeldCatalog(outcome.held);
+          // Nothing changed on disk unless a source actually activated a revision.
+          if (outcome?.sources.some(source => source.status === "activated")) requestSessionRestart();
+          return;
+        }
         if (attempt < 2) await new Promise(resolve => window.setTimeout(resolve, 1000 * (attempt + 1)));
       }
     }
     finally { setCatalogRefreshing(false); }
+  }
+  /** Apply or discard the held revision the dialog is showing. Escape keeps it held. */
+  async function decideHeldCatalog(choice: "accept" | "reject") {
+    const held = heldCatalog;
+    if (!held || catalogDeciding) return;
+    setCatalogDeciding(true);
+    try {
+      const next = await configure({ action: choice === "accept" ? "catalog-accept" : "catalog-reject", revision: held.revision, digest: held.digest, sourceId: held.sourceId || undefined });
+      if (!next) return;
+      setHeldCatalog(null);
+      if (choice === "accept") requestSessionRestart();
+    }
+    finally { setCatalogDeciding(false); }
   }
   useEffect(() => {
     if (restartPending && !chatBusy) { setRestartPending(false); setSessionRevision(value => value + 1); }
@@ -569,7 +597,24 @@ export function App() {
           </div>
         </DialogContent>
       </Dialog>
-    {entryBooting && !entryReady.current && <div className="fixed inset-0 z-40 flex h-screen w-full flex-col bg-background">
+      {/* A held catalog revision is a decision. The desktop shows its own
+          confirmation; it never prints terminal instructions or shells out to the
+          runtime's catalog command. Escape or an outside click defers the decision. */}
+      <Dialog open={heldCatalog !== null} onOpenChange={open => { if (!open) setHeldCatalog(null); }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogTitle>{review.title}</DialogTitle>
+          <DialogDescription>{review.hint}</DialogDescription>
+          {heldCatalog && heldCatalog.reasons.length > 0 && <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+            {heldCatalog.reasons.map(reason => <li key={reason}>{reason}</li>)}
+          </ul>}
+          {heldCatalog && catalogChangeSummary(heldCatalog.changes) && <p className="text-sm">{catalogChangeSummary(heldCatalog.changes)}</p>}
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" disabled={catalogDeciding} onClick={() => void decideHeldCatalog("reject")}>{review.reject}</Button>
+            <Button disabled={catalogDeciding} onClick={() => void decideHeldCatalog("accept")}>{review.accept}</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+      {entryBooting && !entryReady.current && <div className="fixed inset-0 z-40 flex h-screen w-full flex-col bg-background">
       {onboardingBanner(t.connecting, undefined, 0.7, true)}
       <div className="flex shrink-0 justify-center px-6 pb-14 pt-8"><Progress value={null} className="w-full max-w-xl" /></div>
     </div>}
@@ -610,6 +655,9 @@ export function App() {
     </LauncherPage>}
     </main>;
 }
+
+
+
 
 
 
