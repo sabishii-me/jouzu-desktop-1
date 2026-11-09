@@ -10,6 +10,8 @@ import { ChatConversation } from "./chat-conversation";
 import { AgentAction } from "./chat-live";
 import { Composer } from "./composer";
 import { clearPending, pendingFor, setPending, type PendingBySession } from "./pending-prompt";
+import { changedFiles, snapshotComplete, type WorkspaceSnapshot } from "./workspace-diff";
+import { loadCollapsed, saveCollapsed, toggleCollapsed } from "./sidebar-state";
 import { ArtifactsPanel } from "./artifacts-panel";
 import { collectOutputReferences } from "./artifact-references";
 import { PanelStart } from "./panel-start";
@@ -65,6 +67,12 @@ const lastSegment = (path: string) => path.replaceAll("\\", "/").split("/").filt
 const workspaceLabel = (path: string) => lastSegment(path) === "default-workspace" ? "Default workspace" : lastSegment(path);
 const isDefaultWorkspace = (path: string) => lastSegment(path) === "default-workspace";
 const normalizedPath = (path: string) => path.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
+/**
+ * One identity for a session wherever it is stored. The runtime's session file is
+ * authoritative once attached; the selected row covers a session that is still
+ * opening. Queue, pending and draft state must all agree on this key.
+ */
+const sessionKeyOf = (sessionFile: string | undefined, selected: string | null | undefined) => normalizedPath(sessionFile ?? selected ?? "");
 /** The UUID at the end of a session file stem; a preview has no live session state. */
 const sessionIdFromFile = (path?: string): string | undefined => {
   const name = path?.replaceAll("\\", "/").split("/").filter(Boolean).at(-1)?.replace(/\.jsonl$/u, "") ?? "";
@@ -107,7 +115,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [switching, setSwitching] = useState(false);
   const [commandBusy, setCommandBusy] = useState(false);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
-  const queueSessionKey = normalizedPath(selectedSession ?? snapshot.sessionFile ?? "");
+  const queueSessionKey = sessionKeyOf(snapshot.sessionFile, selectedSession);
   const queuedSteers = queueSessionKey ? queuedBySession[queueSessionKey] ?? [] : [];
   const pendingUser = pendingFor(pendingBySession, queueSessionKey);
   useEffect(() => {
@@ -140,6 +148,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // The provider refused an image already in the history; the session stays usable only
   // after the offending image is removed, so offer that instead of a dead end.
   const [imageRepair, setImageRepair] = useState(false);
+  // Files the current turn actually changed. The transcript only carries edit-tool
+  // arguments, so a file written by a shell command needs a workspace comparison.
+  const [turnChangedFiles, setTurnChangedFiles] = useState<string[]>([]);
+  const turnBaseline = useRef<WorkspaceSnapshot | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [textguardBySession, setTextguardBySession] = useState<Record<string, TextGuardView>>({});
   const textguardRef = useRef(textguardBySession);
@@ -175,7 +187,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [diskReports, setDiskReports] = useState<FlowReportRecord[]>([]);
   const [reportsSession, setReportsSession] = useState("");
   const [timing, setTiming] = useState<SessionTiming>();
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => loadCollapsed());
   const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [showArchived, setShowArchived] = useState(false);
@@ -362,6 +374,26 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       else parkPrevious(client ?? null);
     };
   }, [path, revision]);
+  // Snapshot the workspace around each turn so the summary can report files that no
+  // edit tool mentioned. A truncated snapshot is ignored rather than reported as a
+  // partial list.
+  useEffect(() => {
+    if (!snapshot.connected) return;
+    if (snapshot.projection.running) {
+      if (turnBaseline.current) return;
+      void invoke<WorkspaceSnapshot>("workspace_snapshot", { path })
+        .then(before => { if (!turnBaseline.current) turnBaseline.current = before; })
+        .catch(() => { /* The summary falls back to edit-tool arguments. */ });
+      return;
+    }
+    const before = turnBaseline.current;
+    if (!before) return;
+    turnBaseline.current = null;
+    void invoke<WorkspaceSnapshot>("workspace_snapshot", { path })
+      .then(after => setTurnChangedFiles(snapshotComplete(before) && snapshotComplete(after) ? changedFiles(before, after) : []))
+      .catch(() => setTurnChangedFiles([]));
+  }, [snapshot.connected, snapshot.projection.running, path]);
+  useEffect(() => { setTurnChangedFiles([]); turnBaseline.current = null; }, [path, revision]);
   // Only a live turn blocks a runtime restart. A saved draft does not: it lives in
   // localStorage and must not make a model refresh wait for the composer to empty.
   useEffect(() => { onBusyChange?.(snapshot.pending || snapshot.projection.running); }, [snapshot.pending, snapshot.projection.running, onBusyChange]);
@@ -543,7 +575,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const wasHero = hero;
     // Capture the owner of this send. Clearing must never depend on which session is
     // on screen when it settles, and it must never touch another session's entry.
-    const pendingKey = normalizedPath(client.snapshot.sessionFile ?? queueSessionKey ?? path);
+    const pendingKey = sessionKeyOf(client.snapshot.sessionFile, selectedSession ?? path);
     const submitDraftKey = draftKeyRef.current;
     setWorkingStartedAt(Date.now());
     setPendingBySession(previous => setPending(previous, pendingKey, value));
@@ -553,7 +585,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       client = connection.current;
       if (!client) return;
       const running = client.snapshot.projection.running;
-      const queueKey = normalizedPath(client.snapshot.sessionFile ?? queueSessionKey);
+      const queueKey = sessionKeyOf(client.snapshot.sessionFile, selectedSession);
       if (running && queueKey) setQueuedBySession(previous => ({ ...previous, [queueKey]: [...(previous[queueKey] ?? []), value] }));
       try { await client.sendOrSteer(value, submitted.map(item => item.image), running); }
       catch (error) {
@@ -1026,10 +1058,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const defaultGroup = groups.find(group => isDefaultWorkspace(group.path));
   const regularGroups = defaultGroup ? groups.filter(group => group !== defaultGroup) : groups;
   const renderGroup = (group: (typeof groups)[number]) => {
-    const open = !!search.trim() || !collapsed.has(group.id);
+    const open = !!search.trim() || !collapsedGroups.has(group.id);
     return <section key={group.id} className="mb-1">
       <div className={`group flex items-center gap-1 rounded-lg ${(selectedWorkspace ? normalizedPath(selectedWorkspace) === normalizedPath(group.path) : !selectedKey && normalizedPath(group.path) === normalizedPath(path)) ? "bg-accent/70" : "hover:bg-muted/60"}`}>
-        <button type="button" aria-label={`${open ? "Collapse" : "Expand"} ${group.name}`} onClick={() => setCollapsed(current => { const next = new Set(current); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next; })} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
+        <button type="button" aria-label={`${open ? "Collapse" : "Expand"} ${group.name}`} onClick={() => setCollapsedGroups(current => { const next = toggleCollapsed(current, group.id); saveCollapsed(next); return next; })} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
           {open ? <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" /> : <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />}
           <FolderOpen className="size-4 shrink-0 text-muted-foreground" /><span className="truncate text-sm">{group.name}</span>
         </button>
@@ -1268,10 +1300,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       {searchOpen && <div className="px-2 pb-2"><Input autoFocus aria-label="Search sessions" placeholder="Search sessions" value={search} onChange={event => setSearch(event.target.value)} /></div>}
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 pb-2">
         {regularGroups.map(group => {
-          const open = !!search.trim() || !collapsed.has(group.id);
+          const open = !!search.trim() || !collapsedGroups.has(group.id);
           return <section key={group.id} className="mb-1">
             <div className={`group flex items-center gap-1 rounded-lg ${(selectedWorkspace ? normalizedPath(selectedWorkspace) === normalizedPath(group.path) : !selectedKey && normalizedPath(group.path) === normalizedPath(path)) ? "bg-accent/70" : "hover:bg-muted/60"}`}>
-              <button type="button" aria-label={`${open ? "Collapse" : "Expand"} ${group.name}`} onClick={() => setCollapsed(current => { const next = new Set(current); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next; })} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
+              <button type="button" aria-label={`${open ? "Collapse" : "Expand"} ${group.name}`} onClick={() => setCollapsedGroups(current => { const next = toggleCollapsed(current, group.id); saveCollapsed(next); return next; })} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
                 {open ? <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" /> : <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />}
                 <FolderOpen className="size-4 shrink-0 text-muted-foreground" /><span className="truncate text-sm">{group.name}</span>
               </button>
@@ -1327,6 +1359,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       </div>}
       {notification && <div role="status" aria-live="polite" className="pointer-events-none fixed left-1/2 top-16 z-50 w-max max-w-[min(40rem,calc(100vw-2rem))] -translate-x-1/2 rounded-lg bg-popover px-4 py-2 text-xs text-foreground shadow-xl">{notification}</div>}
       {imageRepair && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">This session contains an image the model refuses, so every request fails. Removing it keeps the rest of the transcript.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void repairSessionImages()}>Remove the image</Button></div>}
+      {snapshot.historyError && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">This session is connected, but its transcript could not be loaded. {humanizeRuntimeError(snapshot.historyError)}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void connection.current?.retryHistory()}>Retry</Button></div>}
       {capacityError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">{humanizeRuntimeError(sessionError ?? snapshot.error ?? "")}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void startNewSession()}>New session</Button></div>}
       {flowHistoryError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">Flow request history is full. Clear it before sending again.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void runExtensionCommand("/flow clear")}>Clear Flow history</Button></div>}
       {booting ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-8 sm:px-8">
@@ -1344,7 +1377,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       </div> : !snapshot.sessionId ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
 {snapshot.gap && <p role="status" className="mx-auto mb-2 max-w-3xl text-xs text-muted-foreground">The transcript was refreshed after a display backlog.</p>}
-          <ChatConversation key={conversationKey} projection={conversationProjection} workspace={path} busy={snapshot.pending} pendingUser={pendingUser} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} onLoadEarlier={() => connection.current?.loadEarlier() ?? Promise.resolve(0)} historyLimited={snapshot.historyLimited === true} />
+          <ChatConversation key={conversationKey} projection={conversationProjection} workspace={path} busy={snapshot.pending} pendingUser={pendingUser} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={turnChangedFiles} />
         </div>
         <div className="relative">
           <div className="mx-auto w-full max-w-3xl">
@@ -1388,6 +1421,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
+
+
+
+
+
+
 
 
 

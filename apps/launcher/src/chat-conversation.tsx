@@ -8,7 +8,7 @@ import type { ChatMessage, ChatProjection } from "./chat-projection";
 import { ToolRenderer } from "./tool-renderers";
 import { ActivityStrip, isRichTool, type ActivityItem } from "./tool-renderers/tool-chip";
 import { TurnFooter } from "./turn-footer";
-import { TurnProcess, type TurnOutcome } from "./turn-process";
+import { TurnSummary } from "./turn-summary-card";
 import { summarizeTurn } from "./turn-summary";
 
 function messagePreview(message: ChatMessage) {
@@ -43,12 +43,6 @@ function turnUsageAt(messages: ChatMessage[], end: number) {
 function FinalTurnFooter({ messages, index, message, onFork, forkDisabled = false }: { messages: ChatMessage[]; index: number; message: ChatMessage; onFork?: (prompt: string, index: number) => void; forkDisabled?: boolean }) {
   const metrics = turnUsageAt(messages, index);
   return <TurnFooter message={message} usage={metrics.usage} startedAt={metrics.startedAt} onFork={onFork ? () => onFork(turnPrompt(messages, index), index) : undefined} forkDisabled={forkDisabled} />;
-}
-function turnOutcome(message: ChatMessage): TurnOutcome {
-  if (message.errorMessage || message.stopReason === "error") return "failed";
-  if (message.stopReason === "aborted") return "stopped";
-  if (message.stopReason === "toolUse") return "interrupted";
-  return "complete";
 }
 
 /**
@@ -107,13 +101,12 @@ function UserContent({ message }: { message: ChatMessage }) {
   })}</>;
 }
 
-function ChatConversationView({ projection, workspace, busy = false, pendingUser = "", onFork, onOpenArtifacts, onLoadEarlier, historyLimited = false }: { projection: ChatProjection; workspace?: string; busy?: boolean; pendingUser?: string; onFork?: (prompt: string, index: number) => void; onOpenArtifacts?: () => void; onLoadEarlier?: () => Promise<number>; historyLimited?: boolean }) {
+function ChatConversationView({ projection, workspace, busy = false, pendingUser = "", onFork, onOpenArtifacts, changedFiles = [] }: { projection: ChatProjection; workspace?: string; busy?: boolean; pendingUser?: string; onFork?: (prompt: string, index: number) => void; onOpenArtifacts?: () => void; changedFiles?: readonly string[] }) {
   const scroll = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const following = useRef(true);
   const [showLatest, setShowLatest] = useState(false);
   const [limit, setLimit] = useState(30);
-  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const pinToBottom = () => { if (following.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; };
   useEffect(() => {
     // A session mounts with its newest turn visible. Markdown, images, and collapsed
@@ -199,26 +192,13 @@ function ChatConversationView({ projection, workspace, busy = false, pendingUser
       activity.push(...split.activity);
       last = item;
     }
-    const settled = !projection.running && !busy;
-    if (parts.length || activity.length) rows.push(<article key={`turn-${group[0].index}`} aria-label="assistant message" ref={node => { if (node) articleRefs.current.set(group[0].index, node); else articleRefs.current.delete(group[0].index); }} className="space-y-2">{parts}{!settled && activity.length > 0 && <ActivityStrip items={activity} />}</article>);
+    if (parts.length || activity.length) rows.push(<article key={`turn-${group[0].index}`} aria-label="assistant message" ref={node => { if (node) articleRefs.current.set(group[0].index, node); else articleRefs.current.delete(group[0].index); }} className="space-y-2">{parts}{activity.length > 0 && <ActivityStrip items={activity} />}</article>);
     if (last) {
       const nextMessage = projection.messages[last.index + 1];
       const turnEnd = !nextMessage || nextMessage.role === "user";
       if (last.message.errorMessage) rows.push(<p key={`error-${last.index}`} role="alert" className="select-text text-sm text-destructive">{last.message.errorMessage}</p>);
-      if (turnEnd && settled) {
-        const metrics = turnUsageAt(projection.messages, last.index);
-        const durationMs = last.message.timestamp !== undefined && metrics.startedAt !== undefined ? Math.max(0, last.message.timestamp - metrics.startedAt) : undefined;
-        rows.push(<div key={`footer-${last.index}`}>
-          <TurnProcess
-            outcome={turnOutcome(last.message)}
-            durationMs={durationMs}
-            activity={activity}
-            summary={summarizeTurn(projection.messages, projection.tools, last.index)}
-            workspace={workspace}
-            onOpenArtifacts={onOpenArtifacts}
-          />
-          <FinalTurnFooter messages={projection.messages} index={last.index} message={last.message} onFork={onFork} forkDisabled={busy} />
-        </div>);
+      if (turnEnd && !projection.running && !busy && !last.message.content.some(block => block.type === "toolCall") && last.message.stopReason !== "toolUse") {
+        rows.push(<div key={`footer-${last.index}`}><TurnSummary data={summarizeTurn(projection.messages, projection.tools, last.index, changedFiles)} workspace={workspace} onOpenArtifacts={onOpenArtifacts} /><FinalTurnFooter messages={projection.messages} index={last.index} message={last.message} onFork={onFork} forkDisabled={busy} /></div>);
       }
     }
   }
@@ -227,7 +207,6 @@ function ChatConversationView({ projection, workspace, busy = false, pendingUser
     <div ref={scroll} className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-5 sm:px-8" onScroll={event => { const view = event.currentTarget; following.current = view.scrollHeight - view.scrollTop - view.clientHeight < 80; setShowLatest(!following.current); if (turnMarkers.length) { const max = view.scrollHeight - view.clientHeight; const ratio = max > 0 ? Math.min(1, Math.max(0, view.scrollTop / max)) : 0; setActiveTurn(Math.min(turnMarkers.length - 1, Math.round(ratio * (turnMarkers.length - 1)))); } }}>
       {!visible.length && <div className="mx-auto max-w-xl py-16 text-center"><h2 className="text-xl font-semibold">What would you like to work on?</h2><p className="mt-3 text-sm text-muted-foreground">Ask Jouzu to explore your workspace, explain code, or make a change.</p></div>}
       {visible.length > shown.length && <div className="mx-auto mb-4 flex max-w-3xl justify-center"><Button variant="outline" className="h-7 px-3 text-xs" onClick={() => setLimit(value => value + 50)}>Show {visible.length - shown.length} earlier message{visible.length - shown.length === 1 ? "" : "s"}</Button></div>}
-      {visible.length <= shown.length && historyLimited && onLoadEarlier && <div className="mx-auto mb-4 flex max-w-3xl justify-center"><Button variant="outline" className="h-7 px-3 text-xs" disabled={loadingEarlier} onClick={() => { setLoadingEarlier(true); void onLoadEarlier().finally(() => setLoadingEarlier(false)); }}>{loadingEarlier ? "Loading earlier messages…" : "Load earlier messages"}</Button></div>}
       <div ref={content} className="mx-auto max-w-3xl space-y-3">{rows}
         {pendingUser && <article aria-label="user message" className="ml-6 rounded-xl border border-border bg-muted/50 px-4 py-2 text-left opacity-70">
           <div className="mb-2 text-xs font-medium text-muted-foreground">You</div>
@@ -249,3 +228,6 @@ function ChatConversationView({ projection, workspace, busy = false, pendingUser
   </WorkspaceContext.Provider>;
 }
 export const ChatConversation = memo(ChatConversationView);
+
+
+

@@ -250,6 +250,59 @@ pub fn workspace_list(path: String) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "path": directory.to_string_lossy(), "entries": entries }))
 }
 
+/// Directories that never belong to a turn's output. Skipping them keeps a snapshot
+/// cheap and stops dependency or build churn from being reported as edits.
+const SNAPSHOT_SKIP: &[&str] = &[".git", "node_modules", "target", "dist", "build", ".next", ".turbo", "coverage"];
+const SNAPSHOT_MAX_ENTRIES: usize = 20_000;
+const SNAPSHOT_MAX_DEPTH: usize = 8;
+
+/// Snapshot a workspace for the turn summary: path, size and mtime for every file.
+/// Bounded by entry count and depth so a large repository cannot stall a turn end.
+#[tauri::command]
+pub fn workspace_snapshot(path: String) -> Result<serde_json::Value, String> {
+    let root = std::path::Path::new(&path);
+    if !root.is_dir() {
+        return Err("That folder is not available.".into());
+    }
+    fn walk(directory: &std::path::Path, depth: usize, out: &mut Vec<serde_json::Value>) {
+        if depth > SNAPSHOT_MAX_DEPTH || out.len() >= SNAPSHOT_MAX_ENTRIES {
+            return;
+        }
+        let Ok(read) = std::fs::read_dir(directory) else { return };
+        for entry in read.flatten() {
+            if out.len() >= SNAPSHOT_MAX_ENTRIES {
+                return;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if SNAPSHOT_SKIP.iter().any(|skip| name.eq_ignore_ascii_case(skip)) {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else { continue };
+            if metadata.is_dir() {
+                walk(&path, depth + 1, out);
+            } else if metadata.is_file() {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|elapsed| elapsed.as_secs())
+                    .unwrap_or(0);
+                out.push(serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "size": metadata.len(),
+                    "modified": modified,
+                }));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, 0, &mut files);
+    let truncated = files.len() >= SNAPSHOT_MAX_ENTRIES;
+    Ok(serde_json::json!({ "path": root.to_string_lossy(), "files": files, "truncated": truncated }))
+}
+
 /// Copy an artifact to a destination chosen by the user.
 #[tauri::command]
 pub fn save_copy(from: String, to: String) -> Result<(), String> {
@@ -390,6 +443,25 @@ mod workspace_tests {
     #[test]
     fn rejects_a_missing_folder() {
         assert!(workspace_list("C:/definitely/not/here".into()).is_err());
+    }
+
+    #[test]
+    fn snapshots_workspace_files_and_skips_dependency_folders() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("hello.pdf"), b"%PDF").unwrap();
+        std::fs::create_dir(root.path().join("node_modules")).unwrap();
+        std::fs::write(root.path().join("node_modules").join("dep.js"), b"x").unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        std::fs::write(root.path().join("nested").join("notes.md"), b"# n").unwrap();
+
+        let value = workspace_snapshot(root.path().to_string_lossy().to_string()).unwrap();
+        let files = value["files"].as_array().unwrap();
+        let paths: Vec<&str> = files.iter().filter_map(|file| file["path"].as_str()).collect();
+
+        assert!(paths.iter().any(|path| path.ends_with("hello.pdf")));
+        assert!(paths.iter().any(|path| path.ends_with("notes.md")));
+        assert!(!paths.iter().any(|path| path.contains("node_modules")));
+        assert_eq!(value["truncated"], false);
     }
 
     #[test]

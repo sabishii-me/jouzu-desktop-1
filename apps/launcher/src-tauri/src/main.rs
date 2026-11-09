@@ -670,6 +670,7 @@ fn main() {
             attachments::reveal_path,
             attachments::save_copy,
             attachments::workspace_list,
+            attachments::workspace_snapshot,
             attachments::workspace_read,
             sessions::chat_sessions,
             sessions::chat_session_update,
@@ -800,6 +801,7 @@ mod build_check_tests {
         assert_eq!(production_build_check(arguments(&["jouzu-desktop.exe"])), None);
     }
 }
+
 
 
 

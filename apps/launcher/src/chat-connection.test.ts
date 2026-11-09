@@ -131,7 +131,7 @@ describe("desktop RPC connection", () => {
     expect(request).not.toHaveBeenCalledWith("get_messages");
     expect(client.snapshot.sessionFile).toBe("C:/sessions/big.jsonl");
   });
-  it("reads a large session through the native tail instead of get_messages", async () => {
+  it("keeps the connection when a transcript exceeds the frame limit", async () => {
     const client = new ChatConnection(() => {}, () => {});
     client.snapshot = { ...client.snapshot, connected: true };
     const request = vi.spyOn(client, "request").mockImplementation(async (command: string) => {
@@ -139,36 +139,14 @@ describe("desktop RPC connection", () => {
       if (command === "get_messages") throw new Error("JSONL frame exceeds 33554432 bytes");
       return undefined;
     });
-    vi.mocked(invoke).mockImplementation(async (command: string) => {
-      if (command === "chat_session_bytes") return 25 * 1024 * 1024;
-      if (command === "chat_session_messages") return [{ role: "user", content: [{ type: "text", text: "recent" }] }];
-      return undefined;
-    });
 
     await client.refreshHistory();
 
-    expect(request).not.toHaveBeenCalledWith("get_messages");
-    expect(client.snapshot.projection.messages.at(-1)?.content[0]?.text).toBe("recent");
-  });
-  it("prepends the previous native page and stops at the beginning", async () => {
-    const client = new ChatConnection(() => {}, () => {});
-    client.snapshot = {
-      ...client.snapshot,
-      connected: true,
-      sessionFile: "C:/sessions/big.jsonl",
-      historyLimited: true,
-      projection: { ...client.snapshot.projection, messages: [{ role: "user", content: [{ type: "text", text: "newer" }] }] },
-    };
-    vi.mocked(invoke).mockImplementation(async (command: string, args?: any) => {
-      if (command !== "chat_session_messages") return undefined;
-      if (args?.before === 1) return [{ role: "user", content: [{ type: "text", text: "older" }] }];
-      return [];
-    });
-
-    expect(await client.loadEarlier()).toBe(1);
-    expect(client.snapshot.projection.messages.map(message => message.content[0]?.text)).toEqual(["older", "newer"]);
-    expect(await client.loadEarlier(200)).toBe(0);
-    expect(client.snapshot.historyLimited).toBe(false);
+    expect(request).toHaveBeenCalledWith("get_messages");
+    // The runtime is reachable; only this transcript could not be read.
+    expect(client.snapshot.connected).toBe(true);
+    expect(client.snapshot.error).toBeNull();
+    expect(client.snapshot.historyError).toContain("frame exceeds");
   });
   it("waits out a long released-runtime cold start", async () => {
     vi.useFakeTimers();
