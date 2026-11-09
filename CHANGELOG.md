@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.23 - 2026-11-09
+
+- Restore the session open path to the 2570a2d behaviour: a 4 MB tail preview
+  read once, and an authoritative runtime transcript. The desktop-side pager,
+  the 256 MB scan and the 20 MB native fallback are gone.
+- A transcript above the 32 MiB frame limit is reported as a per-session error
+  with a retry instead of dropping the session offline.
+- The turn summary reports files created by shell commands, not only by edit
+  tools, and renders them as cards instead of collapsing the whole turn.
+- Settings blocks the view behind it while it is open.
+- Workspace groups stay collapsed once the user collapses them.
+
 ## 1.0.11 - 2026-11-03
 
 - Retry the model catalog after a fresh sign-in. The first catalog refresh can
@@ -41,3 +53,4 @@
 ## 0.2.0 - 2026-10-20
 
 - Add the Windows launcher with the embedded chat workspace.
+
