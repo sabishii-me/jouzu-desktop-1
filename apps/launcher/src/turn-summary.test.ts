@@ -43,4 +43,16 @@ describe("turn summary", () => {
     const plain: ChatMessage[] = [{ role: "user", content: [{ type: "text", text: "hi" }] }, { role: "assistant", content: [{ type: "text", text: "hello" }] }];
     expect(summarizeTurn(plain, {}, 1)).toEqual({ artifacts: [], files: [] });
   });
+
+  it("includes a file that only a shell command created", () => {
+    // The transcript mentions write for a.md; the pdf came from a bash command and
+    // is only visible through the workspace diff.
+    const summary = summarizeTurn(messages, tools, 1, ["C:/work/hello.pdf", "C:/work/a.md"]);
+    expect(summary.files).toEqual(["C:/work/hello.pdf", "C:/work/a.md"]);
+  });
+
+  it("ignores case and separator differences when merging", () => {
+    const summary = summarizeTurn(messages, tools, 1, ["c:\\work\\A.MD"]);
+    expect(summary.files).toEqual(["c:\\work\\A.MD"]);
+  });
 });

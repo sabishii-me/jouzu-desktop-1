@@ -107,7 +107,7 @@ function UserContent({ message }: { message: ChatMessage }) {
   })}</>;
 }
 
-function ChatConversationView({ projection, workspace, busy = false, pendingUser = "", onFork, onOpenArtifacts }: { projection: ChatProjection; workspace?: string; busy?: boolean; pendingUser?: string; onFork?: (prompt: string, index: number) => void; onOpenArtifacts?: () => void }) {
+function ChatConversationView({ projection, workspace, busy = false, pendingUser = "", onFork, onOpenArtifacts, changedFiles = [] }: { projection: ChatProjection; workspace?: string; busy?: boolean; pendingUser?: string; onFork?: (prompt: string, index: number) => void; onOpenArtifacts?: () => void; changedFiles?: readonly string[] }) {
   const scroll = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const following = useRef(true);
@@ -212,7 +212,7 @@ function ChatConversationView({ projection, workspace, busy = false, pendingUser
             outcome={turnOutcome(last.message)}
             durationMs={durationMs}
             activity={activity}
-            summary={summarizeTurn(projection.messages, projection.tools, last.index)}
+            summary={summarizeTurn(projection.messages, projection.tools, last.index, changedFiles)}
             workspace={workspace}
             onOpenArtifacts={onOpenArtifacts}
           />
@@ -247,4 +247,5 @@ function ChatConversationView({ projection, workspace, busy = false, pendingUser
   </WorkspaceContext.Provider>;
 }
 export const ChatConversation = memo(ChatConversationView);
+
 

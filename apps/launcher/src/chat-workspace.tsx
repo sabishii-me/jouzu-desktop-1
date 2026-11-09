@@ -10,6 +10,7 @@ import { ChatConversation } from "./chat-conversation";
 import { AgentAction } from "./chat-live";
 import { Composer } from "./composer";
 import { clearPending, pendingFor, setPending, type PendingBySession } from "./pending-prompt";
+import { changedFiles, snapshotComplete, type WorkspaceSnapshot } from "./workspace-diff";
 import { ArtifactsPanel } from "./artifacts-panel";
 import { collectOutputReferences } from "./artifact-references";
 import { PanelStart } from "./panel-start";
@@ -140,6 +141,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // The provider refused an image already in the history; the session stays usable only
   // after the offending image is removed, so offer that instead of a dead end.
   const [imageRepair, setImageRepair] = useState(false);
+  // Files the current turn actually changed. The transcript only carries edit-tool
+  // arguments, so a file written by a shell command needs a workspace comparison.
+  const [turnChangedFiles, setTurnChangedFiles] = useState<string[]>([]);
+  const turnBaseline = useRef<WorkspaceSnapshot | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [textguardBySession, setTextguardBySession] = useState<Record<string, TextGuardView>>({});
   const textguardRef = useRef(textguardBySession);
@@ -362,6 +367,26 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       else parkPrevious(client ?? null);
     };
   }, [path, revision]);
+  // Snapshot the workspace around each turn so the summary can report files that no
+  // edit tool mentioned. A truncated snapshot is ignored rather than reported as a
+  // partial list.
+  useEffect(() => {
+    if (!snapshot.connected) return;
+    if (snapshot.projection.running) {
+      if (turnBaseline.current) return;
+      void invoke<WorkspaceSnapshot>("workspace_snapshot", { path })
+        .then(before => { if (!turnBaseline.current) turnBaseline.current = before; })
+        .catch(() => { /* The summary falls back to edit-tool arguments. */ });
+      return;
+    }
+    const before = turnBaseline.current;
+    if (!before) return;
+    turnBaseline.current = null;
+    void invoke<WorkspaceSnapshot>("workspace_snapshot", { path })
+      .then(after => setTurnChangedFiles(snapshotComplete(before) && snapshotComplete(after) ? changedFiles(before, after) : []))
+      .catch(() => setTurnChangedFiles([]));
+  }, [snapshot.connected, snapshot.projection.running, path]);
+  useEffect(() => { setTurnChangedFiles([]); turnBaseline.current = null; }, [path, revision]);
   // Only a live turn blocks a runtime restart. A saved draft does not: it lives in
   // localStorage and must not make a model refresh wait for the composer to empty.
   useEffect(() => { onBusyChange?.(snapshot.pending || snapshot.projection.running); }, [snapshot.pending, snapshot.projection.running, onBusyChange]);
@@ -1345,7 +1370,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       </div> : !snapshot.sessionId ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
 {snapshot.gap && <p role="status" className="mx-auto mb-2 max-w-3xl text-xs text-muted-foreground">The transcript was refreshed after a display backlog.</p>}
-          <ChatConversation key={conversationKey} projection={conversationProjection} workspace={path} busy={snapshot.pending} pendingUser={pendingUser} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} />
+          <ChatConversation key={conversationKey} projection={conversationProjection} workspace={path} busy={snapshot.pending} pendingUser={pendingUser} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={turnChangedFiles} />
         </div>
         <div className="relative">
           <div className="mx-auto w-full max-w-3xl">
@@ -1389,6 +1414,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
+
 
 
 
