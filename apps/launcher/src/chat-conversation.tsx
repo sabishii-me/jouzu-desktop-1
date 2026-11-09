@@ -8,7 +8,7 @@ import type { ChatMessage, ChatProjection } from "./chat-projection";
 import { ToolRenderer } from "./tool-renderers";
 import { ActivityStrip, isRichTool, type ActivityItem } from "./tool-renderers/tool-chip";
 import { TurnFooter } from "./turn-footer";
-import { TurnProcess, type TurnOutcome } from "./turn-process";
+import { TurnSummary } from "./turn-summary-card";
 import { summarizeTurn } from "./turn-summary";
 
 function messagePreview(message: ChatMessage) {
@@ -43,12 +43,6 @@ function turnUsageAt(messages: ChatMessage[], end: number) {
 function FinalTurnFooter({ messages, index, message, onFork, forkDisabled = false }: { messages: ChatMessage[]; index: number; message: ChatMessage; onFork?: (prompt: string, index: number) => void; forkDisabled?: boolean }) {
   const metrics = turnUsageAt(messages, index);
   return <TurnFooter message={message} usage={metrics.usage} startedAt={metrics.startedAt} onFork={onFork ? () => onFork(turnPrompt(messages, index), index) : undefined} forkDisabled={forkDisabled} />;
-}
-function turnOutcome(message: ChatMessage): TurnOutcome {
-  if (message.errorMessage || message.stopReason === "error") return "failed";
-  if (message.stopReason === "aborted") return "stopped";
-  if (message.stopReason === "toolUse") return "interrupted";
-  return "complete";
 }
 
 /**
@@ -198,26 +192,13 @@ function ChatConversationView({ projection, workspace, busy = false, pendingUser
       activity.push(...split.activity);
       last = item;
     }
-    const settled = !projection.running && !busy;
-    if (parts.length || activity.length) rows.push(<article key={`turn-${group[0].index}`} aria-label="assistant message" ref={node => { if (node) articleRefs.current.set(group[0].index, node); else articleRefs.current.delete(group[0].index); }} className="space-y-2">{parts}{!settled && activity.length > 0 && <ActivityStrip items={activity} />}</article>);
+    if (parts.length || activity.length) rows.push(<article key={`turn-${group[0].index}`} aria-label="assistant message" ref={node => { if (node) articleRefs.current.set(group[0].index, node); else articleRefs.current.delete(group[0].index); }} className="space-y-2">{parts}{activity.length > 0 && <ActivityStrip items={activity} />}</article>);
     if (last) {
       const nextMessage = projection.messages[last.index + 1];
       const turnEnd = !nextMessage || nextMessage.role === "user";
       if (last.message.errorMessage) rows.push(<p key={`error-${last.index}`} role="alert" className="select-text text-sm text-destructive">{last.message.errorMessage}</p>);
-      if (turnEnd && settled) {
-        const metrics = turnUsageAt(projection.messages, last.index);
-        const durationMs = last.message.timestamp !== undefined && metrics.startedAt !== undefined ? Math.max(0, last.message.timestamp - metrics.startedAt) : undefined;
-        rows.push(<div key={`footer-${last.index}`}>
-          <TurnProcess
-            outcome={turnOutcome(last.message)}
-            durationMs={durationMs}
-            activity={activity}
-            summary={summarizeTurn(projection.messages, projection.tools, last.index, changedFiles)}
-            workspace={workspace}
-            onOpenArtifacts={onOpenArtifacts}
-          />
-          <FinalTurnFooter messages={projection.messages} index={last.index} message={last.message} onFork={onFork} forkDisabled={busy} />
-        </div>);
+      if (turnEnd && !projection.running && !busy && !last.message.content.some(block => block.type === "toolCall") && last.message.stopReason !== "toolUse") {
+        rows.push(<div key={`footer-${last.index}`}><TurnSummary data={summarizeTurn(projection.messages, projection.tools, last.index, changedFiles)} workspace={workspace} onOpenArtifacts={onOpenArtifacts} /><FinalTurnFooter messages={projection.messages} index={last.index} message={last.message} onFork={onFork} forkDisabled={busy} /></div>);
       }
     }
   }
@@ -247,5 +228,6 @@ function ChatConversationView({ projection, workspace, busy = false, pendingUser
   </WorkspaceContext.Provider>;
 }
 export const ChatConversation = memo(ChatConversationView);
+
 
 

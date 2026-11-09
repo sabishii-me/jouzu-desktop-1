@@ -144,7 +144,6 @@ test("the last workspace opens and prewarms chat without a workspace click", asy
   await page.getByLabel("Message Jouzu").fill("Explain this project");
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect(page.getByRole("article", { name: "assistant message" })).toContainText("Hello from Jouzu");
-  await page.getByRole("button", { name: /^Completed/ }).last().click();
   await page.getByRole("button", { name: /Thinking/ }).last().click();
   await expect(page.getByText("Live thinking preview")).toBeVisible();
   const flow = page.getByRole("button", { name: "Flow", exact: true });
