@@ -58,6 +58,8 @@ export interface ChatSnapshot {  projection: ChatProjection;
   transportReady?: boolean;
   pending: boolean;
   error: string | null;
+  /** The runtime is reachable but its transcript could not be read. */
+  historyError?: string;
   sessionId?: string;
   sessionFile?: string;
   model?: string;
@@ -65,8 +67,6 @@ export interface ChatSnapshot {  projection: ChatProjection;
   modelId?: string;
   models?: ChatModel[];
   modelsLoaded?: boolean;
-  /** The transcript starts at a recent page; older messages are loaded on demand. */
-  historyLimited?: boolean;
   widgets?: Record<string, string[]>;
   statuses?: Record<string, string>;
   flowNotice?: string;
@@ -96,7 +96,7 @@ export class ChatConnection {
   private lastPoll = Date.now();
   private preferredModel = readModelPreference();
   private requests = new Map<string, { command: string; resolve: (value: unknown) => void; reject: (error: Error) => void; deadline: number }>();
-  snapshot: ChatSnapshot = { projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [], historyLimited: false };
+  snapshot: ChatSnapshot = { projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [] };
   private subscribers = new Set<(state: ChatSnapshot) => void>();
   constructor(publish: (state: ChatSnapshot) => void, private dialog: (request: WireObject, client: ChatConnection) => void) {
     this.subscribers.add(publish);
@@ -269,45 +269,23 @@ export class ChatConnection {
   }
   async refreshHistory() {
     const state = await this.readState();
-    const sessionPath = this.snapshot.sessionFile;
-    let messages: unknown[];
-    let bytes = 0;
-    if (sessionPath) {
-      try { bytes = await invoke<number>("chat_session_bytes", { sessionPath }); } catch { bytes = 0; }
+    let history: unknown;
+    try {
+      history = await this.request("get_messages");
+    } catch (error) {
+      // A transcript larger than the transport frame is a per-session limit, not a
+      // reason to take the whole connection offline. Report it and stay reachable.
+      this.update({ historyError: String(error).replace(/^Error:\s*/u, "") });
+      return;
     }
-    const historyLimited = !!sessionPath && bytes > 20 * 1024 * 1024;
-    if (historyLimited) {
-      // A full get_messages response for a large JSONL session exceeds the 32 MiB
-      // transport frame and kills the connection. Read the recent page natively.
-      messages = await invoke<unknown[]>("chat_session_messages", { sessionPath, limit: 200 });
-    } else {
-      const history = await this.request("get_messages");
-      if (!object(history) || !Array.isArray(history.messages)) throw new Error("Runtime returned incompatible history.");
-      messages = history.messages;
-    }
-    const projection = historyProjection(messages);
+    if (!object(history) || !Array.isArray(history.messages)) throw new Error("Runtime returned incompatible history.");
+    const projection = historyProjection(history.messages);
     projection.running = state.isStreaming as boolean;
     const reconciled = projection.running ? projection : interruptUnfinishedTools(projection);
-    this.update({ projection: reconciled, historyLimited });
+    this.update({ projection: reconciled, historyError: undefined });
   }
-  /** Prepend the previous native page. Returns how many messages were added. */
-  async loadEarlier(limit = 200): Promise<number> {
-    const sessionPath = this.snapshot.sessionFile;
-    if (!sessionPath || !this.snapshot.historyLimited) return 0;
-    const current = this.snapshot.projection;
-    const older = await invoke<unknown[]>("chat_session_messages", { sessionPath, limit, before: current.messages.length });
-    if (!older.length) { this.update({ historyLimited: false }); return 0; }
-    const page = historyProjection(older);
-    const added = page.messages.length;
-    this.update({
-      projection: {
-        ...current,
-        messages: [...page.messages, ...current.messages],
-        activeMessage: current.activeMessage === null ? null : current.activeMessage + added,
-      },
-    });
-    return added;
-  }
+  /** Retry the transcript read that failed; the connection was never closed. */
+  async retryHistory() { await this.refreshHistory(); }
   private async applyPreferredModel() {
     const preferred = this.preferredModel;
     if (!preferred) return;
@@ -499,4 +477,5 @@ export class ChatConnection {
     if (this.handle) await invoke("chat_stop", { handle: this.handle });
   }
 }
+
 
