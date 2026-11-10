@@ -31,16 +31,22 @@ test("settings works through the real host", async ({ page }) => {
   // Control status arrives from the host on open; the Shisa.AI card proves it parsed.
   await expect(dialog.getByText("Shisa.AI", { exact: true }).first()).toBeVisible();
 
-  // A real control action through the same endpoint the UI uses.
-  const status = await page.evaluate(async () => {
-    const response = await fetch("/v1/control", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "status" }),
-    });
-    return { code: response.status, body: await response.text() };
-  });
-  expect(status.code).toBe(200);
+  // The same control endpoint the UI uses. The UI may still hold the single control
+  // slot while it reads status on open, so a 409 is expected and retried, not a failure.
+  let status = { code: 0, body: "" };
+  await expect
+    .poll(async () => {
+      status = await page.evaluate(async () => {
+        const response = await fetch("/v1/control", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "status" }),
+        });
+        return { code: response.status, body: await response.text() };
+      });
+      return status.code;
+    }, { timeout: 30_000 })
+    .toBe(200);
   expect(status.body).toContain('"schemaVersion"');
 
   // Switching tabs keeps the dialog alive and shows host-backed environment data.

@@ -98,6 +98,24 @@ struct Inflight {
     cancel: Arc<Notify>,
 }
 
+/// Releases the single control slot and cancels the running operation when the request
+/// future is dropped, for example because the page navigated away.
+struct InflightGuard<'a> {
+    slot: &'a Mutex<Option<Inflight>>,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(active) = slot.take() {
+            active.cancel.notify_one();
+        }
+    }
+}
+
 pub struct ControlManager {
     context: adapter::ControlContext,
     inflight: Mutex<Option<Inflight>>,
@@ -204,6 +222,9 @@ impl ControlManager {
                 cancel: cancel.clone(),
             });
         }
+        // The slot is released on drop, including when the HTTP client goes away and
+        // axum drops this future: a disconnected request must not wedge control forever.
+        let _slot = InflightGuard { slot: &self.inflight };
         let started = Instant::now();
         self.bus.publish(
             "control.started",
@@ -213,14 +234,6 @@ impl ControlManager {
         let result = self
             .run(&request_id, &action, body, cancel, started)
             .await;
-
-        {
-            let mut inflight = self
-                .inflight
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *inflight = None;
-        }
 
         match result {
             Ok(value) => {
@@ -495,4 +508,5 @@ impl Drop for Job {
         }
     }
 }
+
 
