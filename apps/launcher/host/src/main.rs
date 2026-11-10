@@ -99,6 +99,21 @@ async fn main() -> ExitCode {
     let bash = arg_value(&args, "--bash")
         .map(PathBuf::from)
         .or_else(|| find_bash(&managed));
+    let install = arg_value(&args, "--install")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| managed.clone());
+    let control = match jouzu_host::control::ControlManager::new(
+        &install,
+        &managed,
+        &home,
+        &runtime_home,
+    ) {
+        Ok(manager) => std::sync::Arc::new(manager),
+        Err(error) => {
+            eprintln!("control is unavailable: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let sessions = std::sync::Arc::new(SessionManager::new(
         runtime,
         home.clone(),
@@ -154,6 +169,7 @@ async fn main() -> ExitCode {
         started: Instant::now(),
         version: VERSION.to_string(),
         sessions: sessions.clone(),
+        control,
     };
     let app = router(state);
 
@@ -179,3 +195,4 @@ async fn main() -> ExitCode {
         }
     }
 }
+

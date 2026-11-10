@@ -25,7 +25,6 @@ mod node_path;
 mod renderer;
 mod update_lock;
 mod jouzu_update;
-mod control;
 mod environment;
 mod runtime;
 mod sessions;
@@ -670,9 +669,7 @@ fn main() {
             command_entry_remove,
             command_entry_repair,
             jouzu_update::jouzu_update,
-            control::control_request,
-            control::cancel_control,
-            terminal,
+                            terminal,
             terminal_install,
             git_bash,
             git_bash_install,
@@ -747,4 +744,5 @@ mod build_check_tests {
         assert_eq!(production_build_check(arguments(&["jouzu-desktop.exe"])), None);
     }
 }
+
 

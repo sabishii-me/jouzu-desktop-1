@@ -15,7 +15,7 @@ use std::{
 #[cfg(windows)]
 mod runtime_process;
 mod artifacts;
-mod control;
+pub mod control;
 mod environment;
 mod files;
 pub mod session;
@@ -51,6 +51,7 @@ pub struct AppState {
     pub started: Instant,
     pub version: String,
     pub sessions: Arc<SessionManager>,
+    pub control: Arc<control::ControlManager>,
 }
 
 #[derive(Debug, Serialize)]
@@ -227,6 +228,9 @@ pub fn router(state: AppState) -> Router {
             get(read_environment).put(save_environment),
         )
         .route("/capabilities", get(capabilities))
+        .route("/control", axum::routing::post(control_request))
+        .route("/control/cancel", axum::routing::post(control_cancel))
+        .route("/control/events", get(control_events))
         .route("/models", get(models))
         .route(
             "/workspaces",
@@ -737,6 +741,79 @@ fn sse_event(event: session::SessionEvent) -> SseEvent {
         .data(serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string()))
 }
 
+async fn control_request(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    state.control.request(body).await.map(Json)
+}
+
+#[derive(Deserialize)]
+struct ControlCancelRequest {
+    #[serde(rename = "requestId")]
+    request_id: Option<String>,
+}
+
+async fn control_cancel(
+    State(state): State<AppState>,
+    body: Option<Json<ControlCancelRequest>>,
+) -> StatusCode {
+    let requested = body.and_then(|Json(body)| body.request_id);
+    state.control.cancel(requested.as_deref());
+    StatusCode::NO_CONTENT
+}
+
+/// Control progress and cancel results. Same envelope as session events so one client
+/// reader can consume both.
+async fn control_events(
+    State(state): State<AppState>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let after = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(query.after)
+        .unwrap_or(0);
+    let mut receiver = state.control.subscribe();
+    let (initial, mut last) = state.control.events_after(after);
+    let control = state.control.clone();
+    let stream = async_stream::stream! {
+        for event in initial {
+            last = event.seq;
+            yield Ok::<_, Infallible>(control_sse_event(event));
+        }
+        loop {
+            match receiver.recv().await {
+                Ok(event) if event.seq > last => {
+                    last = event.seq;
+                    yield Ok::<_, Infallible>(control_sse_event(event));
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let (missed, _) = control.events_after(last);
+                    for event in missed {
+                        last = event.seq;
+                        yield Ok::<_, Infallible>(control_sse_event(event));
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+fn control_sse_event(event: control::ControlEvent) -> SseEvent {
+    SseEvent::default()
+        .id(event.seq.to_string())
+        .event(event.event)
+        .data(serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string()))
+}
+
 fn session_not_found() -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
@@ -1059,6 +1136,13 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    fn control_manager(home: &Path) -> Arc<control::ControlManager> {
+        Arc::new(
+            control::ControlManager::new(home, home, home, &home.join("data"))
+                .expect("control manager"),
+        )
+    }
+
     fn state(dist: PathBuf) -> AppState {
         AppState {
             token: Arc::new("a".repeat(64)),
@@ -1066,7 +1150,14 @@ mod tests {
             dist: dist.clone(),
             started: Instant::now(),
             version: "0.1.0".to_string(),
-            sessions: Arc::new(SessionManager::new(None, dist.clone(), dist, None, 10)),
+            sessions: Arc::new(SessionManager::new(
+                None,
+                dist.clone(),
+                dist.clone(),
+                None,
+                10,
+            )),
+            control: control_manager(&dist),
         }
     }
 
@@ -1391,13 +1482,15 @@ mod session_tests {
     }
 
     fn app(manager: Arc<SessionManager>) -> Router {
+        let home = std::env::temp_dir();
         AppState {
             token: Arc::new("a".repeat(64)),
             port: 40123,
-            dist: std::env::temp_dir(),
+            dist: home.clone(),
             started: Instant::now(),
             version: "0.1.0".to_string(),
             sessions: manager,
+            control: Arc::new(control::ControlManager::new(&home, &home, &home, &home.join("data")).expect("control manager")),
         }
         .pipe(router)
     }
@@ -2372,3 +2465,9 @@ mod session_tests {
         assert_eq!(reports[0]["kind"], "work");
     }
 }
+
+
+
+
+
+

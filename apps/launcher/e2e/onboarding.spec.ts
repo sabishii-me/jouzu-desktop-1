@@ -1,4 +1,5 @@
 import {test,expect,type Page} from '@playwright/test';
+import { UI_BASE } from './host-control';
 
 // Drives the real onboarding surface through a stateful configuration backend.
 async function openSetup(page:Page, initial:{profile?:string|null;modelReady?:boolean;recent?:{id:string;path:string;environment:{kind:string}}[]}={}) {
@@ -38,7 +39,7 @@ async function openSetup(page:Page, initial:{profile?:string|null;modelReady?:bo
    }
   };
  },initial);
- await page.goto('http://localhost:1420');
+ await page.goto(UI_BASE);
 }
 
 // Drives the first status read so the window is caught in its start-up state, before any page exists.
@@ -61,7 +62,7 @@ async function openStartup(page:Page, status:'hang'|'fail') {
    }
   };
  },status);
- await page.goto('http://localhost:1420');
+ await page.goto(UI_BASE);
 }
 test('a missing model opens the connect-a-model page, without a language step', async ({page}) => {
  await openSetup(page,{modelReady:false});
@@ -89,3 +90,6 @@ test('a configured model opens the workspace', async ({page}) => {
  await expect(page.getByRole('button',{name:'New session',exact:true})).toBeVisible();
  await expect(page.getByRole('heading',{name:'Connect a model'})).toHaveCount(0);
 });
+
+
+

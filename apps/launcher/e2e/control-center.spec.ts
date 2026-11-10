@@ -1,5 +1,15 @@
 import { test, expect } from '@playwright/test';
+import { UI_BASE, stubHostControl } from './host-control';
 const state = {schemaVersion:1,profile:'core',account:{signedIn:false},credentials:[],customProviders:[],providers:[{id:'openai',name:'OpenAI'}],models:[]};
+test.beforeEach(async ({page}, testInfo) => {
+  const legacy = testInfo.title.includes('rejects old protocol');
+  await stubHostControl(page, body => {
+    const result: any = { ...state };
+    if (body?.action === 'profile') result.profile = body.profile;
+    if (legacy) delete result.customProviders;
+    return result;
+  });
+});
 for (const legacy of [false,true]) {
  test(`control center ${legacy ? 'rejects old protocol without crashing' : 'opens all tabs'}`, async ({page}) => {
   const errors: string[]=[]; page.on('pageerror', error=>errors.push(error.message));
@@ -20,7 +30,7 @@ for (const legacy of [false,true]) {
     }
    };
   },{state,legacy});
-  await page.goto('http://localhost:1420');
+  await page.goto(UI_BASE);
   await page.getByRole('button',{name:'Settings',exact:true}).click();
   const dialog=page.getByRole('dialog');await expect(dialog).toBeVisible();
   if(legacy) await expect(dialog.getByRole('alert')).toContainText('incompatible');
@@ -100,7 +110,7 @@ const updateStub = (config: {
 };
 
 async function openSystem(page: any) {
-  await page.goto('http://localhost:1420');
+  await page.goto(UI_BASE);
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   const dialog = page.getByRole('dialog');
   await dialog.getByRole('tab', { name: 'System', exact: true }).click();
@@ -209,7 +219,7 @@ test('the System section names the copy in use and offers installing the ones Jo
    }
   };
  });
- await page.goto('http://localhost:1420');
+ await page.goto(UI_BASE);
  await page.getByRole('button',{name:'Settings',exact:true}).click();
  const dialog=page.getByRole('dialog');
  await dialog.getByRole('tab',{name:'System',exact:true}).click();
@@ -249,7 +259,7 @@ test('a component row keeps its height while an action runs', async ({page})=>{
    }
   };
  });
- await page.goto('http://localhost:1420');
+ await page.goto(UI_BASE);
  await page.getByRole('button',{name:'Settings',exact:true}).click();
  const dialog=page.getByRole('dialog');
  await dialog.getByRole('tab',{name:'System',exact:true}).click();
@@ -290,7 +300,7 @@ test('a console this machine cannot draw is repaired before Jouzu starts', async
    }
   };
  });
- await page.goto('http://localhost:1420');
+ await page.goto(UI_BASE);
  await page.getByRole('button',{name:/Open Jouzu here/}).click();
  // The repair is shown while it runs, and Jouzu only starts once it is done.
  const dialog=page.getByRole('dialog');
@@ -323,7 +333,7 @@ test('a component copy that is here but does not run is repaired, not installed'
    }
   };
  });
- await page.goto('http://localhost:1420');
+ await page.goto(UI_BASE);
  await page.getByRole('button',{name:'Settings',exact:true}).click();
  const dialog=page.getByRole('dialog');
  await dialog.getByRole('tab',{name:'System',exact:true}).click();
@@ -358,7 +368,7 @@ test('the terminal command row names what answers and takes precedence only when
    }
   };
  });
- await page.goto('http://localhost:1420');
+ await page.goto(UI_BASE);
  await page.getByRole('button',{name:'Settings',exact:true}).click();
  const dialog=page.getByRole('dialog');
  await dialog.getByRole('tab',{name:'System',exact:true}).click();
@@ -393,7 +403,7 @@ test('the header opens a terminal in a chosen folder and starts nothing', async 
    }
   };
  });
- await page.goto('http://localhost:1420');
+ await page.goto(UI_BASE);
  await page.getByRole('button',{name:'Open a terminal',exact:true}).click();
  await page.waitForFunction(()=> (window as any).__terminals.length===1);
  // The folder the picker returned is the one the terminal opens in, and nothing else ran.
@@ -402,3 +412,7 @@ test('the header opens a terminal in a chosen folder and starts nothing', async 
  expect(await page.evaluate(()=> (window as any).__dialogs)).toBe(0);
  expect(await page.getByRole('button',{name:'Open a terminal',exact:true}).isEnabled()).toBe(true);
 });
+
+
+
+

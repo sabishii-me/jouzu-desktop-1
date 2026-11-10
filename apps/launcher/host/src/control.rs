@@ -1,197 +1,496 @@
-use serde_json::Value;
+//! Jouzu configuration executed by the host.
+//!
+//! One operation at a time, a shared update lock, both pipes read concurrently, the
+//! child in its own job object, device codes from stderr as events, and a cancel or a
+//! 190 second deadline that terminates the tree. The shell no longer runs this code.
+
+mod adapter;
+mod app;
+
 use std::{
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    collections::VecDeque,
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
-/// Jouzu's private configuration adapter. The host owns its execution; the shell
-/// no longer runs configuration code.
-const CONTROL: &str = include_str!("../../../../packaging/launcher/control.mjs");
+use serde::Serialize;
+use serde_json::{json, Value};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    sync::{broadcast, Notify},
+};
 
-pub struct ControlManager {
-    root: PathBuf,
-    home: PathBuf,
-    node: PathBuf,
-    app: PathBuf,
-    active: AtomicBool,
+use crate::session::ApiError;
+
+pub const TIMEOUT: Duration = Duration::from_secs(190);
+const REPLAY: usize = 100;
+const STDOUT_LIMIT: usize = 8 * 1024 * 1024;
+
+/// The actions the contract exposes to the UI.
+const ACTIONS: &[&str] = &[
+    "status",
+    "refresh-catalogs",
+    "catalog-accept",
+    "catalog-reject",
+    "profile",
+    "import",
+    "custom-provider",
+    "provider-key",
+    "provider-remove",
+    "default-model",
+    "shisa-login",
+    "shisa-logout",
+    "provider-oauth",
+];
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlEvent {
+    pub seq: u64,
+    pub event: String,
+    pub data: Value,
 }
 
-struct Guard<'a>(&'a AtomicBool);
+/// The event ring and its subscribers. Cloned into the pipe readers so a device line
+/// can be published without borrowing the manager.
+struct EventBus {
+    seq: AtomicU64,
+    sender: broadcast::Sender<ControlEvent>,
+    history: Mutex<VecDeque<ControlEvent>>,
+}
 
-impl Drop for Guard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+impl EventBus {
+    fn new() -> Self {
+        let (sender, _) = broadcast::channel(256);
+        Self {
+            seq: AtomicU64::new(0),
+            sender,
+            history: Mutex::new(VecDeque::with_capacity(REPLAY)),
+        }
     }
+
+    fn publish(&self, event: &str, data: Value) {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let frame = ControlEvent {
+            seq,
+            event: event.to_string(),
+            data,
+        };
+        {
+            let mut history = self
+                .history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if history.len() == REPLAY {
+                history.pop_front();
+            }
+            history.push_back(frame.clone());
+        }
+        let _ = self.sender.send(frame);
+    }
+}
+
+struct Inflight {
+    request_id: String,
+    cancel: Arc<Notify>,
+}
+
+pub struct ControlManager {
+    context: adapter::ControlContext,
+    inflight: Mutex<Option<Inflight>>,
+    bus: Arc<EventBus>,
 }
 
 impl ControlManager {
-    pub fn new(root: PathBuf, home: PathBuf) -> Self {
-        let node = root.join("runtime").join("node").join("node.exe");
-        let app = resolve_app(&root);
-        Self {
-            root,
-            home,
-            node,
-            app,
-            active: AtomicBool::new(false),
+    pub fn new(
+        install: &Path,
+        managed: &Path,
+        host_home: &Path,
+        runtime_home: &Path,
+    ) -> Result<Self, String> {
+        let app = app::resolve_app(install, managed)?;
+        let node = app::node_executable(managed);
+        let environment = crate::environment::read(host_home)?
+            .into_iter()
+            .filter(|entry| entry.enabled)
+            .map(|entry| (entry.name, entry.value))
+            .collect();
+        Ok(Self {
+            context: adapter::ControlContext {
+                node,
+                root: managed.to_path_buf(),
+                app,
+                home: runtime_home.to_path_buf(),
+                environment,
+            },
+            inflight: Mutex::new(None),
+            bus: Arc::new(EventBus::new()),
+        })
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<ControlEvent> {
+        self.bus.sender.subscribe()
+    }
+
+    /// Every event after `after`, for SSE resume.
+    pub fn events_after(&self, after: u64) -> (Vec<ControlEvent>, u64) {
+        let history = self
+            .bus
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let events: Vec<ControlEvent> = history
+            .iter()
+            .filter(|event| event.seq > after)
+            .cloned()
+            .collect();
+        let last = events.last().map(|event| event.seq).unwrap_or(after);
+        (events, last)
+    }
+
+    /// Cancel the active operation, or the one with this id. An idle manager is a no-op.
+    pub fn cancel(&self, request_id: Option<&str>) -> bool {
+        let inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(active) = inflight.as_ref() else {
+            return false;
+        };
+        if let Some(requested) = request_id {
+            if requested != active.request_id {
+                return false;
+            }
         }
+        active.cancel.notify_one();
+        true
     }
 
-    pub fn paths(&self) -> (PathBuf, PathBuf) {
-        (self.node.clone(), self.app.clone())
-    }
+    pub async fn request(&self, body: Value) -> Result<Value, ApiError> {
+        let action = body
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("status")
+            .to_string();
+        if !ACTIONS.contains(&action.as_str()) {
+            return Err(ApiError::bad_request("Unsupported configuration operation"));
+        }
+        let request_id = body
+            .get("requestId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 64)
+            .map(ToString::to_string)
+            .unwrap_or_else(new_request_id);
 
-    pub fn request(&self, request: Value) -> Result<Value, String> {
-        if self
-            .active
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
+        let cancel = Arc::new(Notify::new());
         {
-            return Err("Another configuration operation is running".into());
+            let mut inflight = self
+                .inflight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if inflight.is_some() {
+                return Err(ApiError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    "control-busy",
+                    "Another configuration operation is running",
+                    true,
+                ));
+            }
+            *inflight = Some(Inflight {
+                request_id: request_id.clone(),
+                cancel: cancel.clone(),
+            });
         }
-        let _guard = Guard(&self.active);
-        if !self.node.is_file() {
-            return Err(format!("Configuration Node is unavailable: {}", self.node.display()));
-        }
-        if !self.app.join("bootstrap.mjs").is_file() {
-            return Err(format!("Configuration app is unavailable: {}", self.app.display()));
+        let started = Instant::now();
+        self.bus.publish(
+            "control.started",
+            json!({ "requestId": request_id, "action": action, "startedAt": now() }),
+        );
+
+        let result = self
+            .run(&request_id, &action, body, cancel, started)
+            .await;
+
+        {
+            let mut inflight = self
+                .inflight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *inflight = None;
         }
 
-        let mut child = Command::new(&self.node);
-        child
-            .arg("--input-type=module")
-            .arg("--eval")
-            .arg(CONTROL)
-            .arg("--")
-            .arg(&self.root)
-            .arg(&self.app)
-            .env("JOUZU_HOME", &self.home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        match result {
+            Ok(value) => {
+                self.bus.publish(
+                    "control.finished",
+                    json!({
+                        "requestId": request_id,
+                        "action": action,
+                        "ok": true,
+                        "durationMs": started.elapsed().as_millis() as u64,
+                    }),
+                );
+                Ok(value)
+            }
+            Err(error) => {
+                self.bus.publish(
+                    "control.error",
+                    json!({
+                        "requestId": request_id,
+                        "action": action,
+                        "code": error.code,
+                        "message": error.message,
+                        "retryable": error.retryable,
+                    }),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    async fn run(
+        &self,
+        request_id: &str,
+        action: &str,
+        body: Value,
+        cancel: Arc<Notify>,
+        _started: Instant,
+    ) -> Result<Value, ApiError> {
+        let spec = adapter::spec(&self.context).map_err(|message| {
+            ApiError::internal(format!("Configuration is unavailable: {message}"))
+        })?;
+        let mut command = tokio::process::Command::new(&spec.program);
+        command
+            .args(&spec.args)
+            .envs(spec.env.iter().map(|(key, value)| (key, value)))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
-            child.creation_flags(0x08000000);
+            command.creation_flags(0x08000000);
         }
-        let mut child = child
+        let mut child = command
             .spawn()
-            .map_err(|_| "Cannot start configuration service".to_string())?;
-        child
-            .stdin
-            .take()
-            .ok_or("Configuration input unavailable")?
-            .write_all(
-                &serde_json::to_vec(&request)
-                    .map_err(|error| format!("Invalid configuration request: {error}"))?,
+            .map_err(|_| ApiError::internal("Cannot start the configuration service"))?;
+        let job = child.id().and_then(Job::adopt).ok_or_else(|| {
+            ApiError::internal("Cannot own the configuration process")
+        })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let payload = serde_json::to_vec(&request_payload(&body, action))
+                .map_err(|_| ApiError::bad_request("Invalid configuration request"))?;
+            let _ = stdin.write_all(&payload).await;
+            let _ = stdin.shutdown().await;
+            drop(stdin);
+        }
+
+        let mut stderr_task = None;
+        if let Some(stderr) = child.stderr.take() {
+            let bus = self.bus.clone();
+            let request_id = request_id.to_string();
+            stderr_task = Some(tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(device) = adapter::parse_event(&line) {
+                        bus.publish(
+                            "control.device",
+                            json!({
+                                "requestId": request_id,
+                                "url": device.url,
+                                "code": device.code,
+                            }),
+                        );
+                    }
+                }
+            }));
+        }
+        let stdout_task = child.stdout.take().map(|mut stream| {
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            if buffer.len() + count > STDOUT_LIMIT {
+                                break;
+                            }
+                            buffer.extend_from_slice(&chunk[..count]);
+                        }
+                    }
+                }
+                buffer
+            })
+        });
+
+        let deadline = tokio::time::sleep(TIMEOUT);
+        tokio::pin!(deadline);
+        enum Stop {
+            Exited(std::io::Result<std::process::ExitStatus>),
+            Cancelled,
+            TimedOut,
+        }
+        let stop = tokio::select! {
+            status = child.wait() => Stop::Exited(status),
+            _ = cancel.notified() => Stop::Cancelled,
+            _ = &mut deadline => Stop::TimedOut,
+        };
+
+        match stop {
+            Stop::Exited(status) => {
+                drop(job);
+                if let Some(task) = stderr_task.take() {
+                    let _ = task.await;
+                }
+                let stdout = match stdout_task {
+                    Some(task) => task.await.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let status = status
+                    .map_err(|_| ApiError::internal("Cannot check the configuration service"))?;
+                let value: Value = serde_json::from_slice(&stdout).map_err(|_| {
+                    ApiError::internal("Invalid configuration service response")
+                })?;
+                if !status.success() {
+                    let message = value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Configuration operation failed")
+                        .to_string();
+                    return Err(ApiError::new(
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "control-failed",
+                        message,
+                        true,
+                    ));
+                }
+                Ok(value)
+            }
+            Stop::Cancelled | Stop::TimedOut => {
+                // The adapter has no cancel channel of its own, so stopping means the
+                // whole job goes. That is the documented loss in ADR 0012.
+                job.terminate();
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                drop(job);
+                if let Some(task) = stderr_task.take() {
+                    task.abort();
+                }
+                if let Some(task) = stdout_task {
+                    task.abort();
+                }
+                let (code, message) = if matches!(stop, Stop::Cancelled) {
+                    (
+                        "control-cancelled",
+                        "Configuration operation cancelled; refresh the status before retrying",
+                    )
+                } else {
+                    (
+                        "control-timeout",
+                        "Configuration operation timed out; refresh the status before retrying",
+                    )
+                };
+                Err(ApiError::new(
+                    axum::http::StatusCode::REQUEST_TIMEOUT,
+                    code,
+                    message,
+                    true,
+                ))
+            }
+        }
+    }
+}
+
+fn request_payload(body: &Value, action: &str) -> Value {
+    let mut payload = body.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("action".to_string(), Value::String(action.to_string()));
+        object.remove("requestId");
+    }
+    payload
+}
+
+fn new_request_id() -> String {
+    format!("c-{:016x}", rand::random::<u64>())
+}
+
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// A job object that owns the control child. `Drop` closes the job, which terminates
+/// whatever remains because the limit is KILL_ON_JOB_CLOSE.
+struct Job {
+    handle: isize,
+}
+
+impl Job {
+    #[cfg(windows)]
+    fn adopt(pid: u32) -> Option<Job> {
+        use windows::Win32::{
+            Foundation::CloseHandle,
+            System::{
+                JobObjects::{
+                    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                    SetInformationJobObject, TerminateJobObject,
+                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                },
+                Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
+            },
+        };
+        unsafe {
+            let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).ok()?;
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
-            .map_err(|_| "Cannot send configuration request".to_string())?;
-
-        let started = Instant::now();
-        loop {
-            if child
-                .try_wait()
-                .map_err(|_| "Cannot check configuration operation".to_string())?
-                .is_some()
-            {
-                break;
+            .ok()?;
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid).ok()?;
+            let assigned = AssignProcessToJobObject(job, process).is_ok();
+            let _ = CloseHandle(process);
+            if !assigned {
+                let _ = CloseHandle(job);
+                return None;
             }
-            if started.elapsed() > Duration::from_secs(190) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("Configuration operation timed out; retry it".into());
-            }
-            std::thread::sleep(Duration::from_millis(100));
+            let _ = TerminateJobObject;
+            Some(Job {
+                handle: job.0 as isize,
+            })
         }
-
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        if let Some(mut pipe) = child.stdout.take() {
-            pipe.read_to_end(&mut stdout)
-                .map_err(|_| "Configuration output failed".to_string())?;
-        }
-        if let Some(mut pipe) = child.stderr.take() {
-            let _ = pipe.read_to_end(&mut stderr);
-        }
-        let status = child
-            .wait()
-            .map_err(|_| "Configuration service failed".to_string())?;
-        let result: Value = serde_json::from_slice(&stdout)
-            .map_err(|_| "Invalid configuration service response".to_string())?;
-        if !status.success() {
-            return Err(result["error"]
-                .as_str()
-                .unwrap_or("Configuration operation failed")
-                .to_string());
-        }
-        Ok(result)
     }
+
+    #[cfg(not(windows))]
+    fn adopt(_pid: u32) -> Option<Job> {
+        None
+    }
+
+    #[cfg(windows)]
+    fn terminate(&self) {
+        use windows::Win32::{Foundation::HANDLE, System::JobObjects::TerminateJobObject};
+        unsafe {
+            let _ = TerminateJobObject(HANDLE(self.handle as *mut _), 1);
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn terminate(&self) {}
 }
 
-fn resolve_app(root: &Path) -> PathBuf {
-    let bundled = root.join("app");
-    if bundled.join("bootstrap.mjs").is_file() {
-        return bundled;
-    }
-    let receipt = root.join("updates").join("active.json");
-    let Ok(bytes) = std::fs::read(&receipt) else {
-        return bundled;
-    };
-    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-        return bundled;
-    };
-    let Some(slot) = value["slot"].as_str() else {
-        return bundled;
-    };
-    if slot.is_empty()
-        || slot.len() > 100
-        || !slot
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    {
-        return bundled;
-    }
-    let selected = root
-        .join("updates")
-        .join("versions")
-        .join(slot)
-        .join("app");
-    if selected.join("bootstrap.mjs").is_file() {
-        selected
-    } else {
-        bundled
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn active_slot_wins_when_present() {
-        let root = tempfile::tempdir().unwrap();
-        let app = root.path().join("updates/versions/test-slot/app");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::write(app.join("bootstrap.mjs"), "fixture").unwrap();
-        std::fs::write(
-            root.path().join("updates/active.json"),
-            r#"{"schemaVersion":1,"slot":"test-slot","version":"0.1.18"}"#,
-        )
-        .unwrap();
-        assert_eq!(resolve_app(root.path()), app);
-    }
-
-    #[test]
-    fn invalid_slot_does_not_escape() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("updates/active.json"),
-            r#"{"schemaVersion":1,"slot":"../escape","version":"0.1.18"}"#,
-        )
-        .unwrap();
-        assert_eq!(resolve_app(root.path()), root.path().join("app"));
+impl Drop for Job {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(
+                self.handle as *mut _,
+            ));
+        }
     }
 }
