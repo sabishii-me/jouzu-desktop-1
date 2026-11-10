@@ -170,6 +170,7 @@ async fn main() -> ExitCode {
         version: VERSION.to_string(),
         sessions: sessions.clone(),
         control,
+        models: std::sync::Arc::new(jouzu_host::models::Models::new(&home)),
     };
     let app = router(state);
 
@@ -195,4 +196,5 @@ async fn main() -> ExitCode {
         }
     }
 }
+
 

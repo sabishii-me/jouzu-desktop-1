@@ -18,6 +18,7 @@ mod artifacts;
 pub mod control;
 mod environment;
 mod files;
+pub mod models;
 pub mod session;
 
 use session::{ApiError, CreateRequest, SendRequest, SessionManager};
@@ -52,6 +53,7 @@ pub struct AppState {
     pub version: String,
     pub sessions: Arc<SessionManager>,
     pub control: Arc<control::ControlManager>,
+    pub models: Arc<models::Models>,
 }
 
 #[derive(Debug, Serialize)]
@@ -232,6 +234,7 @@ pub fn router(state: AppState) -> Router {
         .route("/control/cancel", axum::routing::post(control_cancel))
         .route("/control/events", get(control_events))
         .route("/models", get(models))
+        .route("/models/refresh", axum::routing::post(refresh_models))
         .route(
             "/workspaces",
             get(list_workspaces).post(add_workspaces),
@@ -880,7 +883,13 @@ async fn save_environment(
 }
 
 async fn models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(state.sessions.models()?))
+    state.models.get(&state.control).await.map(Json)
+}
+
+/// Jouzu refreshes its catalog, then the host re-reads the snapshot. A failure keeps
+/// the previous snapshot and marks it stale.
+async fn refresh_models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    state.models.refresh(&state.control).await.map(Json)
 }
 
 async fn capabilities(State(state): State<AppState>) -> Json<Value> {
@@ -1158,6 +1167,7 @@ mod tests {
                 10,
             )),
             control: control_manager(&dist),
+            models: Arc::new(models::Models::new(&dist)),
         }
     }
 
@@ -1491,6 +1501,7 @@ mod session_tests {
             version: "0.1.0".to_string(),
             sessions: manager,
             control: Arc::new(control::ControlManager::new(&home, &home, &home, &home.join("data")).expect("control manager")),
+            models: Arc::new(models::Models::new(&home)),
         }
         .pipe(router)
     }
@@ -2465,6 +2476,10 @@ mod session_tests {
         assert_eq!(reports[0]["kind"], "work");
     }
 }
+
+
+
+
 
 
 

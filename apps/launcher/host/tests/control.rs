@@ -8,7 +8,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use jouzu_host::control::ControlManager;
+use jouzu_host::{control::ControlManager, models::Models};
 use serde_json::json;
 
 fn app_dir() -> Option<PathBuf> {
@@ -79,3 +79,46 @@ async fn cancelling_idle_control_is_a_no_op() {
     assert!(!manager.cancel(None));
     assert!(!manager.cancel(Some("c-never-started")));
 }
+
+#[tokio::test]
+async fn models_snapshot_comes_from_the_real_adapter() {
+    let Some(app) = app_dir() else { return };
+    let temp = tempfile::tempdir().unwrap();
+    let home = match std::env::var_os("JOUZU_HOST_TEST_HOME") {
+        Some(value) => PathBuf::from(value),
+        None => {
+            eprintln!("skipped: set JOUZU_HOST_TEST_HOME to a real JOUZU_HOME with models");
+            return;
+        }
+    };
+    let control = manager(&app, &home);
+    let cache = temp.path().join("host");
+    let models = Models::new(&cache);
+
+    let snapshot = models.get(&control).await.expect("model snapshot");
+    let list = snapshot["models"].as_array().expect("models array");
+    assert!(!list.is_empty(), "adapter returned no models: {snapshot}");
+    assert!(snapshot["generatedAt"].is_string());
+    assert_eq!(snapshot["stale"], false);
+    let first = &list[0];
+    assert!(first["provider"].is_string() && first["id"].is_string() && first["name"].is_string());
+    assert!(cache.join("host-state").join("models.json").is_file(), "snapshot was not cached");
+
+    // A second read is served from the cache: no adapter process is needed.
+    let cached = models.get(&control).await.expect("cached snapshot");
+    assert_eq!(cached["generatedAt"], snapshot["generatedAt"]);
+}
+
+#[tokio::test]
+async fn a_fresh_home_still_yields_a_snapshot() {
+    let Some(app) = app_dir() else { return };
+    let temp = tempfile::tempdir().unwrap();
+    let control = manager(&app, &temp.path().to_path_buf());
+    let models = Models::new(temp.path());
+
+    // Jouzu ships built-in catalogue providers, so a fresh home is usable and must not
+    // be reported as "no models" merely because nothing was refreshed yet.
+    let snapshot = models.get(&control).await.expect("snapshot on a fresh home");
+    assert!(!snapshot["models"].as_array().expect("models array").is_empty());
+}
+
