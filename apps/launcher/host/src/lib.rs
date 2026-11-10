@@ -15,6 +15,7 @@ use std::{
 #[cfg(windows)]
 mod runtime_process;
 mod artifacts;
+mod control;
 mod environment;
 mod files;
 pub mod session;
