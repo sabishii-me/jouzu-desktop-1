@@ -188,6 +188,8 @@ export class ChatPool {
       return cached;
     }
     if (cached) this.entries.delete(key);
+    const sessionKey = `session:${key}`;
+    await invoke("chat_stop_session", { sessionKey }).catch(() => {});
     let client: ChatConnection;
     try { client = await this.lease(path, sessionPath, dialog, false); }
     catch (error) {
@@ -200,6 +202,7 @@ export class ChatPool {
       this.entries.delete(key);
       client = await this.lease(path, sessionPath, dialog, false);
     }
+    await invoke("chat_claim", { handle: client.chatHandle, sessionKey });
     this.entries.set(key, client);
     this.watch(client);
     this.emitStatus();
@@ -214,9 +217,24 @@ export class ChatPool {
     return client;
   }
 
+  /** Drop a dead entry after the native owner was force-stopped. */
+  forget(sessionPath: string): void {
+    const key = entryKey(sessionPath);
+    const client = this.entries.get(key);
+    this.entries.delete(key);
+    if (client) { this.unwatch(client); void client.close(); }
+    this.emitStatus();
+  }
+
   /** Keep an existing client under its session path so switching back is instant. */
   remember(sessionPath: string, client: ChatConnection): void {
-    this.entries.set(entryKey(sessionPath), client);
+    const key = entryKey(sessionPath);
+    const previous = this.entries.get(key);
+    if (previous && previous !== client) {
+      this.unwatch(previous);
+      void previous.close();
+    }
+    this.entries.set(key, client);
     this.watch(client);
     this.emitStatus();
     while (this.entries.size > this.maxSessions) {

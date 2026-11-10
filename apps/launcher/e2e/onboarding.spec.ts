@@ -10,7 +10,7 @@ async function openSetup(page:Page, initial:{profile?:string|null;modelReady?:bo
   const callbacks:Record<string,unknown>={};
   const s={profile:state.profile ?? null,modelReady:state.modelReady ?? false,signedIn:state.modelReady ?? false,recent:state.recent ?? []};
   let cancelPending:(()=>void)|null=null;
-  const snapshot=()=>({schemaVersion:1,modelReady:s.modelReady,profile:s.profile,account:{signedIn:s.signedIn},credentials:[],customProviders:[],providers:[{id:'openai',name:'OpenAI'}],models:[]});
+  const snapshot=()=>({schemaVersion:1,modelReady:s.modelReady,profile:s.profile,account:{signedIn:s.signedIn},credentials:[],customProviders:[],providers:[{id:'openai',name:'OpenAI'},{id:'openai-codex',name:'Codex',oauth:true,oauthName:'OpenAI (ChatGPT Plus/Pro)',apiKey:false}],models:[]});
   (window as any).__TAURI_INTERNALS__={
    metadata:{currentWindow:{label:'main'},currentWebview:{label:'main'}},
    transformCallback:(callback:unknown)=>{const id=String(Math.random());callbacks[id]=callback;return id;},
@@ -30,6 +30,10 @@ async function openSetup(page:Page, initial:{profile?:string|null;modelReady?:bo
       s.signedIn=true;
       // The device panel stays until sign-in settles, mirroring the blocking backend call.
       (callbacks[(window as any).__deviceHandler] as any)?.({event:'control-device',id:1,payload:{url:'https://platform.shisa.ai/connect',code:'DEMO-1234'}});
+      return new Promise((resolve,reject)=>{cancelPending=()=>{cancelPending=null;reject(new Error('cancelled'));};setTimeout(()=>{cancelPending=null;resolve(snapshot());},8000);});
+     }
+     if(action==='provider-oauth'){
+      (callbacks[(window as any).__deviceHandler] as any)?.({event:'control-device',id:1,payload:{provider:'openai-codex',url:'https://auth.openai.com/codex/device',code:'DEMO-CODE'}});
       return new Promise((resolve,reject)=>{cancelPending=()=>{cancelPending=null;reject(new Error('cancelled'));};setTimeout(()=>{cancelPending=null;resolve(snapshot());},8000);});
      }
      return snapshot();
@@ -83,6 +87,18 @@ test('Shisa.AI authorization keeps its actions together and cancels cleanly', as
  await cancel.click();
  await expect(open).toHaveCount(0);
  await expect(page.getByRole('button',{name:'Sign in to Shisa.AI',exact:true})).toBeVisible();
+});
+
+test('Codex OAuth is an Add Provider entry and cancels cleanly', async ({page}) => {
+ await openSetup(page,{modelReady:false});
+ await page.getByRole('combobox',{name:'Service',exact:true}).click();
+ await page.getByRole('option',{name:'Codex',exact:true}).click();
+ await expect(page.getByText('OpenAI (ChatGPT Plus/Pro)',{exact:true})).toBeVisible();
+ await page.getByRole('button',{name:'Sign in with ChatGPT',exact:true}).click();
+ await expect(page.getByLabel('Sign-in URL',{exact:true})).toHaveValue('https://auth.openai.com/codex/device');
+ await expect(page.getByLabel('Device code',{exact:true})).toHaveValue('DEMO-CODE');
+ await page.getByRole('button',{name:'Cancel',exact:true}).click();
+ await expect(page.getByRole('button',{name:'Sign in with ChatGPT',exact:true})).toBeVisible();
 });
 
 test('a configured model opens the workspace', async ({page}) => {

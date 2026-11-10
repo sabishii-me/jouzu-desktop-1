@@ -3,6 +3,7 @@ import { Popover } from 'radix-ui';
 import { Check, ChevronsUpDown } from 'lucide-react';
 import { Button } from './button';
 import { Input } from './input';
+import { ScrollArea } from './scroll-area';
 
 export function ProviderPicker({value,items,label,placeholder,searchLabel,empty,disabled,onChange}:{value:string;items:{id:string;name:string}[];label:string;placeholder:string;searchLabel:string;empty:string;disabled?:boolean;onChange:(value:string)=>void}) {
  const [open,setOpen]=useState(false);
@@ -19,7 +20,7 @@ export function ProviderPicker({value,items,label,placeholder,searchLabel,empty,
     if(event.key==='ArrowUp'){event.preventDefault();setActive(index=>Math.max(0,index-1));}
     if(event.key==='Enter' && filtered[active]){event.preventDefault();select(filtered[active].id);}
    }}/>
-   <div id={id} role="listbox" aria-label={label} className="mt-2 max-h-64 overflow-y-auto">{filtered.map((item,index)=><button key={item.id} id={`${id}-${index}`} type="button" role="option" aria-selected={value===item.id} onMouseEnter={()=>setActive(index)} onClick={()=>select(item.id)} className={`flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm ${index===active ? 'bg-accent text-accent-foreground' : ''}`}>{item.name}{value===item.id && <Check className="size-4"/>}</button>)}{!filtered.length && <p className="p-3 text-sm text-muted-foreground">{empty}</p>}</div>
+   <ScrollArea className="mt-2" style={{ height: Math.min(256, Math.max(64, filtered.length * 40)) }}><div id={id} role="listbox" aria-label={label}>{filtered.map((item,index)=><button key={item.id} id={`${id}-${index}`} type="button" role="option" aria-selected={value===item.id} onMouseEnter={()=>setActive(index)} onClick={()=>select(item.id)} className={`flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm ${index===active ? 'bg-accent text-accent-foreground' : ''}`}>{item.name}{value===item.id && <Check className="size-4"/>}</button>)}{!filtered.length && <p className="p-3 text-sm text-muted-foreground">{empty}</p>}</div></ScrollArea>
   </Popover.Content></Popover.Portal>
  </Popover.Root>;
 }

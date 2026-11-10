@@ -12,6 +12,7 @@ pub fn directory(managed: &Path) -> PathBuf {
 }
 
 fn ask(root: &Path, managed: &Path, action: &str, write: bool) -> Result<serde_json::Value, String> {
+    crate::runtime_install::write_tool_scripts(managed)?;
     let mut arguments = vec![
         "-Directory".to_string(),
         directory(managed).to_string_lossy().into_owned(),

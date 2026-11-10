@@ -6,6 +6,8 @@
  * must not call the old Tauri commands.
  */
 export interface ControlDevice {
+  /** Set for a provider OAuth device flow; absent for Shisa.AI sign-in. */
+  provider?: string;
   url: string;
   code: string;
 }
@@ -50,8 +52,12 @@ export function subscribeControl(onDevice: (device: ControlDevice) => void): () 
   source.addEventListener("control.device", event => {
     try {
       const data = JSON.parse((event as MessageEvent<string>).data) as Partial<ControlDevice>;
-      if (typeof data.url === "string" && typeof data.code === "string") {
-        onDevice({ url: data.url, code: data.code });
+      if (typeof data.url === "string") {
+        onDevice({
+          url: data.url,
+          code: typeof data.code === "string" ? data.code : "",
+          ...(typeof data.provider === "string" ? { provider: data.provider } : {}),
+        });
       }
     } catch {
       /* A malformed frame is not a device code. */

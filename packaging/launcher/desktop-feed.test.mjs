@@ -9,7 +9,7 @@ const base = {
 	version: '1.0.1',
 	notes: '- Desktop-only release',
 	pubDate: '2026-10-23T04:00:00Z',
-	repository: 'sabishii-me/jouzu-desktop',
+	repository: 'shisa-ai/jouzu-desktop',
 	assetName: 'JouzuDesktop_1.0.1_x64-setup.exe',
 	signature: '  dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZQo  \n',
 };
@@ -21,7 +21,7 @@ test('the feed names the version release asset for the Windows target', () => {
 	assert.deepEqual(feed.platforms, {
 		'windows-x86_64': {
 			signature: 'dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZQo',
-			url: 'https://github.com/sabishii-me/jouzu-desktop/releases/download/v1.0.1/JouzuDesktop_1.0.1_x64-setup.exe',
+			url: 'https://github.com/shisa-ai/jouzu-desktop/releases/download/v1.0.1/JouzuDesktop_1.0.1_x64-setup.exe',
 		},
 	});
 });
@@ -52,3 +52,4 @@ test('the feed file is UTF-8 without a byte order mark', () => {
 	assert.ok(bytes.toString('utf8').endsWith('\n'));
 	assert.equal(JSON.parse(bytes.toString('utf8')).platforms['windows-x86_64'].signature, 'dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZQo');
 });
+

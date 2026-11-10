@@ -3,7 +3,7 @@
    directory that holds none of this project's markup. */
 @source "../index.html";
 @source "./**/*.{ts,tsx}";
-@theme inline {
+@theme {
   --color-card: #18191f;
   --color-card-foreground: #eeeeF2;
   --color-popover: #18191f;
@@ -72,3 +72,30 @@
 }
 .onboarding-card button.bg-primary:hover { filter: brightness(1.08); }
 
+
+
+/* Light theme keeps the JZ mark unchanged and stays off pure white: a warm lavender paper with
+   cyan and violet accents from the logo. */
+.light {
+  --color-card: #fbf8fd;
+  --color-card-foreground: #211a27;
+  --color-popover: #fbf8fd;
+  --color-popover-foreground: #211a27;
+  --color-accent: #ece2f4;
+  --color-accent-foreground: #241a2e;
+  --color-input: #e3dbea;
+  --color-destructive: #b42318;
+  --color-background: #f3eef7;
+  --color-foreground: #211a27;
+  --color-primary: #0b8fa8;
+  --color-primary-foreground: #ffffff;
+  --color-muted: #eae3f0;
+  --color-muted-foreground: #665b70;
+  --color-border: #d8cee0;
+  --color-ring: #8b6aa8;
+  color-scheme: light;
+}
+.light body { color-scheme: light; }
+.light * { scrollbar-color: #b9aac7 transparent; }
+.light *::-webkit-scrollbar-thumb { background: #b9aac7; background-clip: padding-box; }
+.light *::-webkit-scrollbar-thumb:hover { background: #9e8bb0; background-clip: padding-box; }

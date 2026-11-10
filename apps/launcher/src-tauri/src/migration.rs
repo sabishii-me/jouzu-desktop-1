@@ -10,6 +10,8 @@ const MARKER_DIRECTORY: &str = "migration";
 const MARKER_FILE: &str = "launcher-data-v1.json";
 
 pub fn migrate_legacy_launcher_data() -> Result<(), String> {
+    #[cfg(not(windows))]
+    return Ok(());
     #[cfg(debug_assertions)]
     if std::env::var_os("JOUZU_LAUNCHER_DEV_HOME").is_some() {
         return Ok(());

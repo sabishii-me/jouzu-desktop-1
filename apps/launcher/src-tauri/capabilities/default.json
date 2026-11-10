@@ -29,10 +29,14 @@
           "url": "https://platform.shisa.ai/connect*"
         },
         {
-          "url": "https://github.com/shisa-ai/jouzu/*"
+          "url": "https://auth.openai.com/*"
+        },
+        {
+          "url": "https://github.com/shisa-ai/jouzu-desktop/*"
         }
       ]
     },
     "updater:default"
   ]
 }
+

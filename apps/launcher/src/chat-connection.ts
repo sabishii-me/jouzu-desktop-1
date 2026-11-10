@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { emptyProjection, historyProjection, interruptUnfinishedTools, object, projectEvent, type ChatProjection, type WireObject } from "./chat-projection";
 import { defaultChatTransport, type ChatTransport } from "./chat-transport";
 
@@ -5,7 +6,25 @@ import { defaultChatTransport, type ChatTransport } from "./chat-transport";
 export const pageGeneration = globalThis.crypto.randomUUID();
 
 export interface ChatImage { type: "image"; data: string; mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif" }
-export interface ChatModel { provider: string; id: string; name: string }
+export interface ChatModel {
+  provider: string;
+  id: string;
+  name: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+}
+interface CatalogModel {
+  id: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  cost?: ChatModel["cost"];
+}
+/** The Tauri bridge exists only in the desktop shell; the host-served UI has no bridge. */
+const canInvokeLocal = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+function hasCost(cost: ChatModel["cost"]): boolean {
+  return !!cost && Object.values(cost).some(value => typeof value === "number" && value !== 0);
+}
 export interface SessionStats {
   userMessages?: number;
   assistantMessages?: number;
@@ -42,6 +61,8 @@ export interface ChatSnapshot {  projection: ChatProjection;
   transportReady?: boolean;
   pending: boolean;
   error: string | null;
+  /** The runtime is reachable but its transcript could not be read. */
+  historyError?: string;
   sessionId?: string;
   sessionFile?: string;
   model?: string;
@@ -55,6 +76,8 @@ export interface ChatSnapshot {  projection: ChatProjection;
   stats?: SessionStats;
   thinkingLevel?: string;
   thinkingLevels?: string[];
+  /** The transcript was compacted after a display backlog and will be reloaded. */
+  gap?: boolean;
 }
 // A response watchdog, not a request deadline: the released runtime owns how long a command
 // takes, and a lost answer is only distinguishable from a slow one by waiting a long time.
@@ -69,6 +92,7 @@ export class ChatConnection {
   private timer?: ReturnType<typeof setTimeout>;
   private polling = false;
   private replaying = false;
+  private gapPending = false;
   private nextId = 0;
   private dialogs = new Map<string, number | null>();
   private lastPoll = Date.now();
@@ -146,6 +170,11 @@ export class ChatConnection {
         if (this.replaying && record.type !== "extension_ui_request" && record.type !== "extension_error") continue;
         if (record.type === "response") {
           continue;
+        } else if (record.type === "desktop_gap") {
+          // The native worker compacted an unread backlog. The turn continues; the
+          // view is behind until the next settle reconciles from get_messages.
+          this.gapPending = true;
+          this.update({ gap: true });
         } else if (record.type === "extension_ui_request") {
           if (record.method === "setWidget" && typeof record.widgetKey === "string") {
             const widgets = { ...(this.snapshot.widgets ?? {}) };
@@ -177,6 +206,14 @@ export class ChatConnection {
         this.update({ error });
       }
         else this.update({ projection: projectEvent(this.snapshot.projection, record) });
+      }
+      // Reconcile only when the turn is over: history is authoritative then, and a
+      // mid-turn get_messages would fight the live stream.
+      if (this.gapPending && this.snapshot.projection.running === false && !this.replaying && this.handle) {
+        this.gapPending = false;
+        void this.refreshHistory()
+          .then(() => this.update({ gap: false }))
+          .catch(() => { /* Keep the notice; the next settle retries. */ this.gapPending = true; });
       }
   }
   tick() {
@@ -219,20 +256,14 @@ export class ChatConnection {
         .catch(error => { this.requests.delete(id); reject(new Error(String(error))); });
     });
   }
-  async refreshHistory() {
+  private async readState(): Promise<Record<string, unknown>> {
     const state = await this.request("get_state");
     if (!object(state) || typeof state.sessionId !== "string" || typeof state.isStreaming !== "boolean") throw new Error("Runtime returned incompatible session state.");
-    const history = await this.request("get_messages");
-    if (!object(history) || !Array.isArray(history.messages)) throw new Error("Runtime returned incompatible history.");
-    const projection = historyProjection(history.messages);
-    projection.running = state.isStreaming;
-    const reconciled = projection.running ? projection : interruptUnfinishedTools(projection);
     const detail = object(state.model) ? state.model : undefined;
     const model = detail && typeof detail.name === "string" && detail.name !== "unknown" ? detail.name : undefined;
     const modelProvider = detail && typeof detail.provider === "string" && detail.provider !== "unknown" ? detail.provider : undefined;
     const modelId = detail && typeof detail.id === "string" && detail.id !== "unknown" ? detail.id : undefined;
     this.update({
-      projection: reconciled,
       sessionId: state.sessionId,
       sessionFile: typeof state.sessionFile === "string" ? state.sessionFile : undefined,
       model,
@@ -240,7 +271,27 @@ export class ChatConnection {
       modelId,
       thinkingLevel: typeof state.thinkingLevel === "string" ? state.thinkingLevel : undefined,
     });
+    return state;
   }
+  async refreshHistory() {
+    const state = await this.readState();
+    let history: unknown;
+    try {
+      history = await this.request("get_messages");
+    } catch (error) {
+      // A transcript larger than the transport frame is a per-session limit, not a
+      // reason to take the whole connection offline. Report it and stay reachable.
+      this.update({ historyError: String(error).replace(/^Error:\s*/u, "") });
+      return;
+    }
+    if (!object(history) || !Array.isArray(history.messages)) throw new Error("Runtime returned incompatible history.");
+    const projection = historyProjection(history.messages);
+    projection.running = state.isStreaming as boolean;
+    const reconciled = projection.running ? projection : interruptUnfinishedTools(projection);
+    this.update({ projection: reconciled, historyError: undefined });
+  }
+  /** Retry the transcript read that failed; the connection was never closed. */
+  async retryHistory() { await this.refreshHistory(); }
   private async applyPreferredModel() {
     const preferred = this.preferredModel;
     if (!preferred) return;
@@ -273,6 +324,11 @@ export class ChatConnection {
   }
   newSession() { return this.changeSession("new_session"); }
   resumeSession(sessionPath: string) { return this.changeSession("switch_session", { sessionPath }); }
+  /** Ask the runtime, not the event projection, whether it is processing. */
+  async isStreaming(): Promise<boolean> {
+    const state = await this.request("get_state");
+    return object(state) && state.isStreaming === true;
+  }
   /** Reopen the current session so extensions, skills, MCP servers and catalogs re-bind. */
   async reloadSession() {
     const sessionPath = this.snapshot.sessionFile;
@@ -301,30 +357,75 @@ export class ChatConnection {
     } catch (error) { this.update({ error: String(error) }); throw error; }
     finally { this.update({ pending: false }); }
   }
+  clearError() { this.update({ error: null }); }
   async abort() {
     try { await this.request("clear_queue"); } catch { /* The queue may already be empty; abort still applies. */ }
     try { await this.request("abort"); } catch (error) { this.update({ error: String(error) }); }
   }
-  async compact() {
+  /**
+   * Compact a session without loading its transcript. Attaching for compact used
+   * to call get_messages, and a large session's response exceeds the 32 MiB JSONL
+   * frame limit before compact can run. switch_session loads the runtime side;
+   * get_state is small; the view keeps the preview it already has.
+   */
+  async compactSession(sessionPath?: string) {
     if (!this.snapshot.connected || this.snapshot.pending || this.snapshot.projection.running) throw new Error("Wait for the current conversation to settle before compacting.");
     this.update({ pending: true, error: null });
+    this.replaying = true;
     try {
+      if (sessionPath && sessionPath !== this.snapshot.sessionFile) {
+        const result = await this.request("switch_session", { sessionPath });
+        if (object(result) && result.cancelled === true) throw new Error("The runtime cancelled the conversation change.");
+        await this.readState();
+      }
+      // Compaction changes the runtime context, not the transcript this view already
+      // holds. No get_messages here; the next open reads the compacted history.
       await this.request("compact");
-      await this.refreshHistory();
-    } catch (error) { throw error; }
-    finally { this.update({ pending: false }); }
+    } catch (error) {
+      this.update({ error: String(error) });
+      throw error;
+    } finally {
+      this.replaying = false;
+      this.update({ pending: false });
+    }
   }
+  async compact() { return this.compactSession(); }
   async exportHtml(outputPath: string) {
     if (!this.snapshot.connected) throw new Error("Chat is not connected.");
     await this.request("export_html", { outputPath });
   }
   async loadModels() {
     try {
-      const data = await this.request("get_available_models");
+      const [data, catalog] = await Promise.all([
+        this.request("get_available_models"),
+        canInvokeLocal() ? invoke<{ models?: CatalogModel[] }>("model_catalog").catch(() => ({ models: [] })) : Promise.resolve({ models: [] }),
+      ]);
+      const catalogModels: CatalogModel[] = object(catalog) && Array.isArray(catalog.models) ? (catalog.models.filter(object) as CatalogModel[]) : [];
+      const catalogFor = (id: string) => {
+        const value = id.toLowerCase();
+        return catalogModels.find(model => typeof model.id === "string" && (value === model.id.toLowerCase() || value.endsWith(`/${model.id.toLowerCase()}`)));
+      };
       const models = object(data) && Array.isArray(data.models)
-        ? data.models.flatMap(entry => object(entry) && typeof entry.provider === "string" && typeof entry.id === "string"
-          ? [{ provider: entry.provider, id: entry.id, name: typeof entry.name === "string" ? entry.name : entry.id }]
-          : [])
+        ? data.models.flatMap(entry => {
+          if (!object(entry) || typeof entry.provider !== "string" || typeof entry.id !== "string") return [];
+          const runtimeCost = object(entry.cost) ? {
+            input: typeof entry.cost.input === "number" ? entry.cost.input : undefined,
+            output: typeof entry.cost.output === "number" ? entry.cost.output : undefined,
+            cacheRead: typeof entry.cost.cacheRead === "number" ? entry.cost.cacheRead : undefined,
+            cacheWrite: typeof entry.cost.cacheWrite === "number" ? entry.cost.cacheWrite : undefined,
+          } : undefined;
+          const catalogModel = catalogFor(entry.id);
+          return [{
+            provider: entry.provider,
+            id: entry.id,
+            name: typeof entry.name === "string" ? entry.name : entry.id,
+            contextWindow: catalogModel?.contextWindow ?? (typeof entry.contextWindow === "number" ? entry.contextWindow : undefined),
+            maxTokens: catalogModel?.maxTokens ?? (typeof entry.maxTokens === "number" ? entry.maxTokens : undefined),
+            // The runtime projection uses zero as a placeholder. Show a price only
+            // when the catalog has one, or a provider supplied a real non-zero cost.
+            cost: catalogModel?.cost ?? (hasCost(runtimeCost) ? runtimeCost : undefined),
+          }];
+        })
         : [];
       this.update({ models });
     } catch (error) { this.update({ error: `Could not read the model list. ${String(error)}` }); }
@@ -382,3 +483,7 @@ export class ChatConnection {
     if (this.handle) await this.transport.stop(this.handle);
   }
 }
+
+
+
+

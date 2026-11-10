@@ -117,16 +117,17 @@ pub fn save_tools(managed: &Path, image: &serde_json::Value) -> Result<serde_jso
 
 /// Run the extension's CLI entry with the same home the runtime uses.
 fn run_cli(managed: &Path, args: &[&str]) -> Result<serde_json::Value, String> {
-    let home = crate::runtime::effective_home()?;
-    let node = managed.join("runtime").join("node").join("node.exe");
-    let script = home.join("agent").join("extensions").join("jouzu-image").join("index.js");
+    let node = crate::runtime_install::node_executable(managed);
     if !node.is_file() {
         return Err("The runtime is not installed yet.".into());
     }
+    let home = crate::runtime::effective_home()?;
+    let script = home.join("agent").join("extensions").join("jouzu-image").join("index.js");
     if !script.is_file() {
         return Err("The image tool is not installed yet.".into());
     }
-    let mut child = std::process::Command::new(node)
+    let mut command = std::process::Command::new(node);
+    command
         .arg(&script)
         .args(args)
         .env("JOUZU_HOME", &home)
@@ -134,7 +135,13 @@ fn run_cli(managed: &Path, args: &[&str]) -> Result<serde_json::Value, String> {
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_PATH")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command
         .spawn()
         .map_err(|_| "The image tool could not be started.".to_string())?;
     // Never wait forever on a provider that does not answer.

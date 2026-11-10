@@ -1,5 +1,5 @@
 import { ArtifactImage } from "./artifact-image";
-import { StateDot } from "./activity-row";
+import { ToolFrame } from "./tool-frame";
 import { imageBlocks } from "./tool-output";
 import { toolText, record, type ToolRendererProps } from "./types";
 import { artifactPathFromText } from "./artifact-path";
@@ -26,15 +26,11 @@ export function ImageRenderer({ tool }: ToolRendererProps) {
       height: typeof meta?.height === "number" ? meta.height : undefined,
     };
   });
+  const state = tool.phase === "running" ? "running" : tool.phase === "error" ? "error" : "done";
   const summary = tool.phase === "running" ? "Generating…" : tool.phase === "error" ? "Failed" : `${items.length} image${items.length === 1 ? "" : "s"}${[model, size].filter(Boolean).length ? ` · ${[model, size].filter(Boolean).join(" · ")}` : ""}`;
-  return <section aria-label="Generated image" className="overflow-hidden rounded-lg border border-border bg-card">
-    <header className="flex items-center gap-2 border-b border-border px-3 py-2">
-      <StateDot state={tool.phase === "running" ? "running" : tool.phase === "error" ? "error" : "done"} />
-      <span className="text-xs font-medium">generate_image</span>
-      <span className="min-w-0 truncate text-[10px] text-muted-foreground">{summary}</span>
-    </header>
-    {items.length ? <div className="grid gap-3 p-3 sm:grid-cols-2">
+  return <ToolFrame title="Generated image" subtitle={summary} state={state} defaultOpen>
+    {items.length ? <div className="grid gap-3 sm:grid-cols-2">
       {items.map((image, index) => <ArtifactImage key={index} image={image} caption={image.width && image.height ? `${image.width}×${image.height}` : undefined} />)}
-    </div> : <p className="p-3 text-xs text-muted-foreground">{tool.phase === "error" ? "The generation failed." : "Generating…"}</p>}
-  </section>;
+    </div> : <p className="text-xs text-muted-foreground">{tool.phase === "error" ? "The generation failed." : "Generating…"}</p>}
+  </ToolFrame>;
 }

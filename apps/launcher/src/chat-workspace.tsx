@@ -7,27 +7,39 @@ import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { McpMenu } from "./mcp-menu";
 import { ChatConversation } from "./chat-conversation";
+import { AgentAction } from "./chat-live";
 import { Composer } from "./composer";
+import { clearPending, pendingFor, setPending, type PendingBySession } from "./pending-prompt";
+import { changedFiles, snapshotComplete, type WorkspaceSnapshot } from "./workspace-diff";
+import { loadCollapsed, saveCollapsed, toggleCollapsed } from "./sidebar-state";
 import { ArtifactsPanel } from "./artifacts-panel";
 import { useApi } from "./api/context";
 import type { SessionSummary as ApiSessionSummary } from "./api/jouzu-api";
+import { collectOutputReferences } from "./artifact-references";
 import { PanelStart } from "./panel-start";
 import { FilesPanel } from "./files-panel";
 import { ToolReviewDialog } from "./tool-review-dialog";
 import { ChatConnection, flowNoticeText, type ChatSnapshot } from "./chat-connection";
 import { chatPool } from "./chat-pool";
 import { fitsSendBudget, readImageAttachment, removeSubmittedImages, validateImageSelection, type ImageAttachment } from "./chat-attachments";
+import { normalizeVideoUrl, videoMarker } from "./video-url";
 import { emptyProjection, historyProjection, interruptUnfinishedTools, type ChatProjection, type FlowReportRecord, type WireObject } from "./chat-projection";
 import { clearDraft, draftKey, readDraft, writeDraft } from "./drafts";
-import { humanizeRuntimeError, isCapacityError } from "./runtime-errors";
+import { humanizeRuntimeError, isCapacityError, isFlowHistoryError } from "./runtime-errors";
 import { beginDialogResponse, emptyDialogQueue, enqueueDialog, expireDialogs, nextDialogDeadline, removeDialog, type DialogAnswer, type DialogQueue } from "./dialog-queue";
 import { BackgroundMenu, deriveFlow, deriveSubagents, FlowMenu, latestFlowError, SubagentMenu } from "./tool-renderers";
 import { SessionStatsBar } from "./session-stats-bar";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import { parseTextGuardNotice, parseTextGuardResult, TextGuardBar, type TextGuardData, type TextGuardItem } from "./textguard-bar";
 import type { SessionTiming } from "./chat-connection";
 
 type TextGuardView = { data: TextGuardData | null; seen: boolean; historical: boolean; open: boolean; busy: boolean; error: string | null; loading: boolean };
 const emptyTextGuardView: TextGuardView = { data: null, seen: false, historical: false, open: false, busy: false, error: null, loading: false };
+
+/** The side pane starts at half the window so chat and pane have equal room. */
+function defaultPaneWidth() {
+  return Math.min(960, Math.max(480, Math.round(window.innerWidth / 2)));
+}
 
 interface WorkspaceItem { id: string; path: string }
 interface SessionSummary { path: string; title: string; workspace: string; updated: number; pinned: boolean; archived: boolean }
@@ -43,6 +55,7 @@ export interface ChatWorkspaceProps {
   catalogRefreshing?: boolean;
   canRefreshModels?: boolean;
   onModelsMissing?: () => void;
+  onRetryModels?: () => void;
   workspaces: readonly WorkspaceItem[];
   onSelect: (path: string) => void;
   onAddFolder: () => void;
@@ -54,7 +67,19 @@ export interface ChatWorkspaceProps {
 }
 const lastSegment = (path: string) => path.replaceAll("\\", "/").split("/").filter(Boolean).at(-1) ?? path;
 const workspaceLabel = (path: string) => lastSegment(path) === "default-workspace" ? "Default workspace" : lastSegment(path);
+const isDefaultWorkspace = (path: string) => lastSegment(path) === "default-workspace";
 const normalizedPath = (path: string) => path.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
+/**
+ * One identity for a session wherever it is stored. The runtime's session file is
+ * authoritative once attached; the selected row covers a session that is still
+ * opening. Queue, pending and draft state must all agree on this key.
+ */
+const sessionKeyOf = (sessionFile: string | undefined, selected: string | null | undefined) => normalizedPath(sessionFile ?? selected ?? "");
+/** The UUID at the end of a session file stem; a preview has no live session state. */
+const sessionIdFromFile = (path?: string): string | undefined => {
+  const name = path?.replaceAll("\\", "/").split("/").filter(Boolean).at(-1)?.replace(/\.jsonl$/u, "") ?? "";
+  return /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu.exec(name)?.[1];
+};
 function relativeTime(updated: number) {
   const seconds = Math.max(0, Math.round(Date.now() / 1000 - updated));
   if (seconds < 60) return "now";
@@ -63,10 +88,21 @@ function relativeTime(updated: number) {
   return `${Math.floor(seconds / 86400)}d`;
 }
 
-export function ChatWorkspace({ path, revision = 0, newSession = true, locked = false, onStartSession, onRetry, onBusyChange, onBootChange, catalogRefreshing = false, canRefreshModels = false, onModelsMissing, workspaces, onSelect, onAddFolder, onRemove, onSettings, onUpdate, updateAvailable = false, updateBusy = false }: ChatWorkspaceProps) {
+export function ChatWorkspace({ path, revision = 0, newSession = true, locked = false, onStartSession, onRetry, onBusyChange, onBootChange, catalogRefreshing = false, canRefreshModels = false, onModelsMissing, onRetryModels, workspaces, onSelect, onAddFolder, onRemove, onSettings, onUpdate, updateAvailable = false, updateBusy = false }: ChatWorkspaceProps) {
   const api = useApi();
   const chatUnavailable = !api.capabilities.features.includes("chat");
   const [snapshot, setSnapshot] = useState<ChatSnapshot>({ projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [] });
+  const [workingStartedAt, setWorkingStartedAt] = useState<number>();
+  // A pending prompt belongs to the session that accepted it. A single value made an
+  // unsettled message from one session render in every other session.
+  const [pendingBySession, setPendingBySession] = useState<PendingBySession>({});
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!snapshot.projection.running) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [snapshot.projection.running]);
+  const elapsed = workingStartedAt ? `${String(Math.floor((now - workingStartedAt) / 60000)).padStart(2, "0")}:${String(Math.floor(((now - workingStartedAt) % 60000) / 1000)).padStart(2, "0")}` : undefined;
   const [draft, setDraft] = useState("");
   const draftRef = useRef(draft);
   draftRef.current = draft;
@@ -74,11 +110,29 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [attachments, setAttachments] = useState<ImageAttachment[]>([]);
   const attachmentRef = useRef(attachments);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [videoUrls, setVideoUrls] = useState<string[]>([]);
+  const [queuedBySession, setQueuedBySession] = useState<Record<string, string[]>>({});
+  const videoRef = useRef(videoUrls);
+  videoRef.current = videoUrls;
   const [readingImages, setReadingImages] = useState(false);
   const readingRef = useRef(false);
   const [switching, setSwitching] = useState(false);
   const [commandBusy, setCommandBusy] = useState(false);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
+  const queueSessionKey = sessionKeyOf(snapshot.sessionFile, selectedSession);
+  const queuedSteers = queueSessionKey ? queuedBySession[queueSessionKey] ?? [] : [];
+  const pendingUser = pendingFor(pendingBySession, queueSessionKey);
+  useEffect(() => {
+    if (snapshot.projection.running) return;
+    const key = normalizedPath(snapshot.sessionFile ?? "");
+    if (!key) return;
+    setQueuedBySession(previous => {
+      if (!previous[key]?.length) return previous;
+      const next = { ...previous };
+      delete next[key];
+      return next;
+    });
+  }, [snapshot.projection.running, snapshot.sessionFile]);
   const selectedRowRef = useRef<HTMLDivElement | null>(null);
   const switchingRef = useRef(false);
   const switchingTarget = useRef<string | "new" | null>(null);
@@ -95,6 +149,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const dialog = dialogs.items[0] ?? null;
   const [answer, setAnswer] = useState("");
   const [notification, setNotification] = useState("");
+  // The provider refused an image already in the history; the session stays usable only
+  // after the offending image is removed, so offer that instead of a dead end.
+  const [imageRepair, setImageRepair] = useState(false);
+  // Files the current turn actually changed. The transcript only carries edit-tool
+  // arguments, so a file written by a shell command needs a workspace comparison.
+  const [turnChangedFiles, setTurnChangedFiles] = useState<string[]>([]);
+  const turnBaseline = useRef<WorkspaceSnapshot | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [textguardBySession, setTextguardBySession] = useState<Record<string, TextGuardView>>({});
   const textguardRef = useRef(textguardBySession);
@@ -109,7 +170,18 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [flowNotice, setFlowNotice] = useState("");
   const [dropActive, setDropActive] = useState(false);
   const chatRoot = useRef<HTMLDivElement>(null);
-  const [sidebar, setSidebar] = useState(true);
+  const [sidebar, setSidebarState] = useState(() => {
+    try { return localStorage.getItem("jouzu.ui.sidebar") !== "closed"; } catch { return true; }
+  });
+  // Persist the user's choice: the workspace remounts when the app moves through
+  // runtime/setup screens, and a local default would reopen it behind their back.
+  const setSidebar = (value: boolean | ((current: boolean) => boolean)) => {
+    setSidebarState(current => {
+      const next = typeof value === "function" ? value(current) : value;
+      try { localStorage.setItem("jouzu.ui.sidebar", next ? "open" : "closed"); } catch { /* UI preference only */ }
+      return next;
+    });
+  };
   const [hero, setHero] = useState(newSession);
   // The pool owns every live session, including the ones that are not on screen;
   // the list re-renders when one of them starts or stops a turn.
@@ -119,8 +191,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [diskReports, setDiskReports] = useState<FlowReportRecord[]>([]);
   const [reportsSession, setReportsSession] = useState("");
   const [timing, setTiming] = useState<SessionTiming>();
-  const [workingStartedAt, setWorkingStartedAt] = useState<number>();
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => loadCollapsed());
   const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [showArchived, setShowArchived] = useState(false);
@@ -147,6 +218,23 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     attachmentRef.current = next;
     setAttachments(next);
     saveDraft(draftRef.current, next);
+  }
+  function addVideoUrl(input: string): string | null {
+    try {
+      const url = normalizeVideoUrl(input);
+      if (videoRef.current.includes(url)) return "This video URL is already attached.";
+      const next = [...videoRef.current, url];
+      videoRef.current = next;
+      setVideoUrls(next);
+      return null;
+    } catch (error) {
+      return String(error instanceof Error ? error.message : error);
+    }
+  }
+  function removeVideoUrl(url: string) {
+    const next = videoRef.current.filter(value => value !== url);
+    videoRef.current = next;
+    setVideoUrls(next);
   }
   function saveDraft(text: string, next: ImageAttachment[]) {
     const key = draftKeyRef.current;
@@ -232,6 +320,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       }
       else if (request.method === "notify") {
         const message = String(request.message ?? "");
+        // The runtime already raises a plain-text alert as content is withheld; it carries no
+        // items, so mark the session seen and let the panel's inspect fetch the review.
+        if (/^TextGuard (?:withheld|flagged)\b/u.test(message) || /^TextGuard: \d+ items? waiting for your review/u.test(message)) {
+          const id = activeSessionIdRef.current;
+          if (id) updateTextGuard(id, { seen: true, historical: false, error: null, loading: false });
+          return;
+        }
         const textguard = parseTextGuardNotice(message);
         if (textguard) {
           const id = textguard.sessionId ?? owner.snapshot.sessionId;
@@ -285,7 +380,29 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       else parkPrevious(client ?? null);
     };
   }, [path, revision]);
-  useEffect(() => { onBusyChange?.(snapshot.pending || snapshot.projection.running || draft.trim().length > 0); }, [snapshot.pending, snapshot.projection.running, draft, onBusyChange]);
+  // Snapshot the workspace around each turn so the summary can report files that no
+  // edit tool mentioned. A truncated snapshot is ignored rather than reported as a
+  // partial list.
+  useEffect(() => {
+    if (!snapshot.connected) return;
+    if (snapshot.projection.running) {
+      if (turnBaseline.current) return;
+      void invoke<WorkspaceSnapshot>("workspace_snapshot", { path })
+        .then(before => { if (!turnBaseline.current) turnBaseline.current = before; })
+        .catch(() => { /* The summary falls back to edit-tool arguments. */ });
+      return;
+    }
+    const before = turnBaseline.current;
+    if (!before) return;
+    turnBaseline.current = null;
+    void invoke<WorkspaceSnapshot>("workspace_snapshot", { path })
+      .then(after => setTurnChangedFiles(snapshotComplete(before) && snapshotComplete(after) ? changedFiles(before, after) : []))
+      .catch(() => setTurnChangedFiles([]));
+  }, [snapshot.connected, snapshot.projection.running, path]);
+  useEffect(() => { setTurnChangedFiles([]); turnBaseline.current = null; }, [path, revision]);
+  // Only a live turn blocks a runtime restart. A saved draft does not: it lives in
+  // localStorage and must not make a model refresh wait for the composer to empty.
+  useEffect(() => { onBusyChange?.(snapshot.pending || snapshot.projection.running); }, [snapshot.pending, snapshot.projection.running, onBusyChange]);
   // The app keeps its own loader up until the entry session is connected, so the
   // workspace never opens on a second, still-blocked "Starting session…" state.
   useEffect(() => { onBootChange?.(!chatUnavailable && !snapshot.connected); }, [snapshot.connected, onBootChange, chatUnavailable]);
@@ -473,22 +590,43 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   async function send() {
     let client = connection.current;
     if (!client || readingRef.current) return;
-    const value = draft;
+    if (isFlowHistoryError(client.snapshot.error)) { setNotification("Clear Flow request history before sending again."); return; }
+    const typed = draft;
+    const submittedVideos = videoRef.current;
+    const value = [...submittedVideos.map(videoMarker), typed].filter(Boolean).join("\n");
     const submitted = attachmentRef.current;
     const wasHero = hero;
+    // Capture the owner of this send. Clearing must never depend on which session is
+    // on screen when it settles, and it must never touch another session's entry.
+    const pendingKey = sessionKeyOf(client.snapshot.sessionFile, selectedSession ?? path);
+    const submitDraftKey = draftKeyRef.current;
     setWorkingStartedAt(Date.now());
+    setPendingBySession(previous => setPending(previous, pendingKey, value));
     setCommandBusy(true);
     try {
       if (!await ensureSelectedSession(client)) { setNotification("The session is still opening."); return; }
       client = connection.current;
       if (!client) return;
       const running = client.snapshot.projection.running;
-      await client.sendOrSteer(value, submitted.map(item => item.image), running);
+      const queueKey = sessionKeyOf(client.snapshot.sessionFile, selectedSession);
+      if (running && queueKey) setQueuedBySession(previous => ({ ...previous, [queueKey]: [...(previous[queueKey] ?? []), value] }));
+      try { await client.sendOrSteer(value, submitted.map(item => item.image), running); }
+      catch (error) {
+        if (running && queueKey) setQueuedBySession(previous => {
+          const items = previous[queueKey] ?? [];
+          const at = items.lastIndexOf(value);
+          if (at < 0) return previous;
+          return { ...previous, [queueKey]: [...items.slice(0, at), ...items.slice(at + 1)] };
+        });
+        throw error;
+      }
       if (connection.current !== client) return;
+      if (videoRef.current.join("\n") === submittedVideos.join("\n")) { videoRef.current = []; setVideoUrls([]); }
       // Only a successful send clears the sent key; text typed during the send and
-      // attachments that were not submitted stay.
-      if (draftRef.current === value) {
-        clearDraft(draftKeyRef.current);
+      // attachments that were not submitted stay. Clear the key that submitted, not
+      // whatever session happens to be on screen now.
+      if (draftRef.current === value && draftKeyRef.current === submitDraftKey) {
+        clearDraft(submitDraftKey);
         draftRef.current = "";
         setDraft("");
       }
@@ -501,8 +639,29 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (connection.current === client && /Flow attachment is closed|Flow session metadata is missing/u.test(message)) {
         try { if (await recoverSession()) return; } catch (recoveryError) { setNotification(String(recoveryError).replace(/^Error:\s*/u, "")); return; }
       }
-      if (connection.current === client) setNotification(humanizeRuntimeError(message));
-    } finally { setCommandBusy(false); }
+      if (connection.current === client) {
+        // A refused image lives in the history, so every later request fails the same
+        // way. Offer the repair rather than leaving a session that cannot continue.
+        if (/image[^.]{0,80}(must be larger|too small|minimum|below)|(must be larger|minimum)[^.]{0,40}image/iu.test(message)) setImageRepair(true);
+        setNotification(humanizeRuntimeError(message));
+      }
+    } finally {
+      setCommandBusy(false);
+      // Settling clears this send's own entry even after the user switched session.
+      setPendingBySession(previous => clearPending(previous, pendingKey));
+    }
+  }
+  /** Remove the images the provider refuses, keeping the original session file. */
+  async function repairSessionImages() {
+    const sessionPath = connection.current?.snapshot.sessionFile ?? snapshot.sessionFile;
+    if (!sessionPath) return;
+    setImageRepair(false);
+    try {
+      const result = await invoke<{ removed: number; backup: string }>("chat_session_sanitize_images", { sessionPath });
+      if (!result.removed) { setNotification("No image in this session is below the model's minimum."); return; }
+      setNotification(`Removed ${result.removed} image${result.removed === 1 ? "" : "s"} the model cannot read. The original file is kept as a backup.`);
+      await reloadSession();
+    } catch (error) { setNotification(String(error)); }
   }
   const name = workspaceLabel(path);
   function parkPrevious(previous: ChatConnection | null) {
@@ -590,6 +749,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       const active = connection.current;
       if (!active) return;
       await active.runCommand(command);
+      if (command === "/flow clear") {
+        setFlowNotice("");
+        setSessionError(null);
+        const key = normalizedPath(active.snapshot.sessionFile ?? queueSessionKey);
+        if (key) setQueuedBySession(previous => { const next = { ...previous }; delete next[key]; return next; });
+        active.clearError();
+      }
     }
     catch (error) { setNotification(String(error).replace(/^Error:\s*/u, "")); }
     finally { setCommandBusy(false); }
@@ -668,7 +834,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     return true;
   }
   /** The one place that changes which runtime session is loaded. */
-  async function switchSession(target: string) {
+  async function switchSession(target: string, recovered = false) {
     const client = connection.current;
     if (!client || switchingRef.current) return;
     if (target !== "new" && normalizedPath(target) === normalizedPath(client.snapshot.sessionFile ?? "")) {
@@ -680,6 +846,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     switchingTarget.current = target;
     setSwitching(true);
     setSessionError(null);
+    setFlowNotice("");
     try {
       const previous = connection.current;
       const next = await chatPool.enter(path, target, dialogRef.current);
@@ -702,6 +869,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     } catch (error) {
       if (connection.current !== client) return;
       const message = String(error).replace(/^Error:\s*/u, "");
+      if (!recovered && /owned|busy|unavailable|exited|disposed/iu.test(message)) {
+        await invoke("chat_stop_all").catch(() => {});
+        chatPool.forget(target);
+        switchingRef.current = false;
+        switchingTarget.current = null;
+        return switchSession(target, true);
+      }
       const readable = previewRef.current && normalizedPath(previewRef.current.path) === normalizedPath(target);
       if (readable) {
         // The transcript is already on screen. Never replace a readable session with a blank
@@ -854,13 +1028,16 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const client = connection.current;
     if (!client || commandBusy) return;
     setCommandBusy(true);
+    const target = selectedSessionRef.current || undefined;
     try {
-      if (!await ensureSelectedSession(client)) { setNotification("Could not attach this session for compacting."); return; }
-      const active = connection.current;
-      if (!active) return;
-      await active.compact();
+      // Compact attaches the target without loading its transcript: get_messages on
+      // a large session exceeds the desktop's JSONL frame limit before compact runs.
+      const pooled = target ? chatPool.client(target) : undefined;
+      const active = pooled ?? client;
+      if (active !== client) { parkPrevious(client); bindClient(active); }
+      await active.compactSession(target);
       if (connection.current === active) setNotification("Earlier conversation compacted.");
-    } catch (error) { if (connection.current === client) setNotification(String(error).replace(/^Error:\s*/u, "")); }
+    } catch (error) { setNotification(String(error).replace(/^Error:\s*/u, "")); }
     finally { setCommandBusy(false); }
   }
   async function exportConversation() {
@@ -911,8 +1088,43 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     else result.sort((left, right) => (right.sessions[0]?.updated ?? 0) - (left.sessions[0]?.updated ?? 0));
     return result;
   }, [workspaces, sessions, search, sort, showArchived]);
+  const defaultGroup = groups.find(group => isDefaultWorkspace(group.path));
+  const regularGroups = defaultGroup ? groups.filter(group => group !== defaultGroup) : groups;
+  const renderGroup = (group: (typeof groups)[number]) => {
+    const open = !!search.trim() || !collapsedGroups.has(group.id);
+    return <section key={group.id} className="mb-1">
+      <div className={`group flex items-center gap-1 rounded-lg ${(selectedWorkspace ? normalizedPath(selectedWorkspace) === normalizedPath(group.path) : !selectedKey && normalizedPath(group.path) === normalizedPath(path)) ? "bg-accent/70" : "hover:bg-muted/60"}`}>
+        <button type="button" aria-label={`${open ? "Collapse" : "Expand"} ${group.name}`} onClick={() => setCollapsedGroups(current => { const next = toggleCollapsed(current, group.id); saveCollapsed(next); return next; })} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
+          {open ? <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" /> : <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />}
+          <FolderOpen className="size-4 shrink-0 text-muted-foreground" /><span className="truncate text-sm">{group.name}</span>
+        </button>
+        <Button variant="ghost" className="mr-1 size-6 p-0 opacity-0 group-hover:opacity-100 focus:opacity-100" aria-label={`Remove ${group.path}`} onClick={() => { const workspace = workspaces.find(item => normalizedPath(item.path) === normalizedPath(group.path)); if (workspace) onRemove(workspace.id); }}><X className="size-3" /></Button>
+      </div>
+      {open && <div className="ml-4 border-l border-border pl-1.5">
+        {group.sessions.map(session => <div key={session.path} ref={node => { if (selectedKey === normalizedPath(session.path)) selectedRowRef.current = node; }} data-session-selected={selectedKey === normalizedPath(session.path) || undefined} className={`group/session relative flex items-center rounded-md text-sm ${selectedKey === normalizedPath(session.path) ? "bg-accent text-foreground before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded-full before:bg-primary" : "hover:bg-muted/60"} ${session.archived ? "opacity-60" : ""}`}>
+          <button type="button" onClick={() => void openSession(session.path)} title={session.path} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left">
+            {session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label="Pinned" /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span className="min-w-0 flex-1 truncate">{session.title}</span>{chatPool.isRunning(session.path) && <span role="img" aria-label="Running" title="Running" data-session-running className="size-1.5 shrink-0 rounded-full bg-primary" />}<span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={`${artifactCount(session.path)} artifact${artifactCount(session.path) === 1 ? "" : "s"}`}>{artifactCount(session.path)}</span>}
+          </button>
+          <div className={`relative flex shrink-0 items-center gap-0.5 pr-1 transition-opacity focus-within:opacity-100 group-hover/session:opacity-100 ${sessionMenu === session.path ? "opacity-100" : "opacity-0"}`} data-session-menu>
+            <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={session.pinned ? "Unpin session" : "Pin session"} title={session.pinned ? "Unpin session" : "Pin session"} onClick={() => void updateSession(session.path, { pinned: !session.pinned })}><Pin className={`size-3.5 ${session.pinned ? "text-primary" : "text-muted-foreground"}`} /></button>
+            <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label="Session actions" title="Session actions" aria-haspopup="menu" aria-expanded={sessionMenu === session.path} onClick={() => setSessionMenu(value => value === session.path ? null : session.path)}><MoreHorizontal className="size-4 text-muted-foreground" /></button>
+            {sessionMenu === session.path && <div role="menu" aria-label={`Actions for ${session.title}`} className="absolute right-0 top-full z-40 mt-1 w-52 rounded-xl border border-border bg-popover p-1 text-sm shadow-xl">
+              <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { pinned: !session.pinned }); setSessionMenu(null); }}><Pin className="size-4 text-muted-foreground" />{session.pinned ? "Unpin session" : "Pin session"}</button>
+              <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void renameSession(session)}><Pencil className="size-4 text-muted-foreground" />Rename</button>
+              <button type="button" role="menuitem" disabled title="Fork is not available in the runtime yet" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent disabled:opacity-50"><GitFork className="size-4 text-muted-foreground" />Fork session</button>
+              <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { archived: !session.archived }); setSessionMenu(null); }}>{session.archived ? <ArchiveRestore className="size-4 text-muted-foreground" /> : <Archive className="size-4 text-muted-foreground" />}{session.archived ? "Restore session" : "Archive session"}</button>
+              <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void copySessionId(session)}><Copy className="size-4 text-muted-foreground" />Copy Session ID</button>
+            </div>}
+          </div>
+        </div>)}
+        {!group.sessions.length && <p className="px-2 py-1.5 text-xs text-muted-foreground">No sessions yet</p>}
+      </div>}
+    </section>;
+  };
   const activeSession = normalizedPath(snapshot.sessionFile ?? "");
   const selectedKey = normalizedPath(selectedSession ?? snapshot.sessionFile ?? "");
+  const selectedSessionWorkspace = sessions.find(item => normalizedPath(item.path) === selectedKey)?.workspace ?? path;
+  const selectedSessionWorkspacePath = selectedSessionWorkspace.startsWith("\\\\?\\") ? selectedSessionWorkspace.slice(4) : selectedSessionWorkspace;
   // Stop belongs to the session on screen. A running turn in the background must
   // not put a Stop button under a transcript the button would not stop.
   const composerRunning = snapshot.projection.running && selectedKey === activeSession;
@@ -929,7 +1141,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         ? saved.panes
             .filter((pane: any) => pane && Array.isArray(pane.tabs) && pane.tabs.length && typeof pane.active === "string")
             .slice(0, 2)
-            .map((pane: any) => ({ tabs: pane.tabs.filter((tab: unknown) => typeof tab === "string"), active: pane.active, width: typeof pane.width === "number" ? Math.min(760, Math.max(280, pane.width)) : 360 }))
+            .map((pane: any) => {
+              const active = pane.active;
+              const width = typeof pane.width === "number" ? Math.min(960, Math.max(360, pane.width)) : defaultPaneWidth();
+              return { tabs: pane.tabs.filter((tab: unknown) => typeof tab === "string"), active, width: [360, 420, 560].includes(width) ? defaultPaneWidth() : width };
+            })
         : [];
       setPanes(next);
     } catch { setPanes([]); }
@@ -942,7 +1158,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const move = (event: PointerEvent) => {
       const current = resizingPane.current;
       if (!current) return;
-      setPanes(list => list.map((pane, index) => index === current.index ? { ...pane, width: Math.min(760, Math.max(280, current.startWidth + (current.startX - event.clientX))) } : pane));
+      setPanes(list => list.map((pane, index) => index === current.index ? { ...pane, width: Math.min(960, Math.max(360, current.startWidth + (current.startX - event.clientX))) } : pane));
     };
     const stop = () => { resizingPane.current = null; };
     window.addEventListener("pointermove", move);
@@ -962,10 +1178,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     return artifactCounts[sessionId] ?? 0;
   }
   function toggleSide() {
-    setPanes(current => current.length ? [] : [{ tabs: ["start"], active: "start", width: 300 }]);
+    setPanes(current => current.length ? [] : [{ tabs: ["start"], active: "start", width: defaultPaneWidth() }]);
   }
   function addPane() {
-    setPanes(current => current.length >= 2 ? current : [...current, { tabs: ["start"], active: "start", width: 280 }]);
+    setPanes(current => current.length >= 2 ? current : [...current, { tabs: ["start"], active: "start", width: defaultPaneWidth() }]);
   }
   function removePane(index: number) {
     setPanes(current => current.filter((_, position) => position !== index));
@@ -993,7 +1209,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   }
   function openArtifactsPanel() {
     setPanes(current => {
-      if (!current.length) return [{ tabs: ["artifacts"], active: "artifacts", width: 420 }];
+      if (!current.length) return [{ tabs: ["artifacts"], active: "artifacts", width: defaultPaneWidth() }];
       return current.map((pane, position) => position !== current.length - 1 ? pane : pane.tabs.includes("artifacts") ? { ...pane, tabs: pane.tabs.filter(tab => tab !== "start"), active: "artifacts" } : { ...pane, tabs: [...pane.tabs, "artifacts"], active: "artifacts" });
     });
   }
@@ -1005,18 +1221,37 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       <fieldset disabled={dialog.responding || !snapshot.transportReady} className="mt-3 flex flex-wrap justify-end gap-2"><Button variant="outline" onClick={() => void reply({ cancelled: true })}>Cancel</Button>{dialog.method === "confirm" ? <><Button variant="outline" onClick={() => void reply({ confirmed: false })}>No</Button><Button onClick={() => void reply({ confirmed: true })}>Yes</Button></> : dialog.method === "select" ? (dialog.options ?? []).map(option => <Button key={option} onClick={() => void reply({ value: option })}>{option}</Button>) : <Button onClick={() => void reply({ value: answer })}>Submit</Button>}</fieldset></section>;
   const selectedTitle = sessions.find(session => normalizedPath(session.path) === selectedKey)?.title;
   const activePreview = preview && normalizedPath(preview.path) === selectedKey ? preview : null;
+  // A preview is read from disk, so the live connection has no sessionId yet.
+  // The session file's UUID is the same identifier the artifact sidecars store.
+  const artifactsSessionId = activePreview ? sessionIdFromFile(activePreview.path) : snapshot.sessionId;
   const opening = !chatUnavailable && !hero && !!selectedSession && selectedKey !== activeSession && !activePreview;
   // One gate: the entry session is connected before the chat UI appears, so the user
   // never sees a second, still-blocked "Connecting…" state.
   const booting = !chatUnavailable && !snapshot.connected && !sessionError;
   const conversationProjection = activePreview?.projection ?? snapshot.projection;
+  const activeMessage = conversationProjection.activeMessage === null ? undefined : conversationProjection.messages[conversationProjection.activeMessage];
+  const hasRunningTool = Object.values(conversationProjection.tools).some(tool => tool.phase === "running");
+  const liveThinking = conversationProjection.running && activeMessage && !hasRunningTool
+    ? activeMessage.content.flatMap(block => block.type === "thinking" ? [block.thinking ?? ""] : []).join("\n")
+    : "";
+  const lastMessage = conversationProjection.messages.at(-1);
+  const settled = !conversationProjection.running
+    ? lastMessage?.role === "assistant" && lastMessage.stopReason === "error" ? "failed" as const
+      : lastMessage?.role === "toolResult" || (lastMessage?.role === "assistant" && (lastMessage.stopReason === "aborted" || lastMessage.stopReason === "toolUse")) ? "interrupted" as const
+        : undefined
+    : undefined;
+  const outputReferences = useMemo(
+    () => collectOutputReferences(conversationProjection.messages, artifactsSessionId),
+    [conversationProjection.messages, artifactsSessionId],
+  );
   const conversationKey = selectedSession ?? snapshot.sessionId ?? path;
   const hasArchived = sessions.some(session => session.archived);
   const selectedWorkspace = sessions.find(session => normalizedPath(session.path) === selectedKey)?.workspace;
   useEffect(() => { if (selectedSession) selectedRowRef.current?.scrollIntoView({ block: "nearest" }); }, [selectedSession]);
-  const flow = useMemo(() => deriveFlow(snapshot.projection.tools), [snapshot.projection.tools]);
-  const subagents = useMemo(() => deriveSubagents(snapshot.projection.tools), [snapshot.projection.tools]);
-  const flowError = useMemo(() => latestFlowError(snapshot.projection.messages), [snapshot.projection.messages]);
+  const showingAttached = selectedKey === activeSession;
+  const flow = useMemo(() => showingAttached ? deriveFlow(snapshot.projection.tools) : deriveFlow({}), [showingAttached, snapshot.projection.tools]);
+  const subagents = useMemo(() => showingAttached ? deriveSubagents(snapshot.projection.tools) : [], [showingAttached, snapshot.projection.tools]);
+  const flowError = useMemo(() => showingAttached ? latestFlowError(snapshot.projection.messages) : undefined, [showingAttached, snapshot.projection.messages]);
   const textguardWithheld = useMemo(() => Object.values(snapshot.projection.tools).some(tool => {
     const result = JSON.stringify(tool.result ?? "");
     return result.includes("TextGuard withheld") || result.includes("TextGuard advisory");
@@ -1031,7 +1266,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       <FolderOpen className="size-4 shrink-0" aria-hidden="true" /><span className="truncate">{name}</span><ChevronDown className="size-3 shrink-0" aria-hidden="true" />
     </Button>
     {pickerOpen && <div role="menu" aria-label="Choose workspace" className="absolute left-0 top-full z-30 mt-1 w-80 max-w-[calc(100vw-2rem)] rounded-xl border border-border bg-popover p-2 shadow-xl">
-      {workspaces.map(workspace => <button key={workspace.id} type="button" role="menuitemradio" aria-checked={workspace.path === path} onClick={() => void switchWorkspace(workspace.path)} className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent">
+      {[...workspaces].sort((left, right) => Number(isDefaultWorkspace(left.path)) - Number(isDefaultWorkspace(right.path))).map(workspace => <button key={workspace.id} type="button" role="menuitemradio" aria-checked={workspace.path === path} onClick={() => void switchWorkspace(workspace.path)} className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent">
         <span className="min-w-0"><span className="block truncate">{workspaceLabel(workspace.path)}</span><span className="block truncate text-xs text-muted-foreground">{workspace.path}</span></span>
         {workspace.path === path && <span className="text-xs text-primary">Current</span>}
       </button>)}
@@ -1039,20 +1274,22 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       <div className="mt-1 border-t border-border pt-1"><Button type="button" variant="ghost" className="w-full justify-start" onClick={() => { setPickerOpen(false); onAddFolder(); }}><Plus className="size-4" />Add folder</Button></div>
     </div>}
   </div>;
-  const workspaceError = snapshot.error;
+  const workspaceError = showingAttached ? snapshot.error : null;
   // The runtime's Flow submission budget is per session and never reclaimed; a full
   // store cannot be retried, so the banner offers the only way out.
   const capacityError = isCapacityError(sessionError) || isCapacityError(snapshot.error);
+  const flowHistoryError = isFlowHistoryError(sessionError) || isFlowHistoryError(snapshot.error);
   const readableError = (message: string) => humanizeRuntimeError(message);
   const textguardKey = snapshot.sessionId && selectedKey === activeSession ? snapshot.sessionId : "";
   const textguardView = textguardKey ? textguardBySession[textguardKey] : undefined;
   const textguardItems = textguardView?.data?.items.length ?? 0;
-  const textguardBlocked = !!textguardView?.seen && (textguardView.data ? textguardItems > 0 : true);
+  const textguardExpired = !!textguardView?.historical && !!textguardView?.error;
+  const textguardBlocked = !!textguardView?.seen && !textguardExpired && (textguardView.data ? textguardItems > 0 : true);
   const [textguardMode, setTextguardMode] = useState<"on" | "strict" | "off">("on");
   const textguardControl = snapshot.sessionId ? {
-    label: "TextGuard",
-    title: `TextGuard mode: ${textguardMode === "on" ? "On" : textguardMode === "strict" ? "Strict" : "Off"}`,
-    tone: "idle" as "blocked" | "expired" | "idle",
+    label: textguardBlocked ? `${textguardItems || 1} blocked` : "TextGuard",
+    title: textguardBlocked ? `${textguardItems || 1} item(s) withheld from the model` : "TextGuard",
+    tone: (textguardBlocked ? "blocked" : textguardExpired || textguardView?.historical ? "expired" : "idle") as "blocked" | "expired" | "idle",
     disabled: !textguardKey,
     blocked: false,
     mode: textguardMode,
@@ -1081,7 +1318,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     : null;
   return <div ref={chatRoot} className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
     {dropActive && <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-primary bg-background/85 text-sm font-medium text-primary">Drop images or files</div>}
-    {sidebar && <aside aria-label="Workspaces" className="absolute inset-y-0 left-0 z-20 flex w-72 max-w-[85%] flex-col border-r border-border bg-background shadow-xl md:static md:z-auto md:shadow-none">
+    {sidebar && <aside aria-label="Workspaces" className="absolute inset-y-0 left-0 z-20 flex w-80 max-w-[85%] flex-col border-r border-border bg-background shadow-xl md:static md:z-auto md:shadow-none">
       <div className="flex items-center gap-2 px-2 pb-2 pt-3"><Button className="min-w-0 flex-1 justify-start gap-2" disabled={locked} onClick={() => void startNewSession()}><Plus className="size-4" />New session</Button><Button variant="ghost" className="size-8 p-0 md:hidden" aria-label="Hide workspaces" onClick={() => setSidebar(false)}><X className="size-4" /></Button></div>
       <div className="px-2 pb-2"><Button variant={appView === "artifacts" ? "default" : "ghost"} className="w-full justify-start gap-2" aria-pressed={appView === "artifacts"} onClick={() => setAppView(appView === "artifacts" ? "chat" : "artifacts")}><Images className="size-4" />Artifacts</Button></div>
       <div className="flex items-center justify-between border-t border-border px-3 py-2">
@@ -1095,11 +1332,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       </div>
       {searchOpen && <div className="px-2 pb-2"><Input autoFocus aria-label="Search sessions" placeholder="Search sessions" value={search} onChange={event => setSearch(event.target.value)} /></div>}
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 pb-2">
-        {groups.map(group => {
-          const open = !!search.trim() || !collapsed.has(group.id);
+        {regularGroups.map(group => {
+          const open = !!search.trim() || !collapsedGroups.has(group.id);
           return <section key={group.id} className="mb-1">
             <div className={`group flex items-center gap-1 rounded-lg ${(selectedWorkspace ? normalizedPath(selectedWorkspace) === normalizedPath(group.path) : !selectedKey && normalizedPath(group.path) === normalizedPath(path)) ? "bg-accent/70" : "hover:bg-muted/60"}`}>
-              <button type="button" aria-label={`${open ? "Collapse" : "Expand"} ${group.name}`} onClick={() => setCollapsed(current => { const next = new Set(current); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next; })} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
+              <button type="button" aria-label={`${open ? "Collapse" : "Expand"} ${group.name}`} onClick={() => setCollapsedGroups(current => { const next = toggleCollapsed(current, group.id); saveCollapsed(next); return next; })} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
                 {open ? <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" /> : <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />}
                 <FolderOpen className="size-4 shrink-0 text-muted-foreground" /><span className="truncate text-sm">{group.name}</span>
               </button>
@@ -1128,6 +1365,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         })}
         {!groups.length && <p className="p-3 text-sm text-muted-foreground">{search ? "No matching sessions" : "No workspaces yet."}</p>}
       </div>
+      {defaultGroup && <div className="shrink-0 border-t border-border bg-background px-1.5 py-1">{renderGroup(defaultGroup)}</div>}
       <div className="mt-auto border-t border-border p-2">
         <div className="flex items-center gap-1">
           <Button variant="ghost" className="min-w-0 flex-1 justify-start gap-2" onClick={onSettings}><Settings className="size-4" />Settings</Button>
@@ -1144,7 +1382,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           <div className="hidden min-w-0 items-center gap-1.5 md:flex">
             <SubagentMenu agents={subagents} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} />
             <BackgroundMenu jobs={flow.background} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} />
-            <FlowMenu key={snapshot.sessionId ?? path} flow={flow} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} notice={flowNotice} error={flowError} reports={reportsSession && normalizedPath(reportsSession) === activeSession ? diskReports : []} onCommand={command => void runExtensionCommand(command)} busy={commandBusy} />
+            <FlowMenu key={snapshot.sessionId ?? path} flow={flow} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} notice={showingAttached ? flowNotice : ""} error={flowError} reports={reportsSession && normalizedPath(reportsSession) === activeSession ? diskReports : []} onCommand={command => void runExtensionCommand(command)} busy={commandBusy} />
             <McpMenu onReload={() => void reloadSession()} onAsk={() => updateDraft("Add an MCP server to this workspace. Ask me for the name, transport, target, and any required environment variables.")} />
           </div>
         </div>
@@ -1153,8 +1391,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         </div>
       </div>}
       {notification && <div role="status" aria-live="polite" className="pointer-events-none fixed left-1/2 top-16 z-50 w-max max-w-[min(40rem,calc(100vw-2rem))] -translate-x-1/2 rounded-lg bg-popover px-4 py-2 text-xs text-foreground shadow-xl">{notification}</div>}
-      {workspaceError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(40rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">{readableError(workspaceError)}</span>{capacityError ? <Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void startNewSession()}>New session</Button> : <Button variant="outline" className="h-7 shrink-0 px-2" onClick={onRetry}>Retry</Button>}</div>}
-      {sessionError && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">{readableError(sessionError)}{capacityError ? "" : " The transcript is still available; this session was not discarded."}</span>{capacityError ? <Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void startNewSession()}>New session</Button> : <Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => { if (selectedSession) openSession(selectedSession); }}>Retry</Button>}</div>}
+      {imageRepair && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">This session contains an image the model refuses, so every request fails. Removing it keeps the rest of the transcript.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void repairSessionImages()}>Remove the image</Button></div>}
+      {snapshot.historyError && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">This session is connected, but its transcript could not be loaded. {humanizeRuntimeError(snapshot.historyError)}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void connection.current?.retryHistory()}>Retry</Button></div>}
+      {capacityError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">{humanizeRuntimeError(sessionError ?? snapshot.error ?? "")}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void startNewSession()}>New session</Button></div>}
+      {flowHistoryError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">Flow request history is full. Clear it before sending again.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void runExtensionCommand("/flow clear")}>Clear Flow history</Button></div>}
       {booting ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-8 sm:px-8">
         <div className="w-full max-w-3xl">
           <div className="mb-7 flex flex-col items-center gap-3 text-center">
@@ -1164,32 +1404,46 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           </div>
           <div className="mb-2 flex flex-wrap items-center gap-2 px-1">{workspacePicker}</div>
           {dialogNode && <div className="mb-3">{dialogNode}</div>}
-          <Composer hero connected={snapshot.connected} pending={snapshot.pending || commandBusy || switching || locked } opening={false} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={() => void connection.current?.abort()} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} compatibility={snapshot.projection.compatibility} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} models={snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
+          <Composer hero connected={snapshot.connected} pending={snapshot.pending || commandBusy || switching || locked } opening={false} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={() => void connection.current?.abort()} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} compatibility={snapshot.projection.compatibility} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} videos={videoUrls} queued={queuedSteers} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
           <SessionStatsBar stats={snapshot.stats} timing={timing} />
         </div>
       </div> : !snapshot.sessionId && !activePreview ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
-          <ChatConversation key={conversationKey} projection={conversationProjection} pending={snapshot.pending} startedAt={workingStartedAt} opening={false} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} />
-          {opening && !activePreview && <div role="status" aria-live="polite" className="pointer-events-none absolute inset-0 z-10 flex items-start justify-center bg-background/60 pt-24 backdrop-blur-[1px]"><span className="rounded-lg border border-border bg-popover px-4 py-2 text-sm text-foreground shadow-lg">Opening {selectedTitle ?? name}…</span></div>}
+{snapshot.gap && <p role="status" className="mx-auto mb-2 max-w-3xl text-xs text-muted-foreground">The transcript was refreshed after a display backlog.</p>}
+          <ChatConversation key={conversationKey} projection={conversationProjection} workspace={path} busy={snapshot.pending} pendingUser={pendingUser} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={turnChangedFiles} />
         </div>
         <div className="relative">
+          <div className="mx-auto w-full max-w-3xl">
+            {showingAttached && flowNotice && <div role="alert" className="mb-1 flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">
+              <span className="min-w-0 flex-1">{/holding|reconciliation|waiting for recovery/iu.test(flowNotice) ? "Flow is holding your message. Clear it to continue." : flowNotice}</span>
+              {/paused/iu.test(flowNotice) && <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void runExtensionCommand("/flow resume")}>Resume</Button>}
+              <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void runExtensionCommand("/flow clear")}>Clear</Button>
+            </div>}
+            <AgentAction thinking={liveThinking} label="Working…" running={conversationProjection.running} elapsed={elapsed} settled={settled} />
+          </div>
           {dialogNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{dialogNode}</div>}
-          <Composer connected={snapshot.connected} pending={snapshot.pending || commandBusy || (opening && !activePreview) || locked } opening={opening && !activePreview} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={() => void connection.current?.abort()} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} compatibility={snapshot.projection.compatibility} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} models={snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
+          <Composer connected={snapshot.connected || !!activePreview} pending={snapshot.pending || commandBusy || (opening && !activePreview) || locked } opening={opening && !activePreview} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={() => void connection.current?.abort()} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} compatibility={snapshot.projection.compatibility} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} videos={videoUrls} queued={queuedSteers} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
         </div>
         <SessionStatsBar stats={snapshot.stats} timing={timing} />
         </div>
         {panes.map((pane, index) => <aside key={index} data-session={snapshot.sessionId ?? ""} data-pane={index} style={{ width: pane.width }} className="relative flex min-h-0 shrink-0 flex-col border-l border-border bg-background">
-          <div className="flex items-center gap-1 border-b border-border px-2 py-1">
-            {pane.tabs.map(tab => <div key={tab} className={`flex items-center gap-1 rounded-t-md border border-b-0 px-2 py-1 text-xs ${pane.active === tab ? "bg-background" : "bg-muted/40 text-muted-foreground"}`}>
-              <button type="button" onClick={() => setPanes(current => current.map((item, position) => position === index ? { ...item, active: tab } : item))}>{tab === "artifacts" ? "Artifacts" : tab === "start" ? "Start" : tab === "files" ? "Files" : tab}</button>
-              <button type="button" className="rounded p-0.5 hover:bg-muted" aria-label={`Close ${tab} tab`} title="Close tab" onClick={() => closePaneTab(index, tab)}><X className="size-3" /></button>
-            </div>)}
-            <Button variant="ghost" className="size-7 shrink-0 p-0" aria-label="Add panel tab" title="Add tab" onClick={() => addPaneTab(index)}><Plus className="size-3.5" /></Button>
-            <div className="ml-auto flex items-center">
-              {index === panes.length - 1 && <Button variant="ghost" className="size-7 shrink-0 p-0" aria-label={panes.length < 2 ? "Split pane" : "Close second pane"} title={panes.length < 2 ? "Split pane" : "Close second pane"} onClick={() => panes.length < 2 ? addPane() : removePane(1)}><Columns2 className="size-3.5" /></Button>}
+          <Tabs value={pane.active} onValueChange={value => setPanes(current => current.map((item, position) => position === index ? { ...item, active: value } : item))} className="flex min-h-0 flex-1 flex-col gap-0">
+            <div className="flex items-center gap-1 border-b border-border px-2 py-1">
+              <TabsList variant="line" className="h-9 min-w-0 flex-1 justify-start gap-1 overflow-visible rounded-none p-0">
+                {pane.tabs.map(tab => <div key={tab} className="relative flex shrink-0 items-center">
+                  <TabsTrigger value={tab} className="h-9 flex-none px-3 pr-7 text-xs">{tab === "artifacts" ? "Artifacts" : tab === "start" ? "Start" : tab === "files" ? "Files" : tab}</TabsTrigger>
+                  <button type="button" className="absolute right-1 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground" aria-label={`Close ${tab} tab`} title="Close tab" onClick={() => closePaneTab(index, tab)}><X className="size-3" /></button>
+                </div>)}
+              </TabsList>
+              <Button variant="ghost" className="size-7 shrink-0 p-0" aria-label="Add panel tab" title="Add tab" onClick={() => addPaneTab(index)}><Plus className="size-3.5" /></Button>
+              <div className="ml-auto flex items-center">
+                {index === panes.length - 1 && <Button variant="ghost" className="size-7 shrink-0 p-0" aria-label={panes.length < 2 ? "Split pane" : "Close second pane"} title={panes.length < 2 ? "Split pane" : "Close second pane"} onClick={() => panes.length < 2 ? addPane() : removePane(1)}><Columns2 className="size-3.5" /></Button>}
+              </div>
             </div>
-          </div>
-          <div className="min-h-0 flex-1 overflow-auto p-3">{pane.active === "start" ? <PanelStart onOpen={id => openPaneView(index, id)} /> : pane.active === "artifacts" ? <ArtifactsPanel sessionId={snapshot.sessionId} /> : pane.active === "files" ? <FilesPanel path={path} /> : null}</div>
+            <TabsContent value={pane.active} className="min-h-0 flex-1 overflow-auto p-3">
+              {pane.active === "start" ? <PanelStart onOpen={id => openPaneView(index, id)} /> : pane.active === "artifacts" ? <ArtifactsPanel embedded sessionId={artifactsSessionId} workspace={selectedSessionWorkspacePath} references={outputReferences} /> : pane.active === "files" ? <FilesPanel key={selectedSessionWorkspacePath} path={selectedSessionWorkspacePath} /> : null}
+            </TabsContent>
+          </Tabs>
           <div role="separator" aria-orientation="vertical" aria-label="Resize pane" className="absolute left-0 top-0 h-full w-1 cursor-col-resize hover:bg-primary/30" onPointerDown={event => { resizingPane.current = { index, startX: event.clientX, startWidth: pane.width }; event.preventDefault(); }} />
         </aside>)}
       </div>}
@@ -1200,4 +1454,28 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

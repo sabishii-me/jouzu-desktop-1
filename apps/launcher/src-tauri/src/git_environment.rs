@@ -33,9 +33,9 @@ pub fn find(root: &Path) -> Result<PathBuf, String> {
     #[cfg(not(windows))]
     {
         let _ = root;
-        for candidate in ["/bin/bash", "/usr/local/bin/bash", "/opt/homebrew/bin/bash"] {
+        for candidate in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash", "/opt/homebrew/bin/bash"] {
             let path = PathBuf::from(candidate);
-            if path.is_file() {
+            if path.is_file() && std::process::Command::new(&path).args(["-lc", "exit 0"]).status().map(|status| status.success()).unwrap_or(false) {
                 return Ok(path);
             }
         }
@@ -78,8 +78,14 @@ pub fn report(root: &Path) -> Result<serde_json::Value, String> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
-    let git = std::process::Command::new("git")
-        .arg("--version")
+    let mut command = std::process::Command::new("git");
+    command.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let git = command
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -106,3 +112,4 @@ pub fn report(root: &Path) -> Result<serde_json::Value, String> {
 pub fn install(_root: &Path) -> Result<PathBuf, String> {
     Err("Jouzu uses this platform's bash; there is nothing to install.".into())
 }
+

@@ -29,7 +29,7 @@ pub fn install_root_for_executable(executable: &Path) -> Result<PathBuf, String>
 
 /// A root is usable when the provisioned runtime and app are both there.
 fn usable(root: &Path) -> bool {
-    root.join("runtime/node/node.exe").is_file() && root.join("app/bootstrap.mjs").is_file()
+    crate::runtime_install::node_executable(&root).is_file() && root.join("app/bootstrap.mjs").is_file()
 }
 
 /// Where the runtime lives. The desktop release carries no runtime (ADR 0003), so a normal
@@ -64,7 +64,7 @@ fn pick_root(candidates: Vec<PathBuf>) -> Result<PathBuf, String> {
 }
 
 pub fn find_bash(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let root = application_root(app).ok()?;
+    let root = managed_root().ok()?;
     crate::git_environment::find(&root).ok()
 }
 
@@ -147,8 +147,9 @@ mod root_tests {
     fn picks_the_root_that_holds_the_runtime() {
         let empty = tempfile::tempdir().unwrap();
         let provisioned = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(provisioned.path().join("runtime/node")).unwrap();
-        std::fs::write(provisioned.path().join("runtime/node/node.exe"), b"node").unwrap();
+        let node = crate::runtime_install::node_executable(provisioned.path());
+        std::fs::create_dir_all(node.parent().unwrap()).unwrap();
+        std::fs::write(node, b"node").unwrap();
         std::fs::create_dir_all(provisioned.path().join("app")).unwrap();
         std::fs::write(provisioned.path().join("app/bootstrap.mjs"), b"bootstrap").unwrap();
         assert_eq!(
@@ -171,3 +172,5 @@ mod path_tests {
         );
     }
 }
+
+

@@ -56,4 +56,6 @@ test("one entry per session even when the path case differs", () => {
   // A second entry for the same session would be a second runtime for it.
   expect(pool.client("C:/sessions/alpha.jsonl")).toBe(second);
   expect(pool.isRunning("C:/sessions/alpha.jsonl")).toBe(false);
+  expect(first.isDisposed()).toBe(true);
+  expect(second.isDisposed()).toBe(false);
 });

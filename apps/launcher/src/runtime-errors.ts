@@ -9,6 +9,11 @@ export function isCapacityError(message: string | null | undefined): boolean {
   return !!message && /Submission retention limit reached/iu.test(message);
 }
 
+/** Flow's per-session submission store is full; `/flow clear` is the recovery. */
+export function isFlowHistoryError(message: string | null | undefined): boolean {
+  return !!message && /Request history is full/iu.test(message);
+}
+
 export function humanizeRuntimeError(message: string): string {
   return isCapacityError(message) ? CAPACITY_MESSAGE : message;
 }

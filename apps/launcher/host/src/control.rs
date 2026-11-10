@@ -296,14 +296,15 @@ impl ControlManager {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if let Some(device) = adapter::parse_event(&line) {
-                        bus.publish(
-                            "control.device",
-                            json!({
-                                "requestId": request_id,
-                                "url": device.url,
-                                "code": device.code,
-                            }),
-                        );
+                        let mut data = json!({
+                            "requestId": request_id,
+                            "url": device.url,
+                            "code": device.code,
+                        });
+                        if let Some(provider) = device.provider {
+                            data["provider"] = Value::String(provider);
+                        }
+                        bus.publish("control.device", data);
                     }
                 }
             }));
@@ -494,3 +495,4 @@ impl Drop for Job {
         }
     }
 }
+

@@ -1,6 +1,7 @@
 import { ChatWorkspace } from "./chat-workspace";
 import { ToolsPanel } from "./tools-panel";
 import { ArtifactsPanel } from "./artifacts-panel";
+import { LauncherPage } from "./components/launcher-page";
 import { ProviderPicker } from "./components/ui/provider-picker";
 import { recoveryText } from "./recovery-text";
 import { UpdatePreview } from "./update-preview";
@@ -13,18 +14,19 @@ import { useJouzuUpdate } from "./use-jouzu-update";
 import { useLauncherUpdate } from "./use-launcher-update";
 import { Label } from "./components/ui/label";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { parseControlState, type ControlState } from "./control-state";
+import { catalogChangeSummary, parseControlState, type ControlState, type HeldCatalog } from "./control-state";
+
 import { controlCancel, controlRequest, subscribeControl } from "./api/control-client";
 import { Switch } from "./components/ui/switch";
 import { listen } from "@tauri-apps/api/event";
 import jouzuIcon from "./assets/jouzu.svg";
 import { useEffect, useState, useRef, type ReactNode } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Input } from "./components/ui/input";
 import { getVersion } from "@tauri-apps/api/app";
 import { open, confirm } from "@tauri-apps/plugin-dialog";
-import { FolderOpen, Search, X, ArrowUpRight, Settings, Languages, KeyRound, SlidersHorizontal, RefreshCw, LoaderCircle, Minus, Maximize2, Minimize2, Plus, Copy, Check, Wrench } from "lucide-react";
+import { FolderOpen, Search, X, ArrowUpRight, Settings, Languages, KeyRound, SlidersHorizontal, RefreshCw, LoaderCircle, Minus, Maximize2, Minimize2, Plus, Copy, Check, Wrench, Palette } from "lucide-react";
 import { Dialog, DialogContent, DialogTitle, DialogDescription, DialogClose } from "./components/ui/dialog";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import { ScrollArea } from "./components/ui/scroll-area";
@@ -33,19 +35,35 @@ import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from ".
 import { Button } from "./components/ui/button";
 import { JouzuLoader } from "./components/ui/jouzu-loader";
 import { Progress } from "./components/ui/progress";
-import { messages, locales, resolveLocale, type Locale } from "./i18n";
+import { catalogReview, messages, locales, resolveLocale, type Locale } from "./i18n";
 import { type Workspace } from "./history";
 import { parseDiagnostics, type Diagnostics } from "./diagnostics";
-import { useApi } from "./api/context";
 interface LauncherState { platform: "windows" | "macos" | "linux"; recent: Workspace[]; ready: boolean; bash: boolean; bundled_git: boolean }
 interface Components { jouzu: string | null; development: boolean; launcherUpdaterConfigured?: boolean; jouzuUpdaterConfigured?: boolean }
-interface RuntimeReport { status?: string; version: string | null; root: string | null; app: string | null; node: boolean; nodeVersion: string | null; nodeCurrent: boolean; git: boolean; terminal: boolean }
+interface RuntimeReport { status?: string; version: string | null; expectedVersion?: string; versionCurrent?: boolean; minimumVersion?: string; verifiedVersions?: string[]; mandatory?: boolean; root: string | null; app: string | null; node: boolean; nodeVersion: string | null; nodeCurrent: boolean; git: boolean; terminal: boolean }
+type Theme = "dark" | "light" | "system";
 
 export function App() {
-  const api = useApi();
-  const native = api.capabilities.native;
   const [locale, setLocale] = useState<Locale>(() => resolveLocale(localStorage.getItem("jouzu.ui.language") ?? navigator.language));
+  const [theme, setTheme] = useState<Theme>(() => {
+    const saved = localStorage.getItem("jouzu.ui.theme");
+    return saved === "light" || saved === "system" ? saved : "dark";
+  });
+  useEffect(() => {
+    localStorage.setItem("jouzu.ui.theme", theme);
+    const media = window.matchMedia("(prefers-color-scheme: light)");
+    const apply = () => {
+      const light = theme === "light" || (theme === "system" && media.matches);
+      document.documentElement.classList.toggle("light", light);
+      document.documentElement.style.colorScheme = light ? "light" : "dark";
+    };
+    apply();
+    if (theme !== "system") return;
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [theme]);
   const t = messages[locale];
+  const review = catalogReview[locale];
   const [activePath, setActivePath] = useState<string | null>(null);
   const [newSession, setNewSession] = useState(true);
   const [maximized, setMaximized] = useState(false);
@@ -57,6 +75,9 @@ export function App() {
   const entryReady = useRef(false);
   const [restartPending, setRestartPending] = useState(false);
   const [catalogRefreshing, setCatalogRefreshing] = useState(false);
+  // A held revision waits for the user; nothing is applied until they decide.
+  const [heldCatalog, setHeldCatalog] = useState<HeldCatalog | null>(null);
+  const [catalogDeciding, setCatalogDeciding] = useState(false);
   const catalogAttempted = useRef(false);
   const [japaneseOverride, setJapaneseOverride] = useState<boolean | null>(null);
   const japaneseChoice = japaneseOverride ?? locale === "ja";
@@ -75,10 +96,10 @@ export function App() {
     void invoke<Components>("component_versions").then(setComponents).catch(error => setError(String(error)));
     // A runtime update is only visible to a fresh supervised process.
     requestSessionRestart();
-  }, api.capabilities.native);
-  const updater = useLauncherUpdate(components?.launcherUpdaterConfigured === true, native);
+  });
+  const updater = useLauncherUpdate(components?.launcherUpdaterConfigured === true);
   const gitBash = useGitBash();
-  const runtime = useComponent<RuntimeReport>("runtime_report", api.capabilities.native);
+  const runtime = useComponent<RuntimeReport>("runtime_report");
   const [settingsTab,setSettingsTab] = useState("providers");
   // Where a header jump lands in the System list: the row that has something waiting.
   const [updateFocus,setUpdateFocus] = useState<number | null>(null);
@@ -93,7 +114,6 @@ export function App() {
   // One state machine: the runtime is an input to it, not a second screen.
   // null = still probing, false = onboarding installs it, true = the service can run.
   const [runtimePresent, setRuntimePresent] = useState<boolean | null>(null);
-  const [runtimeUpdating, setRuntimeUpdating] = useState<{ phase: string; error: string | null } | null>(null);
   // One prepare surface: real download bytes, then package and verification phases.
   const [prepare, setPrepare] = useState<{ phase: string; downloaded: number; total: number | null; error: string | null }>({ phase: "", downloaded: 0, total: null, error: null });
   // There is no setup wizard: a missing runtime auto-prepares, and a missing
@@ -101,8 +121,9 @@ export function App() {
   const modelReady = setup?.modelReady;
   const needsSetup = modelReady === false;
   const [device, setDevice] = useState<{url:string;code:string} | null>(null);
+  const [providerDevice, setProviderDevice] = useState<{url:string;code:string;provider:string} | null>(null);
   useEffect(() => {
-    if (!native) return;
+    if (!isTauri()) return;
     let disposed = false;
     const window = getCurrentWindow();
     const sync = () => { void window.isMaximized().then(value => { if (!disposed) setMaximized(value); }).catch(() => {}); };
@@ -111,28 +132,31 @@ export function App() {
     return () => { disposed = true; void unlisten.then(remove => remove()).catch(() => {}); };
   }, []);
   useEffect(() => {
-    if (!native) return;
+    if (!isTauri()) return;
     const unlisten = listen("new-session", () => setNewSession(true));
     return () => { void unlisten.then(remove => remove()).catch(() => {}); };
   }, []);
   useEffect(() => {
-    // Device codes come from the host's control events, not from a Tauri event.
-    return subscribeControl(device => setDevice(device));
+    // Device codes arrive from the host, not from a Tauri event.
+    return subscribeControl(device => {
+      if (device.provider && device.provider !== "shisa") setProviderDevice({ ...device, provider: device.provider });
+      else setDevice({ url: device.url, code: device.code });
+    });
   }, []);
   const [envRows, setEnvRows] = useState<{name:string;value:string;enabled:boolean}[]>([]);
   const [editingEnv, setEditingEnv] = useState<number | null>(null);
   const [envLoaded, setEnvLoaded] = useState(false);
   async function readEnvironment() {
-    try { setEnvRows(await api.settings.environment.read()); setEnvLoaded(true); setEditingEnv(null); }
+    try { setEnvRows(await invoke("environment_read")); setEnvLoaded(true); setEditingEnv(null); }
     catch (error) { setError(String(error)); }
   }
   async function saveEnvironment() {
     setOperation("saving"); setError(null);
-    try { await api.settings.environment.save(envRows); setEditingEnv(null); setSetup(parseControlState(await api.settings.control({action:"status"}))); }
+    try { await invoke("environment_save", { entries: envRows }); setEditingEnv(null); setSetup(parseControlState(await invoke<unknown>("control_request", {request:{action:"status"}}))); }
     catch (error) { setError(String(error)); }
     finally { setOperation(null); }
   }
-  const [custom, setCustom] = useState({provider:"",url:"",model:"",edit:false});
+  const [custom, setCustom] = useState({provider:"",url:"",model:"",edit:false,imageInput:false,contextWindow:32768,maxTokens:4096});
   const [provider, setProvider] = useState("");
   const [token, setToken] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -159,7 +183,7 @@ export function App() {
   async function addFolders(paths: string[]) {
     setOperation("saving"); setError(null);
     try {
-      await api.workspaces.add(paths);
+      await invoke("add_workspaces", { paths });
       setQuery("");
       await refresh();
       if (paths.length && !activePath) setActivePath(paths[0]);
@@ -168,7 +192,7 @@ export function App() {
     finally { setOperation(null); }
   }
   useEffect(() => {
-    if (!native) return;
+    if (!isTauri()) return;
     let disposed = false;
     const subscription = getCurrentWindow().onDragDropEvent(event => {
       const payload = event.payload;
@@ -192,6 +216,8 @@ export function App() {
     setPrepare({ phase: "start", downloaded: 0, total: null, error: null });
     try {
       await invoke<string>("runtime_install");
+      const report = await invoke<RuntimeReport>("runtime_report");
+      if (report?.mandatory === true || report?.nodeCurrent === false) throw new Error(`The runtime update did not finish (${report?.version ?? "unknown"}).`);
       setRuntimePresent(true);
       await configure({ action: "profile", profile: japaneseChoice ? "ja" : "core" });
       void loadComponents();
@@ -202,21 +228,6 @@ export function App() {
     }
   }
 
-  /** An outdated runtime is updated in place; the workspace stays open and new sessions wait. */
-  async function updateRuntime() {
-    setRuntimeUpdating({ phase: "start", error: null });
-    try {
-      await invoke<string>("runtime_install");
-      const report = await invoke<RuntimeReport>("runtime_report");
-      if (report && report.nodeCurrent === false) throw new Error("The runtime update did not finish.");
-      setRuntimeUpdating(null);
-      void (async () => { try { await invoke("image_tool_ensure"); } catch { /* the tool is optional on a fixture */ } })();
-      void loadComponents();
-      await readStatus();
-    } catch (error) {
-      setRuntimeUpdating({ phase: "error", error: String(error) });
-    }
-  }
   const prepareStarted = useRef(false);
   useEffect(() => {
     if (runtimePresent !== false) { prepareStarted.current = false; return; }
@@ -224,7 +235,7 @@ export function App() {
     prepareStarted.current = true;
     void runPrepare();
   }, [runtimePresent]);
-  async function configure(request: Record<string, unknown>) {
+  async function configure(request: Record<string, unknown>, options: { restart?: boolean } = {}) {
     // A status read is not a user-visible change; only mutations show progress.
     const mutates = request.action !== "status";
     const run = controlQueue.current.then(async () => {
@@ -234,11 +245,12 @@ export function App() {
         const next = parseControlState(await controlRequest(request as Record<string, unknown>));
         setSetup(next);
         // Provider, credential and model changes only take effect in a fresh runtime process.
-        if (request.action !== "status" && request.action !== "import" && request.action !== "profile") requestSessionRestart();
-        return true;
+        // A catalog refresh decides for itself: only an activated revision needs a new runtime.
+        if (options.restart !== false && request.action !== "status" && request.action !== "import" && request.action !== "profile" && request.action !== "refresh-catalogs") requestSessionRestart();
+        return next;
       }
-      catch (error) { setError(String(error)); return false; }
-      finally { if (mutates) setOperation(null); setDevice(null); }
+      catch (error) { setError(String(error)); return null; }
+      finally { if (mutates) setOperation(null); setDevice(null); setProviderDevice(null); }
     });
     controlQueue.current = run.catch(() => {});
     return run;
@@ -252,6 +264,14 @@ export function App() {
     });
     controlQueue.current = run.catch(() => {});
     return run;
+  }
+  async function openDeviceUrl(value: string) {
+    // Only the two documented sign-in origins may reach the system browser.
+    const url = new URL(value);
+    const shisa = url.origin === "https://platform.shisa.ai" && url.pathname === "/connect";
+    const openai = url.origin === "https://auth.openai.com";
+    if ((!shisa && !openai) || url.username || url.password) throw new Error(t.loginUrl);
+    await openUrl(url.href);
   }
   function openUpdatePanel() {
     // A waiting update is not a question to re-ask: the header opens the System list on the row that has it.
@@ -268,11 +288,8 @@ export function App() {
     } catch (error) { setError(String(error)); }
   }
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(null), 4000); return () => clearTimeout(timer); }, [notice]);
-  useEffect(() => { if (settingsOpen && native) { if (!setup && !busyRef.current) void configure({ action: "status" }); void readEnvironment(); } }, [settingsOpen]);
-  const refresh = async () => {
-    const recent = await api.workspaces.list();
-    setState({ platform: "windows", recent: recent as Workspace[], ready: true, bash: false, bundled_git: false });
-  };
+  useEffect(() => { if (settingsOpen && isTauri()) { if (!setup && !busyRef.current) void configure({ action: "status" }); void readEnvironment(); } }, [settingsOpen]);
+  const refresh = async () => setState(await invoke<LauncherState>("launcher_state"));
   const loadComponents = () => invoke<Components>("component_versions")
     .then(setComponents)
     .catch(error => setError(String(error)));
@@ -282,15 +299,29 @@ export function App() {
     catch { setDiagnostics(null); }
   };
   useEffect(() => {
-    setRuntimePresent(true);
-    setVersion("host");
-    void refresh().catch(error => setError(String(error)));
+    if (!isTauri()) return;
+    refresh().catch(error => setError(String(error)));
+    void refreshDiagnostics();
+    getVersion().then(setVersion).catch(error => setError(String(error)));
+    // The runtime decides whether the setup service exists; probing it first keeps a
+    // clean machine out of the status call instead of turning its absence into an alert.
+    void invoke<RuntimeReport>("runtime_report").then(report => {
+      if (report?.mandatory === true || report?.nodeCurrent === false) { setRuntimePresent(false); return; }
+      setRuntimePresent(true);
+      void (async () => { try { await invoke("image_tool_ensure"); } catch { /* the tool is optional on a fixture */ } })();
+      void loadComponents();
+      void readStatus();
+    }).catch(error => {
+      // Only a missing runtime belongs to onboarding; any other report failure
+      // (an unsupported probe, a broken fixture) must not hide the workspace.
+      if (String(error).includes("application files are missing")) setRuntimePresent(false);
+      else setRuntimePresent(true);
+    });
   }, []);
   // The prepare screen only mirrors the installer's own events; it never guesses progress.
   useEffect(() => {
-    if (!native) return;
+    if (!isTauri()) return;
     const pending = listen<{ phase: string; downloaded?: number; total?: number | null }>("runtime-install-progress", event => {
-      setRuntimeUpdating(current => current && !current.error ? { phase: event.payload.phase, error: null } : current);
       setPrepare(current => ({
         ...current,
         phase: event.payload.phase,
@@ -313,13 +344,54 @@ export function App() {
   // A signed-in account supplies models through Jouzu's published catalog. The chat shell
   // asks for a refresh only when the connected runtime has no models, so warm starts do not
   // pay a network round trip. A successful refresh restarts the session with the new catalog.
-  async function refreshModelCatalog() {
-    if (catalogAttempted.current) return;
+  // A refresh is cheap and the runtime's own terminal build does it at startup, so the
+  // desktop does it too. Only an activated revision needs a new runtime; a held revision
+  // waits for the user's decision in the catalog dialog.
+  async function refreshModelCatalog(force = false) {
+    if (catalogAttempted.current && !force) return;
     catalogAttempted.current = true;
     setCatalogRefreshing(true);
-    try { await configure({ action: "refresh-catalogs" }); }
+    try {
+      // A newly issued account key can lag its catalog by a moment. Retry the
+      // refresh before leaving a signed-in install with an empty model list.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const next = await configure({ action: "refresh-catalogs" });
+        if (next) {
+          const outcome = next.catalog;
+          if (outcome?.held) setHeldCatalog(outcome.held);
+          // Nothing changed on disk unless a source activated a revision. An adapter
+          // that reports no outcome keeps the older behaviour and rebinds.
+          if (!outcome || outcome.sources.some(source => source.status === "activated")) requestSessionRestart();
+          return;
+        }
+        if (attempt < 2) await new Promise(resolve => window.setTimeout(resolve, 1000 * (attempt + 1)));
+      }
+    }
     finally { setCatalogRefreshing(false); }
   }
+  /** Apply or discard the held revision the dialog is showing. Escape keeps it held. */
+  async function decideHeldCatalog(choice: "accept" | "reject") {
+    const held = heldCatalog;
+    if (!held || catalogDeciding) return;
+    setCatalogDeciding(true);
+    try {
+      const next = await configure({ action: choice === "accept" ? "catalog-accept" : "catalog-reject", revision: held.revision, digest: held.digest, sourceId: held.sourceId || undefined });
+      if (!next) return;
+      setHeldCatalog(null);
+      if (choice === "accept") requestSessionRestart();
+    }
+    finally { setCatalogDeciding(false); }
+  }
+  // The runtime's terminal build refreshes its catalogs at startup. The desktop spoke
+  // to the runtime in rpc mode, which skips that step, so a catalog published since the
+  // last launch never reached a session. Refresh once per launch and rebind only when a
+  // source actually activated a revision.
+  useEffect(() => {
+    if (!setup?.account.signedIn) return;
+    void refreshModelCatalog();
+    // refreshModelCatalog is stable for this purpose and self-gates with catalogAttempted.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setup?.account.signedIn]);
   useEffect(() => {
     if (restartPending && !chatBusy) { setRestartPending(false); setSessionRevision(value => value + 1); }
   }, [restartPending, chatBusy]);
@@ -344,14 +416,14 @@ export function App() {
   async function chooseFolder() {
     setOperation("choosing"); setError(null);
     try {
-      const path = await api.native.pickFolder();
-      if (path) { await addFolders([path]); setActivePath(path); }
+      const path = await open({ directory: true, multiple: false, title: t.picker });
+      if (typeof path === "string") { await addFolders([path]); setActivePath(path); }
     } catch (error) { setError(String(error)); } finally { setOperation(null); }
   }
   async function forget(workspace: Workspace) {
     setOperation("saving"); setError(null);
     try {
-      await api.workspaces.forget(workspace.id);
+      await invoke("forget_workspace", { id: workspace.id });
       const next = state?.recent.find(item => item.id !== workspace.id)?.path ?? null;
       if (activePath === workspace.path) setActivePath(next);
       await refresh();
@@ -363,18 +435,25 @@ export function App() {
   if (sort === "path") recent.sort((a,b) => a.path.localeCompare(b.path, locale));
   const development = components?.development ?? import.meta.env.DEV;
   const inlineProviders = !settingsOpen;
-  const providerContent = <div className="space-y-4">                  {(inlineProviders || !addingConnection) && <><Card className={inlineProviders ? "gap-3 rounded-none border-0 bg-transparent p-0 shadow-none" : "border-border gap-4 py-5 shadow-none"}><CardHeader className={inlineProviders ? "px-0" : undefined}><CardTitle>Shisa.AI</CardTitle><CardDescription>{device ? t.waitingAuthorization : setup?.account.signedIn ? t.shisaConnected : t.shisaHint}</CardDescription></CardHeader><CardContent className={inlineProviders ? "space-y-3 px-0" : "space-y-3"}>{!device && setup?.account.revocation === "unconfirmed" && <p role="status" className="text-sm text-muted-foreground">{t.signOutUnconfirmed}</p>}{!device && <div className="flex justify-end"><Button disabled={busy || !setup} onClick={() => void configure({ action: setup?.account.signedIn ? "shisa-logout" : "shisa-login" })}>{setup?.account.signedIn ? t.signOut : t.signIn}</Button></div>}{device && <div className="space-y-3"><Input readOnly aria-label={t.loginUrl} value={device.url} onFocus={event => event.target.select()} /><Input readOnly aria-label={t.deviceCode} value={device.code} onFocus={event => event.target.select()} /><p className="text-xs text-muted-foreground">{t.loginHint}</p><div className="flex items-center justify-end gap-2"><Button variant="outline" onClick={() => void controlCancel()}>{t.cancel}</Button><Button onClick={async () => { try { const url = new URL(device.url); if (url.origin !== "https://platform.shisa.ai" || url.pathname !== "/connect" || url.username || url.password) throw new Error(t.loginUrl); await openUrl(url.href); } catch (error) { setError(String(error)); } }}><ArrowUpRight />{t.openBrowser}</Button></div></div>}</CardContent></Card>
-                  {!inlineProviders && <>                  <Card className="border-border gap-4 py-5 shadow-none"><CardHeader><CardTitle>{t.connections}</CardTitle></CardHeader><CardContent className="space-y-2">{!!setup && setup.credentials.length + setup.customProviders.length > 5 && <Input aria-label={t.searchProviders} placeholder={t.searchProviders} value={providerQuery} onChange={event => setProviderQuery(event.target.value)} />}{!addingConnection && setup && [...new Set([...setup.credentials.map(c => c.providerId), ...setup.customProviders.map(c => c.id)])].filter(id => `${id} ${setup.providers.find(p => p.id === id)?.name ?? ""}`.toLowerCase().includes(providerQuery.toLowerCase())).map(id => ({providerId:id})).map(c => <div key={c.providerId} className="flex items-center gap-2"><Button variant="outline" className="h-auto min-w-0 flex-1 justify-between gap-2 py-3" disabled={busy} onClick={() => { setProvider(c.providerId); setToken(""); const saved = setup?.customProviders.find(p => p.id === c.providerId); setConnectionMode(saved?.editable ? "custom" : "builtin"); setCustom(saved?.editable ? {provider:saved.id,url:saved.url,model:saved.model,edit:true} : {provider:"",url:"",model:"",edit:false}); setAddingConnection(true); }}><span>{setup.providers.find(p => p.id === c.providerId)?.name ?? c.providerId}</span><span className="text-xs text-muted-foreground">{setup.credentials.some(key => key.providerId === c.providerId) ? t.credentialSaved : t.configuredNoKey}</span></Button></div>)}<Button variant="outline" disabled={busy || !setup} onClick={() => { setProviderQuery(""); setProvider(""); setConnectionMode("builtin"); setCustom({provider:"",url:"",model:"",edit:false}); setAddingConnection(true); }}><Plus />{t.addConnection}</Button></CardContent></Card></>}</>}
+  const providerInfo = setup?.providers.find(item => item.id === provider);
+  const providerOauth = connectionMode === "builtin" && provider === "openai-codex";
+  const providerSignedIn = !!setup?.credentials.some(item => item.providerId === provider);
+  // Shisa is an account, not a provider credential. Its saved key is shown by
+  // the Shisa.AI card and must not appear again as a phantom provider row.
+  const otherProviders = setup ? [...new Set([...setup.credentials.map(c => c.providerId), ...setup.customProviders.map(c => c.id)])].filter(id => id !== "shisa") : [];
+  const providerApiKey = providerInfo?.apiKey !== false;
+  const providerContent = <div className="space-y-4">                  {(inlineProviders || !addingConnection) && <><Card className={inlineProviders ? "gap-3 rounded-none border-0 bg-transparent p-0 shadow-none" : "border-border gap-4 py-5 shadow-none"}><CardHeader className={inlineProviders ? "px-0" : undefined}><CardTitle>Shisa.AI</CardTitle><CardDescription>{device ? t.waitingAuthorization : setup?.account.signedIn ? t.shisaConnected : t.shisaHint}</CardDescription></CardHeader><CardContent className={inlineProviders ? "space-y-3 px-0" : "space-y-3"}>{!device && setup?.account.revocation === "unconfirmed" && <p role="status" className="text-sm text-muted-foreground">{t.signOutUnconfirmed}</p>}{!device && <div className="flex flex-wrap justify-end gap-2">{setup?.account.signedIn && <Button variant="outline" disabled={busy || catalogRefreshing || !setup} onClick={() => void refreshModelCatalog(true)}><RefreshCw className={catalogRefreshing ? "animate-spin" : undefined} />{t.refreshModels}</Button>}<Button disabled={busy || !setup} onClick={() => void configure({ action: setup?.account.signedIn ? "shisa-logout" : "shisa-login" })}>{setup?.account.signedIn ? t.signOut : t.signIn}</Button></div>}{device && <div className="space-y-3"><Input readOnly aria-label={t.loginUrl} value={device.url} onFocus={event => event.target.select()} /><Input readOnly aria-label={t.deviceCode} value={device.code} onFocus={event => event.target.select()} /><p className="text-xs text-muted-foreground">{t.loginHint}</p><div className="flex items-center justify-end gap-2"><Button variant="outline" onClick={() => void controlCancel()}>{t.cancel}</Button><Button onClick={async () => { try { const url = new URL(device.url); if (url.origin !== "https://platform.shisa.ai" || url.pathname !== "/connect" || url.username || url.password) throw new Error(t.loginUrl); await openUrl(url.href); } catch (error) { setError(String(error)); } }}><ArrowUpRight />{t.openBrowser}</Button></div></div>}</CardContent></Card>
+                  {!inlineProviders && <>                  <Card className="border-border gap-4 py-5 shadow-none"><CardHeader><CardTitle>{t.connections}</CardTitle></CardHeader><CardContent className="space-y-2">{!!setup && otherProviders.length > 5 && <Input aria-label={t.searchProviders} placeholder={t.searchProviders} value={providerQuery} onChange={event => setProviderQuery(event.target.value)} />}{!addingConnection && setup && otherProviders.filter(id => `${id} ${setup.providers.find(p => p.id === id)?.name ?? ""}`.toLowerCase().includes(providerQuery.toLowerCase())).map(id => ({providerId:id})).map(c => <div key={c.providerId} className="flex items-center gap-2"><Button variant="outline" className="h-auto min-w-0 flex-1 justify-between gap-2 py-3" disabled={busy} onClick={() => { setProvider(c.providerId); setToken(""); const saved = setup?.customProviders.find(p => p.id === c.providerId); setConnectionMode(saved?.editable ? "custom" : "builtin"); setCustom(saved?.editable ? {provider:saved.id,url:saved.url,model:saved.model,edit:true,imageInput:saved.imageInput ?? false,contextWindow:saved.contextWindow ?? 32768,maxTokens:saved.maxTokens ?? 4096} : {provider:"",url:"",model:"",edit:false,imageInput:false,contextWindow:32768,maxTokens:4096}); setAddingConnection(true); }}><span>{setup.providers.find(p => p.id === c.providerId)?.name ?? c.providerId}</span><span className="text-xs text-muted-foreground">{setup.credentials.some(key => key.providerId === c.providerId) ? t.credentialSaved : t.configuredNoKey}</span></Button></div>)}<Button variant="outline" disabled={busy || !setup} onClick={() => { setProviderQuery(""); setProvider(""); setConnectionMode("builtin"); setCustom({provider:"",url:"",model:"",edit:false,imageInput:false,contextWindow:32768,maxTokens:4096}); setAddingConnection(true); }}><Plus />{t.addConnection}</Button></CardContent></Card></>}</>}
                   {(inlineProviders || addingConnection) && <section className={inlineProviders ? "space-y-3 border-t border-border pt-4" : "space-y-4 rounded-xl border border-border bg-card p-5"}><div className="flex items-center justify-between gap-3"><h3 className="text-sm font-semibold">{inlineProviders ? t.connections : custom.edit ? t.editConnection : t.addConnection}</h3>{!inlineProviders && <Button variant="ghost" disabled={busy} onClick={() => setAddingConnection(false)}>{t.backConnections}</Button>}</div><div className="space-y-4">
                   <div className="space-y-2">{!inlineProviders && <Label>{t.service}</Label>}<ProviderPicker value={connectionMode === "custom" ? "__custom__" : provider} disabled={busy || custom.edit} label={t.service} placeholder={t.chooseService} searchLabel={t.searchProviders} empty={t.noResults} items={[...(setup?.providers ?? []),{id:"__custom__",name:t.customProvider}]} onChange={value => { setToken(""); if(value === "__custom__") {setConnectionMode("custom");setProvider("");} else {setConnectionMode("builtin");setProvider(value);} }}/></div>
 
                   {connectionMode === "builtin" && provider &&
                   <div className="space-y-4 border-t border-border pt-4">
 
-                    {provider && <><Label>{t.apiKey}</Label><Input type="password" autoComplete="off" aria-label={t.apiKey} placeholder={t.apiKey} value={token} onChange={event => setToken(event.target.value)} /><div className="flex justify-end gap-2"><Button disabled={busy || !token.trim()} onClick={async () => { if (await configure({ action: "provider-key", provider, token })) { setToken(""); setAddingConnection(false); } }}>{t.save}</Button>{setup?.credentials.some(c => c.providerId === provider) && <Button variant="outline" disabled={busy} onClick={() => void configure({ action: "provider-remove", provider })}>{t.removeCredential}</Button>}</div>
+                    {provider && <>{providerOauth && <div className="space-y-3 rounded-lg border border-border p-3"><p className="text-sm text-muted-foreground">{providerInfo?.oauthName ?? t.oauthHint}</p>{providerSignedIn ? <div className="flex items-center justify-between gap-2"><span className="text-sm">{t.oauthConnected}</span><Button variant="outline" disabled={busy} onClick={() => void configure({ action: "provider-remove", provider })}>{t.removeCredential}</Button></div> : <div className="flex justify-end"><Button disabled={busy} onClick={async () => { await configure({ action: "provider-oauth", provider }); }}>{t.oauthSignIn}</Button></div>}{providerDevice?.provider === provider && <div className="space-y-3"><Input readOnly aria-label={t.loginUrl} value={providerDevice.url} onFocus={event => event.target.select()} />{providerDevice.code && <Input readOnly aria-label={t.deviceCode} value={providerDevice.code} onFocus={event => event.target.select()} />}<p className="text-xs text-muted-foreground">{t.loginHint}</p><div className="flex items-center justify-end gap-2"><Button variant="outline" onClick={() => void controlCancel()}>{t.cancel}</Button><Button onClick={async () => { try { await openDeviceUrl(providerDevice.url); } catch (error) { setError(String(error)); } }}><ArrowUpRight />{t.openBrowser}</Button></div></div>}</div>}{providerApiKey && <><Label>{t.apiKey}</Label><Input type="password" autoComplete="off" aria-label={t.apiKey} placeholder={t.apiKey} value={token} onChange={event => setToken(event.target.value)} /><div className="flex justify-end gap-2"><Button disabled={busy || !token.trim()} onClick={async () => { if (await configure({ action: "provider-key", provider, token })) { setToken(""); setAddingConnection(false); } }}>{t.save}</Button>{setup?.credentials.some(c => c.providerId === provider) && <Button variant="outline" disabled={busy} onClick={() => void configure({ action: "provider-remove", provider })}>{t.removeCredential}</Button>}</div></>}
                     <Label>{t.defaultModel}</Label><Select value={setup?.defaultProvider === provider ? setup.defaultModel : ""} onValueChange={model => void configure({ action: "default-model", provider, model })}><SelectTrigger className="w-full" aria-label={t.defaultModel}><SelectValue placeholder={t.defaultModel} /></SelectTrigger><SelectContent>{setup?.models.filter(m => m.provider === provider).map(m => <SelectItem key={m.id} value={m.id}>{m.name}</SelectItem>)}</SelectContent></Select></>}
                   </div>}
-                  {connectionMode === "custom" &&<div className="space-y-3 border-t border-border pt-4"><p className="text-sm text-muted-foreground">{t.customHint}</p><Label>{t.providerId}</Label><Input placeholder={t.providerId} aria-label={t.providerId} disabled={custom.edit} value={custom.provider} onChange={event => setCustom({...custom,provider:event.target.value})} /><Label>{t.endpoint}</Label><Input placeholder={t.endpoint} aria-label={t.endpoint} value={custom.url} onChange={event => setCustom({...custom,url:event.target.value})} /><Label>{t.modelId}</Label><Input placeholder={t.modelId} aria-label={t.modelId} value={custom.model} onChange={event => setCustom({...custom,model:event.target.value})} /><Label>{t.apiKey}</Label><Input type="password" autoComplete="off" aria-label={t.apiKey} placeholder={t.apiKey} value={token} onChange={event=>setToken(event.target.value)}/><div className="flex justify-end pt-1"><Button disabled={busy || !custom.provider || !custom.url || !custom.model} onClick={async () => { if (await configure({action:"custom-provider",...custom})) { setCustom(value=>({...value,edit:true})); if (token.trim() && !await configure({action:"provider-key",provider:custom.provider,token})) return; setToken("");setAddingConnection(false); } }}>{t.save}</Button></div></div>}
+                  {connectionMode === "custom" &&<div className="space-y-3 border-t border-border pt-4"><p className="text-sm text-muted-foreground">{t.customHint}</p><Label>{t.providerId}</Label><Input placeholder={t.providerId} aria-label={t.providerId} disabled={custom.edit} value={custom.provider} onChange={event => setCustom({...custom,provider:event.target.value})} /><Label>{t.endpoint}</Label><Input placeholder={t.endpoint} aria-label={t.endpoint} value={custom.url} onChange={event => setCustom({...custom,url:event.target.value})} /><Label>{t.modelId}</Label><Input placeholder={t.modelId} aria-label={t.modelId} value={custom.model} onChange={event => setCustom({...custom,model:event.target.value})} /><div className="flex items-center justify-between gap-3"><Label htmlFor="custom-image-input">{t.imageInput}</Label><Switch id="custom-image-input" checked={custom.imageInput} onCheckedChange={imageInput => setCustom(value=>({...value,imageInput}))} /></div><p className="text-xs text-muted-foreground">{t.imageInputHint}</p><Label>{t.contextWindow}</Label><Input type="number" min={1024} max={2000000} step={1024} aria-label={t.contextWindow} value={custom.contextWindow} onChange={event => setCustom(value=>({...value,contextWindow:Number(event.target.value)}))} /><p className="text-xs text-muted-foreground">{t.contextWindowHint}</p><Label>{t.maxOutput}</Label><Input type="number" min={1} max={custom.contextWindow} step={1} aria-label={t.maxOutput} value={custom.maxTokens} onChange={event => setCustom(value=>({...value,maxTokens:Number(event.target.value)}))} /><p className="text-xs text-muted-foreground">{t.maxOutputHint}</p><Label>{t.apiKey}</Label><Input type="password" autoComplete="off" aria-label={t.apiKey} placeholder={t.apiKey} value={token} onChange={event=>setToken(event.target.value)}/><div className="flex justify-end pt-1"><Button disabled={busy || !custom.provider || !custom.url || !custom.model} onClick={async () => { if (await configure({action:"custom-provider",...custom})) { setCustom(value=>({...value,edit:true})); if (token.trim() && !await configure({action:"provider-key",provider:custom.provider,token})) return; setToken("");setAddingConnection(false); } }}>{t.save}</Button></div></div>}
                   </div></section>}
 </div>;
   const errorBanner = error && <div role="alert" className="fixed left-1/2 top-4 z-[60] flex w-[min(42rem,calc(100vw-2rem))] -translate-x-1/2 items-start justify-between gap-3 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-900 shadow-xl"><div><p className="font-medium">{t.error}</p><details className="mt-2 break-all"><summary className="cursor-pointer">{t.details}</summary><p className="mt-2">{error}</p></details></div><button onClick={() => setError(null)} aria-label={t.dismiss}><X className="size-4" /></button></div>;
@@ -392,7 +471,7 @@ export function App() {
   </div>;
   // The first-run pages have no titlebar of their own; without these a loading
   // window cannot be closed.
-  const firstRunControls = <div className="fixed right-2 top-2 z-50 flex items-center gap-1">{native && <>
+  const firstRunControls = <div className="fixed right-2 top-2 z-50 flex items-center gap-1">{isTauri() && <>
     <Button variant="ghost" aria-label={t.minimize} title={t.minimize} onClick={() => getCurrentWindow().minimize().catch(error => setError(String(error)))}><Minus /></Button>
     <Button variant="ghost" aria-label="Close launcher" title={t.dismiss} onClick={() => getCurrentWindow().close().catch(error => setError(String(error)))}><X /></Button>
   </>}</div>;
@@ -437,17 +516,20 @@ export function App() {
     <span role="status" aria-live="polite" className="sr-only">{busy || notice ? (operation === "preparing" ? t.preparing : operation === "launching" ? t.launching : operation === "choosing" ? t.choosing : operation === "saving" ? t.saving : notice ? t[notice] : null) : state && !state.ready ? t.repair : ""}</span>
     <header data-tauri-drag-region className="flex items-center justify-between border-b border-border px-4 py-2">
       <div className="absolute left-0 right-0 top-0 h-3" data-tauri-drag-region />
-      <div className="pointer-events-none flex items-center gap-2"><img src={jouzuIcon} alt="" draggable={false} className="size-7" /><h1 className="min-w-16 flex-1 text-sm font-semibold tracking-tight">Jouzu</h1></div>
-      <div className="pointer-events-none flex items-center gap-1 [&>*]:pointer-events-auto"><Dialog open={settingsOpen} onOpenChange={value => { if (!value && device) void controlCancel(); if (!value) setUpdateFocus(null); setSettingsOpen(value); }}>
-        <DialogContent showCloseButton={false} className="flex h-[min(560px,85dvh)] max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden rounded-2xl border-border p-0 sm:max-w-3xl">
+      <div className="pointer-events-none flex items-center gap-2"><img src={jouzuIcon} alt="" draggable={false} className="size-7" /><h1 className="min-w-16 flex-1 text-sm font-semibold tracking-tight">Jouzu</h1>{import.meta.env.DEV && <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600">DEV 1.0.12</span>}</div>
+      <div className="pointer-events-none flex items-center gap-1 [&>*]:pointer-events-auto"><Dialog modal={false} open={settingsOpen} onOpenChange={value => { if (!value && device) void controlCancel(); if (!value) setUpdateFocus(null); setSettingsOpen(value); }}>
+        {/* The dialog must stay open on an outside click and must not let the view behind it be used. A non-modal dialog keeps the background interactive, so shield it. */}
+        {settingsOpen && <div aria-hidden="true" data-settings-shield className="fixed inset-0 z-40" onPointerDown={event => event.preventDefault()} onWheel={event => event.preventDefault()} />}
+        <DialogContent showCloseButton={false} onInteractOutside={event => event.preventDefault()} onPointerDownOutside={event => event.preventDefault()} className="flex h-[min(560px,85dvh)] max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden rounded-2xl border-border p-0 sm:max-w-3xl">
           {error && <p role="alert" className="border-b border-border bg-red-50 px-4 py-2 text-sm text-red-900">{error}</p>}
           <DialogDescription className="sr-only">{t.preferences}</DialogDescription>
           <Tabs value={settingsTab} onValueChange={setSettingsTab} orientation="vertical" className="min-h-0 flex-1 gap-0">
             <aside className="w-36 shrink-0 border-r border-border bg-muted/60 p-3 sm:w-48">
-              <DialogTitle className="mb-5 flex items-center gap-2 px-2 pt-2 text-sm font-semibold"><Settings className="size-4" />{t.settings}</DialogTitle>
+              <DialogTitle className="mb-5 flex items-center gap-2 px-2 pt-2 text-sm font-semibold"><Settings className="size-4" />{t.settings}<DialogClose asChild><Button variant="ghost" className="ml-auto size-7 shrink-0 p-0" aria-label={t.dismiss}><X className="size-4" /></Button></DialogClose></DialogTitle>
               <TabsList aria-label={t.settings} className="h-auto w-full items-stretch gap-1 bg-transparent p-0">
                 <TabsTrigger value="providers" className="min-h-10 justify-start gap-2 px-3"><KeyRound className="size-4 shrink-0" aria-hidden="true" />{t.providers}</TabsTrigger>
                 <TabsTrigger value="tools" className="min-h-10 justify-start gap-2 px-3"><Wrench className="size-4 shrink-0" aria-hidden="true" />{t.toolsTab}</TabsTrigger>
+                <TabsTrigger value="appearance" className="min-h-10 justify-start gap-2 px-3"><Palette className="size-4 shrink-0" aria-hidden="true" />{t.appearance}</TabsTrigger>
                 <TabsTrigger value="environment" className="min-h-10 justify-start gap-2 px-3"><SlidersHorizontal className="size-4 shrink-0" aria-hidden="true" />{t.environment}</TabsTrigger><TabsTrigger value="general" className="min-h-10 justify-start gap-2 px-3"><Languages className="size-4 shrink-0" aria-hidden="true" />{t.general}</TabsTrigger>
                 <TabsTrigger value="system" className="min-h-10 justify-start gap-2 whitespace-normal px-3 text-left"><RefreshCw className="size-4 shrink-0" aria-hidden="true" />{t.system}</TabsTrigger>
               </TabsList>
@@ -463,6 +545,11 @@ export function App() {
                   {envRows.map((row,index) => <div key={index} className="space-y-2 rounded-lg border border-border p-3"><div className="flex items-center gap-2">{editingEnv === index ? <Input aria-label={t.variableName} placeholder={t.variableName} value={row.name} disabled={busy} onChange={event => setEnvRows(rows => rows.map((r,i) => i === index ? {...r,name:event.target.value} : r))} /> : <span className="min-w-0 flex-1 truncate text-sm font-medium" title={row.name}>{row.name}</span>}<Button variant="ghost" disabled={busy} onClick={() => setEditingEnv(index)}>{t.editValue}</Button><Switch aria-label={t.enabled} checked={row.enabled} disabled={busy} onCheckedChange={enabled => setEnvRows(rows => rows.map((r,i) => i === index ? {...r,enabled} : r))} /><Button variant="ghost" disabled={busy} aria-label={t.deleteEntry} onClick={() => { setEnvRows(rows => rows.filter((_,i) => i !== index)); setEditingEnv(null); }}><X /></Button></div>{editingEnv === index && <Input type="password" autoComplete="off" aria-label={t.variableValue} placeholder={t.variableValue} value={row.value} disabled={busy} onChange={event => setEnvRows(rows => rows.map((r,i) => i === index ? {...r,value:event.target.value} : r))} />}</div>)}
                   <div className="flex gap-2"><Button variant="outline" disabled={!envLoaded || busy} onClick={() => { setEditingEnv(envRows.length); setEnvRows(rows => [...rows,{name:"",value:"",enabled:true}]); }}><Plus />{t.addEntry}</Button><Button className="ml-auto" disabled={!envLoaded || busy} onClick={saveEnvironment}>{t.save}</Button></div>
                 </CardContent></Card></TabsContent>
+                <TabsContent value="appearance" className="m-0 space-y-4">
+                  <Card className="border-border shadow-none"><CardHeader><CardTitle>{t.appearance}</CardTitle><CardDescription>{t.appearanceHint}</CardDescription></CardHeader><CardContent>
+                    <Select value={theme} onValueChange={value => setTheme(value as Theme)}><SelectTrigger aria-label={t.appearance} className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="system">{t.themeSystem}</SelectItem><SelectItem value="dark">{t.themeDark}</SelectItem><SelectItem value="light">{t.themeLight}</SelectItem></SelectContent></Select>
+                  </CardContent></Card>
+                </TabsContent>
                 <TabsContent value="general" className="m-0 space-y-4">
                   <Card className="border-border shadow-none"><CardHeader><CardTitle>{t.language}</CardTitle><CardDescription>{t.languageHint}</CardDescription></CardHeader><CardContent>
                     <Select value={locale} onValueChange={value => setLocale(value as Locale)}><SelectTrigger aria-label={t.language} className="w-full"><SelectValue /></SelectTrigger><SelectContent>{Object.entries(locales).map(([key,label]) => <SelectItem key={key} value={key}>{label}</SelectItem>)}</SelectContent></Select>
@@ -475,6 +562,7 @@ export function App() {
 
                 </TabsContent>
                 <TabsContent value="system" className="m-0 space-y-4">
+                  
                   <UpdatePreview locale={locale} focusIndex={updateFocus} live={{
                     phases:[jouzuUpdater.phase === 'preparing' || jouzuUpdater.phase === 'verifying' || jouzuUpdater.phase === 'activating' || jouzuUpdater.phase === 'staged' ? 'installing' : jouzuUpdater.phase as 'idle'|'checking'|'available'|'current'|'downloading'|'installing'|'complete'|'error', updater.phase],
                     versions:[components?.jouzu ?? t.unavailable, version ?? t.unavailable],
@@ -507,10 +595,9 @@ export function App() {
               </div>
             </ScrollArea>
           </Tabs>
-          <DialogClose asChild><Button variant="ghost" className="absolute right-2 top-2 px-3" aria-label={t.dismiss}><X /></Button></DialogClose>
         </DialogContent>
       </Dialog>
-      {native && <><Button variant="ghost" aria-label={t.minimize} onClick={() => getCurrentWindow().minimize().catch(error => setError(String(error)))}><Minus /></Button><Button variant="ghost" aria-label={maximized ? "Restore" : "Maximize"} onClick={() => getCurrentWindow().toggleMaximize().catch(error => setError(String(error)))}>{maximized ? <Minimize2 /> : <Maximize2 />}</Button><Button variant="ghost" aria-label="Hide to tray" title="Hide to tray" onClick={() => getCurrentWindow().close().catch(error => setError(String(error)))}><X /></Button></>}
+      {isTauri() && <><Button variant="ghost" aria-label={t.minimize} onClick={() => getCurrentWindow().minimize().catch(error => setError(String(error)))}><Minus /></Button><Button variant="ghost" aria-label={maximized ? "Restore" : "Maximize"} onClick={() => getCurrentWindow().toggleMaximize().catch(error => setError(String(error)))}>{maximized ? <Minimize2 /> : <Maximize2 />}</Button><Button variant="ghost" aria-label="Hide to tray" title="Hide to tray" onClick={() => getCurrentWindow().close().catch(error => setError(String(error)))}><X /></Button></>}
       </div>
     </header>
       <Dialog open={repair !== null} onOpenChange={open => { if (!open) setRepair(null); }}>
@@ -524,21 +611,33 @@ export function App() {
           </div>
         </DialogContent>
       </Dialog>
-    {entryBooting && !entryReady.current && <div className="fixed inset-0 z-40 flex h-screen w-full flex-col bg-background">
+      {/* A held catalog revision is a decision. The desktop shows its own
+          confirmation; it never prints terminal instructions or shells out to the
+          runtime's catalog command. Escape or an outside click defers the decision. */}
+      <Dialog open={heldCatalog !== null} onOpenChange={open => { if (!open) setHeldCatalog(null); }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogTitle>{review.title}</DialogTitle>
+          <DialogDescription>{review.hint}</DialogDescription>
+          {heldCatalog && heldCatalog.reasons.length > 0 && <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+            {heldCatalog.reasons.map(reason => <li key={reason}>{reason}</li>)}
+          </ul>}
+          {heldCatalog && catalogChangeSummary(heldCatalog.changes) && <p className="text-sm">{catalogChangeSummary(heldCatalog.changes)}</p>}
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" disabled={catalogDeciding} onClick={() => void decideHeldCatalog("reject")}>{review.reject}</Button>
+            <Button disabled={catalogDeciding} onClick={() => void decideHeldCatalog("accept")}>{review.accept}</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+      {entryBooting && !entryReady.current && <div className="fixed inset-0 z-40 flex h-screen w-full flex-col bg-background">
       {onboardingBanner(t.connecting, undefined, 0.7, true)}
       <div className="flex shrink-0 justify-center px-6 pb-14 pt-8"><Progress value={null} className="w-full max-w-xl" /></div>
     </div>}
     {errorBanner}
-    {runtimeUpdating && <div role="status" className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-muted/40 px-4 py-2 text-sm">
-      <span className="min-w-0 flex-1 truncate" title={runtimeUpdating.error ?? undefined}>{runtimeUpdating.error ? `${t.runtimeUpdateFailed} ${runtimeUpdating.error}` : t.runtimeUpdating}</span>
-      {runtimeUpdating.error && <Button variant="outline" onClick={() => void updateRuntime()}>{t.retry}</Button>}
-    </div>}
     {activePath && <div className="flex min-h-0 flex-1">
       <ChatWorkspace
         path={activePath}
         revision={sessionRevision}
         newSession={newSession}
-        locked={runtimeUpdating !== null}
         onStartSession={() => setNewSession(false)}
         onRetry={() => setSessionRevision(value => value + 1)}
         onBusyChange={setChatBusy}
@@ -553,19 +652,35 @@ export function App() {
         catalogRefreshing={catalogRefreshing}
         canRefreshModels={setup?.account.signedIn === true}
         onModelsMissing={() => void refreshModelCatalog()}
+        onRetryModels={() => void refreshModelCatalog(true)}
         workspaces={state?.recent ?? []}
         onSelect={setActivePath}
         onAddFolder={() => void chooseFolder()}
         onRemove={id => { const workspace = state?.recent.find(item => item.id === id); if (workspace) void forget(workspace); }}
+
         onSettings={() => setSettingsOpen(true)}
         onUpdate={openUpdatePanel}
         updateAvailable={!!(updater.version || jouzuUpdater.version)}
         updateBusy={updater.busy || jouzuUpdater.busy}
       />
     </div>}
-    {!activePath && <div role="status" aria-label="Loading" className="flex min-h-0 flex-1 items-center justify-center"><JouzuLoader /></div>}
+    {!activePath && <LauncherPage title={t.heading} description={t.intro}>
+      <div className="flex min-h-0 flex-1 items-center justify-center gap-2 p-6"><Button onClick={() => void chooseFolder()} disabled={!state || busy}><Plus />{t.addFolder}</Button><Button variant="outline" onClick={() => setSettingsOpen(true)}>{t.settings}</Button></div>
+    </LauncherPage>}
     </main>;
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

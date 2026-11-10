@@ -22,7 +22,7 @@ on:
         description: Version to release; must match apps/launcher/package.json
         required: true
         type: string
-        default: '1.0.3'
+        default: '1.0.11'
       notes:
         description: Release notes for the feed; empty uses the CHANGELOG section when it exists
         required: false
@@ -45,7 +45,7 @@ concurrency:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       version: ${{ steps.check.outputs.version }}
     steps:
@@ -54,7 +54,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: '24.22.1'
+          node-version: '24.22.2'
       - name: Check the dispatched version
         id: check
         shell: bash
@@ -81,7 +81,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: '24.22.1'
+          node-version: '24.22.2'
       - name: Install frontend dependencies
         run: npm ci --prefix apps/launcher
       - name: Install the acceptance browser
@@ -89,6 +89,20 @@ jobs:
         run: npx playwright install chromium
       - name: Frontend build, unit tests and acceptance tests
         run: npm --prefix apps/launcher run test:acceptance
+      - name: Mocked onboarding UI tests
+        working-directory: apps/launcher
+        run: |
+          $vite = Start-Process node -ArgumentList 'node_modules/vite/bin/vite.js' -PassThru -NoNewWindow
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              try { Invoke-WebRequest http://localhost:1420 -TimeoutSec 2 | Out-Null; $ready = $true; break } catch { Start-Sleep 1 }
+            }
+            if (-not $ready) { throw 'Vite did not become ready' }
+            npx playwright test e2e/onboarding.spec.ts --reporter=line
+            $code = $LASTEXITCODE
+          } finally { if (-not $vite.HasExited) { Stop-Process -Id $vite.Id } }
+          exit $code
       - name: Native tests
         working-directory: apps/launcher/src-tauri
         run: cargo test --locked --bins
@@ -147,7 +161,7 @@ jobs:
           Get-ChildItem apps/launcher/src-tauri/target/release/bundle/nsis -Filter 'JouzuDesktop_*' |
             Copy-Item -Destination $stage
           Copy-Item apps/launcher/SHA256SUMS.txt $stage
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: windows-release
           path: ${{ runner.temp }}/release
@@ -157,7 +171,7 @@ jobs:
   publish:
     needs: [prepare, windows]
     if: ${{ inputs.publish }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     environment: desktop-release
     permissions:
@@ -169,7 +183,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: '24.22.1'
+          node-version: '24.22.2'
       - name: Check the updater configuration
         shell: bash
         run: |
@@ -236,3 +250,6 @@ jobs:
           cmp latest.json published.json
           asset="$(node -p "require('./published.json').platforms['windows-x86_64'].url")"
           curl -fsSL -o /dev/null "$asset"
+
+
+

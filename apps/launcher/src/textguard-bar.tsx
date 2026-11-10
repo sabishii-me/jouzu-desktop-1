@@ -100,7 +100,7 @@ export function TextGuardBar({ data, open, busy, running, error, historical = fa
       ? "The turn is still running. Review this content when it settles."
       : historical
       ? error
-        ? "The transcript is intact, but this review cannot be reopened."
+        ? "The content is still withheld. Re-run the request to create a new review."
         : "The transcript shows withheld content. Click Review to inspect this session."
       : "Click Review to inspect the current session."
     : items.length === 0

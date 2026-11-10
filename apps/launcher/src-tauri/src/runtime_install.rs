@@ -6,7 +6,8 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 /// The runtime is the official npm package, installed from the official registry.
-const NODE_VERSION: &str = "24.22.1";
+const NODE_VERSION: &str = "24.22.2";
+const JOUZU_VERSION: &str = "0.2.5";
 const NODE_BASE: &str = "https://nodejs.org/dist";
 const LOCKFILE: &str = "4.1.2";
 const MAX_ARCHIVE: u64 = 192 * 1024 * 1024;
@@ -31,9 +32,27 @@ const TERMINAL_ENVIRONMENT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../packaging/launcher/terminal-environment.ps1"
 ));
+const COMMAND_PATH: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../packaging/launcher/command-path.ps1"
+));
+const COMMAND_ENTRIES: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../packaging/launcher/command-entries.ps1"
+));
 const APP_MANIFEST: &str = "{\n  \"name\": \"jouzu-desktop-runtime\",\n  \"private\": true\n}\n";
 
 type Progress<'a> = &'a dyn Fn(serde_json::Value);
+
+/// Runtime install children are console programs. On Windows they must not
+/// create a console window over the onboarding screen.
+fn hidden(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+}
 
 fn http(url: &str, limit: u64) -> Result<Vec<u8>, String> {
     let client = reqwest::blocking::Client::builder()
@@ -103,7 +122,23 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 fn archive_name() -> String {
-    format!("node-v{NODE_VERSION}-win-x64.zip")
+    #[cfg(windows)]
+    return format!("node-v{NODE_VERSION}-win-x64.zip");
+    #[cfg(target_os = "macos")]
+    return format!("node-v{NODE_VERSION}-darwin-arm64.tar.gz");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    return format!("node-v{NODE_VERSION}-linux-x64.tar.gz");
+}
+
+/// The Node executable inside the managed runtime: `node.exe` on Windows, `bin/node`
+/// in the official Unix tarball.
+pub fn node_executable(root: &Path) -> PathBuf {
+    let directory = root.join("runtime").join("node");
+    if cfg!(windows) {
+        directory.join("node.exe")
+    } else {
+        directory.join("bin").join("node")
+    }
 }
 
 fn digest_for(shasums: &str, name: &str) -> Option<String> {
@@ -117,18 +152,22 @@ fn digest_for(shasums: &str, name: &str) -> Option<String> {
 }
 
 fn tar_exe() -> PathBuf {
-    let root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    root.join("System32").join("tar.exe")
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        return root.join("System32").join("tar.exe");
+    }
+    #[cfg(not(windows))]
+    return PathBuf::from("tar");
 }
 
 fn extract(archive: &Path, directory: &Path) -> Result<(), String> {
-    let status = Command::new(tar_exe())
-        .arg("-xf")
-        .arg(archive)
-        .arg("-C")
-        .arg(directory)
+    let mut command = Command::new(tar_exe());
+    command.arg("-xf").arg(archive).arg("-C").arg(directory);
+    hidden(&mut command);
+    let status = command
         .status()
         .map_err(|error| format!("Could not start the extractor: {error}"))?;
     if !status.success() {
@@ -144,12 +183,14 @@ fn version_matches(actual: &str) -> bool {
 
 /// Whether the managed Node is the pinned, patched build.
 pub fn node_version_ok(root: &Path) -> bool {
-    let executable = root.join("runtime").join("node").join("node.exe");
+    let executable = node_executable(root);
     if !executable.is_file() {
         return false;
     }
-    std::process::Command::new(executable)
-        .arg("--version")
+    let mut command = std::process::Command::new(executable);
+    command.arg("--version");
+    hidden(&mut command);
+    command
         .output()
         .ok()
         .map(|output| version_matches(&String::from_utf8_lossy(&output.stdout)))
@@ -158,7 +199,7 @@ pub fn node_version_ok(root: &Path) -> bool {
 
 fn ensure_node(managed: &Path, progress: Progress) -> Result<PathBuf, String> {
     let node = managed.join("runtime").join("node");
-    let executable = node.join("node.exe");
+    let executable = node_executable(managed);
     if executable.is_file() {
         if node_version_ok(managed) {
             return Ok(executable);
@@ -213,13 +254,24 @@ fn installer_path(node: &Path, app: &Path) -> Result<std::ffi::OsString, String>
 }
 
 fn npm_install(node: &Path, app: &Path, progress: Progress) -> Result<(), String> {
-    let npm = node
-        .parent()
-        .unwrap()
-        .join("node_modules")
-        .join("npm")
-        .join("bin")
-        .join("npm-cli.js");
+    let npm = if cfg!(windows) {
+        node.parent()
+            .unwrap()
+            .join("node_modules")
+            .join("npm")
+            .join("bin")
+            .join("npm-cli.js")
+    } else {
+        node.parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("lib")
+            .join("node_modules")
+            .join("npm")
+            .join("bin")
+            .join("npm-cli.js")
+    };
     if !npm.is_file() {
         return Err("The Node package does not carry npm.".into());
     }
@@ -229,16 +281,19 @@ fn npm_install(node: &Path, app: &Path, progress: Progress) -> Result<(), String
     }
     progress(serde_json::json!({ "phase": "packages" }));
     let path = installer_path(node, app)?;
-    let output = Command::new(node)
+    let mut command = Command::new(node);
+    command
         .arg(&npm)
         .arg("install")
-        .arg("jouzu@latest")
+        .arg(format!("jouzu@{JOUZU_VERSION}"))
         .arg(format!("proper-lockfile@{LOCKFILE}"))
         .arg("--omit=dev")
         .arg("--no-audit")
         .arg("--no-fund")
         .env("PATH", path)
-        .current_dir(app)
+        .current_dir(app);
+    hidden(&mut command);
+    let output = command
         .output()
         .map_err(|_| "Could not start the package installation.".to_string())?;
     if !output.status.success() {
@@ -296,13 +351,16 @@ fn check_health(managed: &Path, node: &Path) -> Result<(), String> {
     let bootstrap = managed.join("app").join("bootstrap.mjs");
     let home = managed.join("data");
     std::fs::create_dir_all(&home).map_err(|error| error.to_string())?;
-    let output = Command::new(node)
+    let mut command = Command::new(node);
+    command
         .arg(&bootstrap)
         .arg("--version")
         .env("JOUZU_HOME", &home)
         .env("JOUZU_NO_UPDATE", "1")
         .env_remove("NODE_OPTIONS")
-        .env_remove("NODE_PATH")
+        .env_remove("NODE_PATH");
+    hidden(&mut command);
+    let output = command
         .output()
         .map_err(|_| "The installed runtime did not start.".to_string())?;
     if !output.status.success() {
@@ -319,7 +377,8 @@ fn check_health(managed: &Path, node: &Path) -> Result<(), String> {
 
 /// The setup service is what onboarding talks to next, so it must answer.
 fn check_control(managed: &Path, node: &Path) -> Result<(), String> {
-    let mut child = Command::new(node)
+    let mut command = Command::new(node);
+    command
         .arg("--input-type=module")
         .arg("--eval")
         .arg(CONTROL)
@@ -332,7 +391,9 @@ fn check_control(managed: &Path, node: &Path) -> Result<(), String> {
         .env_remove("NODE_PATH")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    hidden(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|_| "The installed runtime did not answer the setup service.".to_string())?;
     child
@@ -377,14 +438,34 @@ fn install_runtime(managed: &Path, progress: Progress) -> Result<String, String>
     Ok(version)
 }
 
+/// The runtime version this desktop build requires.
+pub fn expected_version() -> &'static str {
+    JOUZU_VERSION
+}
+
 /// Install Node, the official npm package and the tools the workspace needs.
 pub fn install(managed: &Path, progress: Progress) -> Result<String, String> {
     // The app may already be installed while its Node is old; replace Node first.
-    ensure_node(managed, progress)?;
+    let node = ensure_node(managed, progress)?;
     let app = managed.join("app");
-    // A retry after a tool failure must not touch a runtime that is already there.
     let version = if app.join("bootstrap.mjs").is_file() {
-        installed_version(&app)?
+        let installed = installed_version(&app)?;
+        if installed == JOUZU_VERSION {
+            installed
+        } else {
+            // Desktop updates replace the launcher, not the managed runtime. Install the
+            // pinned package into the existing app so a launcher update can move 0.2.4 → 0.2.5.
+            progress(serde_json::json!({ "phase": "packages" }));
+            npm_install(&node, &app, progress)?;
+            if let Err(error) = check_health(managed, &node).and_then(|_| check_control(managed, &node)) {
+                return Err(error);
+            }
+            let updated = installed_version(&app)?;
+            if updated != JOUZU_VERSION {
+                return Err(format!("The runtime update left version {updated}; expected {JOUZU_VERSION}."));
+            }
+            updated
+        }
     } else {
         install_runtime(managed, progress)?
     };
@@ -396,21 +477,26 @@ pub fn install(managed: &Path, progress: Progress) -> Result<String, String> {
 
 /// The tool components are part of the same install, not a menu.
 fn install_tools(managed: &Path, progress: Progress) -> Result<(), String> {
-    progress(serde_json::json!({ "phase": "tools", "tool": "git" }));
-    crate::git_environment::install(managed)?;
-    progress(serde_json::json!({ "phase": "tools", "tool": "terminal" }));
-    crate::terminal::install(managed)?;
+    #[cfg(windows)]
+    {
+        progress(serde_json::json!({ "phase": "tools", "tool": "git" }));
+        crate::git_environment::install(managed)?;
+        progress(serde_json::json!({ "phase": "tools", "tool": "terminal" }));
+        crate::terminal::install(managed)?;
+    }
     Ok(())
 }
 
 /// These helpers are the desktop's own; the npm package does not carry them.
-fn write_tool_scripts(managed: &Path) -> Result<(), String> {
+pub(crate) fn write_tool_scripts(managed: &Path) -> Result<(), String> {
     let directory = managed.join("runtime").join("launcher-update");
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     for (name, body) in [
         ("git-environment.ps1", GIT_ENVIRONMENT),
         ("extract-portable-git.ps1", GIT_EXTRACT),
         ("terminal-environment.ps1", TERMINAL_ENVIRONMENT),
+        ("command-path.ps1", COMMAND_PATH),
+        ("command-entries.ps1", COMMAND_ENTRIES),
     ] {
         std::fs::write(directory.join(name), body).map_err(|error| error.to_string())?;
     }
@@ -441,7 +527,7 @@ mod tests {
     #[test]
     fn the_package_installer_puts_the_bundled_node_before_the_existing_path() {
         let root = tempfile::tempdir().unwrap();
-        let node = root.path().join("runtime/node/node.exe");
+        let node = node_executable(root.path());
         let app = root.path().join("app");
         let path = installer_path(&node, &app).unwrap();
         let entries: Vec<_> = std::env::split_paths(&path).collect();
@@ -465,9 +551,11 @@ mod tests {
     fn installs_the_official_runtime() {
         let managed = tempfile::tempdir().unwrap();
         let version = install_runtime(managed.path(), &|_| {}).unwrap();
-        assert!(managed.path().join("runtime/node/node.exe").is_file());
+        assert!(node_executable(managed.path()).is_file());
         assert!(managed.path().join("app/bootstrap.mjs").is_file());
         assert!(managed.path().join("app/node_modules/jouzu/package.json").is_file());
         assert!(!version.is_empty(), "the installed package version is reported");
     }
 }
+
+

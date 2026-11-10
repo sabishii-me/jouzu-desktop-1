@@ -34,6 +34,9 @@ pub struct LaunchSpec {
 /// during Shisa.AI sign-in or a provider OAuth flow; nothing else on stderr is an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceCode {
+    /// Set for a provider OAuth device flow; absent for Shisa.AI sign-in.
+    pub provider: Option<String>,
+    /// A URL-only flow has no user code to type, only a page to open.
     pub url: String,
     pub code: String,
 }
@@ -65,8 +68,9 @@ pub fn spec(context: &ControlContext) -> Result<LaunchSpec, String> {
     })
 }
 
-/// Parse one stderr line. The adapter writes `{"type":"device","url":…,"code":…}`;
-/// every other line (logs, blank lines, malformed JSON) is not an event.
+/// Parse one stderr line. The adapter writes
+/// `{"type":"device","url":…,"code":…,"provider"?:…}`; every other line (logs, blank
+/// lines, malformed JSON) is not an event.
 pub fn parse_event(line: &str) -> Option<DeviceCode> {
     let line = line.trim();
     if !line.starts_with('{') {
@@ -77,11 +81,36 @@ pub fn parse_event(line: &str) -> Option<DeviceCode> {
         return None;
     }
     let url = value.get("url").and_then(|value| value.as_str())?.trim();
-    let code = value.get("code").and_then(|value| value.as_str())?.trim();
-    if url.is_empty() || code.is_empty() || url.len() > 2048 || code.len() > 128 {
+    let code = match value.get("code") {
+        None | Some(serde_json::Value::Null) => "",
+        Some(serde_json::Value::String(text)) => text.trim(),
+        // A malformed code is a malformed event, not an empty one.
+        Some(_) => return None,
+    };
+    // A provider id routes the code to a provider dialog, so a malformed one is a
+    // malformed event rather than an event with the provider dropped.
+    let provider = match value.get("provider") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => {
+            let text = text.trim();
+            if text.is_empty()
+                || text.len() > 64
+                || !text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_' || byte == b'-')
+            {
+                return None;
+            }
+            Some(text.to_string())
+        }
+        Some(_) => return None,
+    };
+    // A URL-only device flow carries an empty code; the URL is what identifies it.
+    if url.is_empty() || url.len() > 2048 || code.len() > 128 {
         return None;
     }
     Some(DeviceCode {
+        provider,
         url: url.to_string(),
         code: code.to_string(),
     })
@@ -128,12 +157,23 @@ mod tests {
     }
 
     #[test]
-    fn a_device_line_becomes_an_event() {
-        // The exact shape `control.mjs` writes to stderr.
-        let line = r#"{"type":"device","url":"https://example.test/activate","code":"ABCD-EFGH"}"#;
+    fn a_shisa_device_line_becomes_an_event() {
+        // The exact shape 1.0.23 `control.mjs` writes for Shisa.AI sign-in.
+        let line = r#"{"type":"device","url":"https://platform.shisa.ai/connect","code":"ABCD-EFGH"}"#;
         let code = parse_event(line).expect("device line");
-        assert_eq!(code.url, "https://example.test/activate");
+        assert_eq!(code.url, "https://platform.shisa.ai/connect");
         assert_eq!(code.code, "ABCD-EFGH");
+        assert_eq!(code.provider, None);
+    }
+
+    #[test]
+    fn a_provider_device_line_keeps_the_provider() {
+        // 1.0.23 adds `provider` for provider OAuth and may omit a user code.
+        let line = r#"{"type":"device","provider":"openai-codex","url":"https://example.test/device","code":""}"#;
+        let code = parse_event(line).expect("provider device line");
+        assert_eq!(code.provider.as_deref(), Some("openai-codex"));
+        assert_eq!(code.url, "https://example.test/device");
+        assert_eq!(code.code, "");
     }
 
     #[test]
@@ -145,11 +185,12 @@ mod tests {
             "{\"type\":\"progress\",\"value\":1}",
             "{\"type\":\"device\"}",
             "{\"type\":\"device\",\"url\":\"\",\"code\":\"X\"}",
-            "{\"type\":\"device\",\"url\":\"https://example.test\",\"code\":\"\"}",
             "{\"type\":\"device\",\"url\":\"https://example.test\",\"code\":1}",
+            "{\"type\":\"device\",\"url\":\"https://example.test\",\"provider\":\"../../x\",\"code\":\"A\"}",
             "not json at all",
         ] {
             assert_eq!(parse_event(line), None, "unexpected event for {line:?}");
         }
     }
 }
+

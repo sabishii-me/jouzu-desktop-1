@@ -11,7 +11,7 @@ pub fn restore_bundled(root: &Path, managed: &Path) -> Result<(), String> {
         &std::fs::read(app.join("node_modules/jouzu/package.json")).map_err(|_| "Bundled Jouzu is unavailable. Repair the installation.")?
     ).map_err(|_| "Bundled Jouzu metadata is invalid")?;
     let version = metadata["version"].as_str().ok_or("Missing bundled version")?;
-    let mut command = Command::new(root.join("runtime/node/node.exe"));
+    let mut command = Command::new(crate::runtime_install::node_executable(&root));
     command.arg("--input-type=module").arg("--eval")
         .arg("import {pathToFileURL} from 'node:url'; const [script,app,version]=process.argv.slice(1); const {checkStagedHealth}=await import(pathToFileURL(script)); await checkStagedHealth({node:process.execPath,app,version});")
         .arg(crate::node_path::node_path(&root.join("runtime/launcher-update/check-update-health.mjs")))
@@ -74,3 +74,4 @@ mod tests {
         assert_eq!(std::fs::read_to_string(lock).unwrap(), "owner");
     }
 }
+

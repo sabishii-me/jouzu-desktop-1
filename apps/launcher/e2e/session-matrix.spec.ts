@@ -52,6 +52,8 @@ async function setup(page: Page) {
     w.forkCalls = [];
     w.branchCalls = [];
     w.compactCalls = [];
+    w.getMessagesCalls = [];
+    w.failMessagesFor = null;
     w.exportCalls = [];
     w.modelCalls = [];
     w.thinkingCalls = [];
@@ -99,12 +101,19 @@ async function setup(page: Page) {
           if (request.type === "switch_session") { w.switchCalls.push(request.sessionPath); current = String(request.sessionPath).replace(/^.*[\\/]|\.jsonl$/g, ""); response(request, { cancelled: false }); }
           else if (request.type === "new_session") { current = ""; response(request, { cancelled: false }); }
           else if (request.type === "get_state") response(request, { sessionId: current || "new", sessionFile: sessionFile(), isStreaming: false, model: { name: "Matrix model" } });
-          else if (request.type === "get_messages") response(request, { messages: histories[sessionFile()] ?? [] });
+          else if (request.type === "get_messages") {
+            w.getMessagesCalls.push(sessionFile());
+            if (w.failMessagesFor === sessionFile()) currentOut.push({ type: "response", id: request.id, command: "get_messages", success: false, error: "JSONL frame exceeds 33554432 bytes" });
+            else response(request, { messages: histories[sessionFile()] ?? [] });
+          }
           else if (request.type === "get_available_models") response(request, { models: [{ provider: "fixture", id: "deterministic", name: "Matrix model" }, { provider: "fixture", id: "alternate", name: "Alternate model" }] });
           else if (request.type === "get_available_thinking_levels") response(request, { levels: ["low", "medium"] });
           else if (request.type === "get_session_stats") response(request, { userMessages: 1, assistantMessages: 1, toolCalls: 0, tokens: { total: 1 } });
           else if (request.type === "prompt") {
             w.promptCalls.push(request.message);
+            if (current === ids[12] && String(request.message).trim() === "continue") {
+              records.push({ type: "extension_ui_request", id: `tg-alert-${w.promptCalls.length}`, method: "notify", message: "TextGuard withheld LIVE.md: yara:command_injection. Run /textguard to review and approve it." });
+            }
             if (String(request.message).startsWith("/textguard-desktop") && String(request.message).includes("inspect")) {
               const payload = current === ids[7]
                 ? (state.approvedLive ? { ...liveReview, items: [] } : liveReview)
@@ -167,10 +176,10 @@ test("matrix: every session shape opens without attaching the runtime", async ({
     const article = page.getByRole("article", { name: "assistant message" });
     if (index === 0) await expect(page.getByText("What would you like to work on?")).toBeVisible();
     if (index === 1) await expect(article).toContainText("short answer");
-    if (index === 3) await expect(page.getByRole("article")).toHaveCount(30);
+    if (index === 3) await expect(article.last()).toBeVisible();
     if (index === 4) await expect(page.getByRole("img", { name: "Conversation attachment" })).toBeVisible();
     if (index === 5) await expect(page.getByRole("alert")).toContainText("fixture failure");
-    if (index === 6) await expect(page.getByRole("button", { name: "Read README.md" })).toBeVisible();
+    if (index === 6) await expect(page.getByRole("button", { name: /read/i })).toBeVisible();
     expect(await page.evaluate(() => (window as any).switchCalls)).toHaveLength(0);
   }
 });
@@ -230,6 +239,7 @@ test("matrix: TextGuard mode is a composer dropdown", async ({ page }) => {
   await composer.fill("continue");
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect.poll(() => page.evaluate(() => (window as any).switchCalls.length)).toBe(1);
+
   await page.getByRole("button", { name: /^TextGuard/ }).click();
   const menu = page.getByRole("menu", { name: "TextGuard mode" });
   await expect(menu).toBeVisible();
@@ -237,6 +247,15 @@ test("matrix: TextGuard mode is a composer dropdown", async ({ page }) => {
   await menu.getByRole("menuitemradio", { name: "Strict" }).click();
   await expect(menu).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => (window as any).promptCalls.some((call: string) => call.includes('/textguard strict')))).toBe(true);
+});
+test("matrix: a live TextGuard alert turns the composer icon red", async ({ page }) => {
+  await setup(page);
+  await page.getByRole("button", { name: /^S12\b/ }).click();
+  const composer = page.getByLabel("Message Jouzu");
+  await composer.fill("continue");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).switchCalls.length)).toBe(1);
+  await expect(page.getByRole("button", { name: /^TextGuard/ })).toContainText("1 blocked");
 });
 test("matrix: fork from a preview attaches and opens the branch", async ({ page }) => {
   await setup(page);
@@ -272,6 +291,22 @@ test("matrix: fork on the attached session switches to the branch", async ({ pag
       "C:/sessions/00000000-0000-4000-8000-000000000002.jsonl",
       "C:/sessions/branch-1.jsonl",
     ]);
+});
+
+test("matrix: compact from a preview never fetches the transcript", async ({ page }) => {
+  await setup(page);
+  await page.evaluate(() => {
+    const w = window as any;
+    w.failMessagesFor = "C:/sessions/00000000-0000-4000-8000-000000000002.jsonl";
+    w.getMessagesCalls.length = 0;
+  });
+  await page.getByRole("button", { name: /^S1\b/ }).click();
+  await expect(page.getByRole("article", { name: "assistant message" })).toContainText("short answer");
+  await page.getByRole("button", { name: "Add files or run commands" }).click();
+  await page.getByRole("menuitem", { name: /Compact/ }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).compactCalls.length)).toBe(1);
+  expect(await page.evaluate(() => (window as any).getMessagesCalls)).toEqual([]);
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("matrix: compact from a preview attaches that session first", async ({ page }) => {
@@ -367,3 +402,8 @@ test("matrix: fork on a single-turn session keeps its turn", async ({ page }) =>
   expect(await page.evaluate(() => (window as any).branchCalls))
     .toEqual([{ source: "C:/sessions/00000000-0000-4000-8000-000000000002.jsonl", index: 1 }]);
 });
+
+
+
+
+

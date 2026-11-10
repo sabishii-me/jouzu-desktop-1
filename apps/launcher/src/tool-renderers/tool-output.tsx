@@ -7,9 +7,10 @@ import { classifyText, diffRows, prettyJson } from "./tool-format";
 import { record, toolText } from "./types";
 import { ArtifactImage } from "./artifact-image";
 import { artifactPathFromText } from "./artifact-path";
+import { RevealPath } from "../reveal-path";
 
 const MAX_LINES = 2000;
-const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+export const MAX_TOOL_IMAGE_BYTES = 8 * 1024 * 1024;
 const ANSI = /\u001b\[([0-9;]*)m/g;
 const ANSI_COLORS: Record<number, string> = {
   30: "text-black", 31: "text-red-500", 32: "text-green-500", 33: "text-yellow-500",
@@ -93,15 +94,27 @@ function readPath(args: unknown): string | undefined {
   return typeof value?.path === "string" ? value.path : undefined;
 }
 
-export function imageBlocks(result: unknown) {
+export interface ToolImageBlock {
+  mime: string;
+  data: string;
+  alt: string;
+  bytes: number;
+  tooLarge: boolean;
+}
+
+/**
+ * Keep every image block a tool returned, including an oversized or unsupported
+ * one: the image component renders a card explaining why it is not inline.
+ */
+export function imageBlocks(result: unknown): ToolImageBlock[] {
   const value = record(result);
   const blocks = value && Array.isArray(value.content) ? value.content : [];
   return blocks.flatMap(block => {
     const item = record(block);
     if (item?.type !== "image" || typeof item.data !== "string") return [];
     const mime = typeof item.mimeType === "string" ? item.mimeType : "";
-    if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mime) || item.data.length * 0.75 > MAX_IMAGE_BYTES) return [];
-    return [{ mime, data: item.data, alt: typeof item.alt === "string" ? item.alt : "Tool output image" }];
+    const bytes = Math.floor(item.data.length * 0.75);
+    return [{ mime, data: item.data, alt: typeof item.alt === "string" ? item.alt : "Tool output image", bytes, tooLarge: bytes > MAX_TOOL_IMAGE_BYTES }];
   });
 }
 
@@ -169,6 +182,7 @@ export function ToolOutput({ tool }: { tool: ToolView }) {
       ...image,
       alt: prompt || image.alt,
       path: typeof meta?.path === "string" ? meta.path : fallbackPath,
+      bytes: image.bytes,
       width: typeof meta?.width === "number" ? meta.width : undefined,
       height: typeof meta?.height === "number" ? meta.height : undefined,
     };
@@ -180,7 +194,7 @@ export function ToolOutput({ tool }: { tool: ToolView }) {
   if (images.length) return <div className="space-y-3">{images.map((image, index) => <ArtifactImage key={index} image={image} caption={[model, size, image.width && image.height ? `${image.width}×${image.height}` : ""].filter(Boolean).join(" · ")} />)}{text && <AnsiPre text={text} expanded={expanded} />}</div>;
   if (!text) return <p className="text-xs text-muted-foreground">No text output.</p>;
   return <div className="space-y-1">
-    <div className="flex items-center justify-between gap-2"><span className="min-w-0 truncate text-[10px] uppercase tracking-wide text-muted-foreground">{tool.name === "read" && path ? path : "Output"}{meta.length ? ` · ${meta.join(" · ")}` : ""}</span><div className="flex shrink-0"><CopyButton text={text} /><DownloadButton text={text} />{long && <Button variant="ghost" className="h-7 px-2 text-[11px]" onClick={() => setExpanded(value => !value)}>{expanded ? "Collapse" : "Expand"}</Button>}</div></div>
+    <div className="flex items-center justify-between gap-2"><span className="flex min-w-0 items-center gap-2"><span className="min-w-0 truncate text-[10px] uppercase tracking-wide text-muted-foreground">{tool.name === "read" && path ? path : "Output"}{meta.length ? ` · ${meta.join(" · ")}` : ""}</span>{tool.name === "read" && path && <RevealPath path={path} compact label="Reveal" />}</span><div className="flex shrink-0"><CopyButton text={text} /><DownloadButton text={text} />{long && <Button variant="ghost" className="h-7 px-2 text-[11px]" onClick={() => setExpanded(value => !value)}>{expanded ? "Collapse" : "Expand"}</Button>}</div></div>
     {tool.phase === "error" && <p className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-[11px] text-destructive">Tool failed{meta.length ? ` (${meta.join(", ")})` : ""}</p>}
     {tool.name === "bash" ? <AnsiPre text={text} expanded={expanded} />
       : tool.name === "read" && markdownPath(tool.args) ? <MarkdownOutput text={text} expanded={expanded} />

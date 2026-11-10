@@ -70,10 +70,17 @@ pub fn draft(
     std::fs::create_dir_all(file.parent().ok_or("Cannot write the report request")?)
         .map_err(|error| error.to_string())?;
     std::fs::write(&file, request.to_string()).map_err(|error| error.to_string())?;
-    let output = Command::new(root.join("runtime/node/node.exe"))
+    let mut command = Command::new(crate::runtime_install::node_executable(&root));
+    command
         .arg(root.join("runtime/desktop-update/bug-report.mjs"))
         .arg(&slot)
-        .arg(&file)
+        .arg(&file);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command
         .output()
         .map_err(|error| error.to_string())?;
     let _ = std::fs::remove_file(&file);
@@ -82,5 +89,6 @@ pub fn draft(
     }
     serde_json::from_slice(&output.stdout).map_err(|_| "Invalid report draft".to_string())
 }
+
 
 

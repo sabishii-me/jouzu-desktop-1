@@ -23,17 +23,17 @@ function record(value: unknown): Record<string, any> | null {
 }
 
 /**
- * Everything a turn produced, read from the transcript only: image tool results
- * become artifact thumbnails, file tools become edited paths. No runtime event is
- * needed for this.
+ * Everything a turn produced: image tool results become artifact thumbnails, file
+ * tools contribute edited paths, and the workspace diff contributes the files those
+ * tools could not see (a file created by a shell command, for example).
  */
-export function summarizeTurn(messages: ChatMessage[], tools: Record<string, ToolView>, end: number): TurnSummaryData {
+export function summarizeTurn(messages: ChatMessage[], tools: Record<string, ToolView>, end: number, changed: readonly string[] = []): TurnSummaryData {
   let start = 0;
   for (let index = Math.min(end, messages.length - 1); index >= 0; index -= 1) {
     if (messages[index]?.role === "user") { start = index; break; }
   }
   const artifacts: TurnArtifact[] = [];
-  const files: string[] = [];
+  const transcriptFiles: string[] = [];
   for (let index = start; index <= end && index < messages.length; index += 1) {
     for (const block of messages[index]?.content ?? []) {
       if (block.type !== "toolCall" || typeof block.id !== "string") continue;
@@ -63,9 +63,22 @@ export function summarizeTurn(messages: ChatMessage[], tools: Record<string, Too
       if (typeof block.name === "string" && EDIT_TOOLS.has(block.name)) {
         const args = record(block.arguments);
         const path = typeof args?.path === "string" ? args.path : typeof args?.file_path === "string" ? args.file_path : undefined;
-        if (path) files.push(path);
+        if (path) transcriptFiles.push(path);
       }
     }
   }
-  return { artifacts, files: [...new Set(files)] };
+  // Workspace changes come first: they are evidence of what the turn produced. Tool
+  // arguments fill in anything the snapshot could not see, without duplicating paths.
+  const seen = new Set<string>();
+  const files: string[] = [];
+  const push = (path: string) => {
+    const key = path.replace(/\\/g, "/").toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    files.push(path);
+  };
+  for (const path of changed) push(path);
+  for (const path of transcriptFiles) push(path);
+  return { artifacts, files };
 }
+

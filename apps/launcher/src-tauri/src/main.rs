@@ -21,6 +21,8 @@ mod migration;
 mod host_bootstrap;
 mod recovery;
 mod runtime_install;
+mod runtime_policy;
+mod model_catalog;
 mod node_path;
 mod renderer;
 mod update_lock;
@@ -148,10 +150,10 @@ fn terminal_open(app: tauri::AppHandle, path: Option<String>) -> Result<(), Stri
     let root = runtime::application_root(&app)?;
     let managed = runtime::managed_root()?;
     let slot = active_app::resolve_app(&root, &managed)?;
-    let bash = git_environment::find(&root)?;
+    let bash = git_environment::find(&managed)?;
     let host = terminal::host(&root)
         .ok_or("Windows Terminal is unavailable. Install it from the launcher.")?;
-    let status = std::process::Command::new(root.join("runtime/node/node.exe"))
+    let status = std::process::Command::new(crate::runtime_install::node_executable(&root))
         .arg(root.join("runtime/launcher-update/open-terminal.mjs"))
         .arg(&slot)
         .arg(&managed)
@@ -185,6 +187,28 @@ fn command_entry_repair(app: tauri::AppHandle) -> Result<serde_json::Value, Stri
 #[tauri::command]
 fn command_entry_remove(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     command_path::remove(&runtime::application_root(&app)?, &runtime::managed_root()?)
+}
+
+#[tauri::command]
+/// The transcript owns the URL policy: only ordinary http(s) URLs without
+/// embedded credentials leave the app, for any host.
+fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let parsed = external_http_url(&url)?;
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_url(parsed.to_string(), None::<&str>)
+        .map_err(|_| "Could not open link.".to_string())
+}
+
+fn external_http_url(value: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(value).map_err(|_| "This link cannot be opened externally.".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("This link cannot be opened externally.".into());
+    }
+    Ok(parsed)
 }
 
 #[tauri::command]
@@ -348,6 +372,17 @@ fn forget_workspace(app: tauri::AppHandle, id: String) -> Result<(), String> {
     Ok(())
 }
 
+fn hidden_node_version(node: &std::path::Path) -> Option<String> {
+    let mut command = std::process::Command::new(node);
+    command.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command.output().ok().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 #[tauri::command]
 fn runtime_report(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let root = runtime::application_root(&app)?;
@@ -364,10 +399,15 @@ fn runtime_report(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         .ok_or("Runtime version is missing")?;
     Ok(serde_json::json!({
         "version": version,
+        "expectedVersion": crate::runtime_install::expected_version(),
+        "versionCurrent": crate::runtime_policy::is_current(version),
+        "minimumVersion": crate::runtime_policy::MINIMUM_VERSION,
+        "verifiedVersions": crate::runtime_policy::VERIFIED_VERSIONS,
+        "mandatory": crate::runtime_policy::is_mandatory(version),
         "root": root.to_string_lossy(),
         "app": app_path.to_string_lossy(),
-        "node": root.join("runtime/node/node.exe").is_file(),
-        "nodeVersion": std::process::Command::new(root.join("runtime/node/node.exe")).arg("--version").output().ok().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()),
+        "node": crate::runtime_install::node_executable(&root).is_file(),
+        "nodeVersion": hidden_node_version(&crate::runtime_install::node_executable(&root)),
         "nodeCurrent": crate::runtime_install::node_version_ok(&root),
         "git": root.join("runtime/git").exists(),
         "terminal": root.join("runtime/terminal").exists(),
@@ -375,8 +415,20 @@ fn runtime_report(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn runtime_install(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+fn model_catalog() -> Result<serde_json::Value, String> {
+    crate::model_catalog::load()
+}
+
+#[tauri::command]
+async fn runtime_install(
+    app: tauri::AppHandle,
+    chat: tauri::State<'_, crate::chat::ChatService>,
+) -> Result<serde_json::Value, String> {
     let managed = runtime::managed_root()?;
+    // An update replaces node_modules underneath every live runtime. Stop the
+    // sessions first; otherwise the old process keeps the old files mapped and
+    // the user has to quit the whole app before a session can start again.
+    chat.pause();
     let handle = app.clone();
     let version = tauri::async_runtime::spawn_blocking(move || {
         let emit = |value: serde_json::Value| { let _ = tauri::Emitter::emit(&handle, "runtime-install-progress", value); };
@@ -629,14 +681,22 @@ fn main() {
             chat::chat_poll_many,
             chat::chat_release_generation,
             chat::chat_stop,
+            chat::chat_stop_all,
+            chat::chat_claim,
+            chat::chat_stop_session,
             attachments::read_dropped_image,
+            attachments::read_local_image,
             attachments::reveal_path,
             attachments::save_copy,
             attachments::workspace_list,
+            attachments::workspace_snapshot,
+            attachments::workspace_read,
             sessions::chat_sessions,
             sessions::chat_session_update,
             sessions::chat_flow_reports,
             sessions::chat_session_messages,
+            sessions::chat_session_bytes,
+            sessions::chat_session_sanitize_images,
             sessions::chat_session_branch,
             sessions::chat_session_timing,
             sessions::chat_session_recover,
@@ -645,6 +705,7 @@ fn main() {
             forget_workspace,
             add_workspaces,
             component_versions,
+            model_catalog,
             runtime_report,
             runtime_install,
             mcp_config,
@@ -656,6 +717,7 @@ fn main() {
             artifacts::artifact_list,
             artifacts::artifact_read,
             artifacts::artifact_delete,
+            artifacts::artifact_store_copy,
             artifacts::artifact_counts,
             recovery::repair_jouzu,
             diagnostics,
@@ -664,6 +726,7 @@ fn main() {
             bug_report,
             terminal_open,
             open_logs,
+            open_external_url,
             command_entry_report,
             command_entry_use,
             command_entry_remove,
@@ -720,6 +783,18 @@ mod tests {
     fn rejects_invalid_preferences() {
         assert!(legacy_workspace("not json").is_err());
         assert!(legacy_workspace(r#"{"schemaVersion":2,"remember":true,"folder":"x"}"#).is_err());
+    }
+    #[test]
+    fn external_links_allow_any_http_host() {
+        assert!(external_http_url("http://localhost:8100").is_ok());
+        assert!(external_http_url("https://example.com/a?b=1").is_ok());
+    }
+    #[test]
+    fn external_links_reject_other_schemes_and_credentials() {
+        assert!(external_http_url("file:///C:/Windows/notepad.exe").is_err());
+        assert!(external_http_url("javascript:alert(1)").is_err());
+        assert!(external_http_url("https://user:pass@example.com/").is_err());
+        assert!(external_http_url("http://").is_err());
     }
 }
 

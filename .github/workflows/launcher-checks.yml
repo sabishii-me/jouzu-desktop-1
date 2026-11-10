@@ -26,9 +26,15 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: '24.22.1'
+          node-version: '24.22.2'
       - name: Install frontend dependencies
         run: npm ci --prefix apps/launcher
+      - name: Dependency audit
+        run: npm audit --prefix apps/launcher --audit-level=high
+      - name: RustSec audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
       - name: Frontend build and unit tests
         run: |
           npm --prefix apps/launcher run build
@@ -59,8 +65,10 @@ jobs:
               try { Invoke-WebRequest http://localhost:1420 -TimeoutSec 2 | Out-Null; $ready = $true; break } catch { Start-Sleep 1 }
             }
             if (-not $ready) { throw 'Vite did not become ready' }
-            npx playwright test e2e/control-center.spec.ts --reporter=line
+            npx playwright test e2e/control-center.spec.ts e2e/onboarding.spec.ts --reporter=line
             $code = $LASTEXITCODE
           } finally { if (-not $vite.HasExited) { Stop-Process -Id $vite.Id } }
           exit $code
+
+
 

@@ -1,10 +1,11 @@
-import { Children, isValidElement, memo, useState, type ComponentPropsWithoutRef, type ReactNode } from "react";
+import { Children, isValidElement, memo, useState, type ComponentPropsWithoutRef, type MouseEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import "highlight.js/styles/github-dark.css";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { invoke } from "@tauri-apps/api/core";
 import { Button } from "./components/ui/button";
+import { MessageImage } from "./message-image";
 
 function nodeText(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -39,13 +40,14 @@ export const ChatMarkdown = memo(function ChatMarkdown({ text }: { text: string 
           const url = new URL(href ?? "");
           if (["http:", "https:"].includes(url.protocol) && !url.username && !url.password) safe = url.href;
         } catch { /* Leave the link inert. */ }
-        return <a href={safe} className="inline break-all text-left text-primary underline" onClick={event => {
+        const open = (event: MouseEvent<HTMLAnchorElement>) => {
           event.preventDefault();
           if (!safe) { setError("This link cannot be opened externally."); return; }
-          void openUrl(safe).catch(() => setError("Could not open link."));
-        }}>{children}</a>;
+          void invoke("open_external_url", { url: safe }).catch(() => setError("Could not open link."));
+        };
+        return <a href={safe} className="inline break-all text-left text-primary underline" onClick={open} onAuxClick={event => { if (event.button === 1) open(event); }}>{children}</a>;
       },
-      img: ({ alt }) => <span className="text-muted-foreground">[Image: {alt || "remote image not loaded"}]</span>,
+      img: ({ src, alt }) => <MessageImage kind="markdown" source={src} alt={alt ?? ""} />,
     }}>{text}</ReactMarkdown>
     {error && <p role="alert" className="text-destructive">{error}</p>}
   </div>;

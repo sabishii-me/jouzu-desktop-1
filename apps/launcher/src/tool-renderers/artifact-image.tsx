@@ -4,15 +4,19 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { Check, Copy, Download, FolderOpen, Maximize2, Quote } from "lucide-react";
 import { Button } from "../components/ui/button";
 import { ImageViewer, type ViewerAction } from "../components/image-viewer";
+import { MAX_TOOL_IMAGE_BYTES, MessageImage } from "../message-image";
 
 export interface ArtifactImageData {
   mime: string;
   data: string;
   alt: string;
   path?: string;
+  bytes?: number;
   width?: number;
   height?: number;
 }
+
+const SUPPORTED_MIME = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 const action = "size-7 shrink-0 p-0";
 
@@ -26,6 +30,9 @@ export function ArtifactImage({ image, caption, onUse }: { image: ArtifactImageD
   const [copied, setCopied] = useState(false);
   const src = `data:${image.mime};base64,${image.data}`;
   const name = image.path?.split(/[\\/]/u).pop() ?? "image.png";
+  const bytes = image.bytes ?? Math.floor(image.data.length * 0.75);
+  const oversized = bytes > MAX_TOOL_IMAGE_BYTES;
+  const unsupported = !SUPPORTED_MIME.includes(image.mime);
 
   async function download() {
     if (!image.path) {
@@ -38,6 +45,15 @@ export function ArtifactImage({ image, caption, onUse }: { image: ArtifactImageD
     // WebView2 ignores an anchor download, so pick a destination and copy the file.
     const target = await save({ defaultPath: name });
     if (target) await invoke("save_copy", { from: image.path, to: target });
+  }
+
+  // Never drop an oversized or unsupported block: the shared image card says
+  // why it is not inline and keeps the path actions available.
+  if (oversized || unsupported) {
+    return <figure className="space-y-1">
+      <MessageImage kind="tool" source={src} alt={image.alt} bytes={bytes} path={image.path} showCaption={false} />
+      {caption && <figcaption className="text-[10px] text-muted-foreground">{caption}</figcaption>}
+    </figure>;
   }
 
   const actions: (ViewerAction & { icon: ReactNode })[] = [
@@ -64,7 +80,7 @@ export function ArtifactImage({ image, caption, onUse }: { image: ArtifactImageD
   ];
 
   return <figure className="space-y-1">
-    <img src={src} alt={image.alt} className="max-h-80 w-full cursor-zoom-in rounded-md border border-border object-contain" onClick={() => setOpen(true)} />
+    <MessageImage kind="tool" source={src} alt={image.alt} bytes={bytes} showCaption={false} />
     <figcaption className="flex flex-wrap items-center justify-between gap-2">
       {caption && <span className="text-[10px] text-muted-foreground">{caption}</span>}
       <div className="ml-auto flex flex-nowrap items-center justify-end gap-0.5">
