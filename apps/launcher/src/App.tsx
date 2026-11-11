@@ -99,7 +99,7 @@ export function App() {
     void invoke<Components>("component_versions").then(setComponents).catch(error => setError(String(error)));
     // A runtime update is only visible to a fresh supervised process.
     requestSessionRestart();
-  });
+  }, native);
   const updater = useLauncherUpdate(components?.launcherUpdaterConfigured === true);
   const gitBash = useGitBash();
   const runtime = useComponent<RuntimeReport>("runtime_report");
