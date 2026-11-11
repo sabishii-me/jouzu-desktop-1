@@ -22,7 +22,7 @@ import { Switch } from "./components/ui/switch";
 import { listen } from "@tauri-apps/api/event";
 import jouzuIcon from "./assets/jouzu.svg";
 import { useEffect, useState, useRef, type ReactNode } from "react";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Input } from "./components/ui/input";
 import { getVersion } from "@tauri-apps/api/app";
@@ -691,6 +691,7 @@ export function App() {
     </LauncherPage>}
     </main>;
 }
+
 
 
 
