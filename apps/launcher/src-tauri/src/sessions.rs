@@ -246,102 +246,6 @@ fn validated_session_path(session_path: &str) -> Result<std::path::PathBuf, Stri
 
 /// Smallest side a provider accepts. A strip thinner than this is refused at attach
 /// time; this is the repair path for a session that already contains one.
-const MIN_IMAGE_SIDE: u32 = 16;
-
-/// Pixel size from the container header, or None when this format's header does not
-/// carry it. Guessing here would delete images that are fine.
-fn image_size(mime: Option<&str>, data: &str) -> Option<(u32, u32)> {
-    let bytes = BASE64.decode(data).ok()?;
-    match mime.unwrap_or("") {
-        "image/png" if bytes.len() >= 24 && &bytes[12..16] == b"IHDR" => Some((
-            u32::from_be_bytes(bytes[16..20].try_into().ok()?),
-            u32::from_be_bytes(bytes[20..24].try_into().ok()?),
-        )),
-        "image/gif" if bytes.len() >= 10 => Some((
-            u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32,
-            u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32,
-        )),
-        "image/jpeg" => {
-            let mut offset = 2;
-            while offset + 9 < bytes.len() {
-                if bytes[offset] != 0xFF {
-                    offset += 1;
-                    continue;
-                }
-                let marker = bytes[offset + 1];
-                let frame = matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
-                if frame {
-                    let height = u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().ok()?) as u32;
-                    let width = u16::from_be_bytes(bytes[offset + 7..offset + 9].try_into().ok()?) as u32;
-                    return Some((width, height));
-                }
-                let length = u16::from_be_bytes(bytes[offset + 2..offset + 4].try_into().ok()?) as usize;
-                if length < 2 {
-                    return None;
-                }
-                offset += 2 + length;
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-/// Replace images the provider would refuse with a text placeholder. The original file
-/// is kept as `.jsonl.bak` and the rewrite is atomic, so a failed repair changes nothing.
-fn sanitize_session_images(path: &Path, min_side: u32) -> Result<(usize, std::path::PathBuf), String> {
-    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    let mut removed = 0usize;
-    let mut output = String::with_capacity(text.len());
-    for line in text.lines() {
-        let Ok(mut value) = serde_json::from_str::<Value>(line) else {
-            output.push_str(line);
-            output.push('\n');
-            continue;
-        };
-        if value.get("type").and_then(Value::as_str) == Some("message") {
-            if let Some(content) = value
-                .get_mut("message")
-                .and_then(|message| message.get_mut("content"))
-                .and_then(Value::as_array_mut)
-            {
-                for block in content.iter_mut() {
-                    if block.get("type").and_then(Value::as_str) != Some("image") {
-                        continue;
-                    }
-                    let mime = block.get("mimeType").and_then(Value::as_str);
-                    let Some((width, height)) = block
-                        .get("data")
-                        .and_then(Value::as_str)
-                        .and_then(|data| image_size(mime, data))
-                    else {
-                        continue;
-                    };
-                    if width.min(height) >= min_side {
-                        continue;
-                    }
-                    *block = serde_json::json!({
-                        "type": "text",
-                        "text": format!("[image removed: {width}\u{00d7}{height}px is below the model's minimum of {min_side}px]")
-                    });
-                    removed += 1;
-                }
-            }
-        }
-        output.push_str(&serde_json::to_string(&value).map_err(|error| error.to_string())?);
-        output.push('\n');
-    }
-    if removed == 0 {
-        return Ok((0, path.to_path_buf()));
-    }
-    let backup = path.with_extension("jsonl.bak");
-    fs::copy(path, &backup).map_err(|error| error.to_string())?;
-    let staged = path.with_extension("jsonl.tmp");
-    fs::write(&staged, output).map_err(|error| error.to_string())?;
-    fs::rename(&staged, path).map_err(|error| error.to_string())?;
-    Ok((removed, backup))
-}
-
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = year - if month <= 2 { 1 } else { 0 };
     let era = if year >= 0 { year } else { year - 399 } / 400;
@@ -761,54 +665,6 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn png_of(width: u32, height: u32) -> String {
-        let mut header = vec![137u8, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13];
-        header.extend_from_slice(b"IHDR");
-        header.extend_from_slice(&width.to_be_bytes());
-        header.extend_from_slice(&height.to_be_bytes());
-        BASE64.encode(header)
-    }
-
-    #[test]
-    fn repairs_a_strip_that_the_provider_would_refuse() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("strip.jsonl");
-        let mut file = File::create(&path).unwrap();
-        writeln!(file, "{}", serde_json::json!({"type":"session","version":3,"id":"s","cwd":"C:/Work"})).unwrap();
-        writeln!(file, "{}", serde_json::json!({"type":"message","message":{"role":"user","content":[
-            {"type":"text","text":"look"},
-            {"type":"image","mimeType":"image/png","data":png_of(256, 1)},
-            {"type":"image","mimeType":"image/png","data":png_of(512, 512)}
-        ]}})).unwrap();
-        drop(file);
-
-        let (removed, backup) = sanitize_session_images(&path, MIN_IMAGE_SIDE).unwrap();
-
-        assert_eq!(removed, 1);
-        assert!(backup.exists());
-        let repaired = fs::read_to_string(&path).unwrap();
-        assert!(repaired.contains("below the model's minimum"));
-        // The acceptable image is untouched.
-        assert!(repaired.contains(&png_of(512, 512)));
-        let kept: Value = serde_json::from_str(repaired.lines().last().unwrap()).unwrap();
-        assert_eq!(kept["message"]["content"][1]["type"], "text");
-        assert_eq!(kept["message"]["content"][2]["type"], "image");
-    }
-
-    #[test]
-    fn leaves_a_session_with_only_acceptable_images_alone() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("fine.jsonl");
-        let original = serde_json::json!({"type":"message","message":{"role":"user","content":[{"type":"image","mimeType":"image/png","data":png_of(64, 64)}]}}).to_string();
-        fs::write(&path, format!("{original}\n")).unwrap();
-
-        let (removed, backup) = sanitize_session_images(&path, MIN_IMAGE_SIDE).unwrap();
-
-        assert_eq!(removed, 0);
-        assert_eq!(backup, path);
-        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{original}\n"));
-    }
-
     fn write_session(path: &Path, cwd: &str, title: &str) {
         let mut file = File::create(path).unwrap();
         writeln!(
@@ -958,6 +814,12 @@ mod tests {
         assert!(list_sessions(directory.path()).is_empty());
     }
 }
+
+
+
+
+
+
 
 
 
