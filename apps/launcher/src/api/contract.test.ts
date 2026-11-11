@@ -90,6 +90,7 @@ function bridge() {
     list: vi.fn(async () => [] as FileEntry[]),
     reveal: vi.fn(async () => undefined),
     snapshot: vi.fn(async () => ({ files: [], truncated: false })),
+    readFile: vi.fn(async () => ({ name: 'a.png', mimeType: 'image/png', data: 'AA==' })),
   };
   const settings: SettingsApi = {
     environment: { read: vi.fn(async () => [] as EnvironmentEntry[]), save: vi.fn(async () => undefined) },
@@ -172,4 +173,5 @@ describe("A-API contract suite", () => {
     expect([DesktopApi, WebApi, RemoteApi].some(Platform => api instanceof Platform)).toBe(true);
   });
 });
+
 

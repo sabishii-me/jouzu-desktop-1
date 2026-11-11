@@ -268,6 +268,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/files", get(list_files))
         .route("/files/snapshot", get(snapshot_files))
+        .route("/files/read", get(read_file))
         .route("/sessions/{id}", get(get_session))
         .route(
             "/sessions/{id}/messages",
@@ -373,6 +374,14 @@ async fn list_files(
         ));
     }
     files::list(&query.path)
+        .map(Json)
+        .map_err(|message| ApiError::bad_request(message))
+}
+
+async fn read_file(
+    Query(query): Query<FilesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    files::read(&query.path)
         .map(Json)
         .map_err(|message| ApiError::bad_request(message))
 }
@@ -2485,6 +2494,7 @@ mod session_tests {
         assert_eq!(reports[0]["kind"], "work");
     }
 }
+
 
 
 

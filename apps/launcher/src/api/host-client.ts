@@ -319,9 +319,16 @@ export class HostClient {
     ).then(body => body.entries);
   }
 
+  readFile(path: string): Promise<{ name: string; mimeType: string; data: string }> {
+    return this.request<{ name: string; mimeType: string; data: string }>(
+      `/v1/files/read?path=${encodeURIComponent(path)}`,
+    );
+  }
+
   workspaceSnapshot(path: string): Promise<{ files: Array<{ path: string; size: number; modified: number }>; truncated: boolean }> {
     return this.request<{ files: Array<{ path: string; size: number; modified: number }>; truncated: boolean }>(
       `/v1/files/snapshot?path=${encodeURIComponent(path)}`,
     );
   }
 }
+

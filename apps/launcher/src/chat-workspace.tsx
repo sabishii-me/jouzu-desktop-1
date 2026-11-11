@@ -539,7 +539,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (typeof path !== "string" || !path) return;
       void (async () => {
         try {
-          const data = await invoke<{ name: string; mimeType: string; data: string }>("read_dropped_image", { path });
+          const data = await api.files.readFile(path);
           const binary = atob(data.data);
           const bytes = new Uint8Array(binary.length);
           for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
@@ -557,7 +557,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     for (const path of paths) {
       if (!/\.(?:png|jpe?g|webp|gif)$/iu.test(path)) { files.push(path); continue; }
       try {
-        const data = await invoke<{ name: string; mimeType: string; data: string }>("read_dropped_image", { path });
+        const data = await api.files.readFile(path);
         const binary = atob(data.data);
         const bytes = new Uint8Array(binary.length);
         for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
@@ -1454,6 +1454,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
 
 
 

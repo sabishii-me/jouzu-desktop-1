@@ -62,6 +62,30 @@ fn walk(directory: &Path, depth: usize, out: &mut Vec<Value>) {
     }
 }
 
+/// Read one workspace file for a dropped image. Bounded so a huge file cannot be
+/// pulled into the webview by accident.
+pub fn read(path: &str) -> Result<Value, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use std::path::Path as StdPath;
+    let file = StdPath::new(path)
+        .canonicalize()
+        .map_err(|_| "That file is not available.".to_string())?;
+    let metadata = std::fs::metadata(&file).map_err(|_| "That file is not available.".to_string())?;
+    if !metadata.is_file() || metadata.len() > 25 * 1024 * 1024 {
+        return Err("That file cannot be read.".to_string());
+    }
+    let bytes = std::fs::read(&file).map_err(|_| "That file is not available.".to_string())?;
+    let name = file.file_name().map(|value| value.to_string_lossy().into_owned()).unwrap_or_default();
+    let mime = match file.extension().and_then(|value| value.to_str()).map(str::to_lowercase).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "application/octet-stream",
+    };
+    Ok(json!({ "name": name, "mimeType": mime, "data": STANDARD.encode(bytes) }))
+}
+
 pub fn list(path: &str) -> Result<Value, String> {
     let directory = Path::new(path)
         .canonicalize()
@@ -99,3 +123,4 @@ pub fn list(path: &str) -> Result<Value, String> {
     });
     Ok(json!({ "entries": entries, "path": directory.to_string_lossy() }))
 }
+

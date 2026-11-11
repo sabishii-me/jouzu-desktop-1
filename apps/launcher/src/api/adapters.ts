@@ -133,6 +133,7 @@ function hostGroups(client: HostClient) {
   const files: FileApi = {
     list: path => client.files(path),
     snapshot: path => client.workspaceSnapshot(path),
+    readFile: path => client.readFile(path),
     async reveal() {
       throw new CapabilityUnavailable();
     },
@@ -309,3 +310,4 @@ export function createJouzuApi(client = new HostClient()): JouzuApi {
   }
   return new WebApi(client);
 }
+

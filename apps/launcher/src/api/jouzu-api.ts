@@ -227,6 +227,8 @@ export interface ArtifactApi {
 export interface FileApi {
   list(path: string): Promise<FileEntry[]>;
   reveal(path: string): Promise<void>;
+  /** Read one workspace file (a dropped image) as base64. */
+  readFile(path: string): Promise<{ name: string; mimeType: string; data: string }>;
   /** Bounded workspace snapshot for the turn summary. */
   snapshot(path: string): Promise<{ files: Array<{ path: string; size: number; modified: number }>; truncated: boolean }>;
 }
@@ -282,3 +284,4 @@ export abstract class JouzuApi {
     onError?: (error: unknown) => void,
   ): Unsubscribe;
 }
+
