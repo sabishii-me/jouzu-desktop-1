@@ -1,4 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
 import { emptyProjection, historyProjection, interruptUnfinishedTools, object, projectEvent, type ChatProjection, type WireObject } from "./chat-projection";
 import { chatTransport, type ChatTransport } from "./chat-transport";
 
@@ -394,11 +393,10 @@ export class ChatConnection {
   }
   async loadModels() {
     try {
-      const [data, catalog] = await Promise.all([
-        this.request("get_available_models"),
-        invoke<{ models?: CatalogModel[] }>("model_catalog").catch(() => ({ models: [] })),
-      ]);
-      const catalogModels: CatalogModel[] = object(catalog) && Array.isArray(catalog.models) ? (catalog.models.filter(object) as CatalogModel[]) : [];
+      // The runtime answers with the models it can actually run; catalog metadata is
+      // host data and must not be fetched through the shell.
+      const data = await this.request("get_available_models");
+      const catalogModels: CatalogModel[] = [];
       const catalogFor = (id: string) => {
         const value = id.toLowerCase();
         return catalogModels.find(model => typeof model.id === "string" && (value === model.id.toLowerCase() || value.endsWith(`/${model.id.toLowerCase()}`)));
@@ -481,6 +479,7 @@ export class ChatConnection {
     if (this.handle) await this.transport.stop(this.handle);
   }
 }
+
 
 
 
