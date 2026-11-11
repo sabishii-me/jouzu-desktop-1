@@ -132,6 +132,7 @@ function hostGroups(client: HostClient) {
 
   const files: FileApi = {
     list: path => client.files(path),
+    snapshot: path => client.workspaceSnapshot(path),
     async reveal() {
       throw new CapabilityUnavailable();
     },

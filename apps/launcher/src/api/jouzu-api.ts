@@ -227,6 +227,8 @@ export interface ArtifactApi {
 export interface FileApi {
   list(path: string): Promise<FileEntry[]>;
   reveal(path: string): Promise<void>;
+  /** Bounded workspace snapshot for the turn summary. */
+  snapshot(path: string): Promise<{ files: Array<{ path: string; size: number; modified: number }>; truncated: boolean }>;
 }
 
 export interface SettingsApi {

@@ -387,7 +387,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (!snapshot.connected) return;
     if (snapshot.projection.running) {
       if (turnBaseline.current) return;
-      void invoke<WorkspaceSnapshot>("workspace_snapshot", { path })
+      void (api.files.snapshot(path) as Promise<WorkspaceSnapshot>)
         .then(before => { if (!turnBaseline.current) turnBaseline.current = before; })
         .catch(() => { /* The summary falls back to edit-tool arguments. */ });
       return;
@@ -395,7 +395,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const before = turnBaseline.current;
     if (!before) return;
     turnBaseline.current = null;
-    void invoke<WorkspaceSnapshot>("workspace_snapshot", { path })
+    void (api.files.snapshot(path) as Promise<WorkspaceSnapshot>)
       .then(after => setTurnChangedFiles(snapshotComplete(before) && snapshotComplete(after) ? changedFiles(before, after) : []))
       .catch(() => setTurnChangedFiles([]));
   }, [snapshot.connected, snapshot.projection.running, path]);
@@ -1454,6 +1454,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
+
 
 
 

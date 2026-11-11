@@ -318,4 +318,10 @@ export class HostClient {
       `/v1/files?path=${encodeURIComponent(path)}`,
     ).then(body => body.entries);
   }
+
+  workspaceSnapshot(path: string): Promise<{ files: Array<{ path: string; size: number; modified: number }>; truncated: boolean }> {
+    return this.request<{ files: Array<{ path: string; size: number; modified: number }>; truncated: boolean }>(
+      `/v1/files/snapshot?path=${encodeURIComponent(path)}`,
+    );
+  }
 }

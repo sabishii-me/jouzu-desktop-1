@@ -267,6 +267,7 @@ pub fn router(state: AppState) -> Router {
             get(read_artifact).delete(delete_artifact),
         )
         .route("/files", get(list_files))
+        .route("/files/snapshot", get(snapshot_files))
         .route("/sessions/{id}", get(get_session))
         .route(
             "/sessions/{id}/messages",
@@ -349,6 +350,14 @@ async fn delete_artifact(
 #[derive(Deserialize)]
 struct FilesQuery {
     path: String,
+}
+
+async fn snapshot_files(
+    Query(query): Query<FilesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    files::snapshot(&query.path).map(Json).map_err(|message| {
+        ApiError::bad_request(message)
+    })
 }
 
 async fn list_files(
@@ -2476,6 +2485,7 @@ mod session_tests {
         assert_eq!(reports[0]["kind"], "work");
     }
 }
+
 
 
 
