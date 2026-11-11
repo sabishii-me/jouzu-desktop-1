@@ -77,12 +77,23 @@ export class HostChatTransport implements ChatTransport {
     const queue = this.queues.get(handle);
     if (!this.sessions.has(handle) || !queue) throw new Error("The session is not attached.");
 
-    const command = typeof request.command === "string" ? request.command : undefined;
+    // The connection speaks the runtime's request shape: { type, id, ...fields }.
+    const command = typeof request.type === "string" ? request.type : undefined;
     if (command) {
       // The host runs the command on the session and answers with its data; the
       // connection expects the same correlated response record it always received.
-      const data = await this.api.commands.raw(handle, request);
-      queue.push({ type: "response", id: request.id, command, success: true, data });
+      try {
+        const data = await this.api.commands.raw(handle, request);
+        queue.push({ type: "response", id: request.id, command, success: true, data });
+      } catch (error) {
+        queue.push({
+          type: "response",
+          id: request.id,
+          command,
+          success: false,
+          error: String(error),
+        });
+      }
       return;
     }
 
