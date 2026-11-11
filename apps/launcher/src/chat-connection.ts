@@ -127,14 +127,10 @@ export class ChatConnection {
       this.handle = handle;
       this.update({ transportReady: true });
       this.poll();
-      // Wait for the runtime RPC loop to answer before replacing the session. Sending
-      // new_session before this handshake can close Flow before it has attached.
+      // The host created this session when the transport attached it: a fresh
+      // conversation already exists, so asking the runtime for another one would
+      // replace the session the page is bound to.
       await this.refreshHistory();
-      if (fresh) {
-        const result = await this.request("new_session");
-        if (object(result) && result.cancelled === true) throw new Error("The runtime cancelled the new session.");
-        await this.refreshHistory();
-      }
       this.update({ connected: true });
       await this.applyPreferredModel();
       this.replaying = false;
@@ -156,7 +152,10 @@ export class ChatConnection {
       for (const record of records) {
         if (record.type === "response") {
           const pending = typeof record.id === "string" ? this.requests.get(record.id) : undefined;
-          if (!pending || record.command !== pending.command || typeof record.success !== "boolean") throw new Error("Uncorrelated runtime response.");
+          // A replayed stream can carry responses for requests this page already
+          // settled (or never made). They are history, not protocol errors.
+          if (!pending) continue;
+          if (record.command !== pending.command || typeof record.success !== "boolean") throw new Error("Uncorrelated runtime response.");
           this.requests.delete(record.id as string);
           if (record.success) pending.resolve(record.data); else pending.reject(new Error(typeof record.error === "string" ? record.error : "Runtime request failed."));
         }
@@ -479,6 +478,8 @@ export class ChatConnection {
     if (this.handle) await this.transport.stop(this.handle);
   }
 }
+
+
 
 
 

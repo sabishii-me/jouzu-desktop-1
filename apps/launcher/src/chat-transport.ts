@@ -80,11 +80,11 @@ export class HostChatTransport implements ChatTransport {
     // The connection speaks the runtime's request shape: { type, id, ...fields }.
     const command = typeof request.type === "string" ? request.type : undefined;
     if (command) {
-      // The host runs the command on the session and answers with its data; the
-      // connection expects the same correlated response record it always received.
+      // The runtime answers the command itself and the host relays that record, so a
+      // successful call adds nothing here. Only a rejected call needs an answer the
+      // connection can correlate.
       try {
-        const data = await this.api.commands.raw(handle, request);
-        queue.push({ type: "response", id: request.id, command, success: true, data });
+        await this.api.commands.raw(handle, request);
       } catch (error) {
         queue.push({
           type: "response",

@@ -940,7 +940,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "contract": "2026-10-30",
         "hostVersion": state.version,
-        "features": ["sse", "replay", "prompts", "history-paging"],
+        "features": ["chat", "sse", "replay", "prompts", "history-paging"],
         "scopes": ["loopback"],
         "limits": { "maxMessageBytes": 32768, "maxUploadBytes": 26214400 },
         "defaultWorkspace": default_workspace,
@@ -1071,7 +1071,7 @@ fn apply_cors(response: &mut Response, origin: String) {
     );
     response.headers_mut().insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("authorization, content-type"),
+        HeaderValue::from_static("authorization, content-type, last-event-id"),
     );
 }
 
@@ -2567,6 +2567,8 @@ mod session_tests {
         assert_eq!(reports[0]["kind"], "work");
     }
 }
+
+
 
 
 

@@ -174,7 +174,7 @@ export class WebApi extends JouzuApi {
   readonly capabilities: ApiCapabilities = {
     host: true,
     native: false,
-    features: ["sse", "replay", "prompts", "history-paging"],
+    features: ["chat", "sse", "replay", "prompts", "history-paging"],
     scopes: ["loopback"],
   };
   readonly sessions!: SessionApi;
@@ -217,7 +217,7 @@ export class RemoteApi extends JouzuApi {
   readonly capabilities: ApiCapabilities = {
     host: true,
     native: false,
-    features: ["sse", "replay", "prompts", "history-paging"],
+    features: ["chat", "sse", "replay", "prompts", "history-paging"],
     scopes: ["lan", "tailnet"],
   };
   readonly sessions!: SessionApi;
@@ -260,7 +260,7 @@ export class DesktopApi extends JouzuApi {
   readonly capabilities: ApiCapabilities = {
     host: true,
     native: false,
-    features: ["sse", "replay", "prompts", "history-paging"],
+    features: ["chat", "sse", "replay", "prompts", "history-paging"],
     scopes: ["loopback"],
   };
   readonly sessions!: SessionApi;
@@ -311,5 +311,6 @@ export function createJouzuApi(client = new HostClient()): JouzuApi {
   }
   return new WebApi(client);
 }
+
 
 
