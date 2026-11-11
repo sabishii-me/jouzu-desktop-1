@@ -342,19 +342,6 @@ fn sanitize_session_images(path: &Path, min_side: u32) -> Result<(usize, std::pa
     Ok((removed, backup))
 }
 
-/// Repair a session whose history holds an image the provider refuses. This is the
-/// path that makes a stuck session usable again instead of permanent.
-#[tauri::command]
-pub async fn chat_session_sanitize_images(session_path: String) -> Result<Value, String> {
-    let path = validated_session_path(&session_path)?;
-    let (removed, backup) = tauri::async_runtime::spawn_blocking(move || {
-        sanitize_session_images(&path, MIN_IMAGE_SIDE)
-    })
-    .await
-    .map_err(|_| "Session repair failed".to_string())??;
-    Ok(serde_json::json!({ "removed": removed, "backup": backup.to_string_lossy() }))
-}
-
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = year - if month <= 2 { 1 } else { 0 };
     let era = if year >= 0 { year } else { year - 399 } / 400;
@@ -971,6 +958,7 @@ mod tests {
         assert!(list_sessions(directory.path()).is_empty());
     }
 }
+
 
 
 

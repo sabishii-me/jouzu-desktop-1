@@ -182,6 +182,8 @@ export interface SessionApi {
   update(sessionPath: string, change: { pinned?: boolean; archived?: boolean; title?: string }): Promise<SessionSummary | unknown>;
   branch(sessionPath: string, messageIndex: number): Promise<string>;
   recover(sessionPath: string): Promise<string | null>;
+  /** Replace images the provider refuses with placeholders; the original is kept. */
+  sanitizeImages(sessionPath: string): Promise<{ removed: number; backup: string }>;
   timing(sessionPath: string): Promise<SessionTiming>;
   flowReports(sessionPath: string): Promise<Array<{ kind: string; text: string }>>;
 }
@@ -284,4 +286,5 @@ export abstract class JouzuApi {
     onError?: (error: unknown) => void,
   ): Unsubscribe;
 }
+
 

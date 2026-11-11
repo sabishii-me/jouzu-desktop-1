@@ -51,6 +51,7 @@ function hostGroups(client: HostClient) {
     attach: (workspacePath, sessionPath) => client.attach(workspacePath, sessionPath),
     history: (sessionId, page) => client.history(sessionId, page),
     messages: (sessionPath, limit) => client.messages(sessionPath, limit),
+    sanitizeImages: sessionPath => client.sanitizeSessionImages(sessionPath),
     send: (sessionId, message) =>
       client.send(sessionId, message.text, message.clientMessageId, message.attachments ?? []),
     async interrupt(sessionId) {
@@ -310,4 +311,5 @@ export function createJouzuApi(client = new HostClient()): JouzuApi {
   }
   return new WebApi(client);
 }
+
 

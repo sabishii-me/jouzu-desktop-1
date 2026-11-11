@@ -19,6 +19,7 @@ pub mod control;
 mod environment;
 mod files;
 pub mod models;
+pub mod sessions_repair;
 pub mod session;
 
 use session::{ApiError, CreateRequest, SendRequest, SessionManager};
@@ -269,6 +270,7 @@ pub fn router(state: AppState) -> Router {
         .route("/files", get(list_files))
         .route("/files/snapshot", get(snapshot_files))
         .route("/files/read", get(read_file))
+        .route("/sessions/sanitize-images", axum::routing::post(sanitize_session_images))
         .route("/sessions/{id}", get(get_session))
         .route(
             "/sessions/{id}/messages",
@@ -382,6 +384,19 @@ async fn read_file(
     Query(query): Query<FilesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     files::read(&query.path)
+        .map(Json)
+        .map_err(|message| ApiError::bad_request(message))
+}
+
+#[derive(serde::Deserialize)]
+struct SessionFilePath {
+    sessionPath: String,
+}
+
+async fn sanitize_session_images(
+    Json(body): Json<SessionFilePath>,
+) -> Result<Json<Value>, ApiError> {
+    sessions_repair::sanitize_images(&body.sessionPath)
         .map(Json)
         .map_err(|message| ApiError::bad_request(message))
 }
@@ -2542,6 +2557,9 @@ mod session_tests {
         assert_eq!(reports[0]["kind"], "work");
     }
 }
+
+
+
 
 
 

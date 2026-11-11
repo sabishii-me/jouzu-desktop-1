@@ -701,7 +701,6 @@ fn main() {
             sessions::chat_flow_reports,
             sessions::chat_session_messages,
             sessions::chat_session_bytes,
-            sessions::chat_session_sanitize_images,
             sessions::chat_session_branch,
             sessions::chat_session_timing,
             sessions::chat_session_recover,
@@ -824,5 +823,6 @@ mod build_check_tests {
         assert_eq!(production_build_check(arguments(&["jouzu-desktop.exe"])), None);
     }
 }
+
 
 

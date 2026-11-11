@@ -657,7 +657,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (!sessionPath) return;
     setImageRepair(false);
     try {
-      const result = await invoke<{ removed: number; backup: string }>("chat_session_sanitize_images", { sessionPath });
+      const result = await api.sessions.sanitizeImages(sessionPath);
       if (!result.removed) { setNotification("No image in this session is below the model's minimum."); return; }
       setNotification(`Removed ${result.removed} image${result.removed === 1 ? "" : "s"} the model cannot read. The original file is kept as a backup.`);
       await reloadSession();
@@ -1454,6 +1454,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
 
 
 

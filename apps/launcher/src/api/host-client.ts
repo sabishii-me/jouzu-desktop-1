@@ -325,10 +325,18 @@ export class HostClient {
     );
   }
 
+  sanitizeSessionImages(sessionPath: string): Promise<{ removed: number; backup: string }> {
+    return this.request<{ removed: number; backup: string }>("/v1/sessions/sanitize-images", {
+      method: "POST",
+      body: JSON.stringify({ sessionPath }),
+    });
+  }
+
   workspaceSnapshot(path: string): Promise<{ files: Array<{ path: string; size: number; modified: number }>; truncated: boolean }> {
     return this.request<{ files: Array<{ path: string; size: number; modified: number }>; truncated: boolean }>(
       `/v1/files/snapshot?path=${encodeURIComponent(path)}`,
     );
   }
 }
+
 
