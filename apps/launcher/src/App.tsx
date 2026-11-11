@@ -493,7 +493,7 @@ export function App() {
   </div>;
   // The first-run pages have no titlebar of their own; without these a loading
   // window cannot be closed.
-  const firstRunControls = <div className="fixed right-2 top-2 z-50 flex items-center gap-1">{isTauri() && <>
+  const firstRunControls = <div className="fixed right-2 top-2 z-50 flex items-center gap-1">{api.capabilities.native && <>
     <Button variant="ghost" aria-label={t.minimize} title={t.minimize} onClick={() => getCurrentWindow().minimize().catch(error => setError(String(error)))}><Minus /></Button>
     <Button variant="ghost" aria-label="Close launcher" title={t.dismiss} onClick={() => getCurrentWindow().close().catch(error => setError(String(error)))}><X /></Button>
   </>}</div>;
@@ -619,7 +619,7 @@ export function App() {
           </Tabs>
         </DialogContent>
       </Dialog>
-      {isTauri() && <><Button variant="ghost" aria-label={t.minimize} onClick={() => getCurrentWindow().minimize().catch(error => setError(String(error)))}><Minus /></Button><Button variant="ghost" aria-label={maximized ? "Restore" : "Maximize"} onClick={() => getCurrentWindow().toggleMaximize().catch(error => setError(String(error)))}>{maximized ? <Minimize2 /> : <Maximize2 />}</Button><Button variant="ghost" aria-label="Hide to tray" title="Hide to tray" onClick={() => getCurrentWindow().close().catch(error => setError(String(error)))}><X /></Button></>}
+      {api.capabilities.native && <><Button variant="ghost" aria-label={t.minimize} onClick={() => getCurrentWindow().minimize().catch(error => setError(String(error)))}><Minus /></Button><Button variant="ghost" aria-label={maximized ? "Restore" : "Maximize"} onClick={() => getCurrentWindow().toggleMaximize().catch(error => setError(String(error)))}>{maximized ? <Minimize2 /> : <Maximize2 />}</Button><Button variant="ghost" aria-label="Hide to tray" title="Hide to tray" onClick={() => getCurrentWindow().close().catch(error => setError(String(error)))}><X /></Button></>}
       </div>
     </header>
       <Dialog open={repair !== null} onOpenChange={open => { if (!open) setRepair(null); }}>
@@ -691,6 +691,7 @@ export function App() {
     </LauncherPage>}
     </main>;
 }
+
 
 
 
