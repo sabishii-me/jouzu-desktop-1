@@ -271,6 +271,7 @@ pub fn router(state: AppState) -> Router {
         .route("/files/snapshot", get(snapshot_files))
         .route("/files/read", get(read_file))
         .route("/sessions/sanitize-images", axum::routing::post(sanitize_session_images))
+        .route("/sessions/stop-all", axum::routing::post(stop_all_sessions))
         .route("/sessions/{id}", get(get_session))
         .route(
             "/sessions/{id}/messages",
@@ -399,6 +400,11 @@ async fn sanitize_session_images(
     sessions_repair::sanitize_images(&body.sessionPath)
         .map(Json)
         .map_err(|message| ApiError::bad_request(message))
+}
+
+async fn stop_all_sessions(State(state): State<AppState>) -> Json<Value> {
+    state.sessions.stop_all();
+    Json(json!({ "stopped": true }))
 }
 
 async fn list_workspaces(State(state): State<AppState>) -> Json<Value> {
@@ -2557,6 +2563,7 @@ mod session_tests {
         assert_eq!(reports[0]["kind"], "work");
     }
 }
+
 
 
 
