@@ -1330,7 +1330,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       </div>
       {searchOpen && <div className="px-2 pb-2"><Input autoFocus aria-label="Search sessions" placeholder="Search sessions" value={search} onChange={event => setSearch(event.target.value)} /></div>}
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 pb-2">
-        {regularGroups.map(group => {
+        {[...regularGroups, ...(defaultGroup ? [defaultGroup] : [])].map(group => {
           const open = !!search.trim() || !collapsedGroups.has(group.id);
           return <section key={group.id} className="mb-1">
             <div className={`group flex items-center gap-1 rounded-lg ${(selectedWorkspace ? normalizedPath(selectedWorkspace) === normalizedPath(group.path) : !selectedKey && normalizedPath(group.path) === normalizedPath(path)) ? "bg-accent/70" : "hover:bg-muted/60"}`}>
@@ -1363,7 +1363,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         })}
         {!groups.length && <p className="p-3 text-sm text-muted-foreground">{search ? "No matching sessions" : "No workspaces yet."}</p>}
       </div>
-      {defaultGroup && <div className="shrink-0 border-t border-border bg-background px-1.5 py-1">{renderGroup(defaultGroup)}</div>}
       <div className="mt-auto border-t border-border p-2">
         <div className="flex items-center gap-1">
           <Button variant="ghost" className="min-w-0 flex-1 justify-start gap-2" onClick={onSettings}><Settings className="size-4" />Settings</Button>
@@ -1452,6 +1451,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
 
 
 
