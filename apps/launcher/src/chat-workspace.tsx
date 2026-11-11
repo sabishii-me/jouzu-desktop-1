@@ -572,7 +572,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     }
   }
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!api.capabilities.native) return;
     let disposed = false;
     const subscription = getCurrentWindow().onDragDropEvent(event => {
       const payload = event.payload;
@@ -1454,6 +1454,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
 
 
 
