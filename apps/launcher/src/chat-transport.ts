@@ -2,12 +2,13 @@
  * Chat wire transport. The connection owns projection/state; this boundary owns
  * how records reach the runtime.
  *
- * Phase C: the host owns the session. This transport attaches through the host,
- * buffers the normalized events the host publishes, and never touches Tauri.
+ * The host owns the session. This transport attaches through it, drains the events
+ * the host publishes (including the runtime records it relays), and routes command
+ * requests to the host session instead of a local process.
  */
 
 import { HostChatSession } from "./api/chat-session";
-import type { ApiEvent, JouzuApi, OutgoingMessage } from "./api/jouzu-api";
+import type { ApiEvent, JouzuApi } from "./api/jouzu-api";
 
 export interface ChatPoll {
   records: unknown[];
@@ -23,10 +24,16 @@ export interface ChatTransport {
   send(handle: string, request: Record<string, unknown>): Promise<void>;
 }
 
-/** Events the host publishes are already normalized; the connection projects them. */
+/** Host events that carry a runtime record the projection already understands. */
+function recordOf(event: ApiEvent): unknown | undefined {
+  if (event.event !== "runtime.event") return undefined;
+  const data = event.data as Record<string, unknown>;
+  return data.event ?? data.record ?? data;
+}
+
 export class HostChatTransport implements ChatTransport {
   private readonly sessions = new Map<string, HostChatSession>();
-  private readonly queues = new Map<string, ApiEvent[]>();
+  private readonly queues = new Map<string, unknown[]>();
   private readonly closed = new Map<string, string | undefined>();
 
   constructor(private readonly api: JouzuApi) {}
@@ -40,7 +47,10 @@ export class HostChatTransport implements ChatTransport {
     this.sessions.set(session.id, session);
     this.queues.set(session.id, []);
     session.follow(
-      event => this.queues.get(session.id)?.push(event),
+      event => {
+        const record = recordOf(event);
+        if (record !== undefined) this.queues.get(session.id)?.push(record);
+      },
       error => this.closed.set(session.id, String(error)),
     );
     return session.id;
@@ -58,21 +68,31 @@ export class HostChatTransport implements ChatTransport {
     const error = this.closed.get(handle);
     if (error !== undefined) {
       this.closed.delete(handle);
-      const records = this.queues.get(handle)?.splice(0) ?? [];
-      return { records, closed: true, error };
+      return { records: this.queues.get(handle)?.splice(0) ?? [], closed: true, error };
     }
     return { records: this.queues.get(handle)?.splice(0) ?? [], closed: false };
   }
 
   async send(handle: string, request: Record<string, unknown>): Promise<void> {
-    const session = this.sessions.get(handle);
-    if (!session) throw new Error("The session is not attached.");
+    const queue = this.queues.get(handle);
+    if (!this.sessions.has(handle) || !queue) throw new Error("The session is not attached.");
+
+    const command = typeof request.command === "string" ? request.command : undefined;
+    if (command) {
+      // The host runs the command on the session and answers with its data; the
+      // connection expects the same correlated response record it always received.
+      const data = await this.api.commands.raw(handle, request);
+      queue.push({ type: "response", id: request.id, command, success: true, data });
+      return;
+    }
+
     const text = typeof request.message === "string" ? request.message : "";
     const clientMessageId =
       typeof request.clientMessageId === "string" ? request.clientMessageId : crypto.randomUUID();
-    await session.send({ clientMessageId, text } as OutgoingMessage);
+    await this.sessions.get(handle)!.send({ clientMessageId, text });
   }
 }
+
 let shared: ChatTransport | undefined;
 
 /** Called once by the app shell with the host-backed api. */
