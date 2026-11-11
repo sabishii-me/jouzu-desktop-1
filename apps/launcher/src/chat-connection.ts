@@ -20,8 +20,6 @@ interface CatalogModel {
   maxTokens?: number;
   cost?: ChatModel["cost"];
 }
-/** The Tauri bridge exists only in the desktop shell; the host-served UI has no bridge. */
-const canInvokeLocal = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 function hasCost(cost: ChatModel["cost"]): boolean {
   return !!cost && Object.values(cost).some(value => typeof value === "number" && value !== 0);
 }
@@ -398,7 +396,7 @@ export class ChatConnection {
     try {
       const [data, catalog] = await Promise.all([
         this.request("get_available_models"),
-        canInvokeLocal() ? invoke<{ models?: CatalogModel[] }>("model_catalog").catch(() => ({ models: [] })) : Promise.resolve({ models: [] }),
+        invoke<{ models?: CatalogModel[] }>("model_catalog").catch(() => ({ models: [] })),
       ]);
       const catalogModels: CatalogModel[] = object(catalog) && Array.isArray(catalog.models) ? (catalog.models.filter(object) as CatalogModel[]) : [];
       const catalogFor = (id: string) => {
