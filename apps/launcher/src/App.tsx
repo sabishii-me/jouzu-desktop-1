@@ -17,6 +17,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { catalogChangeSummary, parseControlState, type ControlState, type HeldCatalog } from "./control-state";
 
 import { controlCancel, controlRequest, subscribeControl } from "./api/control-client";
+import { useApi } from "./api/context";
 import { Switch } from "./components/ui/switch";
 import { listen } from "@tauri-apps/api/event";
 import jouzuIcon from "./assets/jouzu.svg";
@@ -44,6 +45,7 @@ interface RuntimeReport { status?: string; version: string | null; expectedVersi
 type Theme = "dark" | "light" | "system";
 
 export function App() {
+  const api = useApi();
   const [locale, setLocale] = useState<Locale>(() => resolveLocale(localStorage.getItem("jouzu.ui.language") ?? navigator.language));
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem("jouzu.ui.theme");
@@ -147,12 +149,12 @@ export function App() {
   const [editingEnv, setEditingEnv] = useState<number | null>(null);
   const [envLoaded, setEnvLoaded] = useState(false);
   async function readEnvironment() {
-    try { setEnvRows(await invoke("environment_read")); setEnvLoaded(true); setEditingEnv(null); }
+    try { setEnvRows(await api.settings.environment.read()); setEnvLoaded(true); setEditingEnv(null); }
     catch (error) { setError(String(error)); }
   }
   async function saveEnvironment() {
     setOperation("saving"); setError(null);
-    try { await invoke("environment_save", { entries: envRows }); setEditingEnv(null); setSetup(parseControlState(await controlRequest({ action: "status" }))); }
+    try { await api.settings.environment.save(envRows); setEditingEnv(null); setSetup(parseControlState(await controlRequest({ action: "status" }))); }
     catch (error) { setError(String(error)); }
     finally { setOperation(null); }
   }
@@ -183,7 +185,7 @@ export function App() {
   async function addFolders(paths: string[]) {
     setOperation("saving"); setError(null);
     try {
-      await invoke("add_workspaces", { paths });
+      await api.workspaces.add(paths);
       setQuery("");
       await refresh();
       if (paths.length && !activePath) setActivePath(paths[0]);
@@ -289,7 +291,12 @@ export function App() {
   }
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(null), 4000); return () => clearTimeout(timer); }, [notice]);
   useEffect(() => { if (!settingsOpen) return; if (!setup && !busyRef.current) void configure({ action: "status" }); void readEnvironment(); }, [settingsOpen]);
-  const refresh = async () => setState(await invoke<LauncherState>("launcher_state"));
+  const workspaceState = (recent: unknown[]): LauncherState => ({
+    platform: navigator.userAgent.includes("Windows") ? "windows" : navigator.userAgent.includes("Mac") ? "macos" : "linux",
+    recent: recent as unknown as Workspace[], ready: true, bash: false, bundled_git: false,
+  });
+  // The workspace list is host data like everything else; the shell no longer provides it.
+  const refresh = async () => setState(workspaceState((await api.workspaces.list()) ?? []));
   const loadComponents = () => invoke<Components>("component_versions")
     .then(setComponents)
     .catch(error => setError(String(error)));
@@ -299,24 +306,38 @@ export function App() {
     catch { setDiagnostics(null); }
   };
   useEffect(() => {
-    if (!isTauri()) return;
-    refresh().catch(error => setError(String(error)));
-    void refreshDiagnostics();
-    getVersion().then(setVersion).catch(error => setError(String(error)));
-    // The runtime decides whether the setup service exists; probing it first keeps a
-    // clean machine out of the status call instead of turning its absence into an alert.
-    void invoke<RuntimeReport>("runtime_report").then(report => {
-      if (report?.mandatory === true || report?.nodeCurrent === false) { setRuntimePresent(false); return; }
-      setRuntimePresent(true);
-      void (async () => { try { await invoke("image_tool_ensure"); } catch { /* the tool is optional on a fixture */ } })();
-      void loadComponents();
-      void readStatus();
-    }).catch(error => {
-      // Only a missing runtime belongs to onboarding; any other report failure
-      // (an unsupported probe, a broken fixture) must not hide the workspace.
-      if (String(error).includes("application files are missing")) setRuntimePresent(false);
-      else setRuntimePresent(true);
-    });
+    // One data source: the host API. Native-only work below stays behind the
+    // capability flag rather than a second boot path.
+    void (async () => {
+      try {
+        const recent = (await api.workspaces.list()) ?? [];
+        const platform = navigator.userAgent.includes("Windows")
+          ? "windows"
+          : navigator.userAgent.includes("Mac")
+            ? "macos"
+            : "linux";
+        setState({ platform, recent: recent as unknown as Workspace[], ready: true, bash: false, bundled_git: false });
+        setRuntimePresent(true);
+        void readStatus();
+      } catch (error) {
+        setError(String(error));
+      }
+    })();
+    if (api.capabilities.native) {
+      void refreshDiagnostics();
+      getVersion().then(setVersion).catch(error => setError(String(error)));
+      void invoke<RuntimeReport>("runtime_report").then(report => {
+        if (report?.mandatory === true || report?.nodeCurrent === false) { setRuntimePresent(false); return; }
+        setRuntimePresent(true);
+        void (async () => { try { await invoke("image_tool_ensure"); } catch { /* the tool is optional on a fixture */ } })();
+        void loadComponents();
+      }).catch(error => {
+        // Only a missing runtime belongs to onboarding; any other report failure
+        // (an unsupported probe, a broken fixture) must not hide the workspace.
+        if (String(error).includes("application files are missing")) setRuntimePresent(false);
+        else setRuntimePresent(true);
+      });
+    }
   }, []);
   // The prepare screen only mirrors the installer's own events; it never guesses progress.
   useEffect(() => {
@@ -423,7 +444,7 @@ export function App() {
   async function forget(workspace: Workspace) {
     setOperation("saving"); setError(null);
     try {
-      await invoke("forget_workspace", { id: workspace.id });
+      await api.workspaces.forget(workspace.id);
       const next = state?.recent.find(item => item.id !== workspace.id)?.path ?? null;
       if (activePath === workspace.path) setActivePath(next);
       await refresh();
@@ -669,6 +690,8 @@ export function App() {
     </LauncherPage>}
     </main>;
 }
+
+
 
 
 
