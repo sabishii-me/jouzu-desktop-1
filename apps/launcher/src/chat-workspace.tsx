@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUpCircle, ArrowUpDown, Archive, ArchiveRestore, ChevronDown, ChevronRight, Copy, FolderOpen, FolderPlus, GitFork, Images, MessageSquare, MoreHorizontal, PanelLeft, Columns2, PanelRight, Pencil, Pin, Plus, RefreshCw, Search, Settings, Sparkles, X } from "lucide-react";
 import { confirm, save } from "@tauri-apps/plugin-dialog";
-import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
@@ -870,7 +869,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (connection.current !== client) return;
       const message = String(error).replace(/^Error:\s*/u, "");
       if (!recovered && /owned|busy|unavailable|exited|disposed/iu.test(message)) {
-        await invoke("chat_stop_all").catch(() => {});
         chatPool.forget(target);
         switchingRef.current = false;
         switchingTarget.current = null;
@@ -1454,6 +1452,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {textguardPanel}
   </div>;
 }
+
 
 
 
