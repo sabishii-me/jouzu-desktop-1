@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ChatConnection } from "./chat-connection";
 import type { WireObject } from "./chat-projection";
-import { defaultChatTransport, type ChatTransport } from "./chat-transport";
+import { chatTransport as sharedChatTransport, type ChatTransport } from "./chat-transport";
 
 let transportFactory: (() => ChatTransport) | undefined;
 
@@ -10,7 +10,7 @@ export function setChatTransportFactory(factory: (() => ChatTransport) | undefin
 }
 
 function chatTransport(): ChatTransport {
-  return transportFactory ? transportFactory() : defaultChatTransport;
+  return transportFactory ? transportFactory() : chatTransport();
 }
 
 interface Slot {
@@ -261,3 +261,5 @@ export class ChatPool {
 
 /** One pool per window: the workspace view leases a runtime from it. */
 export const chatPool = new ChatPool(4);
+
+

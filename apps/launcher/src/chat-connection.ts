@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emptyProjection, historyProjection, interruptUnfinishedTools, object, projectEvent, type ChatProjection, type WireObject } from "./chat-projection";
-import { defaultChatTransport, type ChatTransport } from "./chat-transport";
+import { chatTransport, type ChatTransport } from "./chat-transport";
 
 /** One id per page load: handles from an older page are released by chat_release_generation. */
 export const pageGeneration = globalThis.crypto.randomUUID();
@@ -101,7 +101,7 @@ export class ChatConnection {
   constructor(
     publish: (state: ChatSnapshot) => void,
     private dialog: (request: WireObject, client: ChatConnection) => void,
-    private transport: ChatTransport = defaultChatTransport,
+    private transport: ChatTransport = chatTransport(),
   ) {
     this.subscribers.add(publish);
   }
@@ -481,6 +481,7 @@ export class ChatConnection {
     if (this.handle) await this.transport.stop(this.handle);
   }
 }
+
 
 
 
