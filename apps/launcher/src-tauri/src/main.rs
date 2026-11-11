@@ -1,12 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#[cfg(windows)]
-mod chat_process;
-#[cfg(unix)]
-#[path = "chat_process_unix.rs"]
-mod chat_process;
-mod chat_transport;
-mod chat;
 mod artifacts;
 mod attachments;
 mod active_app;
@@ -422,13 +415,12 @@ fn model_catalog() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn runtime_install(
     app: tauri::AppHandle,
-    chat: tauri::State<'_, crate::chat::ChatService>,
 ) -> Result<serde_json::Value, String> {
     let managed = runtime::managed_root()?;
     // An update replaces node_modules underneath every live runtime. Stop the
     // sessions first; otherwise the old process keeps the old files mapped and
     // the user has to quit the whole app before a session can start again.
-    chat.pause();
+    host_bootstrap::stop_sessions()?;
     let handle = app.clone();
     let version = tauri::async_runtime::spawn_blocking(move || {
         let emit = |value: serde_json::Value| { let _ = tauri::Emitter::emit(&handle, "runtime-install-progress", value); };
@@ -570,7 +562,6 @@ fn main() {
         logs::install_panic_hook(managed, env!("CARGO_PKG_VERSION"));
     }
     tauri::Builder::default()
-        .manage(chat::ChatService::default())
         // The launcher is one window for one installation: a second start hands its wish to the window
         // that is open and leaves, so two launchers never work on the same update or the same session.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -679,16 +670,6 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            chat::chat_start,
-            chat::chat_send,
-            chat::chat_poll,
-            chat::chat_scratch_dir,
-            chat::chat_poll_many,
-            chat::chat_release_generation,
-            chat::chat_stop,
-            chat::chat_stop_all,
-            chat::chat_claim,
-            chat::chat_stop_session,
             attachments::read_dropped_image,
             attachments::read_local_image,
             attachments::reveal_path,
@@ -749,8 +730,6 @@ fn main() {
         .expect("Unable to start Jouzu Desktop")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
-                use tauri::Manager;
-                app.state::<chat::ChatService>().shutdown();
                 host_bootstrap::stop(app);
             }
         });
