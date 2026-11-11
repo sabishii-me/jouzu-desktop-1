@@ -54,10 +54,11 @@ function displayName(item: ArtifactRecord): string {
 }
 
 function Thumb({ id, alt, onOpen }: { id: string; alt: string; onOpen: () => void }) {
+  const api = useApi();
   const [src, setSrc] = useState<string | null>(null);
   useEffect(() => {
     let alive = true;
-    void invoke<{ mimeType: string; data: string }>("artifact_read", { id })
+    void api.artifacts.read(id)
       .then(value => { if (alive) setSrc(`data:${value.mimeType};base64,${value.data}`); })
       .catch(() => {});
     return () => { alive = false; };
@@ -78,8 +79,8 @@ export function ArtifactsPanel({ sessionId, references = [], workspace, embedded
 
   async function load() {
     try {
-      const result = await invoke<{ artifacts: ArtifactRecord[] }>("artifact_list", sessionId ? { sessionId } : {});
-      setItems(result.artifacts ?? []);
+      const artifacts = await api.artifacts.list(sessionId ? { sessionId } : {});
+      setItems(artifacts as unknown as ArtifactRecord[]);
       setError(null);
     } catch (failure) {
       setError(String(failure));
@@ -188,4 +189,5 @@ export function ArtifactsPanel({ sessionId, references = [], workspace, embedded
     </div>}
   </Card>;
 }
+
 
