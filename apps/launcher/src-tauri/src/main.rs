@@ -22,7 +22,6 @@ mod update_lock;
 mod jouzu_update;
 mod environment;
 mod runtime;
-mod sessions;
 mod image_tool;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -677,14 +676,6 @@ fn main() {
             attachments::workspace_list,
             attachments::workspace_snapshot,
             attachments::workspace_read,
-            sessions::chat_sessions,
-            sessions::chat_session_update,
-            sessions::chat_flow_reports,
-            sessions::chat_session_messages,
-            sessions::chat_session_bytes,
-            sessions::chat_session_branch,
-            sessions::chat_session_timing,
-            sessions::chat_session_recover,
             launcher_state,
             launch_jouzu,
             forget_workspace,
