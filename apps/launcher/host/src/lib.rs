@@ -306,6 +306,10 @@ pub fn router(state: AppState) -> Router {
         .fallback(get(static_file))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            desktop_cors,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             host_origin_guard,
         ))
         .with_state(state)
@@ -1047,7 +1051,7 @@ fn allowed_origin(state: &AppState, headers: &HeaderMap) -> bool {
         format!("http://localhost:{}", state.port),
         format!("http://[::1]:{}", state.port),
     ];
-    allowed.iter().any(|value| value == &origin)
+    allowed.iter().any(|value| value == &origin) || desktop_origin(&origin)
 }
 
 /// The desktop webview loads a local build; its origin is trusted for the data API
