@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useApi } from "./api/context";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { Eye, FileText, FolderOpen, Trash2 } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
@@ -68,6 +69,7 @@ function Thumb({ id, alt, onOpen }: { id: string; alt: string; onOpen: () => voi
 
 /** Stored artifacts plus the turn's in-place outputs; Save freezes a copy. */
 export function ArtifactsPanel({ sessionId, references = [], workspace, embedded = false }: { sessionId?: string; references?: readonly OutputReference[]; workspace?: string; embedded?: boolean } = {}) {
+  const api = useApi();
   const [items, setItems] = useState<ArtifactRecord[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
@@ -108,7 +110,7 @@ export function ArtifactsPanel({ sessionId, references = [], workspace, embedded
 
   async function view(item: ArtifactRecord) {
     try {
-      const result = await invoke<{ mimeType: string; data: string }>("artifact_read", { id: item.id });
+      const result = await api.artifacts.read(item.id);
       const title = displayName(item);
       if (isImage(item.mimeType ?? result.mimeType)) {
         setViewing({ src: `data:${result.mimeType};base64,${result.data}`, title });
@@ -131,7 +133,7 @@ export function ArtifactsPanel({ sessionId, references = [], workspace, embedded
     const okay = await confirm("Delete this artifact? The file is removed from disk.", { title: "Delete artifact", kind: "warning" });
     if (!okay) return;
     try {
-      await invoke("artifact_delete", { id: item.id });
+      await api.artifacts.delete(item.id);
       await load();
     } catch (failure) {
       setError(String(failure));
@@ -186,3 +188,4 @@ export function ArtifactsPanel({ sessionId, references = [], workspace, embedded
     </div>}
   </Card>;
 }
+
