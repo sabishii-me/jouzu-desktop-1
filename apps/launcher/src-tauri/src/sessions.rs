@@ -1,4 +1,4 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -814,6 +814,7 @@ mod tests {
         assert!(list_sessions(directory.path()).is_empty());
     }
 }
+
 
 
 
