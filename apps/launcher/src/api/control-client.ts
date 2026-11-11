@@ -1,10 +1,12 @@
 /**
  * Control calls that go to the host.
  *
- * The UI is served by the host, so these are same-origin requests and the host's
- * HttpOnly cookie authenticates them. The shell no longer runs control.mjs; App.tsx
- * must not call the old Tauri commands.
+ * The desktop page loads a local build, so these cannot be same-origin requests and
+ * there is no cookie: every call carries the host token through the one client the
+ * shell configured. The shell no longer runs control.mjs.
  */
+import type { HostClient } from "./host-client";
+
 export interface ControlDevice {
   /** Set for a provider OAuth device flow; absent for Shisa.AI sign-in. */
   provider?: string;
@@ -12,56 +14,35 @@ export interface ControlDevice {
   code: string;
 }
 
-interface ErrorBody {
-  message?: unknown;
+let client: HostClient | undefined;
+
+/** Called once by the app shell with the host-backed client. */
+export function configureControlClient(host: HostClient): void {
+  client = host;
 }
 
-async function failure(response: Response): Promise<Error> {
-  let message = "The configuration service is unavailable.";
-  try {
-    const body = (await response.json()) as ErrorBody;
-    if (typeof body.message === "string" && body.message.trim()) message = body.message;
-  } catch {
-    /* Keep the generic sentence when the body is not JSON. */
-  }
-  return new Error(message);
+function control(): HostClient {
+  if (!client) throw new Error("The control client is not configured.");
+  return client;
 }
 
 export async function controlRequest(request: Record<string, unknown>): Promise<unknown> {
-  const response = await fetch("/v1/control", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request),
-  });
-  if (!response.ok) throw await failure(response);
-  return response.json();
+  return control().control(request);
 }
 
 export async function controlCancel(requestId?: string): Promise<void> {
-  const response = await fetch("/v1/control/cancel", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(requestId ? { requestId } : {}),
-  });
-  if (!response.ok) throw await failure(response);
+  return control().controlCancel(requestId);
 }
 
 /** Device codes from an in-flight sign-in. Returns the unsubscribe function. */
 export function subscribeControl(onDevice: (device: ControlDevice) => void): () => void {
-  const source = new EventSource("/v1/control/events");
-  source.addEventListener("control.device", event => {
-    try {
-      const data = JSON.parse((event as MessageEvent<string>).data) as Partial<ControlDevice>;
-      if (typeof data.url === "string") {
-        onDevice({
-          url: data.url,
-          code: typeof data.code === "string" ? data.code : "",
-          ...(typeof data.provider === "string" ? { provider: data.provider } : {}),
-        });
-      }
-    } catch {
-      /* A malformed frame is not a device code. */
-    }
+  return control().stream("/v1/control/events", (_id, event, data) => {
+    if (event !== "control.device") return;
+    if (typeof data.url !== "string") return;
+    onDevice({
+      url: data.url,
+      code: typeof data.code === "string" ? data.code : "",
+      ...(typeof data.provider === "string" ? { provider: data.provider } : {}),
+    });
   });
-  return () => source.close();
 }

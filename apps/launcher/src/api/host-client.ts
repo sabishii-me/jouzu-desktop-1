@@ -148,6 +148,71 @@ export class HostClient {
     return this.request<ApiCapabilities>("/v1/capabilities");
   }
 
+  /** Control requests reach the host that owns control.mjs. */
+  control(request: Record<string, unknown>): Promise<unknown> {
+    return this.request<unknown>("/v1/control", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
+  controlCancel(requestId?: string): Promise<void> {
+    return this.request<unknown>("/v1/control/cancel", {
+      method: "POST",
+      body: JSON.stringify(requestId ? { requestId } : {}),
+    }).then(() => undefined);
+  }
+
+  /** Follow a server-sent event stream with the bearer token in a header. */
+  stream(
+    path: string,
+    onEvent: (id: number, event: string, data: Record<string, unknown>) => void,
+  ): Unsubscribe {
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+          headers: this.authHeaders(),
+          signal: controller.signal,
+        });
+        if (!response.ok) return;
+        const reader = response.body?.getReader();
+        if (!reader) return;
+        const decoder = new TextDecoder();
+        let buffer = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) return;
+          buffer += decoder.decode(value, { stream: true });
+          let index;
+          while ((index = buffer.indexOf("\n\n")) >= 0) {
+            const block = buffer.slice(0, index);
+            buffer = buffer.slice(index + 2);
+            let id = 0;
+            let event = "";
+            let data = "";
+            for (const line of block.split("\n")) {
+              if (line.startsWith("id:")) id = Number(line.slice(3).trim());
+              else if (line.startsWith("event:")) event = line.slice(6).trim();
+              else if (line.startsWith("data:")) data += line.slice(5).trim();
+            }
+            if (!event) continue;
+            let payload: Record<string, unknown> = {};
+            try {
+              payload = data ? JSON.parse(data) : {};
+            } catch {
+              payload = { raw: data };
+            }
+            onEvent(id, event, payload);
+          }
+        }
+      } catch {
+        /* A closed page or host stops the stream; nothing to report. */
+      }
+    })();
+    return () => controller.abort();
+  }
+
   status(): Promise<RuntimeStatus> {
     return this.request<RuntimeStatus>("/v1/status");
   }

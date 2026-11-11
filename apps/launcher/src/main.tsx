@@ -4,6 +4,7 @@ import { ApiProvider } from "./api/context";
 import { createJouzuApi } from "./api/adapters";
 import { HostClient } from "./api/host-client";
 import { configureChatTransport } from "./chat-transport";
+import { configureControlClient } from "./api/control-client";
 import "./styles.css";
 
 /**
@@ -23,8 +24,10 @@ if (!endpoint?.baseUrl || !endpoint.token) {
 
 // Chat sessions are owned by the host process. StrictMode's development-only double
 // mount would attach the same session twice, so the app mounts once.
-const api = createJouzuApi(new HostClient({ baseUrl: endpoint.baseUrl, token: endpoint.token }));
+const client = new HostClient({ baseUrl: endpoint.baseUrl, token: endpoint.token });
+const api = createJouzuApi(client);
 configureChatTransport(api);
+configureControlClient(client);
 
 async function boot() {
   try { await api.start(); } catch { /* The App surfaces the host error; it never falls back. */ }
