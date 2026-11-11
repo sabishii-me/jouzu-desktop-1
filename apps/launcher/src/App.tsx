@@ -46,6 +46,7 @@ type Theme = "dark" | "light" | "system";
 
 export function App() {
   const api = useApi();
+  const native = api.capabilities.native;
   const [locale, setLocale] = useState<Locale>(() => resolveLocale(localStorage.getItem("jouzu.ui.language") ?? navigator.language));
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem("jouzu.ui.theme");
@@ -125,7 +126,7 @@ export function App() {
   const [device, setDevice] = useState<{url:string;code:string} | null>(null);
   const [providerDevice, setProviderDevice] = useState<{url:string;code:string;provider:string} | null>(null);
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!native) return;
     let disposed = false;
     const window = getCurrentWindow();
     const sync = () => { void window.isMaximized().then(value => { if (!disposed) setMaximized(value); }).catch(() => {}); };
@@ -134,7 +135,7 @@ export function App() {
     return () => { disposed = true; void unlisten.then(remove => remove()).catch(() => {}); };
   }, []);
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!native) return;
     const unlisten = listen("new-session", () => setNewSession(true));
     return () => { void unlisten.then(remove => remove()).catch(() => {}); };
   }, []);
@@ -194,7 +195,7 @@ export function App() {
     finally { setOperation(null); }
   }
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!native) return;
     let disposed = false;
     const subscription = getCurrentWindow().onDragDropEvent(event => {
       const payload = event.payload;
@@ -341,7 +342,7 @@ export function App() {
   }, []);
   // The prepare screen only mirrors the installer's own events; it never guesses progress.
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!native) return;
     const pending = listen<{ phase: string; downloaded?: number; total?: number | null }>("runtime-install-progress", event => {
       setPrepare(current => ({
         ...current,
@@ -690,6 +691,8 @@ export function App() {
     </LauncherPage>}
     </main>;
 }
+
+
 
 
 
