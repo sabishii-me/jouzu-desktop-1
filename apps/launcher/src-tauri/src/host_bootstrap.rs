@@ -168,3 +168,24 @@ fn host_binary(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     }
     Err("Could not find jouzu-host.exe".into())
 }
+
+/// Ask the running host to stop every session before an update swaps the runtime.
+pub fn stop_sessions() -> Result<(), String> {
+    let managed = crate::runtime::managed_root()?;
+    let text = std::fs::read_to_string(managed.join("host.json"))
+        .map_err(|_| "The host is not running.".to_string())?;
+    let value: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    let port = value.get("port").and_then(Value::as_u64).ok_or("The host has no port.")?;
+    let token = value
+        .get("token")
+        .and_then(Value::as_str)
+        .ok_or("The host has no token.")?;
+    reqwest::blocking::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/sessions/stop-all"))
+        .bearer_auth(token)
+        .send()
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
