@@ -2,13 +2,30 @@ import ReactDOM from "react-dom/client";
 import { App } from "./App";
 import { ApiProvider } from "./api/context";
 import { createJouzuApi } from "./api/adapters";
+import { HostClient } from "./api/host-client";
 import { configureChatTransport } from "./chat-transport";
 import "./styles.css";
-// Chat workspaces own a native runtime process. StrictMode's development-only
-// double mount starts a second process while the first is still closing, which
-// can leave a Flow branch attached. The desktop app mounts once.
-const api = createJouzuApi();
+
+/**
+ * The shell injects the host endpoint before this script runs. Every data call goes
+ * there; the page has no second source and therefore needs no remote IPC permission.
+ */
+declare global {
+  interface Window {
+    __JOUZU_HOST__?: { baseUrl: string; token: string };
+  }
+}
+
+const endpoint = window.__JOUZU_HOST__;
+if (!endpoint?.baseUrl || !endpoint.token) {
+  throw new Error("The host endpoint is missing; start the app through the desktop shell.");
+}
+
+// Chat sessions are owned by the host process. StrictMode's development-only double
+// mount would attach the same session twice, so the app mounts once.
+const api = createJouzuApi(new HostClient({ baseUrl: endpoint.baseUrl, token: endpoint.token }));
 configureChatTransport(api);
+
 async function boot() {
   try { await api.start(); } catch { /* The App surfaces the host error; it never falls back. */ }
   ReactDOM.createRoot(document.getElementById("root")!).render(
@@ -18,4 +35,3 @@ async function boot() {
   );
 }
 void boot();
-

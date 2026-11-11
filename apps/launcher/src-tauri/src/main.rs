@@ -606,30 +606,35 @@ fn main() {
             let host_url: url::Url = host_url
                 .parse()
                 .map_err(|error| std::io::Error::other(format!("Invalid host URL: {error}")))?;
+            let host_base = {
+                let mut base = host_url.clone();
+                base.set_query(None);
+                base.set_path("");
+                base.to_string()
+            };
+            let host_token = host_url
+                .query_pairs()
+                .find(|(key, _)| key == "token")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default();
             let config = app
                 .config()
                 .app
                 .windows
                 .first()
                 .ok_or("Missing window configuration")?;
+            // The window loads the local build; the host is only the data API. The
+            // endpoint and token are handed to the page before its own scripts run, so
+            // the UI has one data source and needs no remote IPC permission.
+            let endpoint_script = format!(
+                "window.__JOUZU_HOST__ = {{ baseUrl: {}, token: {} }};",
+                serde_json::to_string(&host_base)?,
+                serde_json::to_string(&host_token)?
+            );
             let window = tauri::WebviewWindowBuilder::from_config(app, config)?
                 .data_directory(data)
+                .initialization_script(&endpoint_script)
                 .build()?;
-            window.navigate(host_url.clone()).map_err(std::io::Error::other)?;
-            // WebView2 can drop the first navigation while it is still creating the
-            // webview; retry on the main thread after the window has settled.
-            let retry_handle = app.handle().clone();
-            let retry_url = host_url.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                let handle_for_main = retry_handle.clone();
-                let _ = retry_handle.run_on_main_thread(move || {
-                    if let Some(window) = tauri::Manager::get_webview_window(&handle_for_main, "main") {
-                        let _ = window.navigate(retry_url);
-                    }
-                });
-            });
-            let _ = window.set_title("Jouzu Host UI");
             renderer::watch(&window, runtime::managed_root().ok());
             let close_window = window.clone();
             window.on_window_event(move |event| {

@@ -1029,6 +1029,54 @@ fn allowed_origin(state: &AppState, headers: &HeaderMap) -> bool {
     allowed.iter().any(|value| value == &origin)
 }
 
+/// The desktop webview loads a local build; its origin is trusted for the data API
+/// and nothing else. Remote pages are never trusted here.
+fn desktop_origin(origin: &str) -> bool {
+    matches!(origin, "tauri://localhost" | "http://tauri.localhost")
+}
+
+fn apply_cors(response: &mut Response, origin: String) {
+    if let Ok(value) = HeaderValue::from_str(&origin) {
+        response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+    }
+    response.headers_mut().insert(header::VARY, HeaderValue::from_static("origin"));
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+    );
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("authorization, content-type"),
+    );
+}
+
+/// Answer the desktop webview preflight and label its responses. The host guard and
+/// the token still decide every request.
+async fn desktop_cors(
+    _state: State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|value| desktop_origin(value));
+    if request.method() == axum::http::Method::OPTIONS {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        if let Some(origin) = origin {
+            apply_cors(&mut response, origin);
+        }
+        return response;
+    }
+    let mut response = next.run(request).await;
+    if let Some(origin) = origin {
+        apply_cors(&mut response, origin);
+    }
+    response
+}
+
 struct Unauthorized(&'static str);
 
 impl IntoResponse for Unauthorized {
@@ -2494,6 +2542,7 @@ mod session_tests {
         assert_eq!(reports[0]["kind"], "work");
     }
 }
+
 
 
 
