@@ -102,6 +102,7 @@ export class HostClient {
               ...this.authHeaders(),
               ...(cursor ? { "last-event-id": String(cursor) } : {}),
             },
+            credentials: "same-origin",
             signal: controller.signal,
           },
         );
@@ -174,6 +175,7 @@ export class HostClient {
       try {
         const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
           headers: this.authHeaders(),
+          credentials: "same-origin",
           signal: controller.signal,
         });
         if (!response.ok) return;

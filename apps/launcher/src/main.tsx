@@ -17,8 +17,13 @@ declare global {
   }
 }
 
-const endpoint = window.__JOUZU_HOST__;
-if (!endpoint?.baseUrl || !endpoint.token) {
+const endpoint = window.__JOUZU_HOST__ ?? {
+  // A browser on the host origin authenticates with the host cookie. Native
+  // actions remain unavailable through the WebApi adapter.
+  baseUrl: window.location.origin,
+  token: "",
+};
+if (!endpoint.baseUrl) {
   throw new Error("The host endpoint is missing; start the app through the desktop shell.");
 }
 
