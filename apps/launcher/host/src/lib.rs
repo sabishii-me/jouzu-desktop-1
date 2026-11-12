@@ -2178,6 +2178,18 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn new_sessions_in_one_workspace_are_distinct() {
+        let (manager, _home, workspace) = manager(50);
+        let first = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        let second = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        assert_ne!(first.id, second.id);
+    }
+
+    #[tokio::test]
     async fn a_new_session_is_pending_until_the_first_message() {
         let (manager, _home, workspace) = manager(50);
         let app = app(manager.clone());

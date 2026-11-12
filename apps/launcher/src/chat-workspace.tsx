@@ -587,6 +587,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     return () => { disposed = true; subscription.then(unlisten => unlisten()).catch(() => {}); };
   }, [path, revision]);
   async function send() {
+    // A new session replaces the connection after it attaches. Waiting here keeps
+    // an early send from entering the previous (now closed) transport handle.
+    if (switchingRef.current) {
+      const pending = switchPromise.current;
+      if (!pending) { setNotification("The session is still opening."); return; }
+      await pending;
+    }
     let client = connection.current;
     if (!client || readingRef.current) return;
     if (isFlowHistoryError(client.snapshot.error)) { setNotification("Clear Flow request history before sending again."); return; }
@@ -703,28 +710,33 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     switchingTarget.current = "new";
     setSwitching(true);
     setSessionError(null);
-    try {
-      const next = await chatPool.lease(path, undefined, dialogRef.current, true);
-      parkPrevious(previous);
-      bindClient(next);
-      updateDialogs(emptyDialogQueue());
-      setDiskReports([]); setReportsSession(""); setTiming(undefined);
-      setNotification("");
-      onStartSession?.();
-      void refreshSessions();
-    } catch (error) {
-      // A failed cold start must not leave the hero over the session that is still
-      // bound: sending from the hero would go into the previous session.
-      const previousFile = previous?.snapshot.sessionFile ?? null;
-      setHero(!previousFile);
-      setSelectedSession(previousFile);
-      setPreview(null);
-      setNotification(humanizeRuntimeError(String(error).replace(/^Error:\s*/u, "")));
-    } finally {
-      switchingRef.current = false;
-      switchingTarget.current = null;
-      setSwitching(false);
-    }
+    const promise = (async () => {
+      try {
+        const next = await chatPool.lease(path, undefined, dialogRef.current, true);
+        parkPrevious(previous);
+        bindClient(next);
+        updateDialogs(emptyDialogQueue());
+        setDiskReports([]); setReportsSession(""); setTiming(undefined);
+        setNotification("");
+        onStartSession?.();
+        void refreshSessions();
+      } catch (error) {
+        // A failed cold start must not leave the hero over the session that is still
+        // bound: sending from the hero would go into the previous session.
+        const previousFile = previous?.snapshot.sessionFile ?? null;
+        setHero(!previousFile);
+        setSelectedSession(previousFile);
+        setPreview(null);
+        setNotification(humanizeRuntimeError(String(error).replace(/^Error:\s*/u, "")));
+      } finally {
+        switchingRef.current = false;
+        switchingTarget.current = null;
+        setSwitching(false);
+      }
+    })();
+    switchPromise.current = promise;
+    try { await promise; }
+    finally { if (switchPromise.current === promise) switchPromise.current = null; }
   }
   async function reloadSession() {
     const client = connection.current;

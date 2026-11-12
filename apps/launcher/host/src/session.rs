@@ -3184,9 +3184,7 @@ impl SessionManager {
             return Err(ApiError::bad_request("workspacePath must be a folder"));
         }
         let key = key.unwrap_or_else(|| {
-            session_path
-                .clone()
-                .unwrap_or_else(|| workspace.to_string_lossy().into_owned())
+            session_path.clone().unwrap_or_else(|| format!("new-{}", random_id()))
         });
         {
             let mut sessions = self
