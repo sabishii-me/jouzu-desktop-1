@@ -13,7 +13,7 @@ const title = process.env.PLAYBOOK_TITLE ?? "Jouzu playbook report";
 const runs = [];
 for (const file of files) runs.push(JSON.parse(await readFile(file, "utf8")));
 
-const missing = (process.env.PLAYBOOK_MISSING ?? [
+const missingBase = (process.env.PLAYBOOK_MISSING ?? [
   "coldProcessLaunch",
   "workingInteractivity",
   "stop",
@@ -31,17 +31,24 @@ const issues = JSON.parse(process.env.PLAYBOOK_ISSUES
     { id: 48, title: "Warm first readable 4.475 s exceeds 1 s", timestamp: "2026-11-12T21:50:35+09:00", class: "product/performance" },
     { id: 49, title: "New sessions missing from sidebar", timestamp: "2026-11-12T21:54:00+09:00", class: "product" },
     { id: 50, title: "Own message echo 167 ms once", timestamp: "2026-11-12T21:53:00+09:00", class: "unclear" },
+    { id: 51, title: "Running turn has no Stop and appears stuck", timestamp: "2026-11-12T22:19:44+09:00", class: "product" },
   ]));
 
 const labels = {
   reloadToReady: ["Reload to ready", 3000],
+  coldStartToInteractive: ["Cold start to interactive", null],
+  coldFirstReadable: ["Cold first readable", null],
   newSessionUsable: ["New session usable", 2000],
   modelMenuVisible: ["Model menu visible", 1000],
   ownMessageVisible: ["Own message visible", 100],
+  ownMessage: ["Own message visible", 100],
+  warmOwnMessage: ["Warm own message visible", 100],
   warmFirstReadable: ["Warm first readable", 1000],
   turnObservedEnd: ["Turn observed end", null],
+  stopToIdle: ["Stop to idle", 2000],
   secondNewSessionUsable: ["Second session usable", 2000],
   savedSessionSwitch: ["Saved-session switch", 2000],
+  newRowCount: ["New session rows visible", null],
 };
 const fmt = value => value == null ? "not measured" : `${Math.round(value)} ms`;
 const slug = value => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -57,12 +64,21 @@ const allMetrics = Object.entries(run.metrics ?? {}).map(([id, value]) => {
 const gates = allMetrics.filter(metric => metric.limitMs != null);
 const observations = allMetrics.filter(metric => metric.limitMs == null).map(({ id, label, valueMs }) => ({ id, label, valueMs }));
 const failed = gates.filter(gate => gate.status === "fail").map(gate => gate.id);
-const scenarios = (run.scenarios ?? []).map(item => ({
-  id: /^P\d-\d+/.test(item.name) ? item.name.split(" ")[0] : slug(item.name),
-  name: item.name,
-  status: item.ok ? "pass" : "fail",
-  evidence: item.detail ?? "",
-}));
+const scenarios = (run.scenarios ?? []).map(item => {
+  const name = item.name ?? item.id ?? "scenario";
+  return {
+    id: /^P\d-\d+/.test(name) ? name.split(" ")[0] : slug(String(name)),
+    name,
+    status: item.ok ? "pass" : "fail",
+    evidence: item.detail ?? "",
+  };
+});
+const ranStop = scenarios.some(item => /stop/i.test(`${item.id} ${item.name}`));
+const missing = missingBase.filter(id => {
+  if (id === "coldProcessLaunch") return run.metrics?.coldStartToInteractive == null;
+  if (id === "stop") return !ranStop;
+  return true;
+});
 const coverage = { complete: missing.length === 0, missing };
 const releaseReleasable = run.pass === true && failed.length === 0 && coverage.complete;
 const report = {
@@ -108,7 +124,7 @@ function latencySection() {
       <div class="bar"><div class="fill ${gate.status === "pass" ? "ok" : ""}" style="width:${Math.min(100, ratio * 50)}%"></div>
       ${gate.limitMs ? '<div class="mark" style="left:50%"></div>' : ""}</div></div>`;
   }).join("")}</div>
-  ${observations.length ? `<p class="muted">Recorded only: ${observations.map(item => `${item.label} ${fmt(item.valueMs)}`).join(" · ")}</p>` : ""}
+  ${observations.length ? `<p class="muted">Recorded only: ${observations.map(item => `${item.label} ${item.id === "newRowCount" ? `${item.valueMs} row(s)` : fmt(item.valueMs)}`).join(" · ")}</p>` : ""}
   </section>`;
 }
 
