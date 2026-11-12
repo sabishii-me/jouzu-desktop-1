@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use crate::log;
+use crate::runtime::adapter::pi::{self, DeltaKind, Record as PiRecord};
 use crate::runtime::{RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -249,6 +250,7 @@ pub struct Session {
     history: Mutex<Vec<Value>>,
     history_seq: AtomicU64,
     assistant_text: Mutex<String>,
+    assistant_blocks: Mutex<Vec<Value>>,
     active_client: Mutex<Option<String>>,
     model: Mutex<Option<Value>>,
     subscribers: AtomicU64,
@@ -355,6 +357,65 @@ impl Session {
 
     fn now_iso() -> String {
         Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+
+    fn append_assistant_block(&self, kind: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut blocks = self
+            .assistant_blocks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(last) = blocks.last_mut() {
+            if last.get("type").and_then(Value::as_str) == Some(kind) {
+                let merged = format!(
+                    "{}{}",
+                    last.get("text").and_then(Value::as_str).unwrap_or(""),
+                    text
+                );
+                last["text"] = Value::String(merged);
+                return;
+            }
+        }
+        blocks.push(json!({ "type": kind, "text": text }));
+    }
+
+    fn push_assistant_tool_call(&self, call_id: &str, name: &str, input: Value) {
+        self.assistant_blocks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(json!({
+                "type": "toolCall",
+                "toolCallId": call_id,
+                "name": name,
+                "input": input,
+            }));
+    }
+
+    fn push_assistant_tool_result(&self, call_id: &str, ok: bool, result: Value) {
+        self.assistant_blocks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(json!({
+                "type": "toolResult",
+                "toolCallId": call_id,
+                "ok": ok,
+                "result": result,
+            }));
+    }
+
+    fn take_assistant_blocks(&self, text: &str) -> Value {
+        let mut blocks = std::mem::take(
+            &mut *self
+                .assistant_blocks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        if blocks.is_empty() && !text.is_empty() {
+            blocks.push(json!({ "type": "text", "text": text }));
+        }
+        Value::Array(blocks)
     }
 
     fn update_history_tool(&self, call_id: &str, status: &str, result: Value) {
@@ -643,20 +704,61 @@ impl Session {
             if role != "user" && role != "assistant" {
                 continue;
             }
-            let text = message
-                .get("content")
-                .and_then(Value::as_array)
-                .map(|content| {
-                    content
-                        .iter()
-                        .filter_map(|block| block.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("")
+            let mut blocks = Vec::new();
+            if let Some(content) = message.get("content").and_then(Value::as_array) {
+                for block in content {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                blocks.push(json!({ "type": "text", "text": text }));
+                            }
+                        }
+                        Some("thinking") => {
+                            if let Some(text) = block
+                                .get("thinking")
+                                .or_else(|| block.get("text"))
+                                .and_then(Value::as_str)
+                            {
+                                blocks.push(json!({ "type": "thinking", "text": text }));
+                            }
+                        }
+                        Some("toolCall") => {
+                            if let Some(id) = block
+                                .get("toolCallId")
+                                .or_else(|| block.get("id"))
+                                .and_then(Value::as_str)
+                            {
+                                blocks.push(json!({
+                                    "type": "toolCall",
+                                    "toolCallId": id,
+                                    "name": block.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                                    "input": block.get("arguments").or_else(|| block.get("input")).cloned().unwrap_or(Value::Null),
+                                }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let text = blocks
+                .iter()
+                .filter_map(|block| {
+                    if block.get("type").and_then(Value::as_str) == Some("text") {
+                        block.get("text").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
                 })
-                .unwrap_or_default();
-            if text.is_empty() {
+                .collect::<Vec<_>>()
+                .join("");
+            if text.is_empty() && blocks.is_empty() {
                 continue;
             }
+            let blocks = if blocks.is_empty() {
+                json!([{ "type": "text", "text": text }])
+            } else {
+                Value::Array(blocks)
+            };
             rows.push(json!({
                 "kind": role,
                 "id": message
@@ -665,11 +767,7 @@ impl Session {
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("import-{index}")),
                 "text": text,
-                "blocks": if text.is_empty() {
-                    json!([])
-                } else {
-                    json!([{ "type": "text", "text": text }])
-                },
+                "blocks": blocks,
                 "createdAt": message
                     .get("timestamp")
                     .and_then(Value::as_str)
@@ -692,9 +790,9 @@ impl Session {
 
     fn handle_runtime_line(self: &Arc<Self>, value: Value) {
         self.publish("runtime.event", value.clone());
-        match value.get("type").and_then(Value::as_str) {
-            Some("response") => self.handle_response(&value),
-            Some("agent_start") => {
+        match pi::classify(&value) {
+            PiRecord::Response => self.handle_response(&value),
+            PiRecord::AgentStart => {
                 self.set_status(Status::Running);
                 if let Some(message_id) = self
                     .active_message
@@ -708,16 +806,14 @@ impl Session {
                     );
                 }
             }
-            Some("message_update") => {
-                let Some(update) = value
+            PiRecord::MessageUpdate => {
+                let Some(_update) = value
                     .get("assistantMessageEvent")
                     .and_then(Value::as_object)
                 else {
                     return;
                 };
-                let Some(kind) = update.get("type").and_then(Value::as_str) else {
-                    return;
-                };
+                let kind = pi::delta_kind(&value);
                 let active = self
                     .active_message
                     .lock()
@@ -727,38 +823,45 @@ impl Session {
                     return;
                 };
                 match kind {
-                    "text_delta" => {
-                        let text = update.get("delta").and_then(Value::as_str).unwrap_or("");
+                    DeltaKind::Text => {
+                        let text = pi::delta_text(&value);
                         if !text.is_empty() {
                             self.assistant_text
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .push_str(text);
+                            self.append_assistant_block("text", text);
                             self.publish(
                                 "message.delta",
                                 json!({ "messageId": message_id, "text": text }),
                             );
                         }
                     }
-                    "thinking_delta" => {
-                        let text = update.get("delta").and_then(Value::as_str).unwrap_or("");
+                    DeltaKind::Thinking => {
+                        let text = pi::delta_text(&value);
                         if !text.is_empty() {
+                            self.append_assistant_block("thinking", text);
                             self.publish(
                                 "message.delta",
                                 json!({ "messageId": message_id, "text": text, "kind": "thinking" }),
                             );
                         }
                     }
-                    _ => {}
+                    DeltaKind::Other => {}
                 }
             }
-            Some("tool_execution_start") => {
+            PiRecord::ToolStart => {
                 let call_id = value
                     .get("toolCallId")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
                 if !call_id.is_empty() {
+                    self.push_assistant_tool_call(
+                        &call_id,
+                        value.get("toolName").and_then(Value::as_str).unwrap_or("tool"),
+                        value.get("args").cloned().unwrap_or(Value::Null),
+                    );
                     self.push_history(json!({
                         "kind": "tool",
                         "id": format!("tool:{call_id}"),
@@ -780,7 +883,7 @@ impl Session {
                     }),
                 );
             }
-            Some("tool_execution_update") => {
+            PiRecord::ToolUpdate => {
                 self.publish(
                     "tool.update",
                     json!({
@@ -789,18 +892,23 @@ impl Session {
                     }),
                 );
             }
-            Some("tool_execution_end") => {
+            PiRecord::ToolEnd => {
                 let call_id = value
                     .get("toolCallId")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                self.push_assistant_tool_result(
+                    &call_id,
+                    value.get("isError").and_then(Value::as_bool) != Some(true),
+                    value.get("result").cloned().unwrap_or(Value::Null),
+                );
                 self.update_history_tool(
                     &call_id,
                     if value.get("isError").and_then(Value::as_bool) == Some(true) {
                         "error"
                     } else {
-                        "complete"
+                        "ok"
                     },
                     value.get("result").cloned().unwrap_or(Value::Null),
                 );
@@ -813,7 +921,7 @@ impl Session {
                     }),
                 );
             }
-            Some("custom_message") => {
+            PiRecord::CustomMessage => {
                 let custom_type = value
                     .get("customType")
                     .and_then(Value::as_str)
@@ -843,7 +951,7 @@ impl Session {
                     }),
                 );
             }
-            Some("agent_settled") => {
+            PiRecord::AgentSettled => {
                 let aborted = value
                     .get("aborted")
                     .and_then(Value::as_bool)
@@ -865,16 +973,13 @@ impl Session {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()),
                     );
+                    let blocks = self.take_assistant_blocks(&text);
                     let mut row = json!({
                         "kind": "assistant",
                         "id": format!("{message_id}:assistant"),
                         "turnId": message_id.clone(),
                         "text": text,
-                        "blocks": if text.is_empty() {
-                            json!([])
-                        } else {
-                            json!([{ "type": "text", "text": text }])
-                        },
+                        "blocks": blocks,
                         "createdAt": Self::now_iso(),
                     });
                     if let Some(message) = value.get("message") {
@@ -921,8 +1026,8 @@ impl Session {
                 self.cancel_pending("turn-ended");
                 self.set_status(Status::Idle);
             }
-            Some("extension_ui_request") => self.handle_extension_ui_request(&value),
-            Some("extension_error") => {
+            PiRecord::ExtensionUiRequest => self.handle_extension_ui_request(&value),
+            PiRecord::ExtensionError => {
                 let message = value
                     .get("error")
                     .and_then(Value::as_str)
@@ -932,7 +1037,7 @@ impl Session {
                     json!({ "code": "extension-error", "message": message, "retryable": false }),
                 );
             }
-            Some("error") => {
+            PiRecord::Error => {
                 let message = value
                     .get("message")
                     .and_then(Value::as_str)
@@ -1538,6 +1643,10 @@ impl Session {
             .assistant_text
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = String::new();
+        self.assistant_blocks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let stored_attachments = self.store_attachments(attachments)?;
         let mut history_row = json!({
             "kind": "user",
@@ -1823,6 +1932,7 @@ impl Session {
             history: Mutex::new(Vec::new()),
             history_seq: AtomicU64::new(0),
             assistant_text: Mutex::new(String::new()),
+            assistant_blocks: Mutex::new(Vec::new()),
             active_client: Mutex::new(None),
             model: Mutex::new(None),
             subscribers: AtomicU64::new(0),

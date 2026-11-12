@@ -8,6 +8,7 @@ const delay = Number(process.env.FAKE_RUNTIME_DELAY_MS ?? 15);
 const startDelay = Number(process.env.FAKE_RUNTIME_START_DELAY_MS ?? 0);
 const exitOnStart = Number(process.env.FAKE_RUNTIME_EXIT_ON_START_MS ?? 0);
 const crashOnPrompt = process.env.FAKE_RUNTIME_CRASH_ON_PROMPT === "1";
+const tool = process.env.FAKE_RUNTIME_TOOL === "1";
 const garbage = process.env.FAKE_RUNTIME_GARBAGE === "1";
 const uiMethod = process.env.FAKE_RUNTIME_UI ?? "";
 const uiTimeout = Number(process.env.FAKE_RUNTIME_UI_TIMEOUT_MS ?? 0);
@@ -122,6 +123,11 @@ function prompt(id, text) {
   response(id, "prompt", { disposition: "handled" });
   if (crashOnPrompt) {
     setTimeout(() => process.exit(8), 10);
+  }
+  if (tool) {
+    out({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "thinking" } });
+    out({ type: "tool_execution_start", toolCallId: "call-1", toolName: "bash", args: { command: "echo hi" } });
+    out({ type: "tool_execution_end", toolCallId: "call-1", isError: false, result: { output: "hi" } });
   }
   out({ type: "agent_start" });
   out({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });

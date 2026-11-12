@@ -1155,7 +1155,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "contract": "2026-11-12",
         "hostVersion": state.version,
-        "runtimeKind": "pi",
+        "runtimeKind": crate::runtime::adapter::pi::KIND,
         "features": ["chat", "sse", "replay", "prompts", "history-paging", "history-blocks", "models", "control", "tools", "mcp", "recovery", "deferred-sessions"],
         "scopes": ["loopback"],
         "limits": { "maxMessageBytes": 32768, "maxUploadBytes": 26214400 },
@@ -2266,6 +2266,34 @@ mod session_tests {
         assert!(rows.iter().any(|row| row["kind"] == "user"));
         assert!(rows.iter().any(|row| row["kind"] == "assistant"));
         reader.abort();
+    }
+
+    #[tokio::test]
+    async fn assistant_blocks_include_thinking_and_tools() {
+        let (manager, _home, workspace) = manager_with_env(50, &[("FAKE_RUNTIME_TOOL", "1")]);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("blocks-2", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        let history = session.history(50, None);
+        let rows = history["messages"].as_array().unwrap();
+        let assistant = rows
+            .iter()
+            .find(|row| row["kind"] == "assistant")
+            .expect("assistant row");
+        let types = assistant["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["type"].as_str())
+            .collect::<Vec<_>>();
+        assert!(types.contains(&"thinking"), "{assistant}");
+        assert!(types.contains(&"toolCall"), "{assistant}");
+        assert!(types.contains(&"toolResult"), "{assistant}");
+        let tool = rows.iter().find(|row| row["kind"] == "tool").unwrap();
+        assert_eq!(tool["tool"]["status"], "ok", "{tool}");
     }
 
     #[tokio::test]

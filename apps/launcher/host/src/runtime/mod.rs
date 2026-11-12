@@ -3,6 +3,7 @@
 //! One supervisor owns one runtime process and its stdio. The rest of the host
 //! never touches a pipe, a `Child`, or the process lock.
 
+pub mod adapter;
 pub mod job;
 pub mod process;
 pub mod supervisor;
