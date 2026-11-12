@@ -1328,6 +1328,16 @@ fn allowed_origin(state: &AppState, headers: &HeaderMap) -> bool {
 /// and nothing else. Remote pages are never trusted here.
 fn desktop_origin(origin: &str) -> bool {
     matches!(origin, "tauri://localhost" | "http://tauri.localhost")
+        // The dev shell loads Vite from 1420 while the host keeps its own origin.
+        // Only debug builds accept that extra loopback origin.
+        || (cfg!(debug_assertions)
+            && matches!(
+                origin,
+                "http://localhost:1420"
+                    | "http://127.0.0.1:1420"
+                    | "http://localhost:1430"
+                    | "http://127.0.0.1:1430"
+            ))
 }
 
 fn apply_cors(response: &mut Response, origin: String) {
@@ -1654,6 +1664,38 @@ mod tests {
             .unwrap();
         let (status, _, _) = call(app.clone(), request).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let request = Request::builder()
+            .uri("/v1/health")
+            .header(header::HOST, "127.0.0.1:40123")
+            .header(header::ORIGIN, "http://localhost:1420")
+            .header(header::AUTHORIZATION, format!("Bearer {}", "a".repeat(64)))
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = call(app.clone(), request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://localhost:1420")
+        );
+
+        let request = Request::builder()
+            .uri("/v1/health")
+            .header(header::HOST, "127.0.0.1:40123")
+            .header(header::ORIGIN, "http://127.0.0.1:1430")
+            .header(header::AUTHORIZATION, format!("Bearer {}", "a".repeat(64)))
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = call(app.clone(), request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://127.0.0.1:1430")
+        );
 
         let request = Request::builder()
             .uri("/v1/health")
