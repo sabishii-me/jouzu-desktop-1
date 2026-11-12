@@ -625,14 +625,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const value = [...submittedVideos.map(videoMarker), typed].filter(Boolean).join("\n");
     const submitted = attachmentRef.current;
     const wasHero = hero;
-    if (client.snapshot.projection.running) {
-      const key = sessionKeyOf(client.snapshot.sessionFile, selectedSession ?? path);
-      if (key) setQueuedBySession(previous => ({ ...previous, [key]: [...(previous[key] ?? []), value] }));
-      if (draftRef.current === value) { clearDraft(draftKeyRef.current); draftRef.current = ""; setDraft(""); }
-      setSendPending(false);
-      setLocalSubmitted("");
-      return;
-    }
+    // The host owns the queue for a turn that is already starting/running. Do
+    // not keep the only copy in the client; the POST below carries it to the host.
     // Capture the owner of this send. Clearing must never depend on which session is
     // on screen when it settles, and it must never touch another session's entry.
     const pendingKey = sessionKeyOf(client.snapshot.sessionFile, selectedSession ?? path);

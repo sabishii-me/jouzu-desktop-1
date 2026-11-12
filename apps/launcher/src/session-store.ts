@@ -131,7 +131,8 @@ export class SessionStore {
   }
 
   async sendOrSteer(text: string, images: readonly ChatImage[] = [], _running = false): Promise<void> {
-    if (this.state.pending) throw new Error("Wait for the current request to be accepted.");
+    // A running turn accepts a follow-up too; the host queues it and delivers it
+    // after the current turn. The client only owns a local echo for display.
     const now = Date.now();
     const content = [
       ...(text ? [{ type: "text" as const, text }] : []),

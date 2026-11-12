@@ -235,6 +235,7 @@ pub struct Session {
     config: SessionConfig,
     lease_path: PathBuf,
     messages: Mutex<HashMap<String, SentMessage>>,
+    queued_turns: Mutex<VecDeque<(String, Value)>>,
     pending_prompts: Mutex<Vec<Value>>,
     next_message: AtomicU64,
     next_request: AtomicU64,
@@ -731,7 +732,9 @@ impl Session {
                     // handshake bookkeeping first, then go idle; never go idle while
                     // an accepted turn still has an active message.
                     if self.active_turn().is_none() && !matches!(self.status(), Status::Running) {
-                        self.set_status(Status::Idle);
+                        if !self.start_queued_turn() {
+                            self.set_status(Status::Idle);
+                        }
                     }
                 }
             }
@@ -1075,7 +1078,13 @@ impl Session {
                     );
                 }
                 self.cancel_pending("turn-ended");
-                self.set_status(Status::Idle);
+                *self
+                    .active_message
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                if !self.start_queued_turn() {
+                    self.set_status(Status::Idle);
+                }
             }
             PiRecord::ExtensionUiRequest => self.handle_extension_ui_request(&value),
             PiRecord::ExtensionError => {
@@ -1672,13 +1681,44 @@ impl Session {
                 "receipt": "queued",
             }));
         }
-        if matches!(self.status(), Status::Running) {
-            return Err(ApiError::new(
-                axum::http::StatusCode::CONFLICT,
-                "session-busy",
-                "Wait for the current turn to settle",
-                true,
-            ));
+        if self.active_turn().is_some() {
+            // A turn is already starting/running. The host owns the follow-up
+            // prompt, not the composer: queue it, show it in history, and deliver
+            // it when the current turn ends.
+            let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
+            let message_id = format!("m-{counter}");
+            let history_row = json!({
+                "kind": "user",
+                "id": format!("{message_id}:user"),
+                "turnId": message_id,
+                "text": text,
+                "blocks": [{ "type": "text", "text": text }],
+                "createdAt": Self::now_iso(),
+                "queued": true,
+            });
+            self.push_history(history_row);
+            self.remember_turn(text);
+            self.publish(
+                "message.accepted",
+                json!({ "messageId": message_id.clone(), "receipt": "queued" }),
+            );
+            let prompt = json!({
+                "id": client_message_id,
+                "type": "prompt",
+                "message": text,
+            });
+            self.queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_back((message_id.clone(), prompt));
+            messages.insert(
+                client_message_id.to_string(),
+                SentMessage {
+                    message_id: message_id.clone(),
+                    text: text.to_string(),
+                },
+            );
+            return Ok(json!({ "messageId": message_id, "receipt": "queued" }));
         }
         let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
         let message_id = format!("m-{counter}");
@@ -2119,6 +2159,7 @@ impl Session {
             config: config.clone(),
             lease_path,
             messages: Mutex::new(HashMap::new()),
+            queued_turns: Mutex::new(VecDeque::new()),
             pending_prompts: Mutex::new(Vec::new()),
             next_message: AtomicU64::new(0),
             next_request: AtomicU64::new(0),
@@ -2333,6 +2374,34 @@ impl Session {
         // Attempts are kept for the five-minute window: a runtime that reaches
         // idle and dies again immediately is flapping, not healthy.
         self.recovery_scheduled.store(false, Ordering::SeqCst);
+    }
+
+    fn start_queued_turn(self: &Arc<Self>) -> bool {
+        let Some((turn, prompt)) = self
+            .queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front()
+        else {
+            return false;
+        };
+        *self
+            .active_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(turn.clone());
+        self.publish(
+            "turn.start",
+            json!({ "turnId": turn, "phase": "running" }),
+        );
+        self.set_status(Status::Running);
+        if let Err(error) = self.write_command(prompt) {
+            self.publish(
+                "error",
+                json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
+            );
+            self.set_status(Status::Error);
+        }
+        true
     }
 
     fn flush_pending_prompts(self: &Arc<Self>) {
