@@ -12,13 +12,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(windows)]
-mod runtime_process;
 mod artifacts;
 pub mod control;
 mod environment;
 mod files;
 pub mod models;
+pub mod runtime;
 pub mod sessions_repair;
 pub mod session;
 
@@ -248,7 +247,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/persisted", get(persisted_sessions))
         .route("/sessions/flow", get(session_flow))
         .route("/sessions/timing", get(session_timing))
-        .route("/sessions/messages", get(raw_messages))
+        .route("/sessions/history", get(history_preview))
         .route(
             "/sessions/branch",
             axum::routing::post(branch_session),
@@ -515,7 +514,7 @@ struct MessagesQuery {
     limit: Option<usize>,
 }
 
-async fn raw_messages(
+async fn history_preview(
     State(state): State<AppState>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<Value>, ApiError> {
@@ -938,8 +937,9 @@ async fn refresh_models(State(state): State<AppState>) -> Result<Json<Value>, Ap
 async fn capabilities(State(state): State<AppState>) -> Json<Value> {
     let default_workspace = default_workspace();
     Json(json!({
-        "contract": "2026-10-30",
+        "contract": "2026-11-12",
         "hostVersion": state.version,
+        "runtimeKind": "pi",
         "features": ["chat", "sse", "replay", "prompts", "history-paging"],
         "scopes": ["loopback"],
         "limits": { "maxMessageBytes": 32768, "maxUploadBytes": 26214400 },
@@ -1578,6 +1578,13 @@ mod session_tests {
         (manager, home, workspace)
     }
 
+    fn slow_manager(replay: usize) -> (Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir) {
+        let mut spec = RuntimeSpec::node_script(&fixture());
+        spec.env
+            .push(("FAKE_RUNTIME_START_DELAY_MS".into(), "2000".into()));
+        manager_with_spec(spec, replay)
+    }
+
     fn manager(replay: usize) -> (Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir) {
         manager_with_spec(RuntimeSpec::node_script(&fixture()), replay)
     }
@@ -1618,6 +1625,107 @@ mod session_tests {
         let headers = response.headers().clone();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn capabilities_report_the_phase_c_contract() {
+        let (manager, _home, _workspace) = manager(50);
+        let app = app(manager);
+        let response = call(
+            app,
+            request(Method::GET, "/v1/capabilities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK);
+        let body: Value = serde_json::from_str(&response.2).unwrap();
+        assert_eq!(body["contract"], "2026-11-12");
+        assert_eq!(body["runtimeKind"], "pi");
+        assert!(body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "sse"));
+    }
+
+    #[tokio::test]
+    async fn a_slow_spawn_does_not_block_health_or_list() {
+        let (manager, _home, workspace) = slow_manager(50);
+        let app = app(manager);
+        let body = json!({ "workspacePath": workspace.path() });
+        let created = call(
+            app.clone(),
+            request(Method::POST, "/v1/sessions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(created.0, StatusCode::ACCEPTED, "{}", created.2);
+
+        let started = Instant::now();
+        let health = call(
+            app.clone(),
+            request(Method::GET, "/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(health.0, StatusCode::OK, "{}", health.2);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "health took {:?}",
+            started.elapsed()
+        );
+
+        let started = Instant::now();
+        let list = call(
+            app,
+            request(Method::GET, "/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(list.0, StatusCode::OK, "{}", list.2);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "list took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn history_preview_is_served_at_the_new_path() {
+        let (manager, _home, _workspace) = manager(50);
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("preview.jsonl");
+        std::fs::write(
+            &file,
+            "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}\n",
+        )
+        .unwrap();
+        let path = file.to_string_lossy().replace('\\', "/");
+        let encoded = percent_encoding::utf8_percent_encode(
+            &path,
+            percent_encoding::NON_ALPHANUMERIC,
+        )
+        .to_string();
+        let app = app(manager);
+        let response = call(
+            app,
+            request(
+                Method::GET,
+                &format!("/v1/sessions/history?sessionPath={encoded}"),
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK, "{}", response.2);
+        let body: Value = serde_json::from_str(&response.2).unwrap();
+        assert_eq!(body["messages"][0]["role"], "user");
     }
 
     async fn wait_status(session: &crate::session::Session, expected: Status) {

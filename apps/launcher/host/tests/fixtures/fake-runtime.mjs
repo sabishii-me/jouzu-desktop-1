@@ -5,6 +5,7 @@ import { writeFileSync } from "node:fs";
 import readline from "node:readline";
 
 const delay = Number(process.env.FAKE_RUNTIME_DELAY_MS ?? 15);
+const startDelay = Number(process.env.FAKE_RUNTIME_START_DELAY_MS ?? 0);
 const uiMethod = process.env.FAKE_RUNTIME_UI ?? "";
 const uiTimeout = Number(process.env.FAKE_RUNTIME_UI_TIMEOUT_MS ?? 0);
 const out = value => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -18,6 +19,10 @@ let interrupted = false;
 let timer = null;
 let current = null;
 let pendingUi = null;
+
+if (startDelay > 0) {
+  await new Promise(resolve => setTimeout(resolve, startDelay));
+}
 
 if (process.env.FAKE_RUNTIME_CHILD_PID_FILE) {
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {

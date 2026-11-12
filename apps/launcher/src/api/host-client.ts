@@ -263,7 +263,7 @@ export class HostClient {
   messages(sessionPath: string, limit?: number): Promise<unknown[]> {
     const query = new URLSearchParams({ sessionPath });
     if (limit) query.set("limit", String(limit));
-    return this.request<{ messages: unknown[] }>(`/v1/sessions/messages?${query}`)
+    return this.request<{ messages: unknown[] }>(`/v1/sessions/history?${query}`)
       .then(body => body.messages);
   }
 

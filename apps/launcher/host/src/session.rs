@@ -39,8 +39,7 @@ struct SessionPreference {
     title: Option<String>,
 }
 
-#[cfg(windows)]
-use crate::runtime_process::ChatProcess;
+use crate::runtime::{RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec};
 
 pub const DEFAULT_REPLAY_LIMIT: usize = 5_000;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
@@ -82,6 +81,7 @@ impl RuntimeSpec {
     }
 }
 
+#[derive(Clone)]
 pub struct SessionConfig {
     pub spec: RuntimeSpec,
     pub home: PathBuf,
@@ -220,7 +220,8 @@ pub struct Session {
     status: Mutex<Status>,
     events: Mutex<EventLog>,
     tx: broadcast::Sender<SessionEvent>,
-    process: Arc<Mutex<ChatProcess>>,
+    runtime: Mutex<Option<Arc<RuntimeSupervisor>>>,
+    config: SessionConfig,
     lease_path: PathBuf,
     messages: Mutex<HashMap<String, SentMessage>>,
     next_message: AtomicU64,
@@ -242,7 +243,6 @@ pub struct Session {
     subscribers: AtomicU64,
     next_client: AtomicU64,
     last_activity: Mutex<Instant>,
-    pending_requests: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
 }
 
 impl Session {
@@ -446,24 +446,27 @@ impl Session {
     }
 
     fn write_command(&self, value: Value) -> Result<(), ApiError> {
-        let line = format!("{}\n", value);
-        let mut process = self
-            .process
+        let runtime = self
+            .runtime
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut offset = 0;
-        let bytes = line.as_bytes();
-        while offset < bytes.len() {
-            match process.write_stdin(&bytes[offset..]) {
-                Ok(0) => return Err(ApiError::unavailable("runtime input is closed")),
-                Ok(count) => offset += count,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Err(_) => return Err(ApiError::unavailable("runtime input is closed")),
-            }
-        }
-        Ok(())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                ApiError::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "runtime-unavailable",
+                    "The runtime is not ready",
+                    true,
+                )
+            })?;
+        runtime.enqueue(value).map_err(|message| {
+            ApiError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "runtime-unavailable",
+                message,
+                true,
+            )
+        })
     }
 
     fn request_messages(&self) {
@@ -543,32 +546,6 @@ impl Session {
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(model.clone());
                 }
             }
-        }
-        let id = value.get("id").and_then(Value::as_str).unwrap_or("");
-        let waiter = if id.is_empty() {
-            None
-        } else {
-            self.pending_requests
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(id)
-        };
-        if let Some(waiter) = waiter {
-            let success = value
-                .get("success")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let result = if success {
-                Ok(value.get("data").cloned().unwrap_or(Value::Null))
-            } else {
-                Err(value
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("runtime request failed")
-                    .to_string())
-            };
-            let _ = waiter.send(result);
-            return;
         }
         let success = value
             .get("success")
@@ -1623,44 +1600,39 @@ impl Session {
                 object.insert("id".to_string(), Value::String(id.clone()));
             }
         }
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_requests
+        let runtime = self
+            .runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(id.clone(), tx);
-        if let Err(error) = self.write_command(command) {
-            self.pending_requests
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&id);
-            return Err(error);
-        }
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(Ok(data))) => Ok(data),
-            Ok(Ok(Err(message))) => Err(ApiError::new(
+            .clone()
+            .ok_or_else(|| {
+                ApiError::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "runtime-unavailable",
+                    "The runtime is not ready",
+                    true,
+                )
+            })?;
+        match runtime.request(command, timeout).await {
+            Ok(data) => Ok(data),
+            Err(RequestError::Timeout) => Err(ApiError::new(
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                "runtime-timeout",
+                "The runtime did not answer in time",
+                true,
+            )),
+            Err(RequestError::Runtime(message)) => Err(ApiError::new(
                 axum::http::StatusCode::BAD_GATEWAY,
                 "runtime-error",
                 message,
                 false,
             )),
-            Ok(Err(_)) => Err(ApiError::new(
+            Err(RequestError::Closed(message)) => Err(ApiError::new(
                 axum::http::StatusCode::BAD_GATEWAY,
-                "runtime-error",
-                "The runtime response was dropped",
+                "runtime-unavailable",
+                message,
                 true,
             )),
-            Err(_) => {
-                self.pending_requests
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&id);
-                Err(ApiError::new(
-                    axum::http::StatusCode::GATEWAY_TIMEOUT,
-                    "runtime-timeout",
-                    "The runtime did not answer in time",
-                    true,
-                ))
-            }
         }
     }
 
@@ -1670,9 +1642,14 @@ impl Session {
         }
         self.set_status(Status::Stopped);
         self.cancel_pending("session-stopped");
-        if let Ok(mut process) = self.process.lock() {
-            process.close_stdin();
-            let _ = process.stop();
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(runtime) = runtime {
+            runtime.cancel_pending("session-stopped");
+            runtime.terminate();
         }
         let _ = std::fs::remove_file(&self.lease_path);
     }
@@ -1696,68 +1673,16 @@ impl Session {
         })
     }
 
-    fn spawn(
+    fn new(
         id: String,
         workspace_path: String,
         session_path: Option<String>,
         key: String,
         config: &SessionConfig,
-    ) -> Result<Arc<Session>, ApiError> {
-        let workspace = PathBuf::from(&workspace_path);
-        let mut environment: HashMap<String, (OsString, OsString)> = std::env::vars_os()
-            .filter(|(name, _)| {
-                let text = name.to_string_lossy();
-                !text.is_empty() && !text.contains('=') && !text.contains('\0')
-            })
-            .map(|(key, value)| (key.to_string_lossy().to_ascii_uppercase(), (key, value)))
-            .collect();
-        for name in ["NODE_OPTIONS", "NODE_PATH"] {
-            environment.remove(name);
-        }
-        let mut set = |name: &str, value: OsString| {
-            environment.insert(name.to_ascii_uppercase(), (OsString::from(name), value));
-        };
-        set("JOUZU_HOME", config.runtime_home.as_os_str().to_os_string());
-        set("JOUZU_NO_UPDATE", OsString::from("1"));
-        set("PI_SKIP_VERSION_CHECK", OsString::from("1"));
-        set("JOUZU_TEXTGUARD_DESKTOP", OsString::from("1"));
-        set("JOUZU_HOST_SESSION_ID", OsString::from(&id));
-        if let Some(bash) = &config.bash {
-            set("JOUZU_LAUNCHER_BASH", bash.as_os_str().to_os_string());
-        }
-        if let Some(path) = &session_path {
-            set("JOUZU_SESSION_PATH", OsString::from(path));
-        }
-        for (key, value) in &config.spec.env {
-            set(key, OsString::from(value));
-        }
-        let env: Vec<(OsString, OsString)> = environment.into_values().collect();
+    ) -> Arc<Session> {
         let lease_path = config.home.join(format!("session-{id}.lease"));
-        let lease = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&lease_path)
-            .map_err(|error| {
-                ApiError::new(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    format!("Could not create the runtime lease: {error}"),
-                    false,
-                )
-            })?;
-        let args: Vec<OsString> = config.spec.args.iter().map(OsString::from).collect();
-        let process = ChatProcess::spawn(&config.spec.program, &args, &workspace, &env, lease)
-            .map_err(|error| {
-                ApiError::new(
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "runtime-unavailable",
-                    format!("Could not start the runtime: {error}"),
-                    false,
-                )
-            })?;
-        let process = Arc::new(Mutex::new(process));
         let (tx, _) = broadcast::channel(1024);
-        let session = Arc::new(Session {
+        Arc::new(Session {
             id,
             workspace_path,
             session_path: Mutex::new(session_path),
@@ -1765,7 +1690,8 @@ impl Session {
             status: Mutex::new(Status::Starting),
             events: Mutex::new(EventLog::new(config.replay_limit)),
             tx,
-            process: process.clone(),
+            runtime: Mutex::new(None),
+            config: config.clone(),
             lease_path,
             messages: Mutex::new(HashMap::new()),
             next_message: AtomicU64::new(0),
@@ -1787,113 +1713,150 @@ impl Session {
             subscribers: AtomicU64::new(0),
             next_client: AtomicU64::new(0),
             last_activity: Mutex::new(Instant::now()),
-            pending_requests: Mutex::new(HashMap::new()),
-        });
-
-        {
-            let session = session.clone();
-            let process = process.clone();
-            std::thread::spawn(move || {
-                let mut buffer: Vec<u8> = Vec::new();
-                let mut chunk = [0u8; 8192];
-                loop {
-                    let result = {
-                        let mut process = process
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        process.read_stdout(&mut chunk)
-                    };
-                    match result {
-                        Ok(0) => {
-                            if exited(&process) {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Ok(count) => {
-                            buffer.extend_from_slice(&chunk[..count]);
-                            while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
-                                let line: Vec<u8> = buffer.drain(..=index).collect();
-                                let text = String::from_utf8_lossy(&line);
-                                let text = text.trim_end_matches(['\r', '\n']);
-                                if text.is_empty() {
-                                    continue;
-                                }
-                                if let Ok(value) = serde_json::from_str::<Value>(text) {
-                                    session.handle_runtime_line(value);
-                                }
-                            }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-        {
-            let process = process.clone();
-            let home = config.home.clone();
-            std::thread::spawn(move || {
-                let mut chunk = [0u8; 4096];
-                loop {
-                    let result = {
-                        let mut process = process
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        process.read_stderr(&mut chunk)
-                    };
-                    match result {
-                        Ok(0) => {
-                            if exited(&process) {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Ok(count) => {
-                            let line = String::from_utf8_lossy(&chunk[..count]).trim().to_string();
-                            if !line.is_empty() {
-                                log(&home, "debug", "runtime.stderr", json!({ "line": line }));
-                            }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-        {
-            let session = session.clone();
-            let process = process.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(50));
-                let exited = {
-                    let mut process = process
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    matches!(process.try_wait(), Ok(Some(_)))
-                };
-                if exited {
-                    if !matches!(session.status(), Status::Stopped) {
-                        session.set_status(Status::Stopped);
-                    }
-                    break;
-                }
-            });
-        }
-        session.start_handshake();
-        Ok(session)
+        })
     }
-}
 
-fn exited(process: &Arc<Mutex<ChatProcess>>) -> bool {
-    let mut process = process
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    matches!(process.try_wait(), Ok(Some(_)))
+    fn start(self: &Arc<Self>) {
+        if let Err(error) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&self.lease_path)
+        {
+            self.set_status(Status::Error);
+            self.publish(
+                "error",
+                json!({
+                    "code": "internal",
+                    "message": format!("Could not create the runtime lease: {error}"),
+                    "retryable": false,
+                }),
+            );
+            return;
+        }
+
+        let spec = SpawnSpec {
+            program: self.config.spec.program.clone(),
+            args: self.config.spec.args.clone(),
+            env: self.environment(),
+            workspace: PathBuf::from(&self.workspace_path),
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+        match RuntimeSupervisor::start(spec, event_tx) {
+            Ok(runtime) => {
+                *self
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
+            }
+            Err(error) => {
+                self.set_status(Status::Error);
+                self.publish(
+                    "error",
+                    json!({
+                        "code": "runtime-unavailable",
+                        "message": format!("Could not start the runtime: {error}"),
+                        "retryable": true,
+                    }),
+                );
+                return;
+            }
+        }
+
+        let session = self.clone();
+        tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                session.handle_runtime_event(event);
+            }
+        });
+        self.start_handshake();
+    }
+
+    fn environment(&self) -> Vec<(OsString, OsString)> {
+        let mut environment: HashMap<String, (OsString, OsString)> = std::env::vars_os()
+            .filter(|(name, _)| {
+                let text = name.to_string_lossy();
+                !text.is_empty() && !text.contains('=') && !text.contains('\0')
+            })
+            .map(|(key, value)| (key.to_string_lossy().to_ascii_uppercase(), (key, value)))
+            .collect();
+        for name in ["NODE_OPTIONS", "NODE_PATH"] {
+            environment.remove(name);
+        }
+        let mut set = |name: &str, value: OsString| {
+            environment.insert(name.to_ascii_uppercase(), (OsString::from(name), value));
+        };
+        set(
+            "JOUZU_HOME",
+            self.config.runtime_home.as_os_str().to_os_string(),
+        );
+        set("JOUZU_NO_UPDATE", OsString::from("1"));
+        set("PI_SKIP_VERSION_CHECK", OsString::from("1"));
+        set("JOUZU_TEXTGUARD_DESKTOP", OsString::from("1"));
+        set("JOUZU_HOST_SESSION_ID", OsString::from(&self.id));
+        if let Some(bash) = &self.config.bash {
+            set("JOUZU_LAUNCHER_BASH", bash.as_os_str().to_os_string());
+        }
+        if let Some(path) = self
+            .session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            set("JOUZU_SESSION_PATH", OsString::from(path));
+        }
+        for (key, value) in &self.config.spec.env {
+            set(key, OsString::from(value));
+        }
+        environment.into_values().collect()
+    }
+
+    fn handle_runtime_event(self: &Arc<Self>, event: RuntimeEvent) {
+        match event {
+            RuntimeEvent::Line(value) => self.handle_runtime_line(value),
+            RuntimeEvent::Stderr(line) => {
+                log(&self.home, "debug", "runtime.stderr", json!({ "line": line }));
+            }
+            RuntimeEvent::ParseError(message) => {
+                log(
+                    &self.home,
+                    "warn",
+                    "runtime.parse_error",
+                    json!({ "message": message }),
+                );
+                self.publish(
+                    "error",
+                    json!({
+                        "code": "runtime-error",
+                        "message": message,
+                        "retryable": true,
+                    }),
+                );
+            }
+            RuntimeEvent::IoError(message) => {
+                self.set_status(Status::Error);
+                self.publish(
+                    "error",
+                    json!({
+                        "code": "runtime-unavailable",
+                        "message": message,
+                        "retryable": true,
+                    }),
+                );
+            }
+            RuntimeEvent::Exited(code) => {
+                log(
+                    &self.home,
+                    "info",
+                    "runtime.exited",
+                    json!({ "code": code }),
+                );
+                if !matches!(self.status(), Status::Stopped) {
+                    self.set_status(Status::Stopped);
+                }
+            }
+        }
+    }
 }
 
 pub struct SessionManager {
@@ -2673,21 +2636,23 @@ impl SessionManager {
                 .clone()
                 .unwrap_or_else(|| workspace.to_string_lossy().into_owned())
         });
-        let mut sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(existing) = sessions
-            .values()
-            .find(|session| session.key == key)
-            .cloned()
         {
-            if !matches!(existing.status(), Status::Stopped) {
-                return Ok(existing);
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(existing) = sessions
+                .values()
+                .find(|session| session.key == key)
+                .cloned()
+            {
+                if !matches!(existing.status(), Status::Stopped) {
+                    return Ok(existing);
+                }
+                sessions.remove(&existing.id);
             }
-            sessions.remove(&existing.id);
         }
-        let config = self.config.as_ref().ok_or_else(|| {
+        let config = self.config.clone().ok_or_else(|| {
             ApiError::new(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "runtime-unavailable",
@@ -2697,14 +2662,22 @@ impl SessionManager {
         })?;
         std::fs::create_dir_all(&config.home.join("data")).ok();
         let id = format!("h-{}", random_id());
-        let session = Session::spawn(
+        let session = Session::new(
             id,
             workspace.to_string_lossy().into_owned(),
             session_path,
             key.clone(),
-            config,
-        )?;
-        sessions.insert(session.id.clone(), session.clone());
+            &config,
+        );
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sessions.insert(session.id.clone(), session.clone());
+        }
+        let starting = session.clone();
+        tokio::spawn(async move { starting.start() });
         Ok(session)
     }
 
