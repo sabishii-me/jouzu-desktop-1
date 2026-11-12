@@ -195,7 +195,7 @@ export function Composer({ hero = false, textguard, connected, pending, opening 
   const [videoDraft, setVideoDraft] = useState("");
   const [videoError, setVideoError] = useState<string | null>(null);
   const [modelOpen, setModelOpen] = useState(false);
-  const submit = () => { if (connected && !unavailable && !readingImages && !!model && (draft.trim() || videos.length) && (running || starting || !pending)) onSend(); };
+  const submit = () => { if ((connected || opening) && !unavailable && !readingImages && !!model && (draft.trim() || videos.length) && (running || starting || !pending)) onSend(); };
   const compactDisabled = !connected || pending || opening || unavailable || running;
   const exportDisabled = !connected || pending || opening || unavailable;  const [commandIndex, setCommandIndex] = useState(0);
   const commands = [
@@ -252,7 +252,7 @@ export function Composer({ hero = false, textguard, connected, pending, opening 
           <span className="hidden text-xs text-muted-foreground lg:inline">{!connected ? "Connecting…" : unavailable ? "Session unavailable" : opening ? "Opening session…" : starting ? "Starting…" : pending ? "Sending…" : running ? "Enter to steer" : "Enter to send · Shift+Enter for newline"}</span>
           <ModelMenu open={modelOpen} onOpenChange={setModelOpen} models={models} model={model} onSelect={onSelectModel} onOpen={onRefreshModels} onRetry={onRetryModels} thinkingLevel={thinkingLevel} thinkingLevels={thinkingLevels} onThinking={onThinkingLevel} />
           {active && <Button type="button" variant="outline" className="h-8 px-2" onClick={onStop}><Square className="size-3.5" />Stop</Button>}
-          <Button type="submit" className="h-8 px-2" disabled={!connected || (pending && !running && !starting) || unavailable || readingImages || !model || !draft.trim()}><Send className="size-3.5" />{running ? "Steer" : "Send"}</Button>
+          <Button type="submit" className="h-8 px-2" disabled={(!connected && !opening) || (pending && !running && !starting) || unavailable || readingImages || !model || !draft.trim()}><Send className="size-3.5" />{running ? "Steer" : "Send"}</Button>
         </div>
       </div>
     </form>
