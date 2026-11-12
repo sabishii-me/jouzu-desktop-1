@@ -84,7 +84,17 @@ export class HostChatTransport implements ChatTransport {
       // successful call adds nothing here. Only a rejected call needs an answer the
       // connection can correlate.
       try {
-        await this.api.commands.raw(handle, request);
+        const data = await this.api.commands.raw(handle, request);
+        // The runtime usually answers itself and the host relays that record. A
+        // host-owned pending session answers locally without a runtime; surface that
+        // answer here so the connection can settle the request.
+        queue.push({
+          type: "response",
+          id: request.id,
+          command,
+          success: true,
+          data,
+        });
       } catch (error) {
         queue.push({
           type: "response",

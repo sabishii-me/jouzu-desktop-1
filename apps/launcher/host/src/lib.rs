@@ -2426,6 +2426,40 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn attach_history_waits_for_the_starting_runtime() {
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().join("attached.jsonl");
+        let session = manager
+            .create(
+                workspace.path().to_str().unwrap(),
+                Some(path.to_string_lossy().into_owned()),
+                None,
+            )
+            .unwrap();
+        // Attach returns before the runtime handshake; get_messages must wait instead
+        // of surfacing "runtime not ready" to the client.
+        let history = session
+            .request(json!({ "type": "get_messages" }), Duration::from_secs(5))
+            .await
+            .expect("history after attach");
+        assert!(history["messages"].is_array(), "{history}");
+    }
+
+    #[tokio::test]
+    async fn pending_history_is_empty_without_a_runtime() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        let history = session
+            .request(json!({ "type": "get_messages" }), Duration::from_secs(1))
+            .await
+            .expect("pending history");
+        assert_eq!(history["messages"].as_array().unwrap().len(), 0);
+        assert!(session.runtime_pid().is_none());
+    }
+
+    #[tokio::test]
     async fn history_preview_is_served_at_the_new_path() {
         let (manager, _home, _workspace) = manager(50);
         let directory = manager.runtime_home().join("state").join("sessions");

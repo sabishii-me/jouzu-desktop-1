@@ -240,6 +240,7 @@ pub struct Session {
     next_request: AtomicU64,
     active_message: Mutex<Option<String>>,
     handshake: Mutex<Handshake>,
+    ready: tokio::sync::Notify,
     pending_approvals: Mutex<HashMap<String, PendingApproval>>,
     pending_questions: Mutex<HashMap<String, PendingQuestion>>,
     approval_outcomes: Mutex<HashMap<String, String>>,
@@ -506,6 +507,7 @@ impl Session {
             }
         };
         if changed {
+            self.ready.notify_waiters();
             self.publish("session.status", json!({ "status": status.as_str() }));
         }
     }
@@ -678,6 +680,7 @@ impl Session {
                     .handshake
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Handshake::Ready;
+                self.ready.notify_waiters();
                 if matches!(self.status(), Status::Starting | Status::Recovering) {
                     self.set_status(Status::Idle);
                     self.recovery_succeeded();
@@ -1780,6 +1783,30 @@ impl Session {
                 ));
             }
         }
+        if matches!(kind, "get_messages" | "get_state") {
+            match self.status() {
+                Status::Pending => {
+                    if kind == "get_messages" {
+                        return Ok(json!({ "messages": [] }));
+                    }
+                    return Ok(json!({
+                        "sessionId": self.id,
+                        "isStreaming": false,
+                        "model": null,
+                        "thinkingLevel": "off",
+                        "sessionFile": null,
+                    }));
+                }
+                Status::Starting | Status::Recovering => {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        self.ready.notified(),
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+        }
         let id = command
             .get("id")
             .and_then(Value::as_str)
@@ -1922,6 +1949,7 @@ impl Session {
             next_request: AtomicU64::new(0),
             active_message: Mutex::new(None),
             handshake: Mutex::new(Handshake::Messages),
+            ready: tokio::sync::Notify::new(),
             pending_approvals: Mutex::new(HashMap::new()),
             pending_questions: Mutex::new(HashMap::new()),
             approval_outcomes: Mutex::new(HashMap::new()),
