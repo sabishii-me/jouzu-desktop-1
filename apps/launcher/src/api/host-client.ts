@@ -328,10 +328,6 @@ export class HostClient {
     return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/interrupt`, { method: "POST" });
   }
 
-  warm(sessionId: string): Promise<unknown> {
-    return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/warm`, { method: "POST" });
-  }
-
   stop(sessionId: string): Promise<unknown> {
     return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/stop`, { method: "POST" });
   }

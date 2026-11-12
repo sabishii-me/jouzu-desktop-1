@@ -183,7 +183,6 @@ export interface SessionApi {
   messages(sessionPath: string, limit?: number): Promise<unknown[]>;
   send(sessionId: string, message: OutgoingMessage): Promise<Receipt>;
   interrupt(sessionId: string): Promise<void>;
-  warm(sessionId: string): Promise<void>;
   stop(sessionId: string): Promise<void>;
   update(sessionPath: string, change: { pinned?: boolean; archived?: boolean; title?: string }): Promise<SessionSummary | unknown>;
   branch(sessionPath: string, messageIndex: number): Promise<string>;
