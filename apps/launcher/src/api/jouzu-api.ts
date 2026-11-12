@@ -129,6 +129,11 @@ export interface Model {
   id: string;
   name: string;
   provider: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+  reasoning?: boolean;
+  thinkingLevels?: string[];
 }
 
 export interface RuntimeStatus {

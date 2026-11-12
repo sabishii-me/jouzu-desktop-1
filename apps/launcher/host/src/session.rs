@@ -254,6 +254,8 @@ pub struct Session {
     assistant_blocks: Mutex<Vec<Value>>,
     active_client: Mutex<Option<String>>,
     model: Mutex<Option<Value>>,
+    pending_model: Mutex<Option<Value>>,
+    pending_thinking: Mutex<Option<String>>,
     subscribers: AtomicU64,
     next_client: AtomicU64,
     last_activity: Mutex<Instant>,
@@ -684,6 +686,7 @@ impl Session {
                 if matches!(self.status(), Status::Starting | Status::Recovering) {
                     self.set_status(Status::Idle);
                     self.recovery_succeeded();
+                    self.apply_pending_preferences();
                     self.flush_pending_prompts();
                 }
             }
@@ -1870,6 +1873,84 @@ impl Session {
             .unwrap_or(0)
     }
 
+    pub async fn select_model(&self, provider: &str, model: &str) -> Result<Value, ApiError> {
+        if matches!(
+            self.status(),
+            Status::Pending | Status::Starting | Status::Recovering
+        ) {
+            *self
+                .pending_model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(json!({ "provider": provider, "model": model }));
+            return Ok(json!({ "provider": provider, "id": model, "name": model }));
+        }
+        self.request(
+            json!({ "type": "set_model", "provider": provider, "model": model }),
+            Duration::from_secs(30),
+        )
+        .await?;
+        let state = self
+            .request(json!({ "type": "get_state" }), Duration::from_secs(10))
+            .await?;
+        Ok(state.get("model").cloned().unwrap_or(Value::Null))
+    }
+
+    pub async fn select_thinking(&self, level: &str) -> Result<Value, ApiError> {
+        if matches!(
+            self.status(),
+            Status::Pending | Status::Starting | Status::Recovering
+        ) {
+            *self
+                .pending_thinking
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(level.to_string());
+            return Ok(json!({ "level": level }));
+        }
+        self.request(
+            json!({ "type": "set_thinking_level", "level": level }),
+            Duration::from_secs(30),
+        )
+        .await?;
+        Ok(json!({ "level": level }))
+    }
+
+    fn apply_pending_preferences(&self) {
+        let model = self
+            .pending_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(model) = model {
+            let Some(provider) = model.get("provider").and_then(Value::as_str) else {
+                return;
+            };
+            let Some(id) = model.get("model").and_then(Value::as_str) else {
+                return;
+            };
+            let request = self.request_id();
+            let _ = self.write_command(json!({
+                "id": request,
+                "type": "set_model",
+                "provider": provider,
+                "model": id,
+            }));
+        }
+        let level = self
+            .pending_thinking
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(level) = level {
+            let request = self.request_id();
+            let _ = self.write_command(json!({
+                "id": request,
+                "type": "set_thinking_level",
+                "level": level,
+            }));
+        }
+    }
+
     pub fn stop(&self) {
         if matches!(self.status(), Status::Stopped | Status::Cancelled) {
             return;
@@ -1963,6 +2044,8 @@ impl Session {
             assistant_blocks: Mutex::new(Vec::new()),
             active_client: Mutex::new(None),
             model: Mutex::new(None),
+            pending_model: Mutex::new(None),
+            pending_thinking: Mutex::new(None),
             subscribers: AtomicU64::new(0),
             next_client: AtomicU64::new(0),
             last_activity: Mutex::new(Instant::now()),

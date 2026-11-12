@@ -13,15 +13,6 @@ export interface ChatModel {
   maxTokens?: number;
   cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
 }
-interface CatalogModel {
-  id: string;
-  contextWindow?: number;
-  maxTokens?: number;
-  cost?: ChatModel["cost"];
-}
-function hasCost(cost: ChatModel["cost"]): boolean {
-  return !!cost && Object.values(cost).some(value => typeof value === "number" && value !== 0);
-}
 export interface SessionStats {
   userMessages?: number;
   assistantMessages?: number;
@@ -392,36 +383,10 @@ export class ChatConnection {
   }
   async loadModels() {
     try {
-      // The runtime answers with the models it can actually run; catalog metadata is
-      // host data and must not be fetched through the shell.
-      const data = await this.request("get_available_models");
-      const catalogModels: CatalogModel[] = [];
-      const catalogFor = (id: string) => {
-        const value = id.toLowerCase();
-        return catalogModels.find(model => typeof model.id === "string" && (value === model.id.toLowerCase() || value.endsWith(`/${model.id.toLowerCase()}`)));
-      };
-      const models = object(data) && Array.isArray(data.models)
-        ? data.models.flatMap(entry => {
-          if (!object(entry) || typeof entry.provider !== "string" || typeof entry.id !== "string") return [];
-          const runtimeCost = object(entry.cost) ? {
-            input: typeof entry.cost.input === "number" ? entry.cost.input : undefined,
-            output: typeof entry.cost.output === "number" ? entry.cost.output : undefined,
-            cacheRead: typeof entry.cost.cacheRead === "number" ? entry.cost.cacheRead : undefined,
-            cacheWrite: typeof entry.cost.cacheWrite === "number" ? entry.cost.cacheWrite : undefined,
-          } : undefined;
-          const catalogModel = catalogFor(entry.id);
-          return [{
-            provider: entry.provider,
-            id: entry.id,
-            name: typeof entry.name === "string" ? entry.name : entry.id,
-            contextWindow: catalogModel?.contextWindow ?? (typeof entry.contextWindow === "number" ? entry.contextWindow : undefined),
-            maxTokens: catalogModel?.maxTokens ?? (typeof entry.maxTokens === "number" ? entry.maxTokens : undefined),
-            // The runtime projection uses zero as a placeholder. Show a price only
-            // when the catalog has one, or a provider supplied a real non-zero cost.
-            cost: catalogModel?.cost ?? (hasCost(runtimeCost) ? runtimeCost : undefined),
-          }];
-        })
-        : [];
+      // Model availability is host catalog data. A pending session has no runtime,
+      // so this must not be a runtime command.
+      if (!this.handle) throw new Error("Chat is not connected.");
+      const models = await this.transport.models(this.handle);
       this.update({ models });
     } catch (error) { this.update({ error: `Could not read the model list. ${String(error)}` }); }
     finally { this.update({ modelsLoaded: true }); }
@@ -435,8 +400,9 @@ export class ChatConnection {
   async selectModel(provider: string, id: string) {
     this.update({ error: null });
     try {
-      const data = await this.request("set_model", { provider, modelId: id });
-      const name = object(data) && typeof data.name === "string" ? data.name : this.snapshot.models?.find(model => model.provider === provider && model.id === id)?.name ?? id;
+      if (!this.handle) throw new Error("Chat is not connected.");
+      await this.transport.selectModel(this.handle, provider, id);
+      const name = this.snapshot.models?.find(model => model.provider === provider && model.id === id)?.name ?? id;
       this.preferredModel = { provider, id };
       writeModelPreference(this.preferredModel);
       this.update({ model: name, modelProvider: provider, modelId: id });
@@ -450,7 +416,11 @@ export class ChatConnection {
     } catch { /* Thinking levels are optional in the released runtime. */ }
   }
   async setThinkingLevel(level: string) {
-    try { await this.request("set_thinking_level", { level }); this.update({ thinkingLevel: level }); }
+    try {
+      if (!this.handle) throw new Error("Chat is not connected.");
+      await this.transport.setThinking(this.handle, level);
+      this.update({ thinkingLevel: level });
+    }
     catch (error) { this.update({ error: String(error) }); }
   }
   async reply(id: string, fields: WireObject) {

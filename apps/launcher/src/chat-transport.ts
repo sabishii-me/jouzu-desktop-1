@@ -9,6 +9,7 @@
 
 import { HostChatSession } from "./api/chat-session";
 import type { ApiEvent, JouzuApi } from "./api/jouzu-api";
+import type { ChatModel } from "./chat-connection";
 
 export interface ChatPoll {
   records: unknown[];
@@ -22,6 +23,9 @@ export interface ChatTransport {
   stop(handle: string): Promise<void>;
   poll(handle: string): Promise<ChatPoll>;
   send(handle: string, request: Record<string, unknown>): Promise<void>;
+  models(handle: string): Promise<ChatModel[]>;
+  selectModel(handle: string, provider: string, model: string): Promise<void>;
+  setThinking(handle: string, level: string): Promise<void>;
 }
 
 /** Host events that carry a runtime record the projection already understands. */
@@ -54,6 +58,25 @@ export class HostChatTransport implements ChatTransport {
       error => this.closed.set(session.id, String(error)),
     );
     return session.id;
+  }
+
+  async models(_handle: string): Promise<ChatModel[]> {
+    return (await this.api.models.list("")).map(model => ({
+      provider: model.provider,
+      id: model.id,
+      name: model.name,
+      contextWindow: model.contextWindow,
+      maxTokens: model.maxTokens,
+      cost: model.cost,
+    }));
+  }
+
+  async selectModel(handle: string, provider: string, model: string): Promise<void> {
+    await this.api.models.select(handle, provider, model);
+  }
+
+  async setThinking(handle: string, level: string): Promise<void> {
+    await this.api.models.thinking(handle, level);
   }
 
   async stop(handle: string): Promise<void> {

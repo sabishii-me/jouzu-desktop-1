@@ -646,18 +646,10 @@ async fn select_session_model(
     Json(request): Json<SessionModelRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
-    session
-        .request(
-            json!({ "type": "set_model", "provider": request.provider, "model": request.model }),
-            Duration::from_secs(30),
-        )
+    let model = session
+        .select_model(&request.provider, &request.model)
         .await?;
-    let state_value = session
-        .request(json!({ "type": "get_state" }), Duration::from_secs(10))
-        .await?;
-    Ok(Json(json!({
-        "model": state_value.get("model").cloned().unwrap_or(Value::Null),
-    })))
+    Ok(Json(json!({ "model": model })))
 }
 
 #[derive(Deserialize)]
@@ -671,12 +663,7 @@ async fn select_session_thinking(
     Json(request): Json<SessionThinkingRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
-    session
-        .request(
-            json!({ "type": "set_thinking_level", "level": request.level.clone() }),
-            Duration::from_secs(30),
-        )
-        .await?;
+    session.select_thinking(&request.level).await?;
     Ok(Json(json!({ "level": request.level })))
 }
 
