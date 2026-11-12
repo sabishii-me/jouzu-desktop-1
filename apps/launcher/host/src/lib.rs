@@ -235,7 +235,9 @@ pub fn router(state: AppState) -> Router {
         .route("/control/events", get(control_events))
         .route("/models", get(models))
         .route("/models/refresh", axum::routing::post(refresh_models))
-        .route("/tools", get(tools_snapshot))
+        .route("/tools", get(tools_snapshot).put(update_tools))
+        .route("/tools/providers", get(tool_providers))
+        .route("/tools/models", get(tool_models))
         .route("/mcp", get(mcp_snapshot))
         .route(
             "/workspaces",
@@ -964,6 +966,72 @@ async fn tools_snapshot(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+fn normalize_image_tool(value: &Value) -> Result<Value, ApiError> {
+    let enabled = value
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let provider = value
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .ok_or_else(|| ApiError::bad_request("provider is required"))?;
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if model.len() > 128
+        || !model
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/'))
+    {
+        return Err(ApiError::bad_request("model is invalid"));
+    }
+    let size = value
+        .get("size")
+        .and_then(Value::as_str)
+        .filter(|size| matches!(*size, "1K" | "2K" | "4K"))
+        .unwrap_or("1K");
+    let max_images = value
+        .get("maxImages")
+        .and_then(Value::as_u64)
+        .map(|max| max.clamp(1, 10))
+        .unwrap_or(3);
+    Ok(json!({
+        "enabled": enabled,
+        "provider": provider,
+        "model": model,
+        "size": size,
+        "maxImages": max_images,
+    }))
+}
+
+async fn update_tools(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let image = body.get("image").unwrap_or(&body);
+    let image = normalize_image_tool(image)?;
+    let path = state.sessions.runtime_home().join("agent").join("tools.json");
+    let current = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| json!({}));
+    let review = current
+        .get("reviewTools")
+        .cloned()
+        .unwrap_or_else(|| json!(["generate_image"]));
+    let value = json!({ "image": image, "reviewTools": review });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| ApiError::internal(format!("Could not create the tools folder: {error}")))?;
+    }
+    std::fs::write(&path, format!("{}\n", value))
+        .map_err(|error| ApiError::internal(format!("Could not save tools: {error}")))?;
+    Ok(Json(value))
+}
+
 async fn mcp_snapshot(State(state): State<AppState>) -> Json<Value> {
     let path = state.sessions.runtime_home().join("agent").join("mcp.json");
     let value = std::fs::read_to_string(&path)
@@ -995,6 +1063,91 @@ async fn mcp_snapshot(State(state): State<AppState>) -> Json<Value> {
         "exists": path.is_file(),
         "servers": servers,
     }))
+}
+
+async fn run_image_cli(state: &AppState, args: &[&str]) -> Result<Value, ApiError> {
+    let node = state.sessions.node_executable().ok_or_else(|| {
+        ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "runtime-unavailable",
+            "The runtime is not installed yet",
+            true,
+        )
+    })?;
+    let home = state.sessions.runtime_home().to_path_buf();
+    let script = home
+        .join("agent")
+        .join("extensions")
+        .join("jouzu-image")
+        .join("index.js");
+    if !script.is_file() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "tools-unavailable",
+            "The image tool is not installed yet",
+            true,
+        ));
+    }
+    let mut command = tokio::process::Command::new(node);
+    command
+        .arg(&script)
+        .args(args)
+        .env("JOUZU_HOME", &home)
+        .env("PI_CODING_AGENT_DIR", home.join("agent"))
+        .env_remove("NODE_OPTIONS")
+        .env_remove("NODE_PATH")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        command.creation_flags(0x0800_0000);
+    }
+    let output = tokio::time::timeout(std::time::Duration::from_secs(20), command.output())
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                "tools-timeout",
+                "The image tool did not answer in time",
+                true,
+            )
+        })?
+        .map_err(|_| ApiError::internal("The image tool could not be started"))?;
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "tools-error",
+            "The image tool returned an unexpected answer",
+            true,
+        )
+    })?;
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "tools-error",
+            error,
+            true,
+        ));
+    }
+    Ok(value)
+}
+
+async fn tool_providers(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    run_image_cli(&state, &["--providers"]).await.map(Json)
+}
+
+#[derive(Deserialize)]
+struct ToolProviderQuery {
+    provider: String,
+}
+
+async fn tool_models(
+    State(state): State<AppState>,
+    Query(query): Query<ToolProviderQuery>,
+) -> Result<Json<Value>, ApiError> {
+    run_image_cli(&state, &["--models", &query.provider])
+        .await
+        .map(Json)
 }
 
 async fn capabilities(State(state): State<AppState>) -> Json<Value> {
@@ -2062,6 +2215,20 @@ mod session_tests {
         .await;
         assert_eq!(tools.0, StatusCode::OK, "{}", tools.2);
         assert!(tools.2.contains("generate_image"));
+
+        let saved = call(
+            app.clone(),
+            request(Method::PUT, "/v1/tools")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "image": { "provider": "shisa", "model": "gemini-3-pro-image", "size": "2K", "maxImages": 2 } })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(saved.0, StatusCode::OK, "{}", saved.2);
+        assert!(saved.2.contains("\"size\":\"2K\""), "{}", saved.2);
 
         let mcp = call(
             app,

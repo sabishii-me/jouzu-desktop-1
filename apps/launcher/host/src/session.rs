@@ -2136,6 +2136,12 @@ impl SessionManager {
         &self.runtime_home
     }
 
+    pub fn node_executable(&self) -> Option<PathBuf> {
+        self.config
+            .as_ref()
+            .map(|config| config.spec.program.clone())
+    }
+
     fn preferences_path(&self) -> PathBuf {
         self.runtime_home.join("state").join("session-preferences.json")
     }
