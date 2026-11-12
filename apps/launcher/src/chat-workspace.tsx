@@ -714,6 +714,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const previous = connection.current;
     setHero(true);
     setSelectedSession(null);
+    // Do not leave the previous transcript under a hero titled "Default workspace"
+    // while the new host session is attaching.
+    setSnapshot({ projection: emptyProjection(), connected: false, pending: false, error: null, models: snapshot.models, thinkingLevels: snapshot.thinkingLevels });
     previewRequest.current += 1;
     setPreview(null);
     switchingRef.current = true;

@@ -330,6 +330,7 @@ export class SessionStore {
         break;
       case "session.status":
         this.applyStatus(typeof data.status === "string" ? data.status : undefined);
+        if (data.status === "stopped" || data.status === "error") this.update({ connected: false });
         break;
       case "turn.start":
         this.update({ pending: true, projection: { ...this.state.projection, running: true, turnStartedAt: Date.now() } });
@@ -455,6 +456,13 @@ export class SessionPool {
       this.emitStatus();
       return undefined;
     }
+    if (!store.snapshot.connected) {
+      this.entries.delete(key);
+      this.unwatch(store);
+      void store.close();
+      this.emitStatus();
+      return undefined;
+    }
     this.entries.delete(key);
     this.entries.set(key, store);
     this.watch(store);
@@ -503,13 +511,13 @@ export class SessionPool {
   async enter(path: string, sessionPath: string, dialog?: SessionDialog): Promise<SessionStore> {
     const key = entryKey(sessionPath);
     const cached = this.entries.get(key);
-    if (cached && !cached.isDisposed()) {
+    if (cached && !cached.isDisposed() && cached.snapshot.connected) {
       this.entries.delete(key);
       this.entries.set(key, cached);
       this.watch(cached);
       return cached;
     }
-    if (cached) this.entries.delete(key);
+    if (cached) { this.entries.delete(key); this.unwatch(cached); void cached.close(); }
     const store = await this.lease(path, sessionPath, dialog, false);
     this.remember(sessionPath, store);
     return store;

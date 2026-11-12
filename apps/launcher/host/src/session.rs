@@ -3196,7 +3196,10 @@ impl SessionManager {
                 .find(|session| session.key == key)
                 .cloned()
             {
-                if !matches!(existing.status(), Status::Stopped | Status::Cancelled) {
+                if !matches!(
+                    existing.status(),
+                    Status::Stopped | Status::Cancelled | Status::Error
+                ) {
                     return Ok(existing);
                 }
                 sessions.remove(&existing.id);
