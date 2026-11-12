@@ -6,7 +6,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use crate::log;
+use crate::runtime::{RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct SessionPreference {
@@ -39,7 +40,7 @@ struct SessionPreference {
     title: Option<String>,
 }
 
-use crate::runtime::{RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec};
+use sha2::{Digest, Sha256};
 
 pub const DEFAULT_REPLAY_LIMIT: usize = 5_000;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
@@ -98,6 +99,7 @@ pub enum Status {
     Running,
     WaitingApproval,
     WaitingQuestion,
+    Recovering,
     Stopped,
     Error,
 }
@@ -110,6 +112,7 @@ impl Status {
             Status::Running => "running",
             Status::WaitingApproval => "waiting_approval",
             Status::WaitingQuestion => "waiting_question",
+            Status::Recovering => "recovering",
             Status::Stopped => "stopped",
             Status::Error => "error",
         }
@@ -221,6 +224,9 @@ pub struct Session {
     events: Mutex<EventLog>,
     tx: broadcast::Sender<SessionEvent>,
     runtime: Mutex<Option<Arc<RuntimeSupervisor>>>,
+    runtime_generation: AtomicU64,
+    recovery_attempts: Mutex<Vec<Instant>>,
+    recovery_scheduled: AtomicBool,
     config: SessionConfig,
     lease_path: PathBuf,
     messages: Mutex<HashMap<String, SentMessage>>,
@@ -529,7 +535,7 @@ impl Session {
         }
     }
 
-    fn handle_response(&self, value: &Value) {
+    fn handle_response(self: &Arc<Self>, value: &Value) {
         let command = value.get("command").and_then(Value::as_str).unwrap_or("");
         if command == "get_state" {
             if let Some(data) = value.get("data") {
@@ -566,7 +572,11 @@ impl Session {
                 "error",
                 json!({ "code": "runtime-error", "message": message, "retryable": false }),
             );
-            self.set_status(Status::Error);
+            if matches!(self.status(), Status::Starting | Status::Recovering) {
+                self.recovery_failed(message.to_string());
+            } else {
+                self.set_status(Status::Error);
+            }
             return;
         }
         match command {
@@ -581,7 +591,11 @@ impl Session {
                         "error",
                         json!({ "code": "session-switch-cancelled", "message": "The runtime cancelled the session switch", "retryable": false }),
                     );
-                    self.set_status(Status::Error);
+                    if matches!(self.status(), Status::Starting | Status::Recovering) {
+                        self.recovery_failed("session switch cancelled".to_string());
+                    } else {
+                        self.set_status(Status::Error);
+                    }
                     return;
                 }
                 *self
@@ -598,8 +612,9 @@ impl Session {
                     .handshake
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Handshake::Ready;
-                if matches!(self.status(), Status::Starting) {
+                if matches!(self.status(), Status::Starting | Status::Recovering) {
                     self.set_status(Status::Idle);
+                    self.recovery_succeeded();
                 }
             }
             _ => {}
@@ -1636,11 +1651,33 @@ impl Session {
         }
     }
 
+    pub fn runtime_pid(&self) -> Option<u32> {
+        self.runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|runtime| runtime.pid())
+    }
+
+    pub fn runtime_parse_errors(&self) -> u64 {
+        self.runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|runtime| runtime.parse_errors())
+            .unwrap_or(0)
+    }
+
     pub fn stop(&self) {
         if matches!(self.status(), Status::Stopped) {
             return;
         }
         self.set_status(Status::Stopped);
+        self.recovery_scheduled.store(false, Ordering::SeqCst);
+        self.recovery_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.cancel_pending("session-stopped");
         let runtime = self
             .runtime
@@ -1665,6 +1702,8 @@ impl Session {
                 .clone(),
             "status": self.status().as_str(),
             "running": self.status() == Status::Running,
+            "runtimePid": self.runtime_pid(),
+            "runtimeParseErrors": self.runtime_parse_errors(),
             "cursor": self.cursor(),
             "pendingApprovals": self.pending_approvals(),
             "pendingQuestions": self.pending_questions(),
@@ -1691,6 +1730,9 @@ impl Session {
             events: Mutex::new(EventLog::new(config.replay_limit)),
             tx,
             runtime: Mutex::new(None),
+            runtime_generation: AtomicU64::new(0),
+            recovery_attempts: Mutex::new(Vec::new()),
+            recovery_scheduled: AtomicBool::new(false),
             config: config.clone(),
             lease_path,
             messages: Mutex::new(HashMap::new()),
@@ -1734,42 +1776,168 @@ impl Session {
             );
             return;
         }
+        self.spawn_runtime(true);
+    }
 
-        let spec = SpawnSpec {
+    fn spawn_spec(&self) -> SpawnSpec {
+        SpawnSpec {
             program: self.config.spec.program.clone(),
             args: self.config.spec.args.clone(),
             env: self.environment(),
             workspace: PathBuf::from(&self.workspace_path),
-        };
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
-        match RuntimeSupervisor::start(spec, event_tx) {
+        }
+    }
+
+    fn spawn_runtime(self: &Arc<Self>, initial: bool) -> bool {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+        match RuntimeSupervisor::start(self.spawn_spec(), event_tx) {
             Ok(runtime) => {
-                *self
-                    .runtime
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
+                self.install_runtime(runtime, event_rx);
+                true
             }
             Err(error) => {
-                self.set_status(Status::Error);
-                self.publish(
-                    "error",
-                    json!({
-                        "code": "runtime-unavailable",
-                        "message": format!("Could not start the runtime: {error}"),
-                        "retryable": true,
-                    }),
-                );
-                return;
+                if initial {
+                    self.set_status(Status::Error);
+                    self.publish(
+                        "error",
+                        json!({
+                            "code": "runtime-unavailable",
+                            "message": format!("Could not start the runtime: {error}"),
+                            "retryable": true,
+                        }),
+                    );
+                } else {
+                    self.recovery_failed(format!("Could not restart the runtime: {error}"));
+                }
+                false
             }
         }
+    }
 
+    fn install_runtime(
+        self: &Arc<Self>,
+        runtime: Arc<RuntimeSupervisor>,
+        mut events: tokio::sync::mpsc::Receiver<RuntimeEvent>,
+    ) {
+        let generation = self.runtime_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        *self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
+        self.recovery_scheduled.store(false, Ordering::SeqCst);
         let session = self.clone();
         tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
+            while let Some(event) = events.recv().await {
+                if session.runtime_generation.load(Ordering::SeqCst) != generation {
+                    break;
+                }
                 session.handle_runtime_event(event);
             }
         });
         self.start_handshake();
+    }
+
+    fn schedule_recovery(self: &Arc<Self>, reason: String) {
+        if matches!(self.status(), Status::Stopped | Status::Error) {
+            return;
+        }
+        if self.recovery_scheduled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let count = self.record_recovery_attempt();
+        if count >= 3 {
+            self.recovery_scheduled.store(false, Ordering::SeqCst);
+            self.set_status(Status::Error);
+            self.publish(
+                "error",
+                json!({
+                    "code": "runtime-crashed",
+                    "message": "The runtime could not recover; restart it to continue.",
+                    "retryable": true,
+                }),
+            );
+            return;
+        }
+        log(
+            &self.home,
+            "warn",
+            "runtime.recovering",
+            json!({ "reason": reason, "attempts": count }),
+        );
+        self.set_status(Status::Recovering);
+        let session = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            session.restart_runtime().await;
+        });
+    }
+
+    async fn restart_runtime(self: &Arc<Self>) {
+        if matches!(self.status(), Status::Stopped | Status::Error) {
+            self.recovery_scheduled.store(false, Ordering::SeqCst);
+            return;
+        }
+        let previous = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(previous) = previous {
+            previous.terminate();
+        }
+        // The Job Object must be gone before the replacement starts: Flow
+        // allows one live attachment per session file.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.spawn_runtime(false);
+    }
+
+    fn recovery_failed(self: &Arc<Self>, reason: String) {
+        self.recovery_scheduled.store(false, Ordering::SeqCst);
+        let count = self
+            .recovery_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        log(
+            &self.home,
+            "warn",
+            "runtime.recovery_failed",
+            json!({ "reason": reason, "attempts": count }),
+        );
+        if count >= 3 {
+            self.set_status(Status::Error);
+            self.publish(
+                "error",
+                json!({
+                    "code": "runtime-crashed",
+                    "message": "The runtime could not recover; restart it to continue.",
+                    "retryable": true,
+                }),
+            );
+            return;
+        }
+        let session = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            session.schedule_recovery(reason);
+        });
+    }
+
+    fn record_recovery_attempt(&self) -> usize {
+        let now = Instant::now();
+        let mut attempts = self
+            .recovery_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attempts.retain(|attempt| now.duration_since(*attempt) < Duration::from_secs(300));
+        attempts.push(now);
+        attempts.len()
+    }
+
+    fn recovery_succeeded(&self) {
+        // Attempts are kept for the five-minute window: a runtime that reaches
+        // idle and dies again immediately is flapping, not healthy.
+        self.recovery_scheduled.store(false, Ordering::SeqCst);
     }
 
     fn environment(&self) -> Vec<(OsString, OsString)> {
@@ -1834,15 +2002,9 @@ impl Session {
                 );
             }
             RuntimeEvent::IoError(message) => {
-                self.set_status(Status::Error);
-                self.publish(
-                    "error",
-                    json!({
-                        "code": "runtime-unavailable",
-                        "message": message,
-                        "retryable": true,
-                    }),
-                );
+                if !matches!(self.status(), Status::Stopped) {
+                    self.schedule_recovery(message);
+                }
             }
             RuntimeEvent::Exited(code) => {
                 log(
@@ -1852,7 +2014,7 @@ impl Session {
                     json!({ "code": code }),
                 );
                 if !matches!(self.status(), Status::Stopped) {
-                    self.set_status(Status::Stopped);
+                    self.schedule_recovery(format!("runtime exited with code {code:?}"));
                 }
             }
         }
@@ -2661,7 +2823,10 @@ impl SessionManager {
             )
         })?;
         std::fs::create_dir_all(&config.home.join("data")).ok();
-        let id = format!("h-{}", random_id());
+        let id = match &session_path {
+            Some(path) => session_id_for_path(path),
+            None => format!("h-{}", random_id()),
+        };
         let session = Session::new(
             id,
             workspace.to_string_lossy().into_owned(),
@@ -2919,6 +3084,16 @@ fn random_id() -> String {
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+
+/// A persisted session keeps the same id across host restarts.
+pub fn session_id_for_path(path: &str) -> String {
+    let canonical = std::path::Path::new(path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(path));
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    format!("s-{}", hex::encode(&digest[..8]))
+}
+
 fn find_program(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)

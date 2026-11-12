@@ -940,7 +940,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<Value> {
         "contract": "2026-11-12",
         "hostVersion": state.version,
         "runtimeKind": "pi",
-        "features": ["chat", "sse", "replay", "prompts", "history-paging"],
+        "features": ["chat", "sse", "replay", "prompts", "history-paging", "recovery"],
         "scopes": ["loopback"],
         "limits": { "maxMessageBytes": 32768, "maxUploadBytes": 26214400 },
         "defaultWorkspace": default_workspace,
@@ -1578,6 +1578,38 @@ mod session_tests {
         (manager, home, workspace)
     }
 
+    fn manager_with_env(
+        replay: usize,
+        env: &[(&str, &str)],
+    ) -> (Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir) {
+        let mut spec = RuntimeSpec::node_script(&fixture());
+        spec.env.extend(
+            env.iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+        );
+        manager_with_spec(spec, replay)
+    }
+
+    #[cfg(windows)]
+    fn kill_tree(pid: u32) {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output();
+    }
+
+    async fn wait_until<F>(mut check: F)
+    where
+        F: FnMut() -> bool,
+    {
+        for _ in 0..240 {
+            if check() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("condition was not reached");
+    }
+
     fn slow_manager(replay: usize) -> (Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir) {
         let mut spec = RuntimeSpec::node_script(&fixture());
         spec.env
@@ -1646,7 +1678,7 @@ mod session_tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|value| value == "sse"));
+            .any(|value| value == "recovery"));
     }
 
     #[tokio::test]
@@ -1693,6 +1725,144 @@ mod session_tests {
             "list took {:?}",
             started.elapsed()
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_crashed_idle_runtime_recovers_without_restart() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let previous = session.runtime_pid().expect("runtime pid");
+        kill_tree(previous);
+        wait_until(|| {
+            session.status() == Status::Idle
+                && session.runtime_pid().is_some_and(|pid| pid != previous)
+        })
+        .await;
+        assert_eq!(session.status(), Status::Idle);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_crash_during_a_turn_keeps_one_user_message() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("client-1", "hello").unwrap();
+        wait_status(&session, Status::Running).await;
+        let previous = session.runtime_pid().expect("runtime pid");
+        kill_tree(previous);
+        wait_until(|| {
+            session.status() == Status::Idle
+                && session.runtime_pid().is_some_and(|pid| pid != previous)
+        })
+        .await;
+        let history = session.history(200, None);
+        let users = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["kind"] == "user")
+            .count();
+        assert_eq!(users, 1, "{history}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn repeated_crashes_end_in_error() {
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_EXIT_ON_START_MS", "5")]);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_until(|| session.status() == Status::Error).await;
+        assert_eq!(session.status(), Status::Error);
+    }
+
+    #[tokio::test]
+    async fn persisted_session_ids_are_stable_and_distinct() {
+        let workspace = tempfile::tempdir().unwrap();
+        let first = workspace.path().join("first.jsonl");
+        let second = workspace.path().join("second.jsonl");
+        std::fs::write(&first, "{}\n").unwrap();
+        std::fs::write(&second, "{}\n").unwrap();
+        let first_id = crate::session::session_id_for_path(first.to_str().unwrap());
+        let again = crate::session::session_id_for_path(first.to_str().unwrap());
+        let other = crate::session::session_id_for_path(second.to_str().unwrap());
+        assert_eq!(first_id, again);
+        assert_ne!(first_id, other);
+    }
+
+    #[tokio::test]
+    async fn garbage_output_is_counted_not_silent() {
+        let (manager, _home, workspace) = manager_with_env(50, &[("FAKE_RUNTIME_GARBAGE", "1")]);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        wait_until(|| session.runtime_parse_errors() > 0).await;
+        assert!(session.runtime_parse_errors() > 0);
+    }
+
+    #[tokio::test]
+    async fn get_state_is_answered_while_streaming() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("client-1", "hello").unwrap();
+        let state = session
+            .request(json!({ "type": "get_state" }), Duration::from_secs(1))
+            .await
+            .expect("get_state during streaming");
+        assert_eq!(state["model"]["id"], "model");
+    }
+
+    #[tokio::test]
+    async fn a_hung_runtime_does_not_block_health_or_list() {
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_IGNORE_STDIN", "1")]);
+        let manager_for_app = manager.clone();
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        let app = app(manager_for_app);
+
+        let started = Instant::now();
+        let health = call(
+            app.clone(),
+            request(Method::GET, "/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(health.0, StatusCode::OK, "{}", health.2);
+        assert!(started.elapsed() < Duration::from_millis(250));
+
+        let started = Instant::now();
+        let list = call(
+            app,
+            request(Method::GET, "/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(list.0, StatusCode::OK, "{}", list.2);
+        assert!(started.elapsed() < Duration::from_millis(250));
+
+        wait_until(|| {
+            matches!(
+                session.status(),
+                Status::Recovering | Status::Error
+            )
+        })
+        .await;
     }
 
     #[tokio::test]

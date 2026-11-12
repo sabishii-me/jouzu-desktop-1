@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::{mpsc, oneshot},
@@ -39,6 +39,7 @@ pub struct RuntimeSupervisor {
     pid: u32,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
     parse_errors: AtomicU64,
+    probe_id: AtomicU64,
 }
 
 impl RuntimeSupervisor {
@@ -66,6 +67,7 @@ impl RuntimeSupervisor {
             pid: spawned.pid,
             pending: Mutex::new(HashMap::new()),
             parse_errors: AtomicU64::new(0),
+            probe_id: AtomicU64::new(0),
         });
 
         let writer = supervisor.clone();
@@ -86,6 +88,31 @@ impl RuntimeSupervisor {
             wait.fail_pending("runtime exited");
             let code = status.ok().and_then(|status| status.code());
             let _ = wait_events.send(RuntimeEvent::Exited(code)).await;
+        });
+
+        // A runtime that stops reading stdin or stops answering is otherwise
+        // indistinguishable from an idle one. Probe it while it lives; a timeout
+        // terminates the job and the ordinary exit path starts recovery.
+        let monitor = supervisor.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let id = format!(
+                    "health-{}",
+                    monitor.probe_id.fetch_add(1, Ordering::Relaxed) + 1
+                );
+                if monitor
+                    .request(
+                        json!({ "id": id, "type": "get_state" }),
+                        Duration::from_secs(3),
+                    )
+                    .await
+                    .is_err()
+                {
+                    monitor.job.terminate();
+                    break;
+                }
+            }
         });
 
         Ok(supervisor)

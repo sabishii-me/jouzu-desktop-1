@@ -6,6 +6,9 @@ import readline from "node:readline";
 
 const delay = Number(process.env.FAKE_RUNTIME_DELAY_MS ?? 15);
 const startDelay = Number(process.env.FAKE_RUNTIME_START_DELAY_MS ?? 0);
+const exitOnStart = Number(process.env.FAKE_RUNTIME_EXIT_ON_START_MS ?? 0);
+const crashOnPrompt = process.env.FAKE_RUNTIME_CRASH_ON_PROMPT === "1";
+const garbage = process.env.FAKE_RUNTIME_GARBAGE === "1";
 const uiMethod = process.env.FAKE_RUNTIME_UI ?? "";
 const uiTimeout = Number(process.env.FAKE_RUNTIME_UI_TIMEOUT_MS ?? 0);
 const out = value => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -19,9 +22,18 @@ let interrupted = false;
 let timer = null;
 let current = null;
 let pendingUi = null;
+const messages = [];
 
 if (startDelay > 0) {
   await new Promise(resolve => setTimeout(resolve, startDelay));
+}
+
+if (garbage) {
+  process.stdout.write("this is not json\n");
+}
+
+if (exitOnStart > 0) {
+  setTimeout(() => process.exit(7), exitOnStart);
 }
 
 if (process.env.FAKE_RUNTIME_CHILD_PID_FILE) {
@@ -64,6 +76,12 @@ function tick() {
     type: "message_end",
     message: { role: "assistant", content: [{ type: "text", text: parts.join("") }], model: "fixture-model", provider: "fixture" },
   });
+  messages.push({
+    role: "assistant",
+    content: [{ type: "text", text: parts.join("") }],
+    model: "fixture-model",
+    provider: "fixture",
+  });
   settled(false);
 }
 
@@ -100,7 +118,11 @@ function requestUi(text) {
 function prompt(id, text) {
   busy = true;
   interrupted = false;
+  messages.push({ role: "user", content: [{ type: "text", text: String(text) }] });
   response(id, "prompt", { disposition: "handled" });
+  if (crashOnPrompt) {
+    setTimeout(() => process.exit(8), 10);
+  }
   out({ type: "agent_start" });
   out({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
   out({ type: "message_start", message: { role: "assistant", content: [] } });
@@ -119,6 +141,10 @@ function prompt(id, text) {
 }
 
 const lines = readline.createInterface({ input: process.stdin });
+if (process.env.FAKE_RUNTIME_IGNORE_STDIN === "1") {
+  lines.pause();
+  process.stdin.pause();
+}
 lines.on("line", line => {
   let value;
   try {
@@ -139,7 +165,7 @@ lines.on("line", line => {
   }
   switch (value.type) {
     case "get_messages":
-      response(value.id, "get_messages", { messages: [] });
+      response(value.id, "get_messages", { messages });
       break;
     case "get_state":
       response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: { name: "fixture-model", provider: "fixture", id: "model" }, thinkingLevel: "off", sessionFile: null });
