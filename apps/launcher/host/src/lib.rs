@@ -235,6 +235,8 @@ pub fn router(state: AppState) -> Router {
         .route("/control/events", get(control_events))
         .route("/models", get(models))
         .route("/models/refresh", axum::routing::post(refresh_models))
+        .route("/tools", get(tools_snapshot))
+        .route("/mcp", get(mcp_snapshot))
         .route(
             "/workspaces",
             get(list_workspaces).post(add_workspaces),
@@ -949,13 +951,59 @@ async fn refresh_models(State(state): State<AppState>) -> Result<Json<Value>, Ap
     state.models.refresh(&state.control).await.map(Json)
 }
 
+async fn tools_snapshot(State(state): State<AppState>) -> Json<Value> {
+    let path = state.sessions.runtime_home().join("agent").join("tools.json");
+    let value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| json!({ "reviewTools": ["generate_image"] }));
+    Json(json!({
+        "path": path.to_string_lossy(),
+        "exists": path.is_file(),
+        "settings": value,
+    }))
+}
+
+async fn mcp_snapshot(State(state): State<AppState>) -> Json<Value> {
+    let path = state.sessions.runtime_home().join("agent").join("mcp.json");
+    let value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| json!({ "mcpServers": {} }));
+    let servers = value
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|(name, config)| {
+                    let url = config.get("url").and_then(Value::as_str);
+                    let command = config.get("command").and_then(Value::as_str);
+                    json!({
+                        "name": name,
+                        "transport": if url.is_some() { "HTTP" } else if command.is_some() { "Local" } else { "Unknown" },
+                        "target": url.or(command).unwrap_or("Unknown target"),
+                        "description": config.get("description").and_then(Value::as_str),
+                        "exposure": config.get("exposure").and_then(Value::as_str).unwrap_or("deferred"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Json(json!({
+        "path": path.to_string_lossy(),
+        "exists": path.is_file(),
+        "servers": servers,
+    }))
+}
+
 async fn capabilities(State(state): State<AppState>) -> Json<Value> {
     let default_workspace = default_workspace();
     Json(json!({
         "contract": "2026-11-12",
         "hostVersion": state.version,
         "runtimeKind": "pi",
-        "features": ["chat", "sse", "replay", "prompts", "history-paging", "recovery", "deferred-sessions"],
+        "features": ["chat", "sse", "replay", "prompts", "history-paging", "recovery", "deferred-sessions", "tools", "mcp"],
         "scopes": ["loopback"],
         "limits": { "maxMessageBytes": 32768, "maxUploadBytes": 26214400 },
         "defaultWorkspace": default_workspace,
@@ -1986,6 +2034,45 @@ mod session_tests {
         )
         .await;
         assert!(refreshed.2.contains("second.jsonl"), "{}", refreshed.2);
+    }
+
+    #[tokio::test]
+    async fn tools_and_mcp_endpoints_read_host_state() {
+        let (manager, home, _workspace) = manager(50);
+        let agent = home.path().join("data").join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("tools.json"),
+            json!({ "reviewTools": ["generate_image"], "image": { "provider": "shisa" } }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("mcp.json"),
+            json!({ "mcpServers": { "local": { "command": "node", "exposure": "eager" } } }).to_string(),
+        )
+        .unwrap();
+        let app = app(manager);
+
+        let tools = call(
+            app.clone(),
+            request(Method::GET, "/v1/tools")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(tools.0, StatusCode::OK, "{}", tools.2);
+        assert!(tools.2.contains("generate_image"));
+
+        let mcp = call(
+            app,
+            request(Method::GET, "/v1/mcp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(mcp.0, StatusCode::OK, "{}", mcp.2);
+        assert!(mcp.2.contains("\"transport\":\"Local\""), "{}", mcp.2);
+        assert!(mcp.2.contains("\"exposure\":\"eager\""), "{}", mcp.2);
     }
 
     #[tokio::test]
