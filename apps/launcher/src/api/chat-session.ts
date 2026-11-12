@@ -47,6 +47,10 @@ export class HostChatSession {
     return this.api.sessions.interrupt(this.id);
   }
 
+  warm(): Promise<void> {
+    return this.api.sessions.warm(this.id);
+  }
+
   /** Close this client's stream. The session itself keeps running. */
   detach(): void {
     this.unsubscribe?.();

@@ -433,10 +433,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   }, [pickerOpen]);
   function fromApiSession(value: ApiSessionSummary): SessionSummary | null {
     if (!value.sessionPath) return null;
-    // A host entry without a title or timestamp is a provisional/empty session,
-    // not a transcript the sidebar should offer. Counting it as 1970 produced
-    // rows such as "20769d" and let empty sessions shadow real ones.
-    if (!value.title?.trim() && !value.updatedAt) return null;
+    // A host entry without a title is an empty/provisional session, not a
+    // transcript the sidebar should offer. The fallback to an id title made
+    // empty page-load sessions look real.
+    if (!value.title?.trim()) return null;
     const parsed = value.updatedAt ? Date.parse(value.updatedAt) : NaN;
     const updated = Number.isFinite(parsed) && parsed > 0 ? parsed / 1000 : Date.now() / 1000;
     return {
@@ -1180,7 +1180,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // sessionFile: a new pending session has no file yet, which hid Stop during
   // the first turn.
   const composerRunning = snapshot.projection.running;
-  const composerStarting = (snapshot.pending || sendPending) && !composerRunning;
+  const composerStarting = snapshot.pending && !composerRunning;
   const [appView, setAppView] = useState<"chat" | "artifacts">("chat");
   const [artifactCounts, setArtifactCounts] = useState<Record<string, number>>({});
   const [panes, setPanes] = useState<Array<{ tabs: string[]; active: string; width: number }>>([]);

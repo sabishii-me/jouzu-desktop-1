@@ -71,6 +71,7 @@ export class SessionStore {
     dialog?: SessionDialog,
   ): Promise<SessionStore> {
     const session = await HostChatSession.open(api, workspacePath, sessionPath);
+    if (!sessionPath) await session.warm();
     const store = SessionStore.attach(session, undefined, api);
     store.dialog = dialog;
     await store.load();

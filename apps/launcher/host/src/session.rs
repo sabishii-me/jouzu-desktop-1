@@ -2228,6 +2228,39 @@ impl Session {
         self.spawn_runtime(true, from_pending);
     }
 
+    /// Start the runtime before the first prompt, so the user's first Enter is
+    /// not paying for the spawn and handshake. This is a per-session prewarm; a
+    /// shared pool is a separate resource policy.
+    pub async fn warm(self: &Arc<Self>) -> Result<(), ApiError> {
+        if matches!(self.status(), Status::Idle) {
+            return Ok(());
+        }
+        if matches!(self.status(), Status::Pending) {
+            self.set_status(Status::Starting);
+            self.start(false);
+        }
+        for _ in 0..600 {
+            match self.status() {
+                Status::Idle => return Ok(()),
+                Status::Error | Status::Cancelled | Status::Stopped => {
+                    return Err(ApiError::new(
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "runtime-unavailable",
+                        "The runtime could not warm",
+                        true,
+                    ))
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+        Err(ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "runtime-warm-timeout",
+            "The runtime did not become ready",
+            true,
+        ))
+    }
+
     fn spawn_spec(&self) -> SpawnSpec {
         SpawnSpec {
             program: self.config.spec.program.clone(),

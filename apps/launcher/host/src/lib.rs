@@ -292,6 +292,10 @@ pub fn router(state: AppState) -> Router {
             "/sessions/{id}/interrupt",
             axum::routing::post(interrupt_session),
         )
+        .route(
+            "/sessions/{id}/warm",
+            axum::routing::post(warm_session),
+        )
         .route("/sessions/{id}/stop", axum::routing::post(stop_session))
         .route(
             "/sessions/{id}/command",
@@ -685,6 +689,15 @@ async fn interrupt_session(
 ) -> Result<Json<Value>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
     session.interrupt()?;
+    Ok(Json(json!({ "status": session.status().as_str() })))
+}
+
+async fn warm_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    session.warm().await?;
     Ok(Json(json!({ "status": session.status().as_str() })))
 }
 
