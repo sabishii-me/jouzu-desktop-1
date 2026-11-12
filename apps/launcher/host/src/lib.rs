@@ -281,6 +281,14 @@ pub fn router(state: AppState) -> Router {
             get(history).post(send_message),
         )
         .route(
+            "/sessions/{id}/model",
+            axum::routing::post(select_session_model),
+        )
+        .route(
+            "/sessions/{id}/thinking",
+            axum::routing::post(select_session_thinking),
+        )
+        .route(
             "/sessions/{id}/interrupt",
             axum::routing::post(interrupt_session),
         )
@@ -624,6 +632,52 @@ async fn send_message(
         &request.attachments,
     )?;
     Ok((StatusCode::ACCEPTED, Json(value)))
+}
+
+#[derive(Deserialize)]
+struct SessionModelRequest {
+    provider: String,
+    model: String,
+}
+
+async fn select_session_model(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<SessionModelRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    session
+        .request(
+            json!({ "type": "set_model", "provider": request.provider, "model": request.model }),
+            Duration::from_secs(30),
+        )
+        .await?;
+    let state_value = session
+        .request(json!({ "type": "get_state" }), Duration::from_secs(10))
+        .await?;
+    Ok(Json(json!({
+        "model": state_value.get("model").cloned().unwrap_or(Value::Null),
+    })))
+}
+
+#[derive(Deserialize)]
+struct SessionThinkingRequest {
+    level: String,
+}
+
+async fn select_session_thinking(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<SessionThinkingRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    session
+        .request(
+            json!({ "type": "set_thinking_level", "level": request.level.clone() }),
+            Duration::from_secs(30),
+        )
+        .await?;
+    Ok(Json(json!({ "level": request.level })))
 }
 
 async fn session_command(
@@ -2294,6 +2348,39 @@ mod session_tests {
         assert!(types.contains(&"toolResult"), "{assistant}");
         let tool = rows.iter().find(|row| row["kind"] == "tool").unwrap();
         assert_eq!(tool["tool"]["status"], "ok", "{tool}");
+    }
+
+    #[tokio::test]
+    async fn model_and_thinking_endpoints_update_the_session() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager);
+        let model = call(
+            app.clone(),
+            request(Method::POST, &format!("/v1/sessions/{}/model", session.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "provider": "fixture", "model": "model" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(model.0, StatusCode::OK, "{}", model.2);
+        assert!(model.2.contains("fixture-model"), "{}", model.2);
+
+        let thinking = call(
+            app,
+            request(Method::POST, &format!("/v1/sessions/{}/thinking", session.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "level": "high" }).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(thinking.0, StatusCode::OK, "{}", thinking.2);
+        assert!(thinking.2.contains("\"high\""), "{}", thinking.2);
     }
 
     #[tokio::test]

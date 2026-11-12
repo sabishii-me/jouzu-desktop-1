@@ -62,6 +62,9 @@ function client() {
     workspaces: vi.fn(async () => [{ id: "C:/work", path: "C:/work", environment: { kind: "windows" } }]),
     addWorkspaces: vi.fn(async () => [{ id: "C:/work", path: "C:/work", environment: { kind: "windows" } }]),
     forgetWorkspace: vi.fn(async () => []),
+    models: vi.fn(async () => ({ models: [{ id: "m", name: "Model", provider: "p" }] })),
+    selectModel: vi.fn(async () => undefined),
+    setThinking: vi.fn(async () => undefined),
     command: vi.fn(async (_id: string, request: Record<string, unknown>) => {
       calls.push(String(request.type));
       if (request.type === "get_available_models") return { models: [{ id: "m", name: "Model", provider: "p" }] };

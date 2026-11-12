@@ -14,7 +14,6 @@ import {
   type ArtifactApi,
   type CommandApi,
   type FileApi,
-  type Model,
   type ModelApi,
   type NativeApi,
   type PromptApi,
@@ -89,17 +88,14 @@ function hostGroups(client: HostClient) {
   };
 
   const models: ModelApi = {
-    async list(sessionId) {
-      const data = (await client.command(sessionId, { type: "get_available_models" })) as {
-        models?: Model[];
-      };
-      return data?.models ?? [];
+    async list() {
+      return (await client.models()).models;
     },
     async select(sessionId, provider, model) {
-      await client.command(sessionId, { type: "set_model", provider, modelId: model });
+      await client.selectModel(sessionId, provider, model);
     },
     async thinking(sessionId, level) {
-      await client.command(sessionId, { type: "set_thinking_level", level });
+      await client.setThinking(sessionId, level);
     },
   };
 

@@ -46,6 +46,28 @@ describe("HostClient", () => {
     });
   });
 
+  test("uses model and thinking endpoints", async () => {
+    const calls: Call[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      if (String(input).endsWith("/v1/models")) {
+        return response({ models: [{ provider: "fixture", id: "model", name: "Fixture" }] });
+      }
+      return response({});
+    }) as typeof fetch;
+    const client = new HostClient({ baseUrl: "http://host", fetchImpl });
+    expect((await client.models()).models[0].id).toBe("model");
+    await client.selectModel("h1", "fixture", "model");
+    await client.setThinking("h1", "high");
+    expect(calls.map(call => call.url)).toEqual([
+      "http://host/v1/models",
+      "http://host/v1/sessions/h1/model",
+      "http://host/v1/sessions/h1/thinking",
+    ]);
+    expect(JSON.parse(String(calls[1].init?.body))).toEqual({ provider: "fixture", model: "model" });
+    expect(JSON.parse(String(calls[2].init?.body))).toEqual({ level: "high" });
+  });
+
   test("unwraps command data and maps error envelopes", async () => {
     const fetchImpl = (async (input: RequestInfo | URL) => {
       if (String(input).endsWith("/v1/sessions/h1/command")) {

@@ -13,6 +13,7 @@ import {
   type EnvironmentEntry,
   type FileEntry,
   type HistoryPage,
+  type Model,
   type Receipt,
   type RuntimeStatus,
   type SessionHandle,
@@ -265,6 +266,24 @@ export class HostClient {
     if (limit) query.set("limit", String(limit));
     return this.request<{ messages: unknown[] }>(`/v1/sessions/history?${query}`)
       .then(body => body.messages);
+  }
+
+  models(): Promise<{ models: Model[] }> {
+    return this.request<{ models: Model[] }>("/v1/models");
+  }
+
+  async selectModel(sessionId: string, provider: string, model: string): Promise<void> {
+    await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/model`, {
+      method: "POST",
+      body: JSON.stringify({ provider, model }),
+    });
+  }
+
+  async setThinking(sessionId: string, level: string): Promise<void> {
+    await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/thinking`, {
+      method: "POST",
+      body: JSON.stringify({ level }),
+    });
   }
 
   send(sessionId: string, text: string, clientMessageId: string, attachments: Attachment[] = []): Promise<Receipt> {
