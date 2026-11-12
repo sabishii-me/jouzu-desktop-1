@@ -183,7 +183,11 @@ lines.on("line", line => {
       response(value.id, "get_available_thinking_levels", { levels: ["off"] });
       break;
     case "set_model":
-      response(value.id, "set_model", { model: { name: "fixture-model", provider: String(value.provider ?? "fixture"), id: String(value.model ?? "model") } });
+      if (typeof value.modelId !== "string") {
+        failure(value.id, "set_model", "set_model requires modelId");
+        break;
+      }
+      response(value.id, "set_model", { model: { name: "fixture-model", provider: String(value.provider ?? "fixture"), id: value.modelId } });
       break;
     case "set_thinking_level":
       response(value.id, "set_thinking_level", { level: String(value.level ?? "off") });

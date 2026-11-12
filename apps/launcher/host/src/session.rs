@@ -1886,7 +1886,7 @@ impl Session {
             return Ok(json!({ "provider": provider, "id": model, "name": model }));
         }
         self.request(
-            json!({ "type": "set_model", "provider": provider, "model": model }),
+            json!({ "type": "set_model", "provider": provider, "modelId": model }),
             Duration::from_secs(30),
         )
         .await?;
@@ -1933,7 +1933,7 @@ impl Session {
                 "id": request,
                 "type": "set_model",
                 "provider": provider,
-                "model": id,
+                "modelId": id,
             }));
         }
         let level = self
