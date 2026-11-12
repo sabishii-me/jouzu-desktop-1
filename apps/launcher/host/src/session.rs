@@ -1752,6 +1752,24 @@ impl Session {
         }
         self.push_history(history_row);
         self.remember_turn(text);
+        if let Some(path) = self
+            .session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            self.publish(
+                "session.attached",
+                json!({
+                    "sessionPath": path,
+                    "title": self
+                        .title
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone(),
+                }),
+            );
+        }
         self.publish(
             "message.accepted",
             json!({ "messageId": message_id.clone(), "receipt": "queued" }),
@@ -3387,6 +3405,30 @@ impl SessionManager {
             )
         })?;
         std::fs::create_dir_all(&config.home.join("data")).ok();
+        // A new session gets its identity at creation, not after the runtime
+        // handshake. The index and navigation can then show it before the first
+        // reply, including when the turn is stopped during starting.
+        let session_path = match session_path {
+            Some(path) => Some(path),
+            None if matches!(status, Status::Pending) => {
+                let directory = self.runtime_home.join("state").join("sessions");
+                std::fs::create_dir_all(&directory).ok();
+                let file = directory.join(format!("{}.jsonl", random_id()));
+                let header = json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": random_id(),
+                    "timestamp": Session::now_iso(),
+                    "cwd": workspace.to_string_lossy(),
+                });
+                if std::fs::write(&file, format!("{header}\n")).is_ok() {
+                    Some(file.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
         let id = match &session_path {
             Some(path) => session_id_for_path(path),
             None => format!("h-{}", random_id()),

@@ -488,6 +488,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", escape); };
   }, [sessionMenu]);
   useEffect(() => { void refreshSessions(); }, [path, revision]);
+  useEffect(() => { if (snapshot.pending) void refreshSessions(); }, [snapshot.pending]);
   useEffect(() => {
     if (!snapshot.connected || snapshot.projection.messages.length === 0) return;
     const timer = setTimeout(() => { void refreshSessions(); }, 500);
