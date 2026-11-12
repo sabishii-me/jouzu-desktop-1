@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -40,6 +40,7 @@ pub struct RuntimeSupervisor {
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
     parse_errors: AtomicU64,
     probe_id: AtomicU64,
+    probe_enabled: AtomicBool,
 }
 
 impl RuntimeSupervisor {
@@ -68,6 +69,7 @@ impl RuntimeSupervisor {
             pending: Mutex::new(HashMap::new()),
             parse_errors: AtomicU64::new(0),
             probe_id: AtomicU64::new(0),
+            probe_enabled: AtomicBool::new(false),
         });
 
         let writer = supervisor.clone();
@@ -97,6 +99,12 @@ impl RuntimeSupervisor {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
+                // The handshake can take several seconds. Starting, running and
+                // recovering turns are not probed; the child exit still reaches the
+                // supervisor wait. Only an idle runtime gets the liveness probe.
+                if !monitor.probe_enabled.load(Ordering::Relaxed) {
+                    continue;
+                }
                 let id = format!(
                     "health-{}",
                     monitor.probe_id.fetch_add(1, Ordering::Relaxed) + 1
@@ -124,6 +132,10 @@ impl RuntimeSupervisor {
 
     pub fn parse_errors(&self) -> u64 {
         self.parse_errors.load(Ordering::Relaxed)
+    }
+
+    pub fn set_probe_enabled(&self, enabled: bool) {
+        self.probe_enabled.store(enabled, Ordering::Relaxed);
     }
 
     pub fn enqueue(&self, value: Value) -> Result<(), String> {

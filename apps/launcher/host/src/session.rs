@@ -448,6 +448,7 @@ impl Session {
             data: json!({
                 "sessionId": self.id,
                 "status": self.status().as_str(),
+                "activeTurn": self.active_turn(),
                 "cursor": cursor,
                 "workspacePath": canonical_path(&self.workspace_path),
                 "sessionPath": self
@@ -509,6 +510,14 @@ impl Session {
             }
         };
         if changed {
+            if let Some(runtime) = self
+                .runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            {
+                runtime.set_probe_enabled(matches!(status, Status::Idle));
+            }
             self.ready.notify_waiters();
             self.publish("session.status", json!({ "status": status.as_str() }));
         }
@@ -1670,6 +1679,14 @@ impl Session {
             "message.accepted",
             json!({ "messageId": message_id.clone(), "receipt": "queued" }),
         );
+        let was_pending = matches!(self.status(), Status::Pending);
+        self.publish(
+            "turn.start",
+            json!({
+                "turnId": message_id.clone(),
+                "phase": if was_pending { "starting" } else { "running" },
+            }),
+        );
         let mut prompt = json!({
             "id": client_message_id,
             "type": "prompt",
@@ -1689,6 +1706,10 @@ impl Session {
             self.set_status(Status::Starting);
             self.start(true);
             if matches!(self.status(), Status::Cancelled | Status::Error) {
+                self.publish(
+                    "turn.end",
+                    json!({ "turnId": message_id, "aborted": true, "reason": "runtime-unavailable" }),
+                );
                 messages.remove(client_message_id);
                 return Err(ApiError::new(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -1704,7 +1725,6 @@ impl Session {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(prompt);
         } else {
-            self.publish("turn.start", json!({ "turnId": message_id.clone() }));
             self.set_status(Status::Running);
             let result = self.write_command(prompt);
             if let Err(error) = result {
@@ -1729,6 +1749,31 @@ impl Session {
     }
 
     pub fn interrupt(&self) -> Result<(), ApiError> {
+        // A pending turn can still be parked before the runtime handshake. There is
+        // nothing in the runtime to abort yet, so remove the queued prompt and end
+        // the turn here; otherwise a Stop during `starting` is a no-op.
+        if matches!(self.status(), Status::Starting | Status::Recovering) {
+            let removed = self
+                .pending_prompts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .drain(..)
+                .count();
+            if removed > 0 {
+                let turn = self
+                    .active_message
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                    .unwrap_or_default();
+                self.publish(
+                    "turn.end",
+                    json!({ "turnId": turn, "aborted": true, "phase": "starting" }),
+                );
+                self.set_status(Status::Idle);
+                return Ok(());
+            }
+        }
         let id = self.request_id();
         self.write_command(json!({ "id": id, "type": "abort" }))
     }
@@ -2249,13 +2294,6 @@ impl Session {
         if prompts.is_empty() {
             return;
         }
-        let turn = self
-            .active_message
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-            .unwrap_or_default();
-        self.publish("turn.start", json!({ "turnId": turn }));
         self.set_status(Status::Running);
         for prompt in prompts {
             if let Err(error) = self.write_command(prompt) {

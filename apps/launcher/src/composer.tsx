@@ -139,6 +139,7 @@ export interface ComposerProps {
   connected: boolean;
   pending: boolean;
   opening?: boolean;
+  starting?: boolean;
   unavailable?: boolean;
   running: boolean;
   draft: string;
@@ -186,14 +187,15 @@ function TextGuardControl({ control }: { control: NonNullable<ComposerProps["tex
     </div>}
   </div>;
 }
-export function Composer({ hero = false, textguard, connected, pending, opening = false, unavailable = false, running, draft, onDraft, onSend, onStop, onCompact, onExport, onReloadMcp, compatibility = [], attachments = [], onAddImages, onRemoveImage, readingImages = false, attachmentError, videos = [], queued = [], onAddVideo, onRemoveVideo, models, model, onSelectModel, onRefreshModels, onRetryModels, thinkingLevel, thinkingLevels, onThinkingLevel }: ComposerProps) {
+export function Composer({ hero = false, textguard, connected, pending, opening = false, starting = false, unavailable = false, running, draft, onDraft, onSend, onStop, onCompact, onExport, onReloadMcp, compatibility = [], attachments = [], onAddImages, onRemoveImage, readingImages = false, attachmentError, videos = [], queued = [], onAddVideo, onRemoveVideo, models, model, onSelectModel, onRefreshModels, onRetryModels, thinkingLevel, thinkingLevels, onThinkingLevel }: ComposerProps) {
+  const active = running || starting;
   const imageInput = useRef<HTMLInputElement>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [videoOpen, setVideoOpen] = useState(false);
   const [videoDraft, setVideoDraft] = useState("");
   const [videoError, setVideoError] = useState<string | null>(null);
   const [modelOpen, setModelOpen] = useState(false);
-  const submit = () => { if (connected && !pending && !opening && !unavailable && !readingImages && !!model && (draft.trim() || videos.length)) onSend(); };
+  const submit = () => { if (connected && !pending && !unavailable && !readingImages && !!model && (draft.trim() || videos.length)) onSend(); };
   const compactDisabled = !connected || pending || opening || unavailable || running;
   const exportDisabled = !connected || pending || opening || unavailable;  const [commandIndex, setCommandIndex] = useState(0);
   const commands = [
@@ -247,10 +249,10 @@ export function Composer({ hero = false, textguard, connected, pending, opening 
           {readingImages && <span role="status" className="text-xs text-muted-foreground">Reading images…</span>}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <span className="hidden text-xs text-muted-foreground lg:inline">{!connected ? "Connecting…" : unavailable ? "Session unavailable" : opening ? "Opening session…" : pending ? "Sending…" : running ? "Enter to steer" : "Enter to send · Shift+Enter for newline"}</span>
+          <span className="hidden text-xs text-muted-foreground lg:inline">{!connected ? "Connecting…" : unavailable ? "Session unavailable" : opening ? "Opening session…" : starting ? "Starting…" : pending ? "Sending…" : running ? "Enter to steer" : "Enter to send · Shift+Enter for newline"}</span>
           <ModelMenu open={modelOpen} onOpenChange={setModelOpen} models={models} model={model} onSelect={onSelectModel} onOpen={onRefreshModels} onRetry={onRetryModels} thinkingLevel={thinkingLevel} thinkingLevels={thinkingLevels} onThinking={onThinkingLevel} />
-          {running && <Button type="button" variant="outline" className="h-8 px-2" onClick={onStop}><Square className="size-3.5" />Stop</Button>}
-          <Button type="submit" className="h-8 px-2" disabled={!connected || pending || opening || unavailable || readingImages || !model || !draft.trim()}><Send className="size-3.5" />{running ? "Steer" : "Send"}</Button>
+          {active && <Button type="button" variant="outline" className="h-8 px-2" onClick={onStop}><Square className="size-3.5" />Stop</Button>}
+          <Button type="submit" className="h-8 px-2" disabled={!connected || pending || unavailable || readingImages || !model || !draft.trim()}><Send className="size-3.5" />{running ? "Steer" : "Send"}</Button>
         </div>
       </div>
     </form>

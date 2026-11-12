@@ -153,6 +153,17 @@ export class SessionStore {
           data: image.data,
         })),
       });
+      // The host accepted the turn. Stop must be available before the runtime
+      // handshake and its turn.start event; waiting for the event leaves the user
+      // with no cancel action during a cold start.
+      this.update({
+        pending: true,
+        projection: {
+          ...this.state.projection,
+          running: true,
+          turnStartedAt: this.state.projection.turnStartedAt ?? now,
+        },
+      });
     } catch (error) {
       this.update({ pending: false, error: String(error) });
       throw error;
@@ -329,6 +340,12 @@ export class SessionStore {
           thinkingLevel: typeof data.thinkingLevel === "string" ? data.thinkingLevel : this.state.thinkingLevel,
           thinkingLevels: Array.isArray(data.thinkingLevels) ? data.thinkingLevels.filter((level): level is string => typeof level === "string") : this.state.thinkingLevels,
         });
+        // The stream can attach after the send was accepted. The snapshot carries
+        // the session phase, so a missed turn.start must not hide Stop.
+        this.applyStatus(typeof data.status === "string" ? data.status : undefined);
+        if (typeof data.activeTurn === "string" && data.activeTurn) {
+          this.update({ pending: true, projection: { ...this.state.projection, running: true, turnStartedAt: this.state.projection.turnStartedAt ?? Date.now() } });
+        }
         // The event stream may attach after the first turn already finished. Its
         // snapshot cursor is authoritative; reload the transcript instead of
         // waiting for live deltas that are already in the past.
@@ -433,8 +450,9 @@ export class SessionStore {
 
   private applyStatus(status: string | undefined): void {
     if (!status) return;
-    const running = status === "running" || status === "waiting_approval" || status === "waiting_question";
+    const running = status === "starting" || status === "running" || status === "waiting_approval" || status === "waiting_question";
     this.update({
+      pending: running || this.state.pending,
       projection: {
         ...this.state.projection,
         running,
