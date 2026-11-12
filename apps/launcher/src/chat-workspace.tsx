@@ -605,6 +605,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     }
     let client = connection.current;
     if (!client || readingRef.current) return;
+    if (!client.snapshot.modelId) {
+      setNotification("Choose a model before sending.");
+      return;
+    }
     if (isFlowHistoryError(client.snapshot.error)) { setNotification("Clear Flow request history before sending again."); return; }
     const typed = draft;
     const submittedVideos = videoRef.current;

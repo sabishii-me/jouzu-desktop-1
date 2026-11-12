@@ -132,7 +132,17 @@ export class SessionStore {
 
   async sendOrSteer(text: string, images: readonly ChatImage[] = [], _running = false): Promise<void> {
     if (this.state.pending) throw new Error("Wait for the current request to be accepted.");
-    this.update({ pending: true, error: null });
+    const now = Date.now();
+    const content = [
+      ...(text ? [{ type: "text" as const, text }] : []),
+      ...images.map(image => ({ type: "image" as const, image })),
+    ];
+    const messages = [...this.state.projection.messages, { role: "user", content, timestamp: now }];
+    this.update({
+      pending: true,
+      error: null,
+      projection: { ...this.state.projection, messages, activeMessage: null },
+    });
     try {
       await this.session.send({
         clientMessageId: crypto.randomUUID(),
