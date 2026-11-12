@@ -122,10 +122,10 @@ export class ChatConnection {
       // conversation already exists, so asking the runtime for another one would
       // replace the session the page is bound to.
       await this.refreshHistory();
+      await this.loadModels();
       this.update({ connected: true });
       await this.applyPreferredModel();
       this.replaying = false;
-      void this.loadModels();
       void this.loadStats();
       void this.loadThinkingLevels();
     } catch (error) {
@@ -283,6 +283,13 @@ export class ChatConnection {
     const preferred = this.preferredModel;
     if (!preferred) return;
     if (this.snapshot.modelProvider === preferred.provider && this.snapshot.modelId === preferred.id) return;
+    // The saved preference may point at a provider that is no longer configured.
+    // Do not apply it before the host catalog has confirmed the pair exists.
+    if (!this.snapshot.models?.some(model => model.provider === preferred.provider && model.id === preferred.id)) {
+      this.preferredModel = undefined;
+      writeModelPreference(undefined);
+      return;
+    }
     try { await this.selectModel(preferred.provider, preferred.id); }
     catch {
       // A saved model may disappear from the catalog; fall back to the runtime default.

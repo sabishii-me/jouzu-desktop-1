@@ -23,6 +23,9 @@ pub struct Models {
     cached: Mutex<Option<Value>>,
 }
 
+/// Bump when the adapter projection changes shape or filtering semantics.
+const SCHEMA_VERSION: u64 = 2;
+
 impl Models {
     pub fn new(host_home: &Path) -> Self {
         Self {
@@ -42,7 +45,9 @@ impl Models {
         }
         let bytes = std::fs::read(&self.path).ok()?;
         let value: Value = serde_json::from_slice(&bytes).ok()?;
-        if !value.get("models").map(Value::is_array).unwrap_or(false) {
+        if !value.get("models").map(Value::is_array).unwrap_or(false)
+            || value.get("schemaVersion").and_then(Value::as_u64) != Some(SCHEMA_VERSION)
+        {
             return None;
         }
         *self
@@ -121,7 +126,7 @@ impl Models {
             ));
         }
         Ok(self.store(json!({
-            "schemaVersion": 1,
+            "schemaVersion": SCHEMA_VERSION,
             "source": "control.available-models",
             "generatedAt": status
                 .get("generatedAt")

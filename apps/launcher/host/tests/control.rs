@@ -35,10 +35,9 @@ fn manager(app: &PathBuf, home: &PathBuf) -> Arc<ControlManager> {
 #[tokio::test]
 async fn available_models_include_thinking_levels() {
     let Some(app) = app_dir() else { return };
-    let temp = tempfile::tempdir().unwrap();
-    let home = match std::env::var_os("JOUZU_HOST_TEST_HOME") {
-        Some(value) => PathBuf::from(value),
-        None => temp.path().to_path_buf(),
+    let Some(home) = std::env::var_os("JOUZU_HOST_TEST_HOME").map(PathBuf::from) else {
+        eprintln!("skipped: set JOUZU_HOST_TEST_HOME to a real JOUZU_HOME with models");
+        return;
     };
     let manager = manager(&app, &home);
 
@@ -136,15 +135,15 @@ async fn models_snapshot_comes_from_the_real_adapter() {
 }
 
 #[tokio::test]
-async fn a_fresh_home_still_yields_a_snapshot() {
+async fn a_fresh_home_has_no_usable_model() {
     let Some(app) = app_dir() else { return };
     let temp = tempfile::tempdir().unwrap();
     let control = manager(&app, &temp.path().to_path_buf());
     let models = Models::new(temp.path());
 
-    // Jouzu ships built-in catalogue providers, so a fresh home is usable and must not
-    // be reported as "no models" merely because nothing was refreshed yet.
-    let snapshot = models.get(&control).await.expect("snapshot on a fresh home");
-    assert!(!snapshot["models"].as_array().expect("models array").is_empty());
+    // No provider is configured in a fresh home; the host must say so instead of
+    // exposing the unconfigured global catalog as selectable models.
+    let error = models.get(&control).await.expect_err("fresh home has no model");
+    assert_eq!(error.code, "models-unavailable", "{error:?}");
 }
 

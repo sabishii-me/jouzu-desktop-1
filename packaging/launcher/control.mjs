@@ -210,7 +210,41 @@ try {
     }
     const byModel = new Map();
     for (const [key, offering] of offerings) byModel.set(key, offering);
-    const models = runtime.getModels().map(model => {
+    // Availability is what the user can actually run, not the full catalog:
+    // unconfigured providers must not appear in the desktop model menu.
+    const available = await runtime.getAvailable();
+    const models = [];
+    const seen = new Set();
+    const add = (model) => {
+      const key = `${model.provider}/${model.id}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      models.push(model);
+    };
+    // The signed Shisa catalog is the desktop's home model list. Its offerings use
+    // the display provider "Shisa AI"; the runtime provider is "shisa".
+    for (const offering of offerings.values()) {
+      if (offering.providerId !== 'Shisa AI' || typeof offering.modelId !== 'string') continue;
+      const limits = offering.limits ?? {};
+      const price = offering.metadata?.price;
+      const cost = price && ['input', 'output', 'cacheRead', 'cacheWrite'].some(key => typeof price[key] === 'number')
+        ? Object.fromEntries(['input', 'output', 'cacheRead', 'cacheWrite'].filter(key => typeof price[key] === 'number').map(key => [key, price[key]]))
+        : null;
+      const levels = Array.isArray(offering.supportedThinkingLevels) && offering.supportedThinkingLevels.length
+        ? offering.supportedThinkingLevels.filter(level => typeof level === 'string')
+        : ['off'];
+      add({
+        provider: 'shisa',
+        id: offering.modelId,
+        name: typeof offering.name === 'string' ? offering.name : offering.modelId,
+        contextWindow: typeof limits.contextWindow === 'number' ? limits.contextWindow : null,
+        maxTokens: typeof limits.maxOutputTokens === 'number' ? limits.maxOutputTokens : null,
+        cost,
+        reasoning: Array.isArray(offering.capabilities) && offering.capabilities.includes('reasoning') || levels.length > 1,
+        thinkingLevels: levels,
+      });
+    }
+    for (const model of available) {
       const offering = offerings.get(`${model.provider}/${model.id}`)
         ?? [...byModel.values()].find(candidate => candidate.modelId === model.id);
       const limits = offering?.limits ?? {};
@@ -218,7 +252,7 @@ try {
       const cost = price && ['input', 'output', 'cacheRead', 'cacheWrite'].some(key => typeof price[key] === 'number')
         ? Object.fromEntries(['input', 'output', 'cacheRead', 'cacheWrite'].filter(key => typeof price[key] === 'number').map(key => [key, price[key]]))
         : (model.cost && (model.cost.input || model.cost.output) ? model.cost : null);
-      return {
+      add({
         provider: model.provider,
         id: model.id,
         name: model.name,
@@ -227,8 +261,8 @@ try {
         cost,
         reasoning: !!model.reasoning,
         thinkingLevels: getSupportedThinkingLevels(model),
-      };
-    });
+      });
+    }
     console.log(JSON.stringify({
       schemaVersion: 1,
       generatedAt: new Date().toISOString(),
