@@ -438,12 +438,17 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   }, [pickerOpen]);
   function fromApiSession(value: ApiSessionSummary): SessionSummary | null {
     if (!value.sessionPath) return null;
-    const updated = value.updatedAt ? Date.parse(value.updatedAt) : 0;
+    // A host entry without a title or timestamp is a provisional/empty session,
+    // not a transcript the sidebar should offer. Counting it as 1970 produced
+    // rows such as "20769d" and let empty sessions shadow real ones.
+    if (!value.title?.trim() && !value.updatedAt) return null;
+    const parsed = value.updatedAt ? Date.parse(value.updatedAt) : NaN;
+    const updated = Number.isFinite(parsed) && parsed > 0 ? parsed / 1000 : Date.now() / 1000;
     return {
       path: value.sessionPath,
-      title: value.title,
+      title: value.title?.trim() || "New session",
       workspace: value.workspacePath,
-      updated: Number.isFinite(updated) ? updated / 1000 : 0,
+      updated,
       pinned: value.pinned,
       archived: value.archived,
     };
@@ -452,7 +457,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   async function refreshSessions() {
     try {
       const list = await api.sessions.list();
-      setSessions(list.map(fromApiSession).filter((value): value is SessionSummary => value !== null));
+      const byPath = new Map<string, SessionSummary>();
+      for (const value of list) {
+        const session = fromApiSession(value);
+        if (session) byPath.set(normalizedPath(session.path), session);
+      }
+      setSessions([...byPath.values()]);
     } catch { /* Session history is ancillary; chat remains usable. */ }
   }
   async function updateSession(sessionPath: string, change: { pinned?: boolean; archived?: boolean; title?: string }) {
