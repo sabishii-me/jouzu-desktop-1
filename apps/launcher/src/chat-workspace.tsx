@@ -626,6 +626,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const value = [...submittedVideos.map(videoMarker), typed].filter(Boolean).join("\n");
     const submitted = attachmentRef.current;
     const wasHero = hero;
+    // The hero screen has no transcript. Switch to the conversation on local
+    // acceptance so the submitted row can render before any host await.
+    if (wasHero) { setHero(false); onStartSession?.(); }
     // The host owns the queue for a turn that is already starting/running. Do
     // not keep the only copy in the client; the POST below carries it to the host.
     // Capture the owner of this send. Clearing must never depend on which session is
@@ -668,7 +671,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       }
       else saveDraft(draftRef.current, attachmentRef.current);
       updateAttachments(removeSubmittedImages(attachmentRef.current, submitted));
-      if (wasHero) { setHero(false); onStartSession?.(); }
     } catch (error) {
       // Keep the draft and images available after rejection, but do not hide why it failed.
       const message = String(error).replace(/^Error:\s*/u, "");
@@ -1457,7 +1459,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           <Composer hero connected={snapshot.connected} pending={snapshot.pending || commandBusy || switching || locked } opening={switching || opening} starting={composerStarting} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={cancelSend} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} compatibility={snapshot.projection.compatibility} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} videos={videoUrls} queued={queuedSteers} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
           <SessionStatsBar stats={snapshot.stats} timing={timing} />
         </div>
-      </div> : !snapshot.sessionId && !activePreview ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
+      </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
 {snapshot.gap && <p role="status" className="mx-auto mb-2 max-w-3xl text-xs text-muted-foreground">The transcript was refreshed after a display backlog.</p>}
           <ChatConversation key={conversationKey} projection={conversationProjection} workspace={path} busy={snapshot.pending} pendingUser={pendingUser} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={turnChangedFiles} />
