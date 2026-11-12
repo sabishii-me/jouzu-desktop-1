@@ -1,4 +1,4 @@
-import type { ChatImage } from "./chat-connection";
+import type { ChatImage } from "./chat-types";
 
 export const IMAGE_ACCEPT = "image/png,image/jpeg,image/webp,image/gif";
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;

@@ -18,8 +18,8 @@ import { collectOutputReferences } from "./artifact-references";
 import { PanelStart } from "./panel-start";
 import { FilesPanel } from "./files-panel";
 import { ToolReviewDialog } from "./tool-review-dialog";
-import { ChatConnection, flowNoticeText, type ChatSnapshot } from "./chat-connection";
-import { chatPool } from "./chat-pool";
+import { SessionStore as ChatConnection, chatPool } from "./session-store";
+import { flowNoticeText, type ChatSnapshot, type SessionTiming } from "./chat-types";
 import { fitsSendBudget, readImageAttachment, removeSubmittedImages, validateImageSelection, type ImageAttachment } from "./chat-attachments";
 import { normalizeVideoUrl, videoMarker } from "./video-url";
 import { emptyProjection, historyProjection, interruptUnfinishedTools, type ChatProjection, type FlowReportRecord, type WireObject } from "./chat-projection";
@@ -30,7 +30,6 @@ import { BackgroundMenu, deriveFlow, deriveSubagents, FlowMenu, latestFlowError,
 import { SessionStatsBar } from "./session-stats-bar";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import { parseTextGuardNotice, parseTextGuardResult, TextGuardBar, type TextGuardData, type TextGuardItem } from "./textguard-bar";
-import type { SessionTiming } from "./chat-connection";
 
 type TextGuardView = { data: TextGuardData | null; seen: boolean; historical: boolean; open: boolean; busy: boolean; error: string | null; loading: boolean };
 const emptyTextGuardView: TextGuardView = { data: null, seen: false, historical: false, open: false, busy: false, error: null, loading: false };
@@ -694,6 +693,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       queueNewSession();
       return;
     }
+    queuedSwitch.current = null;
     if (!snapshot.connected) {
       queueNewSession();
       return;

@@ -3,7 +3,7 @@ import { App } from "./App";
 import { ApiProvider } from "./api/context";
 import { createJouzuApi } from "./api/adapters";
 import { HostClient } from "./api/host-client";
-import { configureChatTransport } from "./chat-transport";
+import { configureSessionPool } from "./session-store";
 import { configureControlClient } from "./api/control-client";
 import "./styles.css";
 
@@ -26,7 +26,7 @@ if (!endpoint?.baseUrl || !endpoint.token) {
 // mount would attach the same session twice, so the app mounts once.
 const client = new HostClient({ baseUrl: endpoint.baseUrl, token: endpoint.token });
 const api = createJouzuApi(client);
-configureChatTransport(api);
+configureSessionPool(api);
 configureControlClient(client);
 
 async function boot() {

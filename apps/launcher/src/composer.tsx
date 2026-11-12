@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ClipboardEvent } from "react";
 import { Check, ChevronDown, Cpu, Download, ImagePlus, Minimize2, Plus, RefreshCw, Send, ShieldAlert, Square, Video, X } from "lucide-react";
 import { IMAGE_ACCEPT, MAX_IMAGES, type ImageAttachment } from "./chat-attachments";
-import type { ChatModel } from "./chat-connection";
+import type { ChatModel } from "./chat-types";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 

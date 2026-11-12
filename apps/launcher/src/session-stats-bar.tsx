@@ -1,5 +1,5 @@
 import { CircleGauge, Database, Gauge } from "lucide-react";
-import type { SessionStats, SessionTiming } from "./chat-connection";
+import type { SessionStats, SessionTiming } from "./chat-types";
 import { StatCard, StatPopover, StatRow } from "./components/stat-popover";
 
 function compact(value: number) {

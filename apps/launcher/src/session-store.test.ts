@@ -34,8 +34,8 @@ describe("SessionStore", () => {
   it("loads host history and projects normalized blocks", async () => {
     const store = SessionStore.attach(fakeSession());
     await store.loadHistory();
-    expect(store.snapshot().connected).toBe(true);
-    expect(store.snapshot().projection.messages[0].content[0]).toEqual({ type: "text", text: "hello" });
+    expect(store.snapshot.connected).toBe(true);
+    expect(store.snapshot.projection.messages[0].content[0]).toEqual({ type: "text", text: "hello" });
   });
 
   it("follows message and tool events without raw runtime records", () => {
@@ -48,7 +48,7 @@ describe("SessionStore", () => {
     session.emit(event(5, "tool.result", { toolCallId: "call-1", ok: true, result: { output: "x" } }));
     session.emit(event(6, "message.done", { messageId: "m-1", blocks: [{ type: "text", text: "hi" }], stopReason: "completed" }));
 
-    const projection = store.snapshot().projection;
+    const projection = store.snapshot.projection;
     expect(projection.messages[0].content).toEqual([{ type: "text", text: "hi" }]);
     expect(projection.tools["call-1"]).toMatchObject({ phase: "complete", name: "bash" });
     expect(projection.running).toBe(false);
@@ -59,9 +59,9 @@ describe("SessionStore", () => {
     const store = SessionStore.attach(session);
     await store.send("hello", [], "client-1");
     expect(session.sent).toEqual([{ clientMessageId: "client-1", text: "hello", attachments: [] }]);
-    expect(store.snapshot().pending).toBe(true);
+    expect(store.snapshot.pending).toBe(true);
     session.emit(event(1, "message.done", { messageId: "m-1", blocks: [], stopReason: "completed" }));
-    expect(store.snapshot().pending).toBe(false);
+    expect(store.snapshot.pending).toBe(false);
   });
 
   it("disposes exactly once", () => {
