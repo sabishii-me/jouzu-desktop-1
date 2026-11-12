@@ -1,5 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { emptyProjection, historyProjection, interruptUnfinishedTools, projectEvent } from "./chat-projection";
+import { emptyProjection, historyProjection, historyRowsProjection, interruptUnfinishedTools, projectEvent } from "./chat-projection";
+
+describe("host history rows", () => {
+  it("maps normalized blocks and tool rows into the existing projection", () => {
+    const projection = historyRowsProjection([
+      { kind: "user", text: "hello", createdAt: "2026-11-12T00:00:00.000Z", blocks: [{ type: "text", text: "hello" }] },
+      { kind: "tool", id: "tool:call-1", tool: { name: "bash", callId: "call-1", status: "ok" }, args: { command: "ls" }, createdAt: "2026-11-12T00:00:01.000Z" },
+      { kind: "assistant", text: "done", createdAt: "2026-11-12T00:00:02.000Z", blocks: [{ type: "thinking", text: "why" }, { type: "text", text: "done" }] },
+    ]);
+    expect(projection.messages[0].role).toBe("user");
+    const assistant = projection.messages.find(message => message.role === "assistant");
+    expect(assistant?.content[0]).toEqual({ type: "thinking", thinking: "why" });
+    expect(projection.tools["call-1"]).toMatchObject({ name: "bash", phase: "complete", args: { command: "ls" } });
+  });
+});
 
 describe("released runtime event projection", () => {
   it("resets populated start blocks before applying released wire deltas", () => {

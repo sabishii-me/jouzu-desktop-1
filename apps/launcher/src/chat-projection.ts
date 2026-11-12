@@ -1,7 +1,7 @@
 // Presentation-only projection of the released JSONL event contract.
 // Agent history and completion remain authoritative in the runtime.
 export type WireObject = Record<string, unknown>;
-export interface ChatBlock { type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: unknown; data?: string; mimeType?: string }
+export interface ChatBlock { type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: unknown; data?: string; mimeType?: string; content?: ChatBlock[]; toolCallId?: string; isError?: boolean }
 export interface ChatMessage { role: string; content: ChatBlock[]; details?: unknown; timestamp?: number; endedAt?: number; stopReason?: string; errorMessage?: string; toolCallId?: string; toolName?: string; isError?: boolean; provider?: string; model?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number; totalTokens?: number } }
 export interface ToolView { id: string; name: string; args: unknown; phase: "running" | "complete" | "error"; result?: unknown; interrupted?: boolean }
 export interface FlowReportRecord { kind: string; text: string; timestamp?: number }
@@ -47,6 +47,50 @@ export function historyProjection(messages: unknown): ChatProjection {
   }
   return { ...emptyProjection(), messages: parsed, tools };
 }
+export function historyRowsProjection(rows: unknown): ChatProjection {
+  if (!Array.isArray(rows)) throw new Error("Invalid host history");
+  const messages: ChatMessage[] = [];
+  const tools: Record<string, ToolView> = {};
+  for (const row of rows) {
+    if (!object(row)) continue;
+    const kind = typeof row.kind === "string" ? row.kind : "";
+    const timestamp = typeof row.createdAt === "string" ? Date.parse(row.createdAt) : undefined;
+    if (kind === "user" || kind === "assistant") {
+      const content = Array.isArray(row.blocks) ? row.blocks.flatMap(block => {
+        if (!object(block) || typeof block.type !== "string") return [];
+        if (block.type === "text" && typeof block.text === "string") return [{ type: "text", text: block.text }];
+        if (block.type === "thinking" && typeof block.text === "string") return [{ type: "thinking", thinking: block.text }];
+        if (block.type === "toolCall" && typeof block.toolCallId === "string") return [{ type: "toolCall", id: block.toolCallId, name: typeof block.name === "string" ? block.name : "tool", arguments: block.input }];
+        if (block.type === "toolResult" && typeof block.toolCallId === "string") return [{ type: "toolResult", toolCallId: block.toolCallId, content: [{ type: "text", text: typeof block.result === "string" ? block.result : JSON.stringify(block.result ?? "") }], isError: block.ok === false } as ChatBlock];
+        return [];
+      }) : [];
+      messages.push({
+        role: kind,
+        content,
+        timestamp: Number.isFinite(timestamp) ? timestamp : undefined,
+        ...(typeof row.model === "string" ? { model: row.model } : {}),
+        ...(typeof row.provider === "string" ? { provider: row.provider } : {}),
+      });
+      for (const block of content) if (block.type === "toolCall" && typeof block.id === "string") tools[block.id] = { id: block.id, name: block.name ?? "tool", args: block.arguments, phase: tools[block.id]?.phase ?? "running", result: tools[block.id]?.result };
+      continue;
+    }
+    if (kind === "tool") {
+      const tool = object(row.tool) ? row.tool : {};
+      const id = typeof tool.callId === "string" ? tool.callId : typeof row.id === "string" ? row.id.replace(/^tool:/u, "") : "";
+      if (!id) continue;
+      const status = typeof tool.status === "string" ? tool.status : "running";
+      tools[id] = {
+        id,
+        name: typeof tool.name === "string" ? tool.name : "tool",
+        args: row.args,
+        phase: status === "error" ? "error" : status === "ok" ? "complete" : "running",
+        result: row.result,
+      };
+    }
+  }
+  return { ...emptyProjection(), messages, tools };
+}
+
 export function interruptUnfinishedTools(state: ChatProjection): ChatProjection {
   if (state.running) return state;
   let changed = false;
