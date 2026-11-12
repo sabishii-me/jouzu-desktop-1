@@ -211,6 +211,17 @@ export interface ModelApi {
   thinking(sessionId: string, level: string): Promise<void>;
 }
 
+export interface ToolsApi {
+  settings(): Promise<{ path: string; exists: boolean; settings: Record<string, unknown> }>;
+  save(image: Record<string, unknown>): Promise<Record<string, unknown>>;
+  providers(): Promise<{ providers: Array<{ id: string; label: string }> }>;
+  models(provider: string): Promise<{ models: unknown }>;
+}
+
+export interface McpApi {
+  servers(): Promise<{ path: string; exists: boolean; servers: Array<{ name: string; transport: string; target?: string; description?: string; exposure?: string }> }>;
+}
+
 export interface CommandApi {
   run(sessionId: string, command: string): Promise<void>;
   raw(sessionId: string, command: Record<string, unknown>): Promise<unknown>;
@@ -269,6 +280,8 @@ export abstract class JouzuApi {
   abstract readonly runtime: RuntimeApi;
   abstract readonly workspaces: WorkspaceApi;
   abstract readonly models: ModelApi;
+  abstract readonly tools: ToolsApi;
+  abstract readonly mcp: McpApi;
   abstract readonly commands: CommandApi;
   abstract readonly artifacts: ArtifactApi;
   abstract readonly files: FileApi;

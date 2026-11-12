@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useApi } from "./api/context";
 import { ChevronDown, Circle, LoaderCircle, Plug, RefreshCw } from "lucide-react";
 import { Button } from "./components/ui/button";
 
@@ -16,6 +16,7 @@ interface McpConfig {
 /** Header status only: configured MCP servers and their transport. Editing is
  * intentionally left to the agent and the config file, not a desktop JSON editor. */
 export function McpMenu({ onReload, onAsk }: { onReload: () => void; onAsk?: () => void }) {
+  const api = useApi();
   const [open, setOpen] = useState(false);
   const [config, setConfig] = useState<McpConfig | null>(null);
   const [loading, setLoading] = useState(false);
@@ -25,7 +26,7 @@ export function McpMenu({ onReload, onAsk }: { onReload: () => void; onAsk?: () 
   async function load() {
     setLoading(true);
     setError("");
-    try { setConfig(await invoke<McpConfig>("mcp_config")); }
+    try { setConfig(await api.mcp.servers() as McpConfig); }
     catch (failure) { setError(String(failure)); }
     finally { setLoading(false); }
   }

@@ -286,6 +286,26 @@ export class HostClient {
     });
   }
 
+  tools(): Promise<{ path: string; exists: boolean; settings: Record<string, unknown> }> {
+    return this.request("/v1/tools");
+  }
+
+  async saveTools(image: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.request("/v1/tools", { method: "PUT", body: JSON.stringify({ image }) });
+  }
+
+  toolProviders(): Promise<{ providers: Array<{ id: string; label: string }> }> {
+    return this.request("/v1/tools/providers");
+  }
+
+  toolModels(provider: string): Promise<{ models: unknown }> {
+    return this.request(`/v1/tools/models?${new URLSearchParams({ provider })}`);
+  }
+
+  mcp(): Promise<{ path: string; exists: boolean; servers: Array<{ name: string; transport: string }> }> {
+    return this.request("/v1/mcp");
+  }
+
   send(sessionId: string, text: string, clientMessageId: string, attachments: Attachment[] = []): Promise<Receipt> {
     const body: Record<string, unknown> = { clientMessageId, text, clientId: this.clientId };
     if (attachments.length) body.attachments = attachments;

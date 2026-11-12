@@ -14,7 +14,9 @@ import {
   type ArtifactApi,
   type CommandApi,
   type FileApi,
+  type McpApi,
   type ModelApi,
+  type ToolsApi,
   type NativeApi,
   type PromptApi,
   type RuntimeApi,
@@ -99,6 +101,17 @@ function hostGroups(client: HostClient) {
     },
   };
 
+  const tools: ToolsApi = {
+    settings: () => client.tools(),
+    save: image => client.saveTools(image),
+    providers: () => client.toolProviders(),
+    models: provider => client.toolModels(provider),
+  };
+
+  const mcp: McpApi = {
+    servers: () => client.mcp(),
+  };
+
   const commands: CommandApi = {
     async run(sessionId, command) {
       await client.send(sessionId, command, `cmd-${crypto.randomUUID()}`);
@@ -154,6 +167,8 @@ function hostGroups(client: HostClient) {
     runtime,
     workspaces,
     models,
+    tools,
+    mcp,
     commands,
     artifacts,
     files,
@@ -178,6 +193,8 @@ export class WebApi extends JouzuApi {
   readonly runtime!: RuntimeApi;
   readonly workspaces!: WorkspaceApi;
   readonly models!: ModelApi;
+  readonly tools!: ToolsApi;
+  readonly mcp!: McpApi;
   readonly commands!: CommandApi;
   readonly artifacts!: ArtifactApi;
   readonly files!: FileApi;
@@ -221,6 +238,8 @@ export class RemoteApi extends JouzuApi {
   readonly runtime!: RuntimeApi;
   readonly workspaces!: WorkspaceApi;
   readonly models!: ModelApi;
+  readonly tools!: ToolsApi;
+  readonly mcp!: McpApi;
   readonly commands!: CommandApi;
   readonly artifacts!: ArtifactApi;
   readonly files!: FileApi;
@@ -264,6 +283,8 @@ export class DesktopApi extends JouzuApi {
   readonly runtime!: RuntimeApi;
   readonly workspaces!: WorkspaceApi;
   readonly models!: ModelApi;
+  readonly tools!: ToolsApi;
+  readonly mcp!: McpApi;
   readonly commands!: CommandApi;
   readonly artifacts!: ArtifactApi;
   readonly files!: FileApi;

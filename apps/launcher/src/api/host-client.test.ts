@@ -68,6 +68,32 @@ describe("HostClient", () => {
     expect(JSON.parse(String(calls[2].init?.body))).toEqual({ level: "high" });
   });
 
+  test("uses tools and MCP endpoints", async () => {
+    const calls: Call[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      if (String(input).endsWith("/v1/tools/providers")) return response({ providers: [{ id: "shisa", label: "Shisa" }] });
+      if (String(input).includes("/v1/tools/models")) return response({ models: ["m"] });
+      if (String(input).endsWith("/v1/mcp")) return response({ path: "mcp.json", exists: false, servers: [] });
+      if (String(input).endsWith("/v1/tools")) return response({ path: "tools.json", exists: false, settings: {} });
+      return response({});
+    }) as typeof fetch;
+    const client = new HostClient({ baseUrl: "http://host", fetchImpl });
+    await client.tools();
+    await client.saveTools({ provider: "shisa" });
+    await client.toolProviders();
+    await client.toolModels("shisa");
+    await client.mcp();
+    expect(calls.map(call => call.url)).toEqual([
+      "http://host/v1/tools",
+      "http://host/v1/tools",
+      "http://host/v1/tools/providers",
+      "http://host/v1/tools/models?provider=shisa",
+      "http://host/v1/mcp",
+    ]);
+    expect(JSON.parse(String(calls[1].init?.body))).toEqual({ image: { provider: "shisa" } });
+  });
+
   test("unwraps command data and maps error envelopes", async () => {
     const fetchImpl = (async (input: RequestInfo | URL) => {
       if (String(input).endsWith("/v1/sessions/h1/command")) {

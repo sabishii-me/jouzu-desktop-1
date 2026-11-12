@@ -65,6 +65,11 @@ function client() {
     models: vi.fn(async () => ({ models: [{ id: "m", name: "Model", provider: "p" }] })),
     selectModel: vi.fn(async () => undefined),
     setThinking: vi.fn(async () => undefined),
+    tools: vi.fn(async () => ({ path: "C:/data/agent/tools.json", exists: false, settings: {} })),
+    saveTools: vi.fn(async () => ({})),
+    toolProviders: vi.fn(async () => ({ providers: [] })),
+    toolModels: vi.fn(async () => ({ models: [] })),
+    mcp: vi.fn(async () => ({ path: "C:/data/agent/mcp.json", exists: false, servers: [] })),
     command: vi.fn(async (_id: string, request: Record<string, unknown>) => {
       calls.push(String(request.type));
       if (request.type === "get_available_models") return { models: [{ id: "m", name: "Model", provider: "p" }] };

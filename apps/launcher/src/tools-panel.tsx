@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useApi } from "./api/context";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
 import { Label } from "./components/ui/label";
 import { Switch } from "./components/ui/switch";
@@ -43,6 +43,7 @@ function readModels(value: unknown): ImageModel[] {
  * extension (CLI mode) so adding a provider does not touch this page.
  */
 export function ToolsPanel() {
+  const api = useApi();
   const [tools, setTools] = useState<ToolsSettings | null>(null);
   const [providers, setProviders] = useState<{ id: string; label: string }[]>([]);
   const [models, setModels] = useState<ImageModel[]>([]);
@@ -53,7 +54,7 @@ export function ToolsPanel() {
     if (!provider) return;
     setBusy(true);
     try {
-      const result = await invoke<{ models: unknown }>("image_models", { provider });
+      const result = await api.tools.models(provider);
       const list = readModels(result.models);
       setModels(list);
       const value = base ?? tools;
@@ -61,7 +62,7 @@ export function ToolsPanel() {
       const selected = list.find(entry => entry.id === currentModel) ?? list[0];
       const nextSize = selected.sizes.includes(currentSize) ? currentSize : selected.sizes[0];
       if (selected.id !== currentModel || nextSize !== currentSize) {
-        const saved = await invoke<ToolsSettings>("tools_settings_save", { image: { ...value.image, provider, model: selected.id, size: nextSize } });
+        const saved = await api.tools.save({ ...value.image, provider, model: selected.id, size: nextSize }) as unknown as ToolsSettings;
         setTools(saved);
       }
     } catch (failure) {
@@ -75,10 +76,10 @@ export function ToolsPanel() {
   useEffect(() => {
     void (async () => {
       try {
-        const value = await invoke<ToolsSettings>("tools_settings_read");
+        const value = (await api.tools.settings()).settings as unknown as ToolsSettings;
         setTools(value);
         try {
-          const result = await invoke<{ providers: { id: string; label: string }[] }>("image_providers");
+          const result = await api.tools.providers();
           setProviders(result.providers ?? []);
         } catch (failure) {
           setError(String(failure));
@@ -95,7 +96,7 @@ export function ToolsPanel() {
     setBusy(true);
     setError(null);
     try {
-      const saved = await invoke<ToolsSettings>("tools_settings_save", { image: { ...tools.image, ...patch } });
+      const saved = await api.tools.save({ ...tools.image, ...patch }) as unknown as ToolsSettings;
       setTools(saved);
     } catch (failure) {
       setError(String(failure));
