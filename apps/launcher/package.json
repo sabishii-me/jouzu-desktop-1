@@ -10,6 +10,7 @@
     "test": "vitest run",
     "test:e2e": "playwright test",
     "playbook": "node e2e/user-playbook.mjs",
+    "playbook:load": "node e2e/session-load-playbook.mjs",
     "test:session": "playwright test e2e/session-matrix.spec.ts e2e/session-switch.spec.ts e2e/session-metrics.spec.ts e2e/session-start-lock.spec.ts",
     "test:acceptance": "npm run build && npm test && playwright test e2e/chat.spec.ts e2e/tools.spec.ts e2e/session-matrix.spec.ts e2e/session-switch.spec.ts e2e/session-metrics.spec.ts e2e/session-start-lock.spec.ts e2e/models-retry.spec.ts"
   },
