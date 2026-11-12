@@ -7,7 +7,9 @@ import { Input } from "./components/ui/input";
 
 function providerLabel(provider: string) {
   if (!provider.startsWith("catalog:")) return provider;
-  const id = provider.split(":")[2] ?? provider;
+  const encoded = provider.split(":")[2] ?? provider;
+  let id = encoded;
+  try { id = decodeURIComponent(encoded); } catch { /* keep the encoded id */ }
   return id.replaceAll("-", " ").replaceAll("_", " ").replace(/\b\w/g, character => character.toUpperCase());
 }
 

@@ -24,7 +24,7 @@ pub struct Models {
 }
 
 /// Bump when the adapter projection changes shape or filtering semantics.
-const SCHEMA_VERSION: u64 = 2;
+const SCHEMA_VERSION: u64 = 3;
 
 impl Models {
     pub fn new(host_home: &Path) -> Self {

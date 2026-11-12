@@ -199,17 +199,19 @@ try {
     await settings.flush();
   } else if (request.action === 'available-models') {
     const { loadActiveModelCatalogs } = await load('model-catalog-sync');
+    const { catalogRuntimeProvider } = await load('model-catalog-projection');
     const { getSupportedThinkingLevels } = await import(pathToFileURL(join(appRoot, 'node_modules/@earendil-works/pi-ai/dist/models.js')));
-    const offerings = new Map();
-    for (const { document } of loadActiveModelCatalogs(paths)) {
+    const catalogModels = [];
+    for (const { source, document } of loadActiveModelCatalogs(paths)) {
+      if (typeof document?.catalogId !== 'string') continue;
       for (const offering of document?.modelOfferings ?? []) {
-        if (typeof offering?.providerId === 'string' && typeof offering?.modelId === 'string') {
-          offerings.set(`${offering.providerId}/${offering.modelId}`, offering);
-        }
+        if (typeof offering?.providerId !== 'string' || typeof offering?.modelId !== 'string') continue;
+        catalogModels.push({
+          offering,
+          provider: catalogRuntimeProvider(document.catalogId, offering.providerId, source?.url),
+        });
       }
     }
-    const byModel = new Map();
-    for (const [key, offering] of offerings) byModel.set(key, offering);
     // Availability is what the user can actually run, not the full catalog:
     // unconfigured providers must not appear in the desktop model menu.
     const available = await runtime.getAvailable();
@@ -221,10 +223,9 @@ try {
       seen.add(key);
       models.push(model);
     };
-    // The signed Shisa catalog is the desktop's home model list. Its offerings use
-    // the display provider "Shisa AI"; the runtime provider is "shisa".
-    for (const offering of offerings.values()) {
-      if (offering.providerId !== 'Shisa AI' || typeof offering.modelId !== 'string') continue;
+    // Catalog offerings are registered in the runtime under the stable
+    // `catalog:<catalogId>:<provider>` identity, not the display name.
+    for (const { offering, provider } of catalogModels) {
       const limits = offering.limits ?? {};
       const price = offering.metadata?.price;
       const cost = price && ['input', 'output', 'cacheRead', 'cacheWrite'].some(key => typeof price[key] === 'number')
@@ -234,7 +235,7 @@ try {
         ? offering.supportedThinkingLevels.filter(level => typeof level === 'string')
         : ['off'];
       add({
-        provider: 'shisa',
+        provider,
         id: offering.modelId,
         name: typeof offering.name === 'string' ? offering.name : offering.modelId,
         contextWindow: typeof limits.contextWindow === 'number' ? limits.contextWindow : null,
@@ -245,20 +246,13 @@ try {
       });
     }
     for (const model of available) {
-      const offering = offerings.get(`${model.provider}/${model.id}`)
-        ?? [...byModel.values()].find(candidate => candidate.modelId === model.id);
-      const limits = offering?.limits ?? {};
-      const price = offering?.metadata?.price;
-      const cost = price && ['input', 'output', 'cacheRead', 'cacheWrite'].some(key => typeof price[key] === 'number')
-        ? Object.fromEntries(['input', 'output', 'cacheRead', 'cacheWrite'].filter(key => typeof price[key] === 'number').map(key => [key, price[key]]))
-        : (model.cost && (model.cost.input || model.cost.output) ? model.cost : null);
       add({
         provider: model.provider,
         id: model.id,
         name: model.name,
-        contextWindow: typeof limits.contextWindow === 'number' ? limits.contextWindow : (model.contextWindow ?? null),
-        maxTokens: typeof limits.maxOutputTokens === 'number' ? limits.maxOutputTokens : (model.maxTokens ?? null),
-        cost,
+        contextWindow: model.contextWindow ?? null,
+        maxTokens: model.maxTokens ?? null,
+        cost: model.cost && (model.cost.input || model.cost.output) ? model.cost : null,
         reasoning: !!model.reasoning,
         thinkingLevels: getSupportedThinkingLevels(model),
       });

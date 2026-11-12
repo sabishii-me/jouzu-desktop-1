@@ -102,6 +102,29 @@ export class HostChatTransport implements ChatTransport {
 
     // The connection speaks the runtime's request shape: { type, id, ...fields }.
     const command = typeof request.type === "string" ? request.type : undefined;
+    // prompt/steer/followUp are host send operations, not raw runtime commands. The
+    // old transport forwarded them to /command, which the host correctly rejects.
+    if (command === "prompt" || command === "steer" || command === "followUp") {
+      const session = this.sessions.get(handle)!;
+      const text = typeof request.message === "string" ? request.message : "";
+      const clientMessageId =
+        typeof request.clientMessageId === "string" ? request.clientMessageId : crypto.randomUUID();
+      const attachments = Array.isArray(request.images)
+        ? request.images.flatMap(image => {
+            if (!image || typeof image !== "object") return [];
+            const value = image as Record<string, unknown>;
+            if (typeof value.data !== "string" || typeof value.mimeType !== "string") return [];
+            return [{ name: "image", mimeType: value.mimeType, data: value.data }];
+          })
+        : [];
+      try {
+        const receipt = await session.send({ clientMessageId, text, attachments });
+        queue.push({ type: "response", id: request.id, command, success: true, data: receipt });
+      } catch (error) {
+        queue.push({ type: "response", id: request.id, command, success: false, error: String(error) });
+      }
+      return;
+    }
     if (command) {
       // The runtime answers the command itself and the host relays that record, so a
       // successful call adds nothing here. Only a rejected call needs an answer the
