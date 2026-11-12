@@ -239,6 +239,8 @@ pub struct Session {
     next_message: AtomicU64,
     next_request: AtomicU64,
     active_message: Mutex<Option<String>>,
+    title: Mutex<String>,
+    updated_at: Mutex<Option<String>>,
     handshake: Mutex<Handshake>,
     ready: tokio::sync::Notify,
     pending_approvals: Mutex<HashMap<String, PendingApproval>>,
@@ -360,6 +362,21 @@ impl Session {
 
     fn now_iso() -> String {
         Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+
+    fn remember_turn(&self, text: &str) {
+        *self
+            .updated_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Self::now_iso());
+        let mut title = self
+            .title
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if title.is_empty() {
+            let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            *title = compact.chars().take(80).collect();
+        }
     }
 
     fn append_assistant_block(&self, kind: &str, text: &str) {
@@ -623,6 +640,20 @@ impl Session {
                         .session_path
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.to_string());
+                    // The first snapshot can precede the runtime's session file.
+                    // Publish the attach once the path exists so every client can
+                    // refresh its session index instead of waiting for a reload.
+                    self.publish(
+                        "session.attached",
+                        json!({
+                            "sessionPath": path,
+                            "title": self
+                                .title
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone(),
+                        }),
+                    );
                 }
                 if let Some(model) = data.get("model") {
                     *self
@@ -693,10 +724,15 @@ impl Session {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Handshake::Ready;
                 self.ready.notify_waiters();
                 if matches!(self.status(), Status::Starting | Status::Recovering) {
-                    self.set_status(Status::Idle);
                     self.recovery_succeeded();
                     self.apply_pending_preferences();
                     self.flush_pending_prompts();
+                    // A cancelled starting turn has no prompt to flush. Complete the
+                    // handshake bookkeeping first, then go idle; never go idle while
+                    // an accepted turn still has an active message.
+                    if self.active_turn().is_none() && !matches!(self.status(), Status::Running) {
+                        self.set_status(Status::Idle);
+                    }
                 }
             }
             _ => {}
@@ -1675,6 +1711,7 @@ impl Session {
             history_row["attachments"] = json!(stored_attachments);
         }
         self.push_history(history_row);
+        self.remember_turn(text);
         self.publish(
             "message.accepted",
             json!({ "messageId": message_id.clone(), "receipt": "queued" }),
@@ -1770,7 +1807,9 @@ impl Session {
                     "turn.end",
                     json!({ "turnId": turn, "aborted": true, "phase": "starting" }),
                 );
-                self.set_status(Status::Idle);
+                // Keep Starting until the handshake completes so preferences and
+                // recovery bookkeeping still run. The handshake path moves to Idle
+                // once it sees no active turn.
                 return Ok(());
             }
         }
@@ -2033,6 +2072,16 @@ impl Session {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
+            "title": self
+                .title
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            "updatedAt": self
+                .updated_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
             "status": self.status().as_str(),
             "running": self.status() == Status::Running,
             "runtimePid": self.runtime_pid(),
@@ -2074,6 +2123,8 @@ impl Session {
             next_message: AtomicU64::new(0),
             next_request: AtomicU64::new(0),
             active_message: Mutex::new(None),
+            title: Mutex::new(String::new()),
+            updated_at: Mutex::new(None),
             handshake: Mutex::new(Handshake::Messages),
             ready: tokio::sync::Notify::new(),
             pending_approvals: Mutex::new(HashMap::new()),
@@ -2381,6 +2432,21 @@ impl Session {
                     json!({ "code": code }),
                 );
                 if !matches!(self.status(), Status::Stopped) {
+                    let turn = self
+                        .active_message
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    self.pending_prompts
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                    if let Some(turn) = turn {
+                        self.publish(
+                            "turn.end",
+                            json!({ "turnId": turn, "aborted": true, "reason": "runtime-exited" }),
+                        );
+                    }
                     self.schedule_recovery(format!("runtime exited with code {code:?}"));
                 }
             }

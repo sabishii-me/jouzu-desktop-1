@@ -450,7 +450,7 @@ export class SessionStore {
 
   private applyStatus(status: string | undefined): void {
     if (!status) return;
-    const running = status === "starting" || status === "running" || status === "waiting_approval" || status === "waiting_question";
+    const running = status === "running" || status === "waiting_approval" || status === "waiting_question";
     this.update({
       pending: running || this.state.pending,
       projection: {

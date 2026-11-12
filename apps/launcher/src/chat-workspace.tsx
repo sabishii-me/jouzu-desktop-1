@@ -117,23 +117,15 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [switching, setSwitching] = useState(false);
   const [commandBusy, setCommandBusy] = useState(false);
   const [sendPending, setSendPending] = useState(false);
+  const [localSubmitted, setLocalSubmitted] = useState("");
   const sendCancelRef = useRef(false);
   const sendKeyRef = useRef<string | null>(null);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const queueSessionKey = sessionKeyOf(snapshot.sessionFile, selectedSession ?? path);
   const queuedSteers = queueSessionKey ? queuedBySession[queueSessionKey] ?? [] : [];
-  const pendingUser = pendingFor(pendingBySession, queueSessionKey);
-  useEffect(() => {
-    if (snapshot.projection.running) return;
-    const key = normalizedPath(snapshot.sessionFile ?? "");
-    if (!key) return;
-    setQueuedBySession(previous => {
-      if (!previous[key]?.length) return previous;
-      const next = { ...previous };
-      delete next[key];
-      return next;
-    });
-  }, [snapshot.projection.running, snapshot.sessionFile]);
+  const pendingUser = pendingFor(pendingBySession, queueSessionKey) || localSubmitted;
+  // Queued steering is owned by the session, not by the composer. Keep it visible
+  // until the host can accept it; clearing it on idle would silently lose input.
   const selectedRowRef = useRef<HTMLDivElement | null>(null);
   const switchingRef = useRef(false);
   const switchingTarget = useRef<string | "new" | null>(null);
@@ -601,6 +593,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   function cancelSend() {
     sendCancelRef.current = true;
     setSendPending(false);
+    setLocalSubmitted("");
     const key = sendKeyRef.current;
     if (key) setPendingBySession(previous => clearPending(previous, key));
     if (!switchingRef.current) void connection.current?.abort();
@@ -610,6 +603,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     // The Stop button and the pending row must exist during that window.
     sendCancelRef.current = false;
     setSendPending(true);
+    setLocalSubmitted(draft);
     // A new session replaces the connection after it attaches. Waiting here keeps
     // an early send from entering the previous (now closed) transport handle.
     if (switchingRef.current) {
@@ -631,6 +625,14 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const value = [...submittedVideos.map(videoMarker), typed].filter(Boolean).join("\n");
     const submitted = attachmentRef.current;
     const wasHero = hero;
+    if (client.snapshot.projection.running) {
+      const key = sessionKeyOf(client.snapshot.sessionFile, selectedSession ?? path);
+      if (key) setQueuedBySession(previous => ({ ...previous, [key]: [...(previous[key] ?? []), value] }));
+      if (draftRef.current === value) { clearDraft(draftKeyRef.current); draftRef.current = ""; setDraft(""); }
+      setSendPending(false);
+      setLocalSubmitted("");
+      return;
+    }
     // Capture the owner of this send. Clearing must never depend on which session is
     // on screen when it settles, and it must never touch another session's entry.
     const pendingKey = sessionKeyOf(client.snapshot.sessionFile, selectedSession ?? path);
@@ -687,6 +689,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     } finally {
       setCommandBusy(false);
       setSendPending(false);
+      setLocalSubmitted("");
       // Settling clears this send's own entry even after the user switched session.
       setPendingBySession(previous => clearPending(previous, pendingKey));
     }
