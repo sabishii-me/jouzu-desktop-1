@@ -1156,7 +1156,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<Value> {
         "contract": "2026-11-12",
         "hostVersion": state.version,
         "runtimeKind": "pi",
-        "features": ["chat", "sse", "replay", "prompts", "history-paging", "recovery", "deferred-sessions", "tools", "mcp"],
+        "features": ["chat", "sse", "replay", "prompts", "history-paging", "history-blocks", "models", "control", "tools", "mcp", "recovery", "deferred-sessions"],
         "scopes": ["loopback"],
         "limits": { "maxMessageBytes": 32768, "maxUploadBytes": 26214400 },
         "defaultWorkspace": default_workspace,
@@ -2240,6 +2240,32 @@ mod session_tests {
         assert_eq!(mcp.0, StatusCode::OK, "{}", mcp.2);
         assert!(mcp.2.contains("\"transport\":\"Local\""), "{}", mcp.2);
         assert!(mcp.2.contains("\"exposure\":\"eager\""), "{}", mcp.2);
+    }
+
+    #[tokio::test]
+    async fn history_rows_and_done_carry_blocks() {
+        let (manager, _home, workspace) = manager(100);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager);
+        let (mut rx, reader) = subscribe(app, &session.id).await;
+        let _ = next_event(&mut rx, "session.snapshot").await;
+
+        session.send("blocks-1", "hello").unwrap();
+        let start = next_event(&mut rx, "message.start").await;
+        assert_eq!(start["role"], "assistant", "{start}");
+        let done = next_event(&mut rx, "message.done").await;
+        assert!(done["blocks"].is_array(), "{done}");
+
+        wait_status(&session, Status::Idle).await;
+        let history = session.history(50, None);
+        let rows = history["messages"].as_array().unwrap();
+        assert!(rows.iter().all(|row| row["blocks"].is_array()), "{history}");
+        assert!(rows.iter().any(|row| row["kind"] == "user"));
+        assert!(rows.iter().any(|row| row["kind"] == "assistant"));
+        reader.abort();
     }
 
     #[tokio::test]

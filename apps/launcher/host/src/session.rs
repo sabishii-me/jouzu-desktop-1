@@ -665,6 +665,11 @@ impl Session {
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("import-{index}")),
                 "text": text,
+                "blocks": if text.is_empty() {
+                    json!([])
+                } else {
+                    json!([{ "type": "text", "text": text }])
+                },
                 "createdAt": message
                     .get("timestamp")
                     .and_then(Value::as_str)
@@ -689,7 +694,20 @@ impl Session {
         self.publish("runtime.event", value.clone());
         match value.get("type").and_then(Value::as_str) {
             Some("response") => self.handle_response(&value),
-            Some("agent_start") => self.set_status(Status::Running),
+            Some("agent_start") => {
+                self.set_status(Status::Running);
+                if let Some(message_id) = self
+                    .active_message
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                {
+                    self.publish(
+                        "message.start",
+                        json!({ "messageId": message_id, "turnId": message_id, "role": "assistant" }),
+                    );
+                }
+            }
             Some("message_update") => {
                 let Some(update) = value
                     .get("assistantMessageEvent")
@@ -852,6 +870,11 @@ impl Session {
                         "id": format!("{message_id}:assistant"),
                         "turnId": message_id.clone(),
                         "text": text,
+                        "blocks": if text.is_empty() {
+                            json!([])
+                        } else {
+                            json!([{ "type": "text", "text": text }])
+                        },
                         "createdAt": Self::now_iso(),
                     });
                     if let Some(message) = value.get("message") {
@@ -878,10 +901,17 @@ impl Session {
                             }
                         }
                     }
-                    self.push_history(row);
+                    self.push_history(row.clone());
                     self.publish(
                         "message.done",
-                        json!({ "messageId": message_id, "stopReason": stop_reason }),
+                        json!({
+                            "messageId": message_id,
+                            "stopReason": stop_reason,
+                            "blocks": row.get("blocks").cloned().unwrap_or_else(|| json!([])),
+                            "model": row.get("model").cloned().unwrap_or(Value::Null),
+                            "provider": row.get("provider").cloned().unwrap_or(Value::Null),
+                            "usage": row.get("usage").cloned().unwrap_or(Value::Null),
+                        }),
                     );
                     self.publish(
                         "turn.end",
@@ -1514,6 +1544,7 @@ impl Session {
             "id": format!("{message_id}:user"),
             "turnId": message_id,
             "text": text,
+            "blocks": [{ "type": "text", "text": text }],
             "createdAt": Self::now_iso(),
         });
         if !stored_attachments.is_empty() {
