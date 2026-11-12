@@ -94,12 +94,14 @@ pub struct SessionConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
+    Pending,
     Starting,
     Idle,
     Running,
     WaitingApproval,
     WaitingQuestion,
     Recovering,
+    Cancelled,
     Stopped,
     Error,
 }
@@ -107,12 +109,14 @@ pub enum Status {
 impl Status {
     pub fn as_str(self) -> &'static str {
         match self {
+            Status::Pending => "pending",
             Status::Starting => "starting",
             Status::Idle => "idle",
             Status::Running => "running",
             Status::WaitingApproval => "waiting_approval",
             Status::WaitingQuestion => "waiting_question",
             Status::Recovering => "recovering",
+            Status::Cancelled => "cancelled",
             Status::Stopped => "stopped",
             Status::Error => "error",
         }
@@ -230,6 +234,7 @@ pub struct Session {
     config: SessionConfig,
     lease_path: PathBuf,
     messages: Mutex<HashMap<String, SentMessage>>,
+    pending_prompts: Mutex<Vec<Value>>,
     next_message: AtomicU64,
     next_request: AtomicU64,
     active_message: Mutex<Option<String>>,
@@ -615,6 +620,7 @@ impl Session {
                 if matches!(self.status(), Status::Starting | Status::Recovering) {
                     self.set_status(Status::Idle);
                     self.recovery_succeeded();
+                    self.flush_pending_prompts();
                 }
             }
             _ => {}
@@ -1419,12 +1425,12 @@ impl Session {
         Ok(stored)
     }
 
-    pub fn send(&self, client_message_id: &str, text: &str) -> Result<Value, ApiError> {
+    pub fn send(self: &Arc<Self>, client_message_id: &str, text: &str) -> Result<Value, ApiError> {
         self.send_with_client(client_message_id, text, None, &[])
     }
 
     pub fn send_with_client(
-        &self,
+        self: &Arc<Self>,
         client_message_id: &str,
         text: &str,
         client_id: Option<&str>,
@@ -1444,12 +1450,20 @@ impl Session {
             return Err(ApiError::bad_request("Images must total 20 MB or less"));
         }
         match self.status() {
-            Status::Stopped | Status::Error => {
+            Status::Stopped | Status::Error | Status::Cancelled => {
                 return Err(ApiError::new(
                     axum::http::StatusCode::CONFLICT,
                     "session-stopped",
                     "Session is not runnable",
                     false,
+                ))
+            }
+            Status::Recovering => {
+                return Err(ApiError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    "session-recovering",
+                    "The runtime is recovering; retry in a moment",
+                    true,
                 ))
             }
             _ => {}
@@ -1510,8 +1524,6 @@ impl Session {
             "message.accepted",
             json!({ "messageId": message_id.clone(), "receipt": "queued" }),
         );
-        self.publish("turn.start", json!({ "turnId": message_id.clone() }));
-        self.set_status(Status::Running);
         let mut prompt = json!({
             "id": client_message_id,
             "type": "prompt",
@@ -1527,14 +1539,37 @@ impl Session {
                 }))
                 .collect::<Vec<_>>());
         }
-        let result = self.write_command(prompt);
-        if let Err(error) = result {
-            self.publish(
-                "error",
-                json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-            );
-            self.set_status(Status::Error);
-            return Err(error);
+        if matches!(self.status(), Status::Pending) {
+            self.set_status(Status::Starting);
+            self.start(true);
+            if matches!(self.status(), Status::Cancelled | Status::Error) {
+                messages.remove(client_message_id);
+                return Err(ApiError::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "runtime-unavailable",
+                    "The runtime could not start",
+                    true,
+                ));
+            }
+        }
+        if matches!(self.status(), Status::Starting | Status::Recovering) {
+            self.pending_prompts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(prompt);
+        } else {
+            self.publish("turn.start", json!({ "turnId": message_id.clone() }));
+            self.set_status(Status::Running);
+            let result = self.write_command(prompt);
+            if let Err(error) = result {
+                self.publish(
+                    "error",
+                    json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
+                );
+                self.set_status(Status::Error);
+                messages.remove(client_message_id);
+                return Err(error);
+            }
         }
         messages.insert(
             client_message_id.to_string(),
@@ -1669,10 +1704,15 @@ impl Session {
     }
 
     pub fn stop(&self) {
-        if matches!(self.status(), Status::Stopped) {
+        if matches!(self.status(), Status::Stopped | Status::Cancelled) {
             return;
         }
-        self.set_status(Status::Stopped);
+        let pending = matches!(self.status(), Status::Pending);
+        self.set_status(if pending {
+            Status::Cancelled
+        } else {
+            Status::Stopped
+        });
         self.recovery_scheduled.store(false, Ordering::SeqCst);
         self.recovery_attempts
             .lock()
@@ -1717,6 +1757,7 @@ impl Session {
         workspace_path: String,
         session_path: Option<String>,
         key: String,
+        status: Status,
         config: &SessionConfig,
     ) -> Arc<Session> {
         let lease_path = config.home.join(format!("session-{id}.lease"));
@@ -1726,7 +1767,7 @@ impl Session {
             workspace_path,
             session_path: Mutex::new(session_path),
             key,
-            status: Mutex::new(Status::Starting),
+            status: Mutex::new(status),
             events: Mutex::new(EventLog::new(config.replay_limit)),
             tx,
             runtime: Mutex::new(None),
@@ -1736,6 +1777,7 @@ impl Session {
             config: config.clone(),
             lease_path,
             messages: Mutex::new(HashMap::new()),
+            pending_prompts: Mutex::new(Vec::new()),
             next_message: AtomicU64::new(0),
             next_request: AtomicU64::new(0),
             active_message: Mutex::new(None),
@@ -1758,7 +1800,7 @@ impl Session {
         })
     }
 
-    fn start(self: &Arc<Self>) {
+    fn start(self: &Arc<Self>, from_pending: bool) {
         if let Err(error) = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1776,7 +1818,7 @@ impl Session {
             );
             return;
         }
-        self.spawn_runtime(true);
+        self.spawn_runtime(true, from_pending);
     }
 
     fn spawn_spec(&self) -> SpawnSpec {
@@ -1788,7 +1830,7 @@ impl Session {
         }
     }
 
-    fn spawn_runtime(self: &Arc<Self>, initial: bool) -> bool {
+    fn spawn_runtime(self: &Arc<Self>, initial: bool, from_pending: bool) -> bool {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
         match RuntimeSupervisor::start(self.spawn_spec(), event_tx) {
             Ok(runtime) => {
@@ -1797,7 +1839,12 @@ impl Session {
             }
             Err(error) => {
                 if initial {
-                    self.set_status(Status::Error);
+                    self.set_status(if from_pending {
+                        Status::Cancelled
+                    } else {
+                        Status::Error
+                    });
+                    let _ = std::fs::remove_file(&self.lease_path);
                     self.publish(
                         "error",
                         json!({
@@ -1888,7 +1935,7 @@ impl Session {
         // The Job Object must be gone before the replacement starts: Flow
         // allows one live attachment per session file.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        self.spawn_runtime(false);
+        self.spawn_runtime(false, false);
     }
 
     fn recovery_failed(self: &Arc<Self>, reason: String) {
@@ -1938,6 +1985,36 @@ impl Session {
         // Attempts are kept for the five-minute window: a runtime that reaches
         // idle and dies again immediately is flapping, not healthy.
         self.recovery_scheduled.store(false, Ordering::SeqCst);
+    }
+
+    fn flush_pending_prompts(self: &Arc<Self>) {
+        let prompts: Vec<Value> = self
+            .pending_prompts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect();
+        if prompts.is_empty() {
+            return;
+        }
+        let turn = self
+            .active_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_default();
+        self.publish("turn.start", json!({ "turnId": turn }));
+        self.set_status(Status::Running);
+        for prompt in prompts {
+            if let Err(error) = self.write_command(prompt) {
+                self.publish(
+                    "error",
+                    json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
+                );
+                self.set_status(Status::Error);
+                return;
+            }
+        }
     }
 
     fn environment(&self) -> Vec<(OsString, OsString)> {
@@ -2027,6 +2104,7 @@ pub struct SessionManager {
     runtime_home: PathBuf,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     clients: Mutex<HashMap<String, Vec<String>>>,
+    persisted_cache: Mutex<Option<Vec<Value>>>,
 }
 
 impl SessionManager {
@@ -2050,6 +2128,7 @@ impl SessionManager {
             runtime_home,
             sessions: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
+            persisted_cache: Mutex::new(None),
         }
     }
 
@@ -2538,7 +2617,10 @@ impl SessionManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut values: Vec<Value> = sessions
             .values()
-            .filter(|session| !is_scratch_workspace(&session.workspace_path))
+            .filter(|session| {
+                !is_scratch_workspace(&session.workspace_path)
+                    && !matches!(session.status(), Status::Pending | Status::Cancelled)
+            })
             .map(|session| session.info())
             .collect();
         for value in &mut values {
@@ -2572,9 +2654,12 @@ impl SessionManager {
         let stale: Vec<String> = sessions
             .iter()
             .filter(|(_, session)| {
-                session.status() == Status::Idle
+                let idle = session.status() == Status::Idle
                     && session.subscriber_count() == 0
-                    && session.last_activity().elapsed() >= ttl
+                    && session.last_activity().elapsed() >= ttl;
+                let pending = session.status() == Status::Pending
+                    && session.last_activity().elapsed() >= ttl;
+                idle || pending
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -2585,7 +2670,7 @@ impl SessionManager {
         }
     }
 
-    pub fn persisted(&self, workspace: Option<&str>) -> Vec<Value> {
+    fn scan_persisted(&self) -> Vec<Value> {
         let preferences = self.read_preferences();
         let directory = self.runtime_home.join("state").join("sessions");
         let mut files: Vec<(PathBuf, std::time::SystemTime)> = std::fs::read_dir(&directory)
@@ -2604,13 +2689,6 @@ impl SessionManager {
             })
             .unwrap_or_default();
         files.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
-        let wanted = workspace.map(|value| {
-            value
-                .replace('\\', "/")
-                .trim_start_matches("//?/")
-                .trim_end_matches('/')
-                .to_lowercase()
-        });
         files
             .into_iter()
             .filter_map(|(path, modified)| {
@@ -2662,9 +2740,7 @@ impl SessionManager {
                     .trim_start_matches("//?/")
                     .trim_end_matches('/')
                     .to_lowercase();
-                if wanted.as_deref().is_some_and(|wanted| wanted != normalized) {
-                    return None;
-                }
+                let _ = normalized;
                 let key = canonical_path(&path.to_string_lossy());
                 let preference = preferences.get(&key);
                 let title = preference
@@ -2697,6 +2773,43 @@ impl SessionManager {
                 }))
             })
             .take(300)
+            .collect()
+    }
+
+    pub fn persisted(&self, workspace: Option<&str>, refresh: bool) -> Vec<Value> {
+        let entries = {
+            let mut cache = self
+                .persisted_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if refresh || cache.is_none() {
+                *cache = Some(self.scan_persisted());
+            }
+            cache.clone().unwrap_or_default()
+        };
+        let Some(wanted) = workspace else {
+            return entries;
+        };
+        let wanted = wanted
+            .replace('\\', "/")
+            .trim_start_matches("//?/")
+            .trim_end_matches('/')
+            .to_lowercase();
+        entries
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .get("workspacePath")
+                    .and_then(Value::as_str)
+                    .map(|path| {
+                        path.replace('\\', "/")
+                            .trim_start_matches("//?/")
+                            .trim_end_matches('/')
+                            .to_lowercase()
+                            == wanted
+                    })
+                    .unwrap_or(false)
+            })
             .collect()
     }
 
@@ -2788,6 +2901,25 @@ impl SessionManager {
         session_path: Option<String>,
         key: Option<String>,
     ) -> Result<Arc<Session>, ApiError> {
+        self.create_with_status(workspace, session_path, key, Status::Starting)
+    }
+
+    pub fn create_pending(
+        &self,
+        workspace: &str,
+        session_path: Option<String>,
+        key: Option<String>,
+    ) -> Result<Arc<Session>, ApiError> {
+        self.create_with_status(workspace, session_path, key, Status::Pending)
+    }
+
+    fn create_with_status(
+        &self,
+        workspace: &str,
+        session_path: Option<String>,
+        key: Option<String>,
+        status: Status,
+    ) -> Result<Arc<Session>, ApiError> {
         let workspace = std::fs::canonicalize(workspace)
             .map_err(|_| ApiError::bad_request("workspacePath is unavailable"))?;
         if !workspace.is_dir() {
@@ -2808,7 +2940,7 @@ impl SessionManager {
                 .find(|session| session.key == key)
                 .cloned()
             {
-                if !matches!(existing.status(), Status::Stopped) {
+                if !matches!(existing.status(), Status::Stopped | Status::Cancelled) {
                     return Ok(existing);
                 }
                 sessions.remove(&existing.id);
@@ -2832,6 +2964,7 @@ impl SessionManager {
             workspace.to_string_lossy().into_owned(),
             session_path,
             key.clone(),
+            status,
             &config,
         );
         {
@@ -2841,8 +2974,10 @@ impl SessionManager {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             sessions.insert(session.id.clone(), session.clone());
         }
-        let starting = session.clone();
-        tokio::spawn(async move { starting.start() });
+        if matches!(status, Status::Starting) {
+            let starting = session.clone();
+            tokio::spawn(async move { starting.start(false) });
+        }
         Ok(session)
     }
 

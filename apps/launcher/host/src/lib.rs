@@ -451,14 +451,22 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
 struct PersistedQuery {
     #[serde(rename = "workspacePath")]
     workspace_path: Option<String>,
+    #[serde(default)]
+    refresh: Option<String>,
 }
 
 async fn persisted_sessions(
     State(state): State<AppState>,
     Query(query): Query<PersistedQuery>,
 ) -> Json<Value> {
+    let refresh = query
+        .refresh
+        .as_deref()
+        .is_some_and(|value| value == "1" || value == "true");
     Json(json!({
-        "sessions": state.sessions.persisted(query.workspace_path.as_deref()),
+        "sessions": state
+            .sessions
+            .persisted(query.workspace_path.as_deref(), refresh),
     }))
 }
 
@@ -563,10 +571,17 @@ async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<CreateRequest>,
 ) -> Result<Response, ApiError> {
-    let session =
+    let session = if request.session_path.is_none() {
+        state.sessions.create_pending(
+            &request.workspace_path,
+            request.session_path,
+            request.key,
+        )?
+    } else {
         state
             .sessions
-            .create(&request.workspace_path, request.session_path, request.key)?;
+            .create(&request.workspace_path, request.session_path, request.key)?
+    };
     let mut response = (
         StatusCode::ACCEPTED,
         Json(json!({
@@ -940,7 +955,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<Value> {
         "contract": "2026-11-12",
         "hostVersion": state.version,
         "runtimeKind": "pi",
-        "features": ["chat", "sse", "replay", "prompts", "history-paging", "recovery"],
+        "features": ["chat", "sse", "replay", "prompts", "history-paging", "recovery", "deferred-sessions"],
         "scopes": ["loopback"],
         "limits": { "maxMessageBytes": 32768, "maxUploadBytes": 26214400 },
         "defaultWorkspace": default_workspace,
@@ -1866,6 +1881,114 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn stopping_a_pending_session_cancels_it_without_a_runtime() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        assert_eq!(session.status(), Status::Pending);
+        session.stop();
+        assert_eq!(session.status(), Status::Cancelled);
+        assert!(session.runtime_pid().is_none());
+        assert!(manager.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_new_session_is_pending_until_the_first_message() {
+        let (manager, _home, workspace) = manager(50);
+        let app = app(manager.clone());
+        let body = json!({ "workspacePath": workspace.path() });
+        let response = call(
+            app.clone(),
+            request(Method::POST, "/v1/sessions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::ACCEPTED, "{}", response.2);
+        let value: Value = serde_json::from_str(&response.2).unwrap();
+        assert_eq!(value["status"], "pending");
+        let session_id = value["sessionId"].as_str().unwrap().to_string();
+        let session = manager.get(&session_id).unwrap();
+        assert_eq!(session.status(), Status::Pending);
+        assert!(session.runtime_pid().is_none());
+
+        let list = call(
+            app.clone(),
+            request(Method::GET, "/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(!list.2.contains(&session_id));
+
+        let send = call(
+            app,
+            request(
+                Method::POST,
+                &format!("/v1/sessions/{session_id}/messages"),
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "clientMessageId": "pending-1", "text": "hello" }).to_string(),
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(send.0, StatusCode::ACCEPTED, "{}", send.2);
+        wait_status(&session, Status::Idle).await;
+        assert!(session.runtime_pid().is_some());
+    }
+
+    #[tokio::test]
+    async fn persisted_list_is_cached_until_refresh() {
+        let (manager, _home, workspace) = manager(50);
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let cwd = workspace.path().to_string_lossy().replace('\\', "/");
+        let first = directory.join("first.jsonl");
+        std::fs::write(
+            &first,
+            format!("{{\"type\":\"session\",\"cwd\":\"{cwd}\"}}\n"),
+        )
+        .unwrap();
+        let app = app(manager);
+        let listed = call(
+            app.clone(),
+            request(Method::GET, "/v1/sessions/persisted")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(listed.2.contains("first.jsonl"), "{}", listed.2);
+
+        let second = directory.join("second.jsonl");
+        std::fs::write(
+            &second,
+            format!("{{\"type\":\"session\",\"cwd\":\"{cwd}\"}}\n"),
+        )
+        .unwrap();
+        let cached = call(
+            app.clone(),
+            request(Method::GET, "/v1/sessions/persisted")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(!cached.2.contains("second.jsonl"), "{}", cached.2);
+
+        let refreshed = call(
+            app,
+            request(Method::GET, "/v1/sessions/persisted?refresh=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(refreshed.2.contains("second.jsonl"), "{}", refreshed.2);
+    }
+
+    #[tokio::test]
     async fn history_preview_is_served_at_the_new_path() {
         let (manager, _home, _workspace) = manager(50);
         let directory = manager.runtime_home().join("state").join("sessions");
@@ -2355,6 +2478,21 @@ mod session_tests {
         let value: Value = serde_json::from_str(&response.2).unwrap();
         let session_id = value["sessionId"].as_str().unwrap().to_string();
         assert!(response.1.contains_key(header::LOCATION));
+
+        let send = call(
+            app.clone(),
+            request(
+                Method::POST,
+                &format!("/v1/sessions/{session_id}/messages"),
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "clientMessageId": "http-1", "text": "hello" }).to_string(),
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(send.0, StatusCode::ACCEPTED, "{}", send.2);
 
         let list = call(
             app.clone(),
