@@ -33,6 +33,32 @@ fn manager(app: &PathBuf, home: &PathBuf) -> Arc<ControlManager> {
 }
 
 #[tokio::test]
+async fn available_models_include_thinking_levels() {
+    let Some(app) = app_dir() else { return };
+    let temp = tempfile::tempdir().unwrap();
+    let home = match std::env::var_os("JOUZU_HOST_TEST_HOME") {
+        Some(value) => PathBuf::from(value),
+        None => temp.path().to_path_buf(),
+    };
+    let manager = manager(&app, &home);
+
+    let value = manager
+        .request(json!({ "action": "available-models" }))
+        .await
+        .expect("available-models");
+    let models = value["models"].as_array().expect("models array");
+    assert!(!models.is_empty(), "no models: {value}");
+    for model in models {
+        assert!(
+            model["thinkingLevels"].is_array(),
+            "thinkingLevels missing: {model}"
+        );
+        assert!(model["provider"].is_string(), "provider missing: {model}");
+        assert!(model["id"].is_string(), "id missing: {model}");
+    }
+}
+
+#[tokio::test]
 async fn status_runs_the_real_adapter() {
     let Some(app) = app_dir() else { return };
     let temp = tempfile::tempdir().unwrap();

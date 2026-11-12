@@ -197,6 +197,46 @@ try {
     if (!runtime.getModel(request.provider, request.model)) throw new Error('Unknown model');
     settings.setDefaultModelAndProvider(request.provider, request.model);
     await settings.flush();
+  } else if (request.action === 'available-models') {
+    const { loadActiveModelCatalogs } = await load('model-catalog-sync');
+    const { getSupportedThinkingLevels } = await import(pathToFileURL(join(appRoot, 'node_modules/@earendil-works/pi-ai/dist/models.js')));
+    const offerings = new Map();
+    for (const { document } of loadActiveModelCatalogs(paths)) {
+      for (const offering of document?.modelOfferings ?? []) {
+        if (typeof offering?.providerId === 'string' && typeof offering?.modelId === 'string') {
+          offerings.set(`${offering.providerId}/${offering.modelId}`, offering);
+        }
+      }
+    }
+    const byModel = new Map();
+    for (const [key, offering] of offerings) byModel.set(key, offering);
+    const models = runtime.getModels().map(model => {
+      const offering = offerings.get(`${model.provider}/${model.id}`)
+        ?? [...byModel.values()].find(candidate => candidate.modelId === model.id);
+      const limits = offering?.limits ?? {};
+      const price = offering?.metadata?.price;
+      const cost = price && ['input', 'output', 'cacheRead', 'cacheWrite'].some(key => typeof price[key] === 'number')
+        ? Object.fromEntries(['input', 'output', 'cacheRead', 'cacheWrite'].filter(key => typeof price[key] === 'number').map(key => [key, price[key]]))
+        : (model.cost && (model.cost.input || model.cost.output) ? model.cost : null);
+      return {
+        provider: model.provider,
+        id: model.id,
+        name: model.name,
+        contextWindow: typeof limits.contextWindow === 'number' ? limits.contextWindow : (model.contextWindow ?? null),
+        maxTokens: typeof limits.maxOutputTokens === 'number' ? limits.maxOutputTokens : (model.maxTokens ?? null),
+        cost,
+        reasoning: !!model.reasoning,
+        thinkingLevels: getSupportedThinkingLevels(model),
+      };
+    });
+    console.log(JSON.stringify({
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      models,
+      defaultProvider: settings.getDefaultProvider() ?? null,
+      defaultModel: settings.getDefaultModel() ?? null,
+    }));
+    process.exit(0);
   } else if (request.action !== 'status') throw new Error('Unsupported operation');
   if (request.action === "custom-provider") await runtime.refresh({ allowNetwork: false });
   const { ModelConfig } = await pi('model-config');

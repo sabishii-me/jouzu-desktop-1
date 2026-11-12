@@ -1,8 +1,10 @@
 //! The model snapshot the UI selects from.
 //!
-//! The snapshot comes from Jouzu through the control adapter (`status.models` and the
-//! saved defaults). The host never reads `cache/model-catalog/**` and never merges
-//! accounts; it caches the adapter's answer so a page reload costs no process.
+//! The snapshot comes from Jouzu's `available-models` control action: the runtime
+//! projection is joined with the active catalog's limits/prices, and thinking levels
+//! come from pi-ai's `getSupportedThinkingLevels`. The host never reads
+//! `cache/model-catalog/**`; the adapter returns already-joined rows and the host
+//! caches that answer so a page reload costs no process.
 
 use std::{
     path::{Path, PathBuf},
@@ -95,7 +97,7 @@ impl Models {
 
     async fn enumerate(&self, control: &ControlManager) -> Result<Value, ApiError> {
         let status = control
-            .request(json!({ "action": "status" }))
+            .request(json!({ "action": "available-models" }))
             .await
             .map_err(|error| {
                 ApiError::new(
@@ -119,7 +121,13 @@ impl Models {
             ));
         }
         Ok(self.store(json!({
-            "generatedAt": now(),
+            "schemaVersion": 1,
+            "source": "control.available-models",
+            "generatedAt": status
+                .get("generatedAt")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .unwrap_or_else(now),
             "models": models,
             "defaultProvider": status.get("defaultProvider").cloned().unwrap_or(Value::Null),
             "defaultModel": status.get("defaultModel").cloned().unwrap_or(Value::Null),
