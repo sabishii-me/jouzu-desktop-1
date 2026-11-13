@@ -245,6 +245,7 @@ pub struct Session {
     active_client_message: Mutex<Option<String>>,
     turn_started_at: Mutex<Option<String>>,
     cancelling: AtomicBool,
+    turn_running: AtomicBool,
     cancelled: Mutex<HashMap<String, Instant>>,
     failed_turn: Mutex<Option<Value>>,
     listed: Mutex<bool>,
@@ -597,6 +598,9 @@ impl Session {
             }
         };
         if changed {
+            if matches!(status, Status::Running) {
+                self.turn_running.store(true, Ordering::SeqCst);
+            }
             if let Some(runtime) = self
                 .runtime
                 .lock()
@@ -670,6 +674,12 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        log(
+            &self.home,
+            "debug",
+            "session.handshake",
+            json!({ "status": self.status().as_str(), "existing": existing }),
+        );
         match existing {
             Some(path) => {
                 let id = self.request_id();
@@ -1161,6 +1171,7 @@ impl Session {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                 self.cancelling.store(false, Ordering::SeqCst);
+                self.turn_running.store(false, Ordering::SeqCst);
                 if !self.start_queued_turn() {
                     self.set_status(Status::Idle);
                 }
@@ -2506,6 +2517,7 @@ impl Session {
             active_client_message: Mutex::new(None),
             turn_started_at: Mutex::new(None),
             cancelling: AtomicBool::new(false),
+            turn_running: AtomicBool::new(false),
             cancelled: Mutex::new(HashMap::new()),
             failed_turn: Mutex::new(None),
             listed: Mutex::new(false),
@@ -2868,12 +2880,14 @@ impl Session {
                 );
                 if !matches!(self.status(), Status::Stopped) {
                     let status = self.status();
-                    if matches!(
-                        status,
-                        Status::Running
-                            | Status::WaitingApproval
-                            | Status::WaitingQuestion
-                    ) {
+                    let finalize = self.turn_running.load(Ordering::SeqCst)
+                        || matches!(
+                            status,
+                            Status::Running
+                                | Status::WaitingApproval
+                                | Status::WaitingQuestion
+                        );
+                    if finalize {
                         let turn = self
                             .active_message
                             .lock()
@@ -2927,6 +2941,12 @@ impl Session {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                         self.cancelling.store(false, Ordering::SeqCst);
+                        self.turn_running.store(false, Ordering::SeqCst);
+                        self.cancel_pending("runtime-exited");
+                        *self
+                            .active_client
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                         self.queue_paused.store(true, Ordering::SeqCst);
                         if let Some(turn) = turn {
                             self.publish(

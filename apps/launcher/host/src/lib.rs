@@ -2200,6 +2200,38 @@ mod session_tests {
         assert_eq!(users, 1, "{history}");
     }
 
+    #[tokio::test]
+    async fn a_restarted_runtime_accepts_a_new_prompt() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("before-crash", "hello").unwrap();
+        wait_status(&session, Status::Running).await;
+        let previous = session.runtime_pid().expect("runtime pid");
+        kill_tree(previous);
+        wait_until(|| {
+            session.status() == Status::Idle
+                && session.runtime_pid().is_some_and(|pid| pid != previous)
+        })
+        .await;
+        let state = session
+            .request(json!({ "type": "get_state" }), Duration::from_secs(2))
+            .await;
+        assert!(state.is_ok(), "recovered runtime did not answer get_state: {state:?}");
+        session.send("after-crash", "again").unwrap();
+        wait_until(|| {
+            session
+                .history(50, None)["messages"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| {
+                    row["kind"] == "assistant" && row["text"] == "again"
+                }))
+        })
+        .await;
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn repeated_crashes_end_in_error() {
