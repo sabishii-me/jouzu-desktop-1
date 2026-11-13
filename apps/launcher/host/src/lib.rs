@@ -717,7 +717,8 @@ async fn queue_session(
     match request.action.as_str() {
         "continue" => Ok(Json(session.continue_queue()?)),
         "discard" => Ok(Json(session.discard_queue()?)),
-        _ => Err(ApiError::bad_request("queue action must be continue or discard")),
+        "retry" => Ok(Json(session.retry_failed()?)),
+        _ => Err(ApiError::bad_request("queue action must be continue, discard or retry")),
     }
 }
 

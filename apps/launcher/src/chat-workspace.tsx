@@ -1491,6 +1491,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
               <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void runExtensionCommand("/flow clear")}>Clear</Button>
             </div>}
             <AgentAction thinking={liveThinking} label="Working…" running={conversationProjection.running} elapsed={elapsed} settled={settled} />
+            {!!snapshot.failedTurn && <div role="alert" className="mt-1 flex flex-wrap items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px]">
+              <span className="min-w-0 flex-1">{snapshot.failedTurn.text || "The last turn failed."}</span>
+              <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void connection.current?.queue("retry")}>Retry</Button>
+            </div>}
             {!!snapshot.queue?.length && <div role="status" aria-label="Queued messages" className="mt-1 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-[11px]">
               <span className="min-w-0 flex-1">{snapshot.queue.map(item => item.text || "Queued message").join(" · ")}</span>
               <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void connection.current?.queue("continue")}>Continue</Button>

@@ -51,7 +51,7 @@ export class HostChatSession {
     return this.api.sessions.cancel(this.id, clientMessageId);
   }
 
-  queue(action: "continue" | "discard"): Promise<void> {
+  queue(action: "continue" | "discard" | "retry"): Promise<void> {
     return this.api.sessions.queue(this.id, action);
   }
 

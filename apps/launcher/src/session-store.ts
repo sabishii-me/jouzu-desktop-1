@@ -24,7 +24,7 @@ export interface SessionPort {
   send(message: { clientMessageId: string; text: string; attachments?: Attachment[] }): Promise<Receipt>;
   interrupt(): Promise<void>;
   cancel(clientMessageId: string): Promise<void>;
-  queue(action: "continue" | "discard"): Promise<void>;
+  queue(action: "continue" | "discard" | "retry"): Promise<void>;
   stop(): Promise<void>;
   detach(): void;
   follow(onEvent: (event: ApiEvent) => void, onError: (error: unknown) => void): void;
@@ -285,7 +285,7 @@ export class SessionStore {
     catch (error) { this.update({ error: String(error) }); }
   }
 
-  async queue(action: "continue" | "discard"): Promise<void> {
+  async queue(action: "continue" | "discard" | "retry"): Promise<void> {
     try { await this.session.queue(action); }
     catch (error) { this.update({ error: String(error) }); }
   }
@@ -435,6 +435,15 @@ export class SessionStore {
               }] : [];
             })
             : [],
+          failedTurn: data.failedTurn && typeof data.failedTurn === "object"
+            ? (() => {
+              const row = data.failedTurn as Record<string, unknown>;
+              return typeof row.clientMessageId === "string" ? {
+                clientMessageId: row.clientMessageId,
+                text: typeof row.text === "string" ? row.text : "",
+              } : null;
+            })()
+            : null,
           projection: {
             ...this.state.projection,
             running: active,

@@ -246,6 +246,7 @@ pub struct Session {
     turn_started_at: Mutex<Option<String>>,
     cancelling: AtomicBool,
     cancelled: Mutex<HashMap<String, Instant>>,
+    failed_turn: Mutex<Option<Value>>,
     listed: Mutex<bool>,
     title: Mutex<String>,
     updated_at: Mutex<Option<String>>,
@@ -1773,6 +1774,10 @@ impl Session {
             }));
         }
         if self.active_turn().is_some() {
+            *self
+                .failed_turn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             // A turn is already starting/running. The host owns the follow-up
             // prompt, not the composer: queue it, show it in history, and deliver
             // it when the current turn ends.
@@ -1825,6 +1830,10 @@ impl Session {
             .active_client_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(client_message_id.to_string());
+        *self
+            .failed_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         *self
             .turn_started_at
             .lock()
@@ -2000,6 +2009,45 @@ impl Session {
         }
         self.publish_summary();
         Ok(json!({ "status": "running" }))
+    }
+
+    pub fn retry_failed(self: &Arc<Self>) -> Result<Value, ApiError> {
+        let Some(failed) = self
+            .failed_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return Err(ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "no-failed-turn",
+                "There is no failed turn to retry",
+                false,
+            ));
+        };
+        let client_message_id = failed
+            .get("clientMessageId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let text = failed
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
+        let turn = format!("m-{counter}");
+        let prompt = json!({ "id": client_message_id, "type": "prompt", "message": text });
+        self.queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back((turn, prompt));
+        self.queue_paused.store(false, Ordering::SeqCst);
+        if self.active_turn().is_none() {
+            self.start_queued_turn();
+        }
+        self.publish_summary();
+        Ok(json!({ "status": "retrying" }))
     }
 
     pub fn discard_queue(&self) -> Result<Value, ApiError> {
@@ -2387,6 +2435,11 @@ impl Session {
             "status": status.as_str(),
             "activeTurn": active_turn,
             "queue": queue,
+            "failedTurn": self
+                .failed_turn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
             "listed": *self
                 .listed
                 .lock()
@@ -2449,6 +2502,7 @@ impl Session {
             turn_started_at: Mutex::new(None),
             cancelling: AtomicBool::new(false),
             cancelled: Mutex::new(HashMap::new()),
+            failed_turn: Mutex::new(None),
             listed: Mutex::new(false),
             title: Mutex::new(String::new()),
             updated_at: Mutex::new(None),
@@ -2812,6 +2866,25 @@ impl Session {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .take();
+                        let client_id = self
+                            .active_client_message
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        let failed_text = client_id.as_deref().and_then(|id| {
+                            self.messages
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .get(id)
+                                .map(|message| message.text.clone())
+                        });
+                        if let Some(id) = client_id {
+                            *self
+                                .failed_turn
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(json!({ "clientMessageId": id, "text": failed_text.unwrap_or_default() }));
+                        }
                         *self
                             .active_client_message
                             .lock()

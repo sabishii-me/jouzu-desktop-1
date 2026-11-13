@@ -360,7 +360,7 @@ export class HostClient {
     });
   }
 
-  queue(sessionId: string, action: "continue" | "discard"): Promise<unknown> {
+  queue(sessionId: string, action: "continue" | "discard" | "retry"): Promise<unknown> {
     return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/queue`, {
       method: "POST",
       body: JSON.stringify({ action }),
