@@ -13,6 +13,9 @@ export interface ChatModel {
   maxTokens?: number;
   cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
   thinkingLevels?: string[];
+  /** False when the runtime cannot use this model now; `unavailableReason` says why. */
+  available?: boolean;
+  unavailableReason?: string | null;
 }
 export interface SessionStats {
   userMessages?: number;

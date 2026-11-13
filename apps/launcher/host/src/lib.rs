@@ -677,6 +677,14 @@ async fn select_session_model(
     Json(request): Json<SessionModelRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    // Refuse what the runtime cannot use now, instead of accepting it and
+    // running the session on another model.
+    state
+        .models
+        .check_usable(&request.provider, &request.model)
+        .map_err(|reason| {
+            ApiError::new(StatusCode::BAD_REQUEST, "model-unavailable", reason, false)
+        })?;
     let model = session
         .select_model(&request.provider, &request.model)
         .await?;
@@ -3046,6 +3054,28 @@ mod session_tests {
         )
         .unwrap();
         assert_eq!(header["cwd"], spelled.as_str());
+    }
+
+    #[tokio::test]
+    async fn a_model_chosen_before_start_that_fails_is_reported_and_not_shown() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        session.select_model("fixture", "missing").await.unwrap();
+        assert_eq!(session.info()["model"]["id"], "missing");
+        session.send("first", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (events, _) = session.events_after(1);
+        let notice = events
+            .iter()
+            .find(|event| event.event == "session.notice")
+            .expect("a notice for the failed switch");
+        assert_eq!(notice.data["level"], "error");
+        assert!(notice.data["message"].as_str().unwrap().contains("missing"));
+        // The session now shows the model the runtime really uses.
+        assert_eq!(session.info()["model"]["id"], "model", "{}", session.info());
     }
 
     #[tokio::test]

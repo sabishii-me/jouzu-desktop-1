@@ -337,6 +337,9 @@ pub struct Session {
     active_client: Mutex<Option<String>>,
     model: Mutex<Option<Value>>,
     pending_model: Mutex<Option<Value>>,
+    /// The request that applies a model chosen before the runtime started; its
+    /// failure is reported to the user, since nobody is waiting on it.
+    pending_model_request: Mutex<Option<(String, Value)>>,
     pending_thinking: Mutex<Option<String>>,
     subscribers: AtomicU64,
     next_client: AtomicU64,
@@ -885,6 +888,20 @@ impl Session {
             .get("success")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // A model chosen before the runtime started was shown as the session's
+        // model; on failure say it was not applied and show the real one.
+        let deferred_model = {
+            let mut deferred = self
+                .pending_model_request
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match deferred.as_ref() {
+                Some((id, _)) if Some(id.as_str()) == value.get("id").and_then(Value::as_str) => {
+                    deferred.take().map(|(_, model)| model)
+                }
+                _ => None,
+            }
+        };
         if !success {
             let message = value
                 .get("error")
@@ -904,6 +921,18 @@ impl Session {
             // command fails alone: its caller gets the error, and a failed
             // prompt ends its turn. A rejected model switch used to stop the
             // whole session, and every later message got "session-stopped".
+            if let Some(model) = deferred_model {
+                let name = model.get("model").and_then(Value::as_str).unwrap_or("the chosen model");
+                self.publish(
+                    "session.notice",
+                    json!({
+                        "level": "error",
+                        "message": format!("Could not switch to {name}: {message}. This session keeps the runtime's current model."),
+                    }),
+                );
+                self.set_model(None);
+                self.request_state();
+            }
             let handshake = matches!(command, "get_state" | "switch_session" | "get_messages");
             if handshake && matches!(self.status(), Status::Starting | Status::Recovering) {
                 self.recovery_failed(message.to_string());
@@ -2671,6 +2700,11 @@ impl Session {
                 return;
             };
             let request = self.request_id();
+            *self
+                .pending_model_request
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((request.clone(), model.clone()));
             let _ = self.write_command(json!({
                 "id": request,
                 "type": "set_model",
@@ -2743,6 +2777,11 @@ impl Session {
             "status": self.status().as_str(),
             "running": self.status() == Status::Running,
             "runtimePid": self.runtime_pid(),
+            "model": self
+                .model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
             "runtimeParseErrors": self.runtime_parse_errors(),
             "cursor": self.cursor(),
             "pendingApprovals": self.pending_approvals(),
@@ -2904,6 +2943,7 @@ impl Session {
             active_client: Mutex::new(None),
             model: Mutex::new(None),
             pending_model: Mutex::new(None),
+            pending_model_request: Mutex::new(None),
             pending_thinking: Mutex::new(None),
             subscribers: AtomicU64::new(0),
             next_client: AtomicU64::new(0),
