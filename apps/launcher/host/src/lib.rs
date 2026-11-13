@@ -316,10 +316,6 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/compact", axum::routing::post(compact_session))
         .route("/sessions/{id}/export", axum::routing::post(export_session))
         .route("/sessions/{id}/reload", axum::routing::post(reload_session))
-        .route(
-            "/sessions/{id}/command",
-            axum::routing::post(session_command),
-        )
         .route("/sessions/{id}/events", get(session_events))
         .route(
             "/approvals/{id}/decision",
@@ -732,18 +728,6 @@ async fn select_session_thinking(
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
     session.select_thinking(&request.level).await?;
     Ok(Json(json!({ "level": request.level })))
-}
-
-async fn session_command(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-    Json(command): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
-    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
-    let data = session
-        .request(command, Duration::from_secs(30))
-        .await?;
-    Ok(Json(json!({ "data": data })))
 }
 
 /// Usage counters for the status line. A session without a runtime yet has no
@@ -3780,6 +3764,38 @@ mod session_tests {
         manager.hold("window", &other.id);
         assert!(super::withheld(&manager, Some("window"), &event(&shown.id, "message.delta")));
         assert!(!super::withheld(&manager, Some("window"), &event(&other.id, "message.delta")));
+    }
+
+    #[tokio::test]
+    async fn session_operations_have_their_own_routes() {
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().to_str().unwrap();
+        let pending = manager.create_pending(path, None, None).unwrap();
+        let session = manager.create(path, None, None).unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager);
+        let stats = |id: &str| request(Method::GET, &format!("/v1/sessions/{id}/stats")).body(Body::empty()).unwrap();
+        let (status, _, body) = call(app.clone(), stats(&pending.id)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"stats\":null"), "{body}");
+        let (status, _, body) = call(
+            app.clone(),
+            request(Method::POST, &format!("/v1/sessions/{}/export", session.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "outputPath": " " }).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, _, _) = call(
+            app,
+            request(Method::POST, &format!("/v1/sessions/{}/command", session.id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "type": "get_state" }).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK, "raw runtime commands are gone");
     }
 
     #[tokio::test]

@@ -304,8 +304,7 @@ pub struct Session {
     tx: broadcast::Sender<SessionEvent>,
     runtime: Mutex<Option<Arc<RuntimeSupervisor>>>,
     runtime_generation: AtomicU64,
-    recovery_attempts: Mutex<Vec<Instant>>,
-    recovery_scheduled: AtomicBool,
+    restarts: crate::runtime::restart::RestartBudget,
     config: SessionConfig,
     lease_path: PathBuf,
     messages: Mutex<HashMap<String, SentMessage>>,
@@ -858,7 +857,7 @@ impl Session {
 
     fn request_messages(&self) {
         let id = self.request_id();
-        if let Err(error) = self.write_command(json!({ "id": id, "type": "get_messages" })) {
+        if let Err(error) = self.write_command(pi::command::with_id(pi::command::get_messages(), &id)) {
             self.publish(
                 "error",
                 json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
@@ -869,7 +868,7 @@ impl Session {
 
     fn request_state(&self) {
         let id = self.request_id();
-        if let Err(error) = self.write_command(json!({ "id": id, "type": "get_state" })) {
+        if let Err(error) = self.write_command(pi::command::with_id(pi::command::get_state(), &id)) {
             self.publish(
                 "error",
                 json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
@@ -887,11 +886,8 @@ impl Session {
         match existing {
             Some(path) => {
                 let id = self.request_id();
-                let result = self.write_command(json!({
-                    "id": id,
-                    "type": "switch_session",
-                    "sessionPath": path,
-                }));
+                let result =
+                    self.write_command(pi::command::with_id(pi::command::switch_session(&path), &id));
                 if let Err(error) = result {
                     self.publish(
                         "error",
@@ -931,16 +927,18 @@ impl Session {
             }
             return;
         }
-        if command == "prompt"
+        let reply = pi::reply_to(value);
+        if reply == pi::Reply::Prompt
             && value.get("success").and_then(Value::as_bool) == Some(true)
             && value.pointer("/data/disposition").and_then(Value::as_str) == Some("handled")
         {
             self.end_turn_without_run(response_id);
             return;
         }
-        if command == "get_state" {
+        if reply == pi::Reply::GetState {
             if let Some(data) = value.get("data") {
-                if let Some(path) = data.get("sessionFile").and_then(Value::as_str) {
+                let state = pi::State::read(data);
+                if let Some(path) = state.session_file.as_deref() {
                     *self
                         .session_path
                         .lock()
@@ -966,18 +964,16 @@ impl Session {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .is_some();
-                if let (Some(model), false) = (data.get("model"), choice_waiting) {
-                    self.set_model(Some(model.clone()));
+                if let (Some(model), false) = (state.model.clone(), choice_waiting) {
+                    self.set_model(Some(model));
                 }
                 let level_waiting = self
                     .pending_thinking
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .is_some();
-                if let (Some(level), false) =
-                    (data.get("thinkingLevel").and_then(Value::as_str), level_waiting)
-                {
-                    self.set_thinking_level(Some(level.to_string()));
+                if let (Some(level), false) = (state.thinking_level.clone(), level_waiting) {
+                    self.set_thinking_level(Some(level));
                 }
             }
         }
@@ -1031,13 +1027,12 @@ impl Session {
                 self.request_state();
             }
             // A refused level leaves the runtime's own; ask which one that is.
-            if command == "set_thinking_level" {
+            if reply == pi::Reply::SetThinkingLevel {
                 self.request_state();
             }
-            let handshake = matches!(command, "get_state" | "switch_session" | "get_messages");
-            if handshake && matches!(self.status(), Status::Starting | Status::Recovering) {
+            if reply.is_handshake() && matches!(self.status(), Status::Starting | Status::Recovering) {
                 self.recovery_failed(message.to_string());
-            } else if command == "prompt" {
+            } else if reply == pi::Reply::Prompt {
                 self.end_turn(
                     response_id,
                     json!({ "aborted": true, "reason": "runtime-error", "message": message }),
@@ -1045,8 +1040,8 @@ impl Session {
             }
             return;
         }
-        match command {
-            "switch_session" => {
+        match reply {
+            pi::Reply::SwitchSession => {
                 let cancelled = value
                     .get("data")
                     .and_then(|data| data.get("cancelled"))
@@ -1070,7 +1065,7 @@ impl Session {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Handshake::Messages;
                 self.request_messages();
             }
-            "get_messages" => {
+            pi::Reply::GetMessages => {
                 // The host's history is the record. After a runtime restart it
                 // already holds every row (including an interrupted reply the
                 // runtime never saved), so only a fresh attach imports.
@@ -1092,11 +1087,10 @@ impl Session {
                     if self.release_flow_hold.swap(false, Ordering::SeqCst) {
                         // `/flow clear` releases the withheld request and keeps its
                         // receipts. Finish the handshake when the runtime answers.
-                        let release = json!({
-                            "id": FLOW_RELEASE_ID,
-                            "type": "prompt",
-                            "message": "/flow clear",
-                        });
+                        let release = pi::command::with_id(
+                            pi::command::prompt("/flow clear", &[]),
+                            FLOW_RELEASE_ID,
+                        );
                         if self.write_command(release).is_ok() {
                             return;
                         }
@@ -1815,11 +1809,7 @@ impl Session {
         data["state"] = Value::String("expired".to_string());
         data["decision"] = Value::String("expired".to_string());
         data["answeredBy"] = Value::Null;
-        let _ = self.write_command(json!({
-            "type": "extension_ui_response",
-            "id": entry.pi_id,
-            "cancelled": true,
-        }));
+        let _ = self.write_command(pi::command::ui_cancelled(&entry.pi_id));
         self.publish("approval.resolved", data);
         self.restore_running_status();
     }
@@ -1835,11 +1825,7 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(question_id.to_string(), "expired".to_string());
-        let _ = self.write_command(json!({
-            "type": "extension_ui_response",
-            "id": entry.pi_id,
-            "cancelled": true,
-        }));
+        let _ = self.write_command(pi::command::ui_cancelled(&entry.pi_id));
         self.publish(
             "question.cancelled",
             json!({ "questionId": question_id, "reason": "expired" }),
@@ -1967,11 +1953,7 @@ impl Session {
             ));
         }
         let confirmed = decision == "Approve";
-        let response = json!({
-            "type": "extension_ui_response",
-            "id": entry.pi_id,
-            "confirmed": confirmed,
-        });
+        let response = pi::command::ui_confirmed(&entry.pi_id, confirmed);
         if let Err(error) = self.write_command(response) {
             self.pending_approvals
                 .lock()
@@ -2038,11 +2020,7 @@ impl Session {
             .and_then(|item_id| answers.get(item_id))
             .cloned()
             .unwrap_or_default();
-        let response = json!({
-            "type": "extension_ui_response",
-            "id": entry.pi_id,
-            "value": value,
-        });
+        let response = pi::command::ui_value(&entry.pi_id, &value);
         if let Err(error) = self.write_command(response) {
             self.pending_questions
                 .lock()
@@ -2241,11 +2219,8 @@ impl Session {
                 "message.accepted",
                 json!({ "messageId": message_id.clone(), "receipt": "queued" }),
             );
-            let prompt = json!({
-                "id": client_message_id,
-                "type": "prompt",
-                "message": text,
-            });
+            let prompt =
+                pi::command::with_id(pi::command::prompt(text, &[]), client_message_id);
             self.queued_turns
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2334,21 +2309,11 @@ impl Session {
             }),
         );
         self.publish_summary();
-        let mut prompt = json!({
-            "id": client_message_id,
-            "type": "prompt",
-            "message": text,
-        });
-        if !attachments.is_empty() {
-            prompt["images"] = json!(attachments
-                .iter()
-                .map(|attachment| json!({
-                    "type": "image",
-                    "data": attachment.data,
-                    "mimeType": attachment.mime_type,
-                }))
-                .collect::<Vec<_>>());
-        }
+        let images: Vec<(&str, &str)> = attachments
+            .iter()
+            .map(|attachment| (attachment.mime_type.as_str(), attachment.data.as_str()))
+            .collect();
+        let prompt = pi::command::with_id(pi::command::prompt(text, &images), client_message_id);
         if matches!(self.status(), Status::Pending) {
             self.set_status(Status::Starting);
             self.start(true);
@@ -2485,7 +2450,7 @@ impl Session {
             .to_string();
         let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
         let turn = format!("m-{counter}");
-        let prompt = json!({ "id": client_message_id, "type": "prompt", "message": text });
+        let prompt = pi::command::with_id(pi::command::prompt(&text, &[]), &client_message_id);
         self.queued_turns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2546,7 +2511,7 @@ impl Session {
             }
         }
         let id = self.request_id();
-        self.write_command(json!({ "id": id, "type": "abort" }))
+        self.write_command(pi::command::with_id(pi::command::abort(), &id))
     }
 
     pub async fn request(&self, mut command: Value, timeout: Duration) -> Result<Value, ApiError> {
@@ -2706,12 +2671,12 @@ impl Session {
             return Ok(json!({ "provider": provider, "id": model, "name": model }));
         }
         self.request(
-            json!({ "type": "set_model", "provider": provider, "modelId": model }),
+            pi::command::set_model(provider, model),
             Duration::from_secs(30),
         )
         .await?;
         let state = self
-            .request(json!({ "type": "get_state" }), Duration::from_secs(10))
+            .request(pi::command::get_state(), Duration::from_secs(10))
             .await?;
         let selected = state.get("model").cloned().unwrap_or(Value::Null);
         if !selected.is_null() {
@@ -2797,7 +2762,7 @@ impl Session {
             return Ok(json!({ "level": level }));
         }
         self.request(
-            json!({ "type": "set_thinking_level", "level": level }),
+            pi::command::set_thinking_level(level),
             Duration::from_secs(30),
         )
         .await?;
@@ -2824,12 +2789,10 @@ impl Session {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 Some((request.clone(), model.clone()));
-            let _ = self.write_command(json!({
-                "id": request,
-                "type": "set_model",
-                "provider": provider,
-                "modelId": id,
-            }));
+            let _ = self.write_command(pi::command::with_id(
+                pi::command::set_model(provider, id),
+                &request,
+            ));
         }
         let level = self
             .pending_thinking
@@ -2838,11 +2801,10 @@ impl Session {
             .take();
         if let Some(level) = level {
             let request = self.request_id();
-            let _ = self.write_command(json!({
-                "id": request,
-                "type": "set_thinking_level",
-                "level": level,
-            }));
+            let _ = self.write_command(pi::command::with_id(
+                pi::command::set_thinking_level(&level),
+                &request,
+            ));
         }
     }
 
@@ -2856,11 +2818,7 @@ impl Session {
         } else {
             Status::Stopped
         });
-        self.recovery_scheduled.store(false, Ordering::SeqCst);
-        self.recovery_attempts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        self.restarts.reset();
         self.cancel_pending("session-stopped");
         let runtime = self
             .runtime
@@ -3027,8 +2985,7 @@ impl Session {
             tx,
             runtime: Mutex::new(None),
             runtime_generation: AtomicU64::new(0),
-            recovery_attempts: Mutex::new(Vec::new()),
-            recovery_scheduled: AtomicBool::new(false),
+            restarts: Default::default(),
             config: config.clone(),
             lease_path,
             messages: Mutex::new(HashMap::new()),
@@ -3193,7 +3150,7 @@ impl Session {
             .runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
-        self.recovery_scheduled.store(false, Ordering::SeqCst);
+        self.restarts.settle();
         let session = self.clone();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
@@ -3210,12 +3167,13 @@ impl Session {
         if matches!(self.status(), Status::Stopped | Status::Error) {
             return;
         }
-        if self.recovery_scheduled.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let count = self.record_recovery_attempt();
-        if count >= 3 {
-            self.recovery_scheduled.store(false, Ordering::SeqCst);
+        use crate::runtime::restart::Decision;
+        let count = match self.restarts.decide() {
+            Decision::AlreadyScheduled => return,
+            Decision::Restart(count) => count,
+            Decision::GiveUp => 0,
+        };
+        if count == 0 {
             self.set_status(Status::Error);
             self.publish(
                 "error",
@@ -3243,7 +3201,7 @@ impl Session {
 
     async fn restart_runtime(self: &Arc<Self>) {
         if matches!(self.status(), Status::Stopped | Status::Error) {
-            self.recovery_scheduled.store(false, Ordering::SeqCst);
+            self.restarts.settle();
             return;
         }
         let previous = self
@@ -3261,19 +3219,15 @@ impl Session {
     }
 
     fn recovery_failed(self: &Arc<Self>, reason: String) {
-        self.recovery_scheduled.store(false, Ordering::SeqCst);
-        let count = self
-            .recovery_attempts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len();
+        self.restarts.settle();
+        let count = self.restarts.attempts();
         log(
             &self.home,
             "warn",
             "runtime.recovery_failed",
             json!({ "reason": reason, "attempts": count }),
         );
-        if count >= 3 {
+        if self.restarts.exhausted() {
             self.set_status(Status::Error);
             self.publish(
                 "error",
@@ -3292,21 +3246,10 @@ impl Session {
         });
     }
 
-    fn record_recovery_attempt(&self) -> usize {
-        let now = Instant::now();
-        let mut attempts = self
-            .recovery_attempts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        attempts.retain(|attempt| now.duration_since(*attempt) < Duration::from_secs(300));
-        attempts.push(now);
-        attempts.len()
-    }
-
     fn recovery_succeeded(&self) {
         // Attempts are kept for the five-minute window: a runtime that reaches
         // idle and dies again immediately is flapping, not healthy.
-        self.recovery_scheduled.store(false, Ordering::SeqCst);
+        self.restarts.settle();
     }
 
     fn start_queued_turn(self: &Arc<Self>) -> bool {

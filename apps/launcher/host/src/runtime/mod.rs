@@ -6,6 +6,7 @@
 pub mod adapter;
 pub mod job;
 pub mod process;
+pub mod restart;
 pub mod supervisor;
 pub mod warm;
 

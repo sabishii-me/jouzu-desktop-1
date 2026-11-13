@@ -67,6 +67,135 @@ pub fn delta_text(value: &Value) -> &str {
         .unwrap_or("")
 }
 
+/// Commands the host sends. Each returns the record without an id; the
+/// session adds the request id it will match the response by.
+pub mod command {
+    use serde_json::{json, Value};
+
+    /// The same command, carrying the id its response will name.
+    pub fn with_id(mut command: Value, id: &str) -> Value {
+        command["id"] = Value::String(id.to_string());
+        command
+    }
+
+    pub fn get_state() -> Value {
+        json!({ "type": "get_state" })
+    }
+
+    pub fn get_messages() -> Value {
+        json!({ "type": "get_messages" })
+    }
+
+    pub fn get_session_stats() -> Value {
+        json!({ "type": "get_session_stats" })
+    }
+
+    pub fn compact() -> Value {
+        json!({ "type": "compact" })
+    }
+
+    pub fn export_html(output_path: &str) -> Value {
+        json!({ "type": "export_html", "outputPath": output_path })
+    }
+
+    /// Attach the runtime to a saved session file.
+    pub fn switch_session(path: &str) -> Value {
+        json!({ "type": "switch_session", "sessionPath": path })
+    }
+
+    /// A user turn. Images are `(mime, base64)` pairs.
+    pub fn prompt(text: &str, images: &[(&str, &str)]) -> Value {
+        let mut prompt = json!({ "type": "prompt", "message": text });
+        if !images.is_empty() {
+            prompt["images"] = json!(images
+                .iter()
+                .map(|(mime, data)| json!({ "type": "image", "data": data, "mimeType": mime }))
+                .collect::<Vec<_>>());
+        }
+        prompt
+    }
+
+    pub fn abort() -> Value {
+        json!({ "type": "abort" })
+    }
+
+    pub fn set_model(provider: &str, model: &str) -> Value {
+        json!({ "type": "set_model", "provider": provider, "modelId": model })
+    }
+
+    pub fn set_thinking_level(level: &str) -> Value {
+        json!({ "type": "set_thinking_level", "level": level })
+    }
+
+    /// Answers to an extension's approval or question.
+    pub fn ui_cancelled(request: &str) -> Value {
+        json!({ "type": "extension_ui_response", "id": request, "cancelled": true })
+    }
+
+    pub fn ui_confirmed(request: &str, confirmed: bool) -> Value {
+        json!({ "type": "extension_ui_response", "id": request, "confirmed": confirmed })
+    }
+
+    pub fn ui_value(request: &str, value: &str) -> Value {
+        json!({ "type": "extension_ui_response", "id": request, "value": value })
+    }
+
+    /// The command kind, as the runtime names it.
+    pub fn kind(command: &Value) -> Option<&str> {
+        command.get("type").and_then(Value::as_str)
+    }
+}
+
+/// Which command a `response` record answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reply {
+    Prompt,
+    GetState,
+    GetMessages,
+    SwitchSession,
+    SetThinkingLevel,
+    Other,
+}
+
+pub fn reply_to(response: &Value) -> Reply {
+    match response.get("command").and_then(Value::as_str) {
+        Some("prompt") => Reply::Prompt,
+        Some("get_state") => Reply::GetState,
+        Some("get_messages") => Reply::GetMessages,
+        Some("switch_session") => Reply::SwitchSession,
+        Some("set_thinking_level") => Reply::SetThinkingLevel,
+        _ => Reply::Other,
+    }
+}
+
+impl Reply {
+    /// Commands that attach a runtime to its session; their failure fails the start.
+    pub fn is_handshake(self) -> bool {
+        matches!(self, Reply::GetState | Reply::GetMessages | Reply::SwitchSession)
+    }
+}
+
+/// What the runtime reports about itself in a `get_state` answer.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct State {
+    pub session_file: Option<String>,
+    pub model: Option<Value>,
+    pub thinking_level: Option<String>,
+}
+
+impl State {
+    pub fn read(data: &Value) -> Self {
+        Self {
+            session_file: data.get("sessionFile").and_then(Value::as_str).map(str::to_string),
+            model: data.get("model").filter(|model| !model.is_null()).cloned(),
+            thinking_level: data
+                .get("thinkingLevel")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +217,20 @@ mod tests {
             delta_text(&json!({ "assistantMessageEvent": { "type": "text_delta", "delta": "hi" } })),
             "hi"
         );
+    }
+
+    #[test]
+    fn commands_carry_the_runtime_vocabulary() {
+        let prompt = command::with_id(command::prompt("hi", &[("image/png", "AA==")]), "c1");
+        assert_eq!(prompt["id"], "c1");
+        assert_eq!(prompt["type"], "prompt");
+        assert_eq!(prompt["images"][0]["mimeType"], "image/png");
+        assert!(command::prompt("hi", &[]).get("images").is_none());
+        assert_eq!(command::switch_session("a.jsonl")["sessionPath"], "a.jsonl");
+        assert_eq!(command::ui_value("r", "yes")["value"], "yes");
+        let state = State::read(&json!({ "sessionFile": "f", "model": null, "thinkingLevel": "low" }));
+        assert_eq!(state.session_file.as_deref(), Some("f"));
+        assert!(state.model.is_none());
+        assert_eq!(state.thinking_level.as_deref(), Some("low"));
     }
 }
