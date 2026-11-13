@@ -1,7 +1,7 @@
 // Fake pi RPC runtime for host tests. It speaks the real wire shapes:
 // {id,type:"response",...}, extension_ui_request, and agent/message events.
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import readline from "node:readline";
 
 const delay = Number(process.env.FAKE_RUNTIME_DELAY_MS ?? 15);
@@ -9,6 +9,8 @@ const startDelay = Number(process.env.FAKE_RUNTIME_START_DELAY_MS ?? 0);
 const exitOnStart = Number(process.env.FAKE_RUNTIME_EXIT_ON_START_MS ?? 0);
 const crashOnPrompt = process.env.FAKE_RUNTIME_CRASH_ON_PROMPT === "1";
 const tool = process.env.FAKE_RUNTIME_TOOL === "1";
+// Real runtimes answer "handled" when Flow keeps the input and no run starts.
+const handledPrompts = process.env.FAKE_RUNTIME_HANDLED === "1";
 const garbage = process.env.FAKE_RUNTIME_GARBAGE === "1";
 const uiMethod = process.env.FAKE_RUNTIME_UI ?? "";
 const uiTimeout = Number(process.env.FAKE_RUNTIME_UI_TIMEOUT_MS ?? 0);
@@ -117,10 +119,16 @@ function requestUi(text) {
 }
 
 function prompt(id, text) {
+  if (handledPrompts || String(text).startsWith("/flow ")) {
+    if (process.env.FAKE_RUNTIME_PROMPT_LOG) appendFileSync(process.env.FAKE_RUNTIME_PROMPT_LOG, `${text}\n`);
+    response(id, "prompt", { disposition: "handled" });
+    return;
+  }
+  if (process.env.FAKE_RUNTIME_PROMPT_LOG) appendFileSync(process.env.FAKE_RUNTIME_PROMPT_LOG, `${text}\n`);
   busy = true;
   interrupted = false;
   messages.push({ role: "user", content: [{ type: "text", text: String(text) }] });
-  response(id, "prompt", { disposition: "handled" });
+  response(id, "prompt", { disposition: "started" });
   if (crashOnPrompt) {
     setTimeout(() => process.exit(8), 10);
   }

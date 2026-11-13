@@ -155,15 +155,18 @@ export class SessionStore {
   async refreshHistory(): Promise<void> {
     try {
       const page = await this.session.history({ limit: 200 });
+      // The host pages newest first (its in-flight partial row leads the page).
+      // The transcript reads oldest first, so the partial reply ends up last.
+      const rows = [...(page.messages as unknown as Array<Record<string, unknown>>)].reverse();
       let active = -1;
       let messageIndex = -1;
       let partial = false;
-      for (const row of page.messages as unknown as Array<Record<string, unknown>>) {
+      for (const row of rows) {
         if (row.kind === "user" || row.kind === "assistant") messageIndex += 1;
         if (row.partial === true) { active = messageIndex; partial = true; }
       }
       this.active = active;
-      const projection = historyRowsProjection(page.messages);
+      const projection = historyRowsProjection(rows);
       this.update({
         projection: partial ? { ...projection, running: true, turnStartedAt: projection.turnStartedAt ?? Date.now() } : projection,
         pending: partial || this.state.pending,
@@ -215,10 +218,26 @@ export class SessionStore {
       // The host accepted the turn. Stop must be available before the runtime
       // handshake and its turn.start event; waiting for the event leaves the user
       // with no cancel action during a cold start.
+      // Without an early echo the caller showed its own pending row until now;
+      // the accepted message must become a transcript row, or it disappears
+      // when that pending row is cleared.
+      let accepted = this.state.projection.messages;
+      if (!echo) {
+        const turnId = typeof receipt.messageId === "string" ? receipt.messageId : undefined;
+        const row = { role: "user", content, timestamp: now, ...(turnId ? { turnId } : {}) };
+        // A fast reply can start streaming before the POST returns. The user row
+        // belongs before the assistant row of its own turn, never before the reply
+        // of a turn that was already running.
+        const at = turnId ? accepted.findIndex(message => message.role === "assistant" && message.turnId === turnId) : -1;
+        accepted = at >= 0 ? [...accepted.slice(0, at), row, ...accepted.slice(at)] : [...accepted, row];
+        if (at >= 0 && this.active >= at) this.active += 1;
+      }
       this.update({
         pending: true,
         projection: {
           ...this.state.projection,
+          messages: accepted,
+          activeMessage: this.active >= 0 ? this.active : this.state.projection.activeMessage,
           running: true,
           turnStartedAt: this.state.projection.turnStartedAt ?? now,
         },
@@ -478,8 +497,15 @@ export class SessionStore {
         this.update({ pending: true });
         break;
       case "message.start": {
-        const messages = [...this.state.projection.messages, { role: "assistant", content: [], timestamp: Date.now() }];
-        this.active = messages.length - 1;
+        const turnId = typeof data.turnId === "string" ? data.turnId : undefined;
+        const current = this.state.projection.messages;
+        // A follow-up can be accepted (and shown) before the running turn's reply
+        // starts. The reply belongs to its own turn, ahead of later user rows.
+        const own = turnId ? current.findIndex(message => message.role === "user" && message.turnId === turnId) : -1;
+        const later = own < 0 ? -1 : current.findIndex((message, index) => index > own && message.role === "user" && message.turnId !== turnId);
+        const at = later < 0 ? current.length : later;
+        const messages = [...current.slice(0, at), { role: "assistant", content: [], timestamp: Date.now(), ...(turnId ? { turnId } : {}) }, ...current.slice(at)];
+        this.active = at;
         this.update({ projection: { ...this.state.projection, messages, activeMessage: this.active, running: true } });
         break;
       }
