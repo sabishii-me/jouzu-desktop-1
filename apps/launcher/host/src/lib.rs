@@ -231,7 +231,7 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/status", get(host_status))
-        .route("/runtime/warm", get(warm_runtime))
+        .route("/runtime/warm", get(warm_runtime).post(aim_warm_runtime))
         .route(
             "/environment",
             get(read_environment).put(save_environment),
@@ -1162,6 +1162,29 @@ async fn health(State(state): State<AppState>) -> Response {
 struct WarmQuery {
     #[serde(rename = "waitMs")]
     wait_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct AimWarmRequest {
+    #[serde(rename = "workspacePath")]
+    workspace_path: String,
+}
+
+/// The client opened a workspace: warm the runtime for it.
+async fn aim_warm_runtime(
+    State(state): State<AppState>,
+    Json(request): Json<AimWarmRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(pool) = state.sessions.warm_runtime() else {
+        return Ok(Json(json!({ "state": "off" })));
+    };
+    let workspace = std::fs::canonicalize(&request.workspace_path)
+        .map_err(|_| ApiError::bad_request("workspacePath is unavailable"))?;
+    if !workspace.is_dir() || !state.sessions.workspace_allowed(&request.workspace_path) {
+        return Err(ApiError::bad_request("workspacePath must be a known folder"));
+    }
+    pool.aim(&workspace);
+    Ok(Json(pool.status()))
 }
 
 /// The warm runtime's state. With `waitMs`, waits until it is ready or failed
@@ -2842,12 +2865,12 @@ mod session_tests {
     async fn a_new_session_takes_the_warm_runtime_and_the_pool_starts_the_next() {
         let (manager, _home, workspace) = manager(50);
         let pool = manager.enable_warm_runtime().expect("warm pool");
-        let status = pool.wait_settled(Duration::from_secs(10)).await;
-        assert_eq!(status["state"], "ready", "{status}");
-        let warm_pid = status["pid"].as_u64().unwrap() as u32;
         let session = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
+        let status = pool.wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(status["state"], "ready", "{status}");
+        let warm_pid = status["pid"].as_u64().unwrap() as u32;
         session.send("first", "hello").unwrap();
         assert_eq!(session.runtime_pid(), Some(warm_pid));
         wait_status(&session, Status::Idle).await;
@@ -2889,11 +2912,11 @@ mod session_tests {
         let (manager, _home, workspace) =
             manager_with_env(50, &[("FAKE_RUNTIME_START_DELAY_MS", "500")]);
         let pool = manager.enable_warm_runtime().expect("warm pool");
-        assert_eq!(pool.status()["state"], "starting");
-        let warm_pid = pool.status()["pid"].as_u64().unwrap() as u32;
         let session = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
+        assert_eq!(pool.status()["state"], "starting");
+        let warm_pid = pool.status()["pid"].as_u64().unwrap() as u32;
         session.send("first", "hello").unwrap();
         assert_eq!(session.runtime_pid(), Some(warm_pid));
         wait_status(&session, Status::Idle).await;
@@ -2934,6 +2957,32 @@ mod session_tests {
         let value: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["state"], "ready", "{value}");
         assert!(value["readyMs"].as_u64().unwrap() >= 300, "{value}");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_new_session_aims_the_warm_runtime_at_its_folder() {
+        let (manager, _home, workspace) = manager(50);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let scratch = pool.wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(scratch["state"], "ready", "{scratch}");
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        let aimed = pool.wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(aimed["state"], "ready", "{aimed}");
+        assert_ne!(aimed["pid"], scratch["pid"]);
+        let folder = std::fs::canonicalize(workspace.path()).unwrap();
+        assert_eq!(aimed["workspace"], folder.to_string_lossy().as_ref());
+        session.send("first", "hello").unwrap();
+        assert_eq!(
+            session.runtime_pid(),
+            Some(aimed["pid"].as_u64().unwrap() as u32)
+        );
+        wait_status(&session, Status::Idle).await;
+        // The next warm runtime is for the same folder, and remembered.
+        let next = pool.wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(next["workspace"], aimed["workspace"]);
         manager.stop_all();
     }
 

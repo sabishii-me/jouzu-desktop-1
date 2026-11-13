@@ -969,7 +969,8 @@ impl Session {
         // runtime booting beside this one would slow down the one the user waits for.
         if let Some(pool) = self.config.warm.get() {
             let pool = pool.clone();
-            tokio::spawn(async move { pool.fill() });
+            let workspace = PathBuf::from(&self.workspace_path);
+            tokio::spawn(async move { pool.aim(&workspace) });
         }
         // A cancelled starting turn has no prompt to flush. Complete the
         // handshake bookkeeping first, then go idle; never go idle while
@@ -2935,12 +2936,19 @@ impl Session {
             .is_some();
         if let (true, Some(pool)) = (has_file, self.config.warm.get()) {
             let before = pool.status();
-            if let Some(runtime) = pool.take(event_tx.clone()) {
+            if let Some((runtime, matched)) =
+                pool.take(event_tx.clone(), Path::new(&self.workspace_path))
+            {
                 log(
                     &self.home,
                     "info",
                     "runtime.warm_taken",
-                    json!({ "session": self.id, "pid": runtime.pid(), "warm": before }),
+                    json!({
+                        "session": self.id,
+                        "pid": runtime.pid(),
+                        "sameWorkspace": matched,
+                        "warm": before,
+                    }),
                 );
                 self.install_runtime(runtime, event_rx);
                 return true;
@@ -4342,6 +4350,9 @@ impl SessionManager {
         if matches!(status, Status::Starting) {
             let starting = session.clone();
             tokio::spawn(async move { starting.start(false) });
+        } else if let Some(pool) = config.warm.get() {
+            // A new session: the user is typing; warm for its folder meanwhile.
+            pool.aim(&workspace);
         }
         Ok(session)
     }
@@ -4353,15 +4364,17 @@ impl SessionManager {
         let scratch = WarmPool::scratch(&config.home);
         let events = config.events.clone();
         let spawn = config.clone();
+        let memory = config.home.join("warm-workspace.txt");
         let pool = config.warm.get_or_init(|| {
             WarmPool::new(
-                move || SpawnSpec {
+                move |workspace| SpawnSpec {
                     program: spawn.spec.program.clone(),
                     args: spawn.spec.args.clone(),
                     env: spawn.environment(None, None),
-                    workspace: scratch.clone(),
+                    workspace: workspace.map(Path::to_path_buf).unwrap_or_else(|| scratch.clone()),
                     low_priority: true,
                 },
+                Some(memory),
                 move |status| {
                     if let Some(events) = &events {
                         events.publish_control("runtime.warm", status);

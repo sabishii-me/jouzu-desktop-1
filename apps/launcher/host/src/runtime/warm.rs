@@ -1,5 +1,10 @@
 //! A runtime started ahead of need.
 //!
+//! The runtime loads its extensions for one folder: switching it to a session in
+//! another folder loads them all again (about 10 s on a normal Windows machine),
+//! while a switch within the same folder takes about a second. So the pool warms
+//! for one workspace: the one the user last worked in.
+//!
 //! Starting a runtime costs seconds to minutes on a busy machine (Node start plus
 //! extension imports). The pool starts one in the background, below normal
 //! priority, before anyone asks for it. A session that needs a runtime takes the
@@ -8,7 +13,7 @@
 //! drains the runtime's output itself so its pipes never fill.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -49,6 +54,7 @@ impl WarmState {
 
 struct Slot {
     generation: u64,
+    workspace: Option<PathBuf>,
     runtime: Arc<RuntimeSupervisor>,
     /// Where the runtime's events go once a session takes it.
     target: Arc<Mutex<Option<mpsc::Sender<RuntimeEvent>>>>,
@@ -63,10 +69,14 @@ struct Inner {
     error: Option<String>,
     failures: usize,
     taken: u64,
+    /// The workspace to warm for; `None` warms in a scratch folder, which still
+    /// saves the Node start.
+    target: Option<PathBuf>,
 }
 
 pub struct WarmPool {
-    spec: Box<dyn Fn() -> SpawnSpec + Send + Sync>,
+    spec: Box<dyn Fn(Option<&Path>) -> SpawnSpec + Send + Sync>,
+    memory: Option<PathBuf>,
     inner: Mutex<Inner>,
     changed: Box<dyn Fn(Value) + Send + Sync>,
     ready: Notify,
@@ -76,12 +86,21 @@ impl WarmPool {
     /// `spec` builds the spawn spec for a warm runtime (no session-specific
     /// environment, a scratch working folder). `changed` is told the pool's
     /// state each time it changes.
+    ///
+    /// `memory` is a file that keeps the target workspace across host restarts.
     pub fn new(
-        spec: impl Fn() -> SpawnSpec + Send + Sync + 'static,
+        spec: impl Fn(Option<&Path>) -> SpawnSpec + Send + Sync + 'static,
+        memory: Option<PathBuf>,
         changed: impl Fn(Value) + Send + Sync + 'static,
     ) -> Arc<Self> {
+        let target = memory
+            .as_ref()
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .map(|text| PathBuf::from(text.trim()))
+            .filter(|path| path.is_dir());
         Arc::new(Self {
             spec: Box::new(spec),
+            memory,
             inner: Mutex::new(Inner {
                 state: WarmState::Off,
                 slot: None,
@@ -91,6 +110,7 @@ impl WarmPool {
                 error: None,
                 failures: 0,
                 taken: 0,
+                target,
             }),
             changed: Box::new(changed),
             ready: Notify::new(),
@@ -114,6 +134,12 @@ impl WarmPool {
             "error": inner.error,
             "taken": inner.taken,
             "pid": inner.slot.as_ref().map(|slot| slot.runtime.pid()),
+            "workspace": inner
+                .slot
+                .as_ref()
+                .and_then(|slot| slot.workspace.as_ref())
+                .or(inner.target.as_ref())
+                .map(|path| path.to_string_lossy().into_owned()),
         })
     }
 
@@ -124,7 +150,7 @@ impl WarmPool {
 
     /// Start a warm runtime unless one is already there or starting.
     pub fn fill(self: &Arc<Self>) {
-        let generation = {
+        let (generation, workspace) = {
             let mut inner = self.lock();
             if inner.slot.is_some() || inner.failures >= MAX_FAILURES {
                 return;
@@ -134,9 +160,9 @@ impl WarmPool {
             inner.started_at = Some(Instant::now());
             inner.ready_ms = None;
             inner.error = None;
-            inner.generation
+            (inner.generation, inner.target.clone())
         };
-        let mut spec = (self.spec)();
+        let mut spec = (self.spec)(workspace.as_deref());
         spec.low_priority = true;
         if let Err(error) = std::fs::create_dir_all(&spec.workspace) {
             self.failed(generation, format!("Could not prepare the warm-up folder: {error}"));
@@ -155,6 +181,7 @@ impl WarmPool {
             let mut inner = self.lock();
             inner.slot = Some(Slot {
                 generation,
+                workspace,
                 runtime: runtime.clone(),
                 target: target.clone(),
             });
@@ -280,7 +307,15 @@ impl WarmPool {
     /// on, it runs at normal priority, and the pool starts the next one. A
     /// runtime that is still starting is handed over too: the session waits for
     /// less than it would for a new one.
-    pub fn take(self: &Arc<Self>, events: mpsc::Sender<RuntimeEvent>) -> Option<Arc<RuntimeSupervisor>> {
+    ///
+    /// A runtime warmed for another folder is still handed over: the switch
+    /// reloads the extensions, but the Node start is saved. The second value
+    /// says whether it was warmed for `workspace`.
+    pub fn take(
+        self: &Arc<Self>,
+        events: mpsc::Sender<RuntimeEvent>,
+        workspace: &Path,
+    ) -> Option<(Arc<RuntimeSupervisor>, bool)> {
         let slot = {
             let mut inner = self.lock();
             let slot = inner.slot.take()?;
@@ -299,7 +334,46 @@ impl WarmPool {
         process::set_low_priority(slot.runtime.pid(), false);
         self.notify();
         // The session refills the pool once its own runtime has answered.
-        Some(slot.runtime)
+        let matched = slot
+            .workspace
+            .as_deref()
+            .is_some_and(|warm| same_folder(warm, workspace));
+        Some((slot.runtime, matched))
+    }
+
+    /// Warm for `workspace` from now on. An unused runtime warmed for another
+    /// folder is replaced; then the pool fills.
+    pub fn aim(self: &Arc<Self>, workspace: &Path) {
+        let stale = {
+            let mut inner = self.lock();
+            let same = inner
+                .target
+                .as_deref()
+                .is_some_and(|target| same_folder(target, workspace));
+            if !same {
+                inner.target = Some(workspace.to_path_buf());
+                if let Some(file) = &self.memory {
+                    let _ = std::fs::write(file, workspace.to_string_lossy().as_bytes());
+                }
+            }
+            let slot_elsewhere = inner.slot.as_ref().is_some_and(|slot| {
+                !slot
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|warm| same_folder(warm, workspace))
+            });
+            if slot_elsewhere {
+                inner.generation += 1;
+                inner.state = WarmState::Off;
+                inner.slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(slot) = stale {
+            slot.runtime.terminate();
+        }
+        self.fill();
     }
 
     /// A session needs a runtime but none is warm: allow the pool to try again
@@ -350,8 +424,21 @@ impl WarmPool {
         }
     }
 
-    /// The folder warm runtimes start in, under the host home.
+    /// The folder warm runtimes start in when no workspace is known yet.
     pub fn scratch(home: &std::path::Path) -> PathBuf {
         home.join("warm")
     }
+}
+
+fn same_folder(left: &Path, right: &Path) -> bool {
+    let normalize = |path: &Path| {
+        let text = path.to_string_lossy().replace('\\', "/");
+        let text = text.strip_prefix("//?/").unwrap_or(&text).trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            text.to_lowercase()
+        } else {
+            text
+        }
+    };
+    normalize(left) == normalize(right)
 }
