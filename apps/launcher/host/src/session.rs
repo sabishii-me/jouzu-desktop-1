@@ -243,6 +243,8 @@ pub struct Session {
     active_message: Mutex<Option<String>>,
     active_client_message: Mutex<Option<String>>,
     turn_started_at: Mutex<Option<String>>,
+    cancelling: AtomicBool,
+    cancelled: Mutex<HashMap<String, Instant>>,
     listed: Mutex<bool>,
     title: Mutex<String>,
     updated_at: Mutex<Option<String>>,
@@ -1110,6 +1112,7 @@ impl Session {
                     .turn_started_at
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                self.cancelling.store(false, Ordering::SeqCst);
                 if !self.start_queued_turn() {
                     self.set_status(Status::Idle);
                 }
@@ -1692,6 +1695,18 @@ impl Session {
             }
             _ => {}
         }
+        let now = Instant::now();
+        let cancelled = {
+            let mut tombstones = self
+                .cancelled
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tombstones.retain(|_, until| *until > now);
+            tombstones.remove(client_message_id).is_some()
+        };
+        if cancelled {
+            return Ok(json!({ "receipt": "cancelled" }));
+        }
         let mut messages = self
             .messages
             .lock()
@@ -1879,6 +1894,56 @@ impl Session {
         );
         drop(messages);
         Ok(json!({ "messageId": message_id, "receipt": "queued" }))
+    }
+
+    pub fn cancel_message(&self, client_message_id: &str) -> Result<Value, ApiError> {
+        let active = self
+            .active_client_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if active.as_deref() == Some(client_message_id) {
+            match self.status() {
+                Status::Running | Status::WaitingApproval | Status::WaitingQuestion => {
+                    self.cancelling.store(true, Ordering::SeqCst);
+                    self.interrupt()?;
+                    self.publish_summary();
+                    return Ok(json!({ "status": "cancelling" }));
+                }
+                Status::Starting | Status::Recovering => {
+                    self.interrupt()?;
+                    self.publish_summary();
+                    return Ok(json!({ "status": "cancelled" }));
+                }
+                _ => {}
+            }
+        }
+        let removed = {
+            let mut queue = self
+                .queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = queue.len();
+            queue.retain(|(_, prompt)| {
+                prompt.get("id").and_then(Value::as_str) != Some(client_message_id)
+            });
+            before != queue.len()
+        };
+        if removed {
+            self.publish_summary();
+            return Ok(json!({ "status": "cancelled" }));
+        }
+        let now = Instant::now();
+        let mut cancelled = self
+            .cancelled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cancelled.retain(|_, until| *until > now);
+        cancelled.insert(
+            client_message_id.to_string(),
+            now + std::time::Duration::from_secs(300),
+        );
+        Ok(json!({ "status": "tombstoned" }))
     }
 
     pub fn interrupt(&self) -> Result<(), ApiError> {
@@ -2198,10 +2263,14 @@ impl Session {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
             .map(|turn| {
-                let phase = match status {
-                    Status::Starting | Status::Recovering => "starting",
-                    Status::Running | Status::WaitingApproval | Status::WaitingQuestion => "running",
-                    _ => "accepted",
+                let phase = if self.cancelling.load(Ordering::Relaxed) {
+                    "cancelling"
+                } else {
+                    match status {
+                        Status::Starting | Status::Recovering => "starting",
+                        Status::Running | Status::WaitingApproval | Status::WaitingQuestion => "running",
+                        _ => "accepted",
+                    }
                 };
                 json!({
                     "turnId": turn,
@@ -2301,6 +2370,8 @@ impl Session {
             active_message: Mutex::new(None),
             active_client_message: Mutex::new(None),
             turn_started_at: Mutex::new(None),
+            cancelling: AtomicBool::new(false),
+            cancelled: Mutex::new(HashMap::new()),
             listed: Mutex::new(false),
             title: Mutex::new(String::new()),
             updated_at: Mutex::new(None),

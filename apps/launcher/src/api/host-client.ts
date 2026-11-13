@@ -353,6 +353,13 @@ export class HostClient {
     return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/interrupt`, { method: "POST" });
   }
 
+  cancel(sessionId: string, clientMessageId: string): Promise<unknown> {
+    return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/cancel`, {
+      method: "POST",
+      body: JSON.stringify({ clientMessageId }),
+    });
+  }
+
   stop(sessionId: string): Promise<unknown> {
     return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/stop`, { method: "POST" });
   }

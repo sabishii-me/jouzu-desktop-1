@@ -295,6 +295,10 @@ pub fn router(state: AppState) -> Router {
             "/sessions/{id}/interrupt",
             axum::routing::post(interrupt_session),
         )
+        .route(
+            "/sessions/{id}/cancel",
+            axum::routing::post(cancel_session),
+        )
         .route("/sessions/{id}/stop", axum::routing::post(stop_session))
         .route(
             "/sessions/{id}/command",
@@ -689,6 +693,21 @@ async fn interrupt_session(
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
     session.interrupt()?;
     Ok(Json(json!({ "status": session.status().as_str() })))
+}
+
+async fn cancel_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<CancelRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    Ok(Json(session.cancel_message(&request.client_message_id)?))
+}
+
+#[derive(Deserialize)]
+struct CancelRequest {
+    #[serde(rename = "clientMessageId")]
+    client_message_id: String,
 }
 
 async fn stop_session(

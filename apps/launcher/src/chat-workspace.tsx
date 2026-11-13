@@ -121,6 +121,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [localSubmitted, setLocalSubmitted] = useState("");
   const sendCancelRef = useRef(false);
   const sendKeyRef = useRef<string | null>(null);
+  const sendClientIdRef = useRef<string | null>(null);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const queueSessionKey = sessionKeyOf(snapshot.sessionFile, selectedSession ?? path);
   const queuedSteers = queueSessionKey ? queuedBySession[queueSessionKey] ?? [] : [];
@@ -610,12 +611,15 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setLocalSubmitted("");
     const key = sendKeyRef.current;
     if (key) setPendingBySession(previous => clearPending(previous, key));
-    if (!switchingRef.current) void connection.current?.abort();
+    const clientMessageId = sendClientIdRef.current;
+    if (clientMessageId) void connection.current?.cancel(clientMessageId);
+    else if (!switchingRef.current) void connection.current?.abort();
   }
   async function send() {
     // A send is locally accepted before the session attach and the host round-trip.
     // The Stop button and the pending row must exist during that window.
     sendCancelRef.current = false;
+    sendClientIdRef.current = crypto.randomUUID();
     setSendPending(true);
     setLocalSubmitted(draft);
     // A new session replaces the connection after it attaches. Waiting here keeps
@@ -655,14 +659,14 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setCommandBusy(true);
     try {
       if (!await ensureSelectedSession(client)) { setNotification("The session is still opening."); return; }
-      if (sendCancelRef.current) { connection.current?.abort(); return; }
+      if (sendCancelRef.current) { connection.current?.cancel(sendClientIdRef.current ?? ""); return; }
       client = connection.current;
       if (!client) return;
-      if (sendCancelRef.current) { void client.abort(); return; }
+      if (sendCancelRef.current) { void client.cancel(sendClientIdRef.current ?? ""); return; }
       const running = client.snapshot.projection.running;
       const queueKey = sessionKeyOf(client.snapshot.sessionFile, selectedSession ?? path);
       if (running && queueKey) setQueuedBySession(previous => ({ ...previous, [queueKey]: [...(previous[queueKey] ?? []), value] }));
-      try { await client.sendOrSteer(value, submitted.map(item => item.image), running); }
+      try { await client.sendOrSteer(value, submitted.map(item => item.image), running, sendClientIdRef.current ?? undefined); }
       catch (error) {
         if (running && queueKey) setQueuedBySession(previous => {
           const items = previous[queueKey] ?? [];
@@ -1193,9 +1197,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // sessionFile: a new pending session has no file yet, which hid Stop during
   // the first turn.
   const composerRunning = snapshot.projection.running;
-  // Stop belongs to a host-accepted turn. The optimistic pending flag must not
-  // create a Stop before the host can actually cancel the send.
-  const composerStarting = false;
+  // A cancel token is sent with the clientMessageId, so Stop can be offered as
+  // soon as the local outbox exists.
+  const composerStarting = (snapshot.pending || sendPending) && !composerRunning;
   const [appView, setAppView] = useState<"chat" | "artifacts">("chat");
   const [artifactCounts, setArtifactCounts] = useState<Record<string, number>>({});
   const [panes, setPanes] = useState<Array<{ tabs: string[]; active: string; width: number }>>([]);

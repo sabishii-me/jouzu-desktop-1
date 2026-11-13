@@ -23,6 +23,7 @@ export interface SessionPort {
   history(page?: { limit?: number; before?: number }): Promise<HistoryPage>;
   send(message: { clientMessageId: string; text: string; attachments?: Attachment[] }): Promise<Receipt>;
   interrupt(): Promise<void>;
+  cancel(clientMessageId: string): Promise<void>;
   stop(): Promise<void>;
   detach(): void;
   follow(onEvent: (event: ApiEvent) => void, onError: (error: unknown) => void): void;
@@ -83,7 +84,13 @@ export class SessionStore {
   static attach(session: SessionPort, onDispose?: () => void, api?: JouzuApi): SessionStore {
     const store = new SessionStore(session, onDispose);
     store.api = api;
-    store.resume();
+    if (api) {
+      store.resume();
+    } else {
+      // Unit tests and legacy direct attach keep the per-session fake path.
+      store.following = true;
+      session.follow(event => store.handle(event), error => store.fail(error));
+    }
     return store;
   }
 
@@ -154,7 +161,7 @@ export class SessionStore {
     }
   }
 
-  async sendOrSteer(text: string, images: readonly ChatImage[] = [], _running = false): Promise<void> {
+  async sendOrSteer(text: string, images: readonly ChatImage[] = [], _running = false, clientMessageId: string = crypto.randomUUID()): Promise<Receipt> {
     // A running turn accepts a follow-up too; the host queues it and delivers it
     // after the current turn. The client only owns a local echo for display.
     const now = Date.now();
@@ -169,8 +176,8 @@ export class SessionStore {
       projection: { ...this.state.projection, messages, activeMessage: null },
     });
     try {
-      await this.session.send({
-        clientMessageId: crypto.randomUUID(),
+      const receipt = await this.session.send({
+        clientMessageId,
         text,
         attachments: images.map((image, index) => ({
           name: `image-${index + 1}`,
@@ -178,6 +185,18 @@ export class SessionStore {
           data: image.data,
         })),
       });
+      if (receipt.receipt === "cancelled") {
+        this.update({
+          pending: false,
+          projection: {
+            ...this.state.projection,
+            messages: this.state.projection.messages.filter(message => !(message.role === "user" && message.timestamp === now)),
+            running: false,
+            turnStartedAt: undefined,
+          },
+        });
+        return receipt;
+      }
       // The host accepted the turn. Stop must be available before the runtime
       // handshake and its turn.start event; waiting for the event leaves the user
       // with no cancel action during a cold start.
@@ -189,6 +208,7 @@ export class SessionStore {
           turnStartedAt: this.state.projection.turnStartedAt ?? now,
         },
       });
+      return receipt;
     } catch (error) {
       this.update({ pending: false, error: String(error) });
       throw error;
@@ -250,6 +270,11 @@ export class SessionStore {
 
   async abort(): Promise<void> {
     try { await this.session.interrupt(); }
+    catch (error) { this.update({ error: String(error) }); }
+  }
+
+  async cancel(clientMessageId: string): Promise<void> {
+    try { await this.session.cancel(clientMessageId); }
     catch (error) { this.update({ error: String(error) }); }
   }
 
