@@ -2274,6 +2274,35 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_queued_follow_up_is_listed_after_the_reply_it_waited_for() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("first", "one").unwrap();
+        wait_status(&session, Status::Running).await;
+        session.send("second", "two").unwrap();
+        wait_until(|| {
+            session.status() == Status::Idle
+                && session.history(50, None)["messages"]
+                    .as_array()
+                    .is_some_and(|rows| rows.len() == 4)
+        })
+        .await;
+        let history = session.history(50, None);
+        let mut rows: Vec<String> = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| format!("{}:{}", row["kind"].as_str().unwrap_or(""), row["text"].as_str().unwrap_or("")))
+            .collect();
+        rows.reverse();
+        assert_eq!(rows, vec!["user:one", "assistant:one", "user:two", "assistant:two"], "{history}");
+        assert!(history["messages"].as_array().unwrap().iter().all(|row| row.get("queued").is_none()));
+    }
+
+    #[tokio::test]
     async fn a_handled_prompt_ends_the_turn_without_a_run() {
         let (manager, _home, workspace) = manager_with_env(50, &[("FAKE_RUNTIME_HANDLED", "1")]);
         let session = manager

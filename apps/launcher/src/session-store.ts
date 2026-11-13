@@ -218,10 +218,24 @@ export class SessionStore {
       // The host accepted the turn. Stop must be available before the runtime
       // handshake and its turn.start event; waiting for the event leaves the user
       // with no cancel action during a cold start.
+      // Without an early echo the caller showed its own pending row until now;
+      // the accepted message must become a transcript row, or it disappears
+      // when that pending row is cleared.
+      let accepted = this.state.projection.messages;
+      if (!echo) {
+        const row = { role: "user", content, timestamp: now };
+        // A fast reply can start streaming before the POST returns. The user row
+        // belongs before the assistant row of its own turn (not of a running one).
+        const at = _running ? -1 : accepted.findIndex(message => message.role === "assistant" && (message.timestamp ?? 0) >= now);
+        accepted = at >= 0 ? [...accepted.slice(0, at), row, ...accepted.slice(at)] : [...accepted, row];
+        if (at >= 0 && this.active >= at) this.active += 1;
+      }
       this.update({
         pending: true,
         projection: {
           ...this.state.projection,
+          messages: accepted,
+          activeMessage: this.active >= 0 ? this.active : this.state.projection.activeMessage,
           running: true,
           turnStartedAt: this.state.projection.turnStartedAt ?? now,
         },

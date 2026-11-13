@@ -422,6 +422,30 @@ impl Session {
             .push(row);
     }
 
+    /// A queued follow-up is recorded when it is accepted, while the previous
+    /// turn is still running. When it starts, move its user row after that turn's
+    /// reply so history reads in the order the conversation happened.
+    fn place_started_row(&self, turn: &str) {
+        let id = format!("{turn}:user");
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(at) = history
+            .iter()
+            .position(|row| row.get("id").and_then(Value::as_str) == Some(id.as_str()))
+        else {
+            return;
+        };
+        let mut row = history.remove(at);
+        let cursor = self.history_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(object) = row.as_object_mut() {
+            object.remove("queued");
+            object.insert("cursor".to_string(), json!(cursor));
+        }
+        history.push(row);
+    }
+
     fn now_iso() -> String {
         Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
     }
@@ -2838,6 +2862,7 @@ impl Session {
         else {
             return false;
         };
+        self.place_started_row(&turn);
         *self
             .active_message
             .lock()
