@@ -2018,13 +2018,13 @@ impl Session {
         // Do not write a queued prompt until the replacement runtime has completed
         // its handshake. A Recovering session starts the queue from the handshake
         // path, not from this command.
-        if self.status() == Status::Idle && self.active_turn().is_none() {
-            if !self.start_queued_turn() {
-                self.set_status(Status::Idle);
-            }
-        }
+        let started = if self.status() == Status::Idle && self.active_turn().is_none() {
+            self.start_queued_turn()
+        } else {
+            false
+        };
         self.publish_summary();
-        Ok(json!({ "status": "running" }))
+        Ok(json!({ "status": if started { "running" } else { "queued" } }))
     }
 
     pub fn retry_failed(self: &Arc<Self>) -> Result<Value, ApiError> {
@@ -2057,7 +2057,7 @@ impl Session {
         self.queued_turns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_back((turn, prompt));
+            .push_front((turn, prompt));
         self.queue_paused.store(false, Ordering::SeqCst);
         if self.active_turn().is_none() {
             self.start_queued_turn();
@@ -2772,7 +2772,15 @@ impl Session {
         );
         self.set_status(Status::Running);
         self.publish_summary();
-        if let Err(error) = self.write_command(prompt) {
+        if let Err(error) = self.write_command(prompt.clone()) {
+            self.queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_front((turn.clone(), prompt));
+            *self
+                .active_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             self.publish(
                 "error",
                 json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),

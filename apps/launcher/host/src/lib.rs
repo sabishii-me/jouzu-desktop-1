@@ -979,6 +979,7 @@ async fn global_events(
         .unwrap_or(0);
     let latest = state.events.latest_seq();
     let summaries = state.sessions.summaries();
+    let sessions = state.sessions.clone();
     let mut receiver = state.events.subscribe();
     let events = state.events.clone();
     let stream = async_stream::stream! {
@@ -1001,6 +1002,12 @@ async fn global_events(
                     latest,
                     json!({ "reason": "event-gap", "latestSeq": latest }),
                 ));
+                for mut summary in sessions.summaries() {
+                    if let Some(object) = summary.as_object_mut() {
+                        object.insert("seq".to_string(), json!(latest));
+                    }
+                    yield Ok::<_, Infallible>(sse_data("session.updated", latest, summary));
+                }
             } else {
                 for event in replay {
                     last = event.seq;
