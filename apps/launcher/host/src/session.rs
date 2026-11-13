@@ -237,6 +237,7 @@ pub struct Session {
     lease_path: PathBuf,
     messages: Mutex<HashMap<String, SentMessage>>,
     queued_turns: Mutex<VecDeque<(String, Value)>>,
+    queue_paused: AtomicBool,
     pending_prompts: Mutex<Vec<Value>>,
     next_message: AtomicU64,
     next_request: AtomicU64,
@@ -1946,7 +1947,35 @@ impl Session {
         Ok(json!({ "status": "tombstoned" }))
     }
 
+    pub fn continue_queue(self: &Arc<Self>) -> Result<Value, ApiError> {
+        self.queue_paused.store(false, Ordering::SeqCst);
+        if self.active_turn().is_none() && !self.start_queued_turn() {
+            self.set_status(Status::Idle);
+        }
+        self.publish_summary();
+        Ok(json!({ "status": "running" }))
+    }
+
+    pub fn discard_queue(&self) -> Result<Value, ApiError> {
+        self.queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.queue_paused.store(false, Ordering::SeqCst);
+        self.publish_summary();
+        Ok(json!({ "status": "discarded" }))
+    }
+
     pub fn interrupt(&self) -> Result<(), ApiError> {
+        if !self
+            .queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
+            self.queue_paused.store(true, Ordering::SeqCst);
+            self.publish_summary();
+        }
         // A pending turn can still be parked before the runtime handshake. There is
         // nothing in the runtime to abort yet, so remove the queued prompt and end
         // the turn here; otherwise a Stop during `starting` is a no-op.
@@ -2296,7 +2325,7 @@ impl Session {
                 json!({
                     "turnId": turn_id,
                     "clientMessageId": prompt.get("id").and_then(Value::as_str),
-                    "state": "queued",
+                    "state": if self.queue_paused.load(Ordering::Relaxed) { "paused" } else { "queued" },
                 })
             })
             .collect();
@@ -2364,6 +2393,7 @@ impl Session {
             lease_path,
             messages: Mutex::new(HashMap::new()),
             queued_turns: Mutex::new(VecDeque::new()),
+            queue_paused: AtomicBool::new(false),
             pending_prompts: Mutex::new(Vec::new()),
             next_message: AtomicU64::new(0),
             next_request: AtomicU64::new(0),
@@ -2586,6 +2616,9 @@ impl Session {
     }
 
     fn start_queued_turn(self: &Arc<Self>) -> bool {
+        if self.queue_paused.load(Ordering::Relaxed) {
+            return false;
+        }
         let Some((turn, prompt)) = self
             .queued_turns
             .lock()

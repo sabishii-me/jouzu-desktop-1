@@ -299,6 +299,10 @@ pub fn router(state: AppState) -> Router {
             "/sessions/{id}/cancel",
             axum::routing::post(cancel_session),
         )
+        .route(
+            "/sessions/{id}/queue",
+            axum::routing::post(queue_session),
+        )
         .route("/sessions/{id}/stop", axum::routing::post(stop_session))
         .route(
             "/sessions/{id}/command",
@@ -702,6 +706,24 @@ async fn cancel_session(
 ) -> Result<Json<Value>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
     Ok(Json(session.cancel_message(&request.client_message_id)?))
+}
+
+async fn queue_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<QueueRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    match request.action.as_str() {
+        "continue" => Ok(Json(session.continue_queue()?)),
+        "discard" => Ok(Json(session.discard_queue()?)),
+        _ => Err(ApiError::bad_request("queue action must be continue or discard")),
+    }
+}
+
+#[derive(Deserialize)]
+struct QueueRequest {
+    action: String,
 }
 
 #[derive(Deserialize)]
