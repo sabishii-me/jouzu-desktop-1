@@ -44,6 +44,8 @@ use tokio::{io::AsyncReadExt, sync::broadcast};
 
 pub const COOKIE_NAME: &str = "jouzu_host";
 pub const HOST_SCHEMA: u32 = 1;
+/// Stamped by `scripts/build-app.mjs`; the shell checks it matches its own.
+pub const BUILD_ID: &str = env!("JOUZU_BUILD_ID");
 
 #[derive(Clone)]
 pub struct AppState {
@@ -63,6 +65,7 @@ pub struct HostInfo {
     pub schema: u32,
     #[serde(rename = "hostVersion")]
     pub host_version: String,
+    pub build: String,
     pub pid: u32,
     pub port: u16,
     pub token: String,
@@ -165,6 +168,7 @@ pub fn write_host_file(
     let info = HostInfo {
         schema: HOST_SCHEMA,
         host_version: version.to_string(),
+        build: BUILD_ID.to_string(),
         pid: std::process::id(),
         port,
         token: token.to_string(),
@@ -1860,6 +1864,7 @@ mod tests {
         let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(value["schema"], 1);
         assert_eq!(value["hostVersion"], "0.1.0");
+        assert_eq!(value["build"], BUILD_ID);
         assert_eq!(value["port"], 40123);
         assert_eq!(value["token"], "a".repeat(64));
         assert!(value["startedAt"].as_str().unwrap().contains('T'));

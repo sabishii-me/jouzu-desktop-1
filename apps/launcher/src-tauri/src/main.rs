@@ -592,7 +592,17 @@ fn main() {
                 .map_err(std::io::Error::other)?
                 .join("cache/webview");
             std::fs::create_dir_all(&data)?;
-            let host_url = host_bootstrap::start(app.handle()).map_err(std::io::Error::other)?;
+            let host_url = host_bootstrap::start(app.handle()).map_err(|error| {
+                if let Ok(managed) = runtime::managed_root() {
+                    logs::append(
+                        &managed,
+                        "launcher.log",
+                        &format!("host start failed: {error}"),
+                    );
+                }
+                host_bootstrap::show_start_failure(&error);
+                std::io::Error::other(error)
+            })?;
             let host_url: url::Url = host_url
                 .parse()
                 .map_err(|error| std::io::Error::other(format!("Invalid host URL: {error}")))?;
