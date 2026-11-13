@@ -1193,6 +1193,8 @@ async fn aim_warm_runtime(
     }
     // In the spelling this folder's sessions already use.
     let text = state.sessions.folder_text(&workspace);
+    // A client asking (loading, or its retry) is a fresh reason to try again.
+    pool.reset_failures();
     pool.aim(std::path::Path::new(&text));
     // The window shows loading until this runtime is ready.
     pool.hurry();

@@ -17,9 +17,13 @@ export interface WarmView {
 
 const initial: WarmView = { state: "unknown", since: null, error: null };
 
-/** Whether the loading screen should still wait for the warm-up. */
+/**
+ * Whether the loading screen holds. It holds while the runtime starts, and on a
+ * failure too: the screen then shows why and offers a retry, instead of letting
+ * the user into a chat whose first message would stall or fail.
+ */
 export function warmBlocks(view: WarmView): boolean {
-  return view.state === "unknown" || view.state === "starting";
+  return view.state === "unknown" || view.state === "starting" || view.state === "failed";
 }
 
 /** Fold one host answer into the view. */
@@ -35,8 +39,9 @@ export function nextWarmView(previous: WarmView, answer: WarmRuntime, now: numbe
  * Aim the host's warm runtime at `workspace` and follow it until it settles.
  * A host without the endpoint (older build) reports "off", which blocks nothing.
  */
-export function useWarmRuntime(runtime: RuntimeApi | undefined, workspace: string | null): WarmView {
+export function useWarmRuntime(runtime: RuntimeApi | undefined, workspace: string | null): [WarmView, () => void] {
   const [view, setView] = useState<WarmView>(initial);
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     if (!runtime || !workspace) { setView({ state: "off", since: null, error: null }); return; }
     let cancelled = false;
@@ -56,6 +61,6 @@ export function useWarmRuntime(runtime: RuntimeApi | undefined, workspace: strin
       }
     })();
     return () => { cancelled = true; };
-  }, [runtime, workspace]);
-  return view;
+  }, [runtime, workspace, attempt]);
+  return [view, () => setAttempt(value => value + 1)];
 }

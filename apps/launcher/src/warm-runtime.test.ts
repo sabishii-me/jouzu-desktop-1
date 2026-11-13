@@ -9,9 +9,9 @@ describe("warm runtime view", () => {
     expect(warmBlocks({ state: "off", since: null, error: null })).toBe(false);
   });
 
-  it("does not hold loading on a failed warm-up and keeps its reason", () => {
+  it("keeps loading on a failed warm-up, with its reason, instead of letting the user into a chat that cannot answer", () => {
     const view = nextWarmView({ state: "starting", since: 1, error: null }, { state: "failed", error: "node missing" }, 5);
-    expect(warmBlocks(view)).toBe(false);
+    expect(warmBlocks(view)).toBe(true);
     expect(view.error).toBe("node missing");
   });
 

@@ -79,7 +79,7 @@ export function App() {
   const [entryBooting, setEntryBooting] = useState(false);
   const [entryWarm, setEntryWarm] = useState<WarmView | null>(null);
   const [bootNow, setBootNow] = useState(() => Date.now());
-  const bootStarted = useRef(Date.now());
+  const retryEntryWarm = useRef<() => void>(() => {});
   useEffect(() => {
     if (!entryBooting || entryReady.current) return;
     const timer = window.setInterval(() => setBootNow(Date.now()), 1000);
@@ -661,12 +661,12 @@ export function App() {
         </DialogContent>
       </Dialog>
       {entryBooting && !entryReady.current && <div className="fixed inset-0 z-40 flex h-screen w-full flex-col bg-background">
-      {onboardingBanner(entryWarm?.state === "starting" ? t.warming : t.connecting, entryWarm?.state === "starting" ? t.warmingHint : undefined, 0.7, true)}
+      {onboardingBanner(entryWarm?.state === "failed" ? t.warmingFailed : entryWarm?.state === "starting" ? t.warming : t.connecting, entryWarm?.state === "starting" ? t.warmingHint : undefined, 0.7, true)}
       <div className="flex shrink-0 flex-col items-center gap-3 px-6 pb-14 pt-8">
-        <Progress value={null} className="w-full max-w-xl" />
+        {entryWarm?.state !== "failed" && <Progress value={null} className="w-full max-w-xl" />}
         {entryWarm?.state === "starting" && entryWarm.since !== null && <span className="text-xs tabular-nums text-muted-foreground">{t.warmingElapsed.replace("{s}", String(Math.max(0, Math.round((bootNow - entryWarm.since) / 1000))))}</span>}
-        {/* The user can always go in; the runtime keeps starting and the chat shows that it is still starting. */}
-        {bootNow - Math.min(bootStarted.current, entryWarm?.since ?? Infinity) > 15000 && <Button variant="outline" onClick={() => { entryReady.current = true; setEntryBooting(false); }}>{t.warmingSkip}</Button>}
+        {/* A failed start stays here with its reason and a retry: a chat without a runtime would only stall. */}
+        {entryWarm?.state === "failed" && <><p className="max-w-xl whitespace-pre-wrap break-words text-center text-xs text-destructive">{entryWarm.error}</p><Button variant="outline" onClick={() => retryEntryWarm.current()}>{t.warmingRetry}</Button></>}
       </div>
     </div>}
     {errorBanner}
@@ -678,8 +678,9 @@ export function App() {
         onStartSession={() => setNewSession(false)}
         onRetry={() => setSessionRevision(value => value + 1)}
         onBusyChange={setChatBusy}
-        onBootChange={(booting, warm) => {
+        onBootChange={(booting, warm, retryWarm) => {
           setEntryWarm(warm);
+          retryEntryWarm.current = retryWarm;
           setEntryBooting(booting);
           if (!booting) entryReady.current = true;
         }}
