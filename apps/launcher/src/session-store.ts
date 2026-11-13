@@ -66,7 +66,7 @@ export class SessionStore {
     readonly session: SessionPort,
     private readonly onDispose?: () => void,
   ) {
-    this.state = { ...this.state, sessionId: session.id, connected: true };
+    this.state = { ...this.state, sessionId: session.id, connected: true, transportReady: true };
   }
 
   static async open(
