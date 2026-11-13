@@ -2004,8 +2004,13 @@ impl Session {
 
     pub fn continue_queue(self: &Arc<Self>) -> Result<Value, ApiError> {
         self.queue_paused.store(false, Ordering::SeqCst);
-        if self.active_turn().is_none() && !self.start_queued_turn() {
-            self.set_status(Status::Idle);
+        // Do not write a queued prompt until the replacement runtime has completed
+        // its handshake. A Recovering session starts the queue from the handshake
+        // path, not from this command.
+        if self.status() == Status::Idle && self.active_turn().is_none() {
+            if !self.start_queued_turn() {
+                self.set_status(Status::Idle);
+            }
         }
         self.publish_summary();
         Ok(json!({ "status": "running" }))
@@ -2741,6 +2746,14 @@ impl Session {
             .turn_started_at
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Self::now_iso());
+        *self
+            .assistant_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = String::new();
+        self.assistant_blocks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.publish(
             "turn.start",
             json!({ "turnId": turn, "phase": "running" }),
@@ -2866,6 +2879,26 @@ impl Session {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .take();
+                        if let Some(turn) = turn.clone() {
+                            let text = std::mem::take(
+                                &mut *self
+                                    .assistant_text
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            );
+                            let blocks = self.take_assistant_blocks(&text);
+                            if !text.is_empty() || blocks.as_array().is_some_and(|items| !items.is_empty()) {
+                                self.push_history(json!({
+                                    "kind": "assistant",
+                                    "id": format!("{turn}:assistant"),
+                                    "turnId": turn,
+                                    "text": text,
+                                    "blocks": blocks,
+                                    "createdAt": Self::now_iso(),
+                                    "interrupted": true,
+                                }));
+                            }
+                        }
                         let client_id = self
                             .active_client_message
                             .lock()
