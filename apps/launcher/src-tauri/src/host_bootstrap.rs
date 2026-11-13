@@ -147,10 +147,13 @@ fn host_binary(app: &tauri::AppHandle) -> Result<PathBuf, String> {
             return Ok(PathBuf::from(value));
         }
     }
-    let dev = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../host/target/debug/jouzu-host.exe");
-    if dev.is_file() {
-        return Ok(dev);
+    #[cfg(debug_assertions)]
+    {
+        let dev = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../host/target/debug/jouzu-host.exe");
+        if dev.is_file() {
+            return Ok(dev);
+        }
     }
     if let Ok(resource) = app.path().resource_dir() {
         let packaged = resource.join("host/jouzu-host.exe");

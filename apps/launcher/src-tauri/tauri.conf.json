@@ -43,6 +43,9 @@
     ],
     "publisher": "Shisa, Inc.",
     "copyright": "Copyright © Shisa, Inc.",
+    "resources": {
+      "../host/target/release/jouzu-host.exe": "host/jouzu-host.exe"
+    },
     "windows": {
       "nsis": {
         "template": "../../../packaging/launcher/installer.nsi",
