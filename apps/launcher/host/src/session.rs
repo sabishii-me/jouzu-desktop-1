@@ -805,11 +805,14 @@ impl Session {
                         }),
                     );
                 }
-                if let Some(model) = data.get("model") {
-                    *self
-                        .model
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(model.clone());
+                // A choice made before the runtime started wins until it is applied.
+                let choice_waiting = self
+                    .pending_model
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some();
+                if let (Some(model), false) = (data.get("model"), choice_waiting) {
+                    self.set_model(Some(model.clone()));
                 }
             }
         }
@@ -2477,6 +2480,10 @@ impl Session {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 Some(json!({ "provider": provider, "model": model }));
+            // The runtime applies it once started; the session's model is the
+            // choice from now on, so every client shows the same one.
+            let chosen = json!({ "provider": provider, "id": model });
+            self.set_model(Some(chosen.clone()));
             return Ok(json!({ "provider": provider, "id": model, "name": model }));
         }
         self.request(
@@ -2487,7 +2494,30 @@ impl Session {
         let state = self
             .request(json!({ "type": "get_state" }), Duration::from_secs(10))
             .await?;
-        Ok(state.get("model").cloned().unwrap_or(Value::Null))
+        let selected = state.get("model").cloned().unwrap_or(Value::Null);
+        if !selected.is_null() {
+            self.set_model(Some(selected.clone()));
+        }
+        Ok(selected)
+    }
+
+    /// The model is part of the session summary; publish it when it changes.
+    fn set_model(&self, model: Option<Value>) {
+        let changed = {
+            let mut current = self
+                .model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *current == model {
+                false
+            } else {
+                *current = model;
+                true
+            }
+        };
+        if changed {
+            self.publish_summary();
+        }
     }
 
     pub async fn select_thinking(&self, level: &str) -> Result<Value, ApiError> {
@@ -3212,7 +3242,40 @@ pub struct SessionManager {
     runtime_home: PathBuf,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     clients: Mutex<HashMap<String, Vec<String>>>,
+    /// What each client connected to the global event stream has open. A
+    /// client opens one session at a time; that session is never reaped while
+    /// the client's stream is connected. Other idle sessions are, so a window
+    /// left open does not keep a runtime alive for every session it visited.
+    holders: Mutex<HashMap<String, Holder>>,
     persisted_cache: Mutex<Option<Vec<Value>>>,
+}
+
+#[derive(Default)]
+struct Holder {
+    streams: usize,
+    session: Option<String>,
+}
+
+/// One connected global stream. Dropping it releases the client's hold once
+/// its last stream closes.
+pub struct ClientStream {
+    manager: Arc<SessionManager>,
+    client_id: String,
+}
+
+impl Drop for ClientStream {
+    fn drop(&mut self) {
+        let mut holders = self
+            .manager
+            .holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Keep what the client had open: a stream that reconnects picks its
+        // hold up again. With no stream connected it protects nothing.
+        if let Some(holder) = holders.get_mut(&self.client_id) {
+            holder.streams = holder.streams.saturating_sub(1);
+        }
+    }
 }
 
 impl SessionManager {
@@ -3238,6 +3301,7 @@ impl SessionManager {
             runtime_home,
             sessions: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
+            holders: Mutex::new(HashMap::new()),
             persisted_cache: Mutex::new(None),
         }
     }
@@ -3763,17 +3827,27 @@ impl SessionManager {
     /// metadata-only: it never starts a runtime and never returns transcript
     /// bodies.
     pub fn reap_idle(&self, ttl: Duration) {
+        let held: Vec<String> = self
+            .holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|holder| holder.streams > 0)
+            .filter_map(|holder| holder.session.clone())
+            .collect();
         let mut sessions = self
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let stale: Vec<String> = sessions
             .iter()
-            .filter(|(_, session)| {
+            .filter(|(id, session)| {
                 let idle = session.status() == Status::Idle
                     && session.subscriber_count() == 0
+                    && !held.contains(id)
                     && session.last_activity().elapsed() >= ttl;
                 let pending = session.status() == Status::Pending
+                    && !held.contains(id)
                     && session.last_activity().elapsed() >= ttl;
                 idle || pending
             })
@@ -3939,6 +4013,33 @@ impl SessionManager {
             if !entry.iter().any(|existing| existing == capability) {
                 entry.push(capability.clone());
             }
+        }
+    }
+
+    /// A client's global stream is open; keep what it holds until it closes.
+    pub fn connect_client(self: &Arc<Self>, client_id: &str) -> ClientStream {
+        self.holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(client_id.to_string())
+            .or_default()
+            .streams += 1;
+        ClientStream {
+            manager: Arc::clone(self),
+            client_id: client_id.to_string(),
+        }
+    }
+
+    /// The client opened or used this session; it replaces what it held.
+    /// Only a client with a connected stream holds anything.
+    pub fn hold(&self, client_id: &str, session_id: &str) {
+        if let Some(holder) = self
+            .holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(client_id)
+        {
+            holder.session = Some(session_id.to_string());
         }
     }
 
@@ -4183,6 +4284,9 @@ pub struct CreateRequest {
     #[serde(rename = "sessionPath")]
     pub session_path: Option<String>,
     pub key: Option<String>,
+    /// The client opening the session; it holds the session (see `hold`).
+    #[serde(rename = "clientId", default)]
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

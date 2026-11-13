@@ -277,7 +277,7 @@ export class HostClient {
   attach(workspacePath: string, sessionPath?: string): Promise<SessionHandle> {
     return this.request<SessionHandle>("/v1/sessions", {
       method: "POST",
-      body: JSON.stringify({ workspacePath, sessionPath: sessionPath ?? null }),
+      body: JSON.stringify({ workspacePath, sessionPath: sessionPath ?? null, clientId: this.clientId }),
     });
   }
 

@@ -46,6 +46,17 @@ describe("HostClient", () => {
     });
   });
 
+  test("opens a session as this client, so the host keeps it while it is open", async () => {
+    let body: Record<string, unknown> | undefined;
+    const fetchImpl = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body));
+      return response({ sessionId: "h1", status: "starting", cursor: 0 }, 202);
+    }) as typeof fetch;
+    const client = new HostClient({ baseUrl: "", clientId: "web-test", fetchImpl });
+    await client.attach("C:/w", "C:/s/one.jsonl");
+    expect(body).toEqual({ workspacePath: "C:/w", sessionPath: "C:/s/one.jsonl", clientId: "web-test" });
+  });
+
   test("uses model and thinking endpoints", async () => {
     const calls: Call[] = [];
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {

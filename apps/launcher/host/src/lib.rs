@@ -598,6 +598,7 @@ async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<CreateRequest>,
 ) -> Result<Response, ApiError> {
+    let client_id = request.client_id.clone();
     let session = if request.session_path.is_none() {
         state.sessions.create_pending(
             &request.workspace_path,
@@ -609,6 +610,12 @@ async fn create_session(
             .sessions
             .create(&request.workspace_path, request.session_path, request.key)?
     };
+    if let Some(client_id) = client_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        state.sessions.hold(client_id, &session.id);
+    }
     let mut response = (
         StatusCode::ACCEPTED,
         Json(json!({
@@ -640,6 +647,13 @@ async fn send_message(
     Json(request): Json<SendRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    if let Some(client_id) = request
+        .client_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        state.sessions.hold(client_id, &session.id);
+    }
     let value = session.send_with_client(
         &request.client_message_id,
         &request.text,
@@ -1000,12 +1014,20 @@ async fn global_events(
             .collect();
         state.sessions.register_client(client_id, &capabilities);
     }
+    // While this stream is open, the session the client has open is not reaped.
+    let client_stream = query
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|client_id| state.sessions.connect_client(client_id));
     let latest = state.events.latest_seq();
     let summaries = state.sessions.summaries();
     let sessions = state.sessions.clone();
     let mut receiver = state.events.subscribe();
     let events = state.events.clone();
     let stream = async_stream::stream! {
+        let _client_stream = client_stream;
         let mut last = after;
         if after == 0 {
             // A fresh client gets current summaries, not the entire history ring.
@@ -2730,6 +2752,21 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn the_summary_carries_the_selected_model() {
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().to_str().unwrap();
+        let pending = manager.create_pending(path, None, None).unwrap();
+        pending.select_model("fixture", "chosen").await.unwrap();
+        assert_eq!(pending.summary()["model"]["id"], "chosen");
+
+        let session = manager.create(path, None, None).unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.select_model("fixture", "model").await.unwrap();
+        assert_eq!(session.summary()["model"]["id"], "model");
+        assert_eq!(session.summary()["model"]["provider"], "fixture");
+    }
+
+    #[tokio::test]
     async fn attach_history_waits_for_the_starting_runtime() {
         let (manager, _home, workspace) = manager(50);
         let path = workspace.path().join("attached.jsonl");
@@ -3423,6 +3460,65 @@ mod session_tests {
             0
         );
         reader.abort();
+    }
+
+    #[tokio::test]
+    async fn a_connected_client_keeps_only_the_session_it_has_open() {
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().to_str().unwrap();
+        let first = manager.create(path, None, Some("first".into())).unwrap();
+        let second = manager.create(path, None, Some("second".into())).unwrap();
+        wait_status(&first, Status::Idle).await;
+        wait_status(&second, Status::Idle).await;
+
+        let stream = manager.connect_client("desktop");
+        manager.hold("desktop", &first.id);
+        manager.hold("desktop", &second.id);
+        manager.reap_idle(Duration::ZERO);
+        assert!(
+            manager.get(&first.id).is_none(),
+            "a session the client left is reaped"
+        );
+        assert!(
+            manager.get(&second.id).is_some(),
+            "the open session is kept"
+        );
+
+        drop(stream);
+        let reconnected = manager.connect_client("desktop");
+        manager.reap_idle(Duration::ZERO);
+        assert!(
+            manager.get(&second.id).is_some(),
+            "a reconnected stream keeps its hold"
+        );
+
+        drop(reconnected);
+        manager.reap_idle(Duration::ZERO);
+        assert!(manager.get(&second.id).is_none(), "a closed stream holds nothing");
+    }
+
+    #[tokio::test]
+    async fn a_new_session_the_client_has_open_is_kept_before_its_first_message() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        let _stream = manager.connect_client("desktop");
+        manager.hold("desktop", &session.id);
+        manager.reap_idle(Duration::ZERO);
+        assert!(manager.get(&session.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_client_without_a_stream_holds_nothing() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        manager.hold("desktop", &session.id);
+        manager.reap_idle(Duration::ZERO);
+        assert!(manager.get(&session.id).is_none());
     }
 
     #[tokio::test]
