@@ -376,6 +376,16 @@ impl WarmPool {
         self.fill();
     }
 
+    /// Someone is waiting for the warm runtime (the loading screen, a new
+    /// session): run it at normal priority. Below normal it starves on a busy
+    /// machine (measured: 83 s to ready using 9 s of CPU at 100% load).
+    pub fn hurry(&self) {
+        let pid = self.lock().slot.as_ref().map(|slot| slot.runtime.pid());
+        if let Some(pid) = pid {
+            process::set_low_priority(pid, false);
+        }
+    }
+
     /// The folder text the pool warms for.
     pub fn target(&self) -> Option<PathBuf> {
         self.lock().target.clone()

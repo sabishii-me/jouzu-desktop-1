@@ -1194,6 +1194,8 @@ async fn aim_warm_runtime(
     // In the spelling this folder's sessions already use.
     let text = state.sessions.folder_text(&workspace);
     pool.aim(std::path::Path::new(&text));
+    // The window shows loading until this runtime is ready.
+    pool.hurry();
     Ok(Json(pool.status()))
 }
 
@@ -1210,6 +1212,7 @@ async fn warm_runtime(
     if wait.is_zero() {
         return Json(pool.status());
     }
+    pool.hurry();
     Json(pool.wait_settled(wait).await)
 }
 

@@ -4464,6 +4464,7 @@ impl SessionManager {
         } else if let Some(pool) = config.warm.get() {
             // A new session: the user is typing; warm for its folder meanwhile.
             pool.aim(Path::new(&session.runtime_cwd()));
+            pool.hurry();
         }
         Ok(session)
     }
@@ -4476,6 +4477,7 @@ impl SessionManager {
         let events = config.events.clone();
         let spawn = config.clone();
         let memory = config.home.join("warm-workspace.txt");
+        let log_home = config.home.clone();
         let pool = config.warm.get_or_init(|| {
             WarmPool::new(
                 move |workspace| SpawnSpec {
@@ -4487,6 +4489,8 @@ impl SessionManager {
                 },
                 Some(memory),
                 move |status| {
+                    // Each state change, so a slow or failed warm-up can be traced.
+                    log(&log_home, "info", "runtime.warm", status.clone());
                     if let Some(events) = &events {
                         events.publish_control("runtime.warm", status);
                     }
@@ -4494,6 +4498,8 @@ impl SessionManager {
             )
         });
         pool.fill();
+        // The app is starting and its loading screen waits for this runtime.
+        pool.hurry();
         Some(pool.clone())
     }
 
