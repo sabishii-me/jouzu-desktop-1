@@ -1,9 +1,11 @@
-//! A runtime started ahead of need.
+//! Runtimes started ahead of need.
 //!
 //! The runtime loads its extensions for one folder: switching it to a session in
-//! another folder loads them all again (about 10 s on a normal Windows machine),
-//! while a switch within the same folder takes about a second. So the pool warms
-//! for one workspace: the one the user last worked in.
+//! another folder loads them all again (9-13 s measured on Windows), while a
+//! switch within the same folder takes about a second. So the pool keeps one
+//! blank runtime for each folder the user worked in recently (up to four), and
+//! gives the spare places to the most recent folder. With the entry session the
+//! app opens while loading, that is five runtimes (ADR 0004 / 0049).
 //!
 //! Starting a runtime costs seconds to minutes on a busy machine (Node start plus
 //! extension imports). The pool starts one before anyone asks for it, plus a
@@ -70,14 +72,57 @@ struct Inner {
     error: Option<String>,
     failures: usize,
     taken: u64,
-    /// The workspace to warm for; `None` warms in a scratch folder, which still
-    /// saves the Node start.
-    target: Option<PathBuf>,
+    /// Folders to warm for, most recent first, at most `CAPACITY`. Empty warms
+    /// in a scratch folder, which still saves the Node start.
+    recent: Vec<PathBuf>,
 }
 
-/// One for the next session and a spare, so two sessions opened in a row both
-/// find a runtime that has started (a refill takes ~20 s on a busy machine).
-const CAPACITY: usize = 2;
+/// Blank runtimes kept warm. The entry session is the fifth runtime.
+const CAPACITY: usize = 4;
+/// With no folder known yet: one for the first session and a spare.
+const SCRATCH_CAPACITY: usize = 2;
+
+/// The folder each warm runtime should be for: one per recent folder, the rest
+/// for the most recent one. `None` is the scratch folder.
+fn plan(recent: &[PathBuf]) -> Vec<Option<PathBuf>> {
+    let Some(first) = recent.first() else {
+        return vec![None; SCRATCH_CAPACITY];
+    };
+    let mut plan: Vec<Option<PathBuf>> = recent.iter().take(CAPACITY).cloned().map(Some).collect();
+    while plan.len() < CAPACITY {
+        plan.push(Some(first.clone()));
+    }
+    plan
+}
+
+fn same_slot(left: Option<&Path>, right: Option<&Path>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => same_folder(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Which planned places are already filled: for each slot, the plan index it
+/// covers, or `None` when it is not needed. Ready slots are matched first.
+fn assign(plan: &[Option<PathBuf>], slots: &[Slot]) -> (Vec<Option<usize>>, Vec<bool>) {
+    let mut covered = vec![false; plan.len()];
+    let mut assigned = vec![None; slots.len()];
+    for ready_pass in [true, false] {
+        for (index, slot) in slots.iter().enumerate() {
+            if assigned[index].is_some() || slot.ready_ms.is_some() != ready_pass {
+                continue;
+            }
+            if let Some(place) = (0..plan.len())
+                .find(|&place| !covered[place] && same_slot(plan[place].as_deref(), slot.workspace.as_deref()))
+            {
+                covered[place] = true;
+                assigned[index] = Some(place);
+            }
+        }
+    }
+    (assigned, covered)
+}
 
 impl Inner {
     fn state(&self) -> WarmState {
@@ -120,11 +165,19 @@ impl WarmPool {
         memory: Option<PathBuf>,
         changed: impl Fn(Value) + Send + Sync + 'static,
     ) -> Arc<Self> {
-        let target = memory
+        let recent: Vec<PathBuf> = memory
             .as_ref()
             .and_then(|file| std::fs::read_to_string(file).ok())
-            .map(|text| PathBuf::from(text.trim()))
-            .filter(|path| path.is_dir());
+            .map(|text| {
+                text.lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_dir())
+                    .take(CAPACITY)
+                    .collect()
+            })
+            .unwrap_or_default();
         Arc::new(Self {
             spec: Box::new(spec),
             memory,
@@ -134,7 +187,7 @@ impl WarmPool {
                 error: None,
                 failures: 0,
                 taken: 0,
-                target,
+                recent,
             }),
             changed: Box::new(changed),
             ready: Notify::new(),
@@ -162,8 +215,14 @@ impl WarmPool {
             "warm": inner.slots.len(),
             "workspace": next
                 .and_then(|slot| slot.workspace.as_ref())
-                .or(inner.target.as_ref())
+                .or(inner.recent.first())
                 .map(|path| path.to_string_lossy().into_owned()),
+            "ready": inner.slots.iter().filter(|slot| slot.ready_ms.is_some()).count(),
+            "slots": inner.slots.iter().map(|slot| json!({
+                "workspace": slot.workspace.as_ref().map(|path| path.to_string_lossy().into_owned()),
+                "ready": slot.ready_ms.is_some(),
+            })).collect::<Vec<_>>(),
+            "folders": inner.recent.iter().map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         })
     }
 
@@ -177,12 +236,18 @@ impl WarmPool {
         let (generation, workspace) = {
             let mut inner = self.lock();
             let starting = inner.slots.iter().any(|slot| slot.ready_ms.is_none());
-            if starting || inner.slots.len() >= CAPACITY || inner.failures >= MAX_FAILURES {
+            if starting || inner.failures >= MAX_FAILURES {
                 return;
             }
+            // The first planned place without a runtime: the most recent folder first.
+            let plan = plan(&inner.recent);
+            let (_, covered) = assign(&plan, &inner.slots);
+            let Some(place) = covered.iter().position(|covered| !covered) else {
+                return;
+            };
             inner.generation += 1;
             inner.error = None;
-            (inner.generation, inner.target.clone())
+            (inner.generation, plan[place].clone())
         };
         let mut spec = (self.spec)(workspace.as_deref());
         // Below normal until someone waits for it (`hurry`, `take`): the spare
@@ -351,10 +416,13 @@ impl WarmPool {
                     .as_deref()
                     .is_some_and(|warm| same_folder(warm, workspace))
             };
+            // Same folder ready, then same folder starting (a cross-folder switch
+            // costs more than the rest of a start), then any ready, then the oldest.
             let index = inner
                 .slots
                 .iter()
                 .position(|slot| slot.ready_ms.is_some() && matches(slot))
+                .or_else(|| inner.slots.iter().position(|slot| matches(slot)))
                 .or_else(|| inner.next())?;
             let slot = inner.slots.remove(index);
             inner.taken += 1;
@@ -376,30 +444,44 @@ impl WarmPool {
         Some((slot.runtime, matched))
     }
 
-    /// Warm for `workspace` from now on. Unused runtimes warmed for another
-    /// folder are replaced; then the pool fills.
+    /// `workspace` is where the user works now: it becomes the most recent
+    /// folder. Unused runtimes the new plan has no place for are retired (the
+    /// folder that dropped out of the recent list, or a spare of the previous
+    /// most recent folder); then the pool fills.
     pub fn aim(self: &Arc<Self>, workspace: &Path) {
         let stale = {
             let mut inner = self.lock();
-            let same = inner
-                .target
-                .as_deref()
-                .is_some_and(|target| same_folder(target, workspace));
-            if !same {
-                inner.target = Some(workspace.to_path_buf());
+            let already_first = inner
+                .recent
+                .first()
+                .is_some_and(|first| same_folder(first, workspace));
+            if !already_first {
+                inner.recent.retain(|folder| !same_folder(folder, workspace));
+                inner.recent.insert(0, workspace.to_path_buf());
+                inner.recent.truncate(CAPACITY);
                 if let Some(file) = &self.memory {
-                    let _ = std::fs::write(file, workspace.to_string_lossy().as_bytes());
+                    let text: Vec<String> = inner
+                        .recent
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect();
+                    let _ = std::fs::write(file, text.join("\n").as_bytes());
                 }
             }
-            let (keep, stale): (Vec<Slot>, Vec<Slot>) =
-                std::mem::take(&mut inner.slots).into_iter().partition(|slot| {
-                    slot.workspace
-                        .as_deref()
-                        .is_some_and(|warm| same_folder(warm, workspace))
-                });
+            let plan = plan(&inner.recent);
+            let (assigned, _) = assign(&plan, &inner.slots);
+            let mut keep = Vec::new();
+            let mut stale = Vec::new();
+            for (slot, place) in std::mem::take(&mut inner.slots).into_iter().zip(assigned) {
+                if place.is_some() {
+                    keep.push(slot);
+                } else {
+                    stale.push(slot);
+                }
+            }
             inner.slots = keep;
             if !stale.is_empty() {
-                // Invalidates a spawn in flight for the old folder.
+                // Invalidates a spawn in flight that the plan may no longer want.
                 inner.generation += 1;
             }
             stale
@@ -428,9 +510,15 @@ impl WarmPool {
         }
     }
 
-    /// The folder text the pool warms for.
+    /// The folder the pool warms most for: the most recent one.
     pub fn target(&self) -> Option<PathBuf> {
-        self.lock().target.clone()
+        self.lock().recent.first().cloned()
+    }
+
+    /// Every folder the pool warms for, most recent first, in the spelling
+    /// their runtimes use.
+    pub fn folders(&self) -> Vec<PathBuf> {
+        self.lock().recent.clone()
     }
 
     /// A session needs a runtime but none is warm: allow the pool to try again
@@ -520,4 +608,23 @@ pub fn same_place(left: &Path, right: &Path) -> bool {
         }
     };
     normalize(left) == normalize(right)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_plan_gives_each_recent_folder_a_place_and_the_rest_to_the_latest() {
+        assert_eq!(plan(&[]), vec![None, None]);
+        let a = PathBuf::from("/a");
+        let b = PathBuf::from("/b");
+        assert_eq!(plan(&[a.clone()]), vec![Some(a.clone()); 4]);
+        assert_eq!(
+            plan(&[b.clone(), a.clone()]),
+            vec![Some(b.clone()), Some(a.clone()), Some(b.clone()), Some(b.clone())]
+        );
+        let many: Vec<PathBuf> = (0..6).map(|n| PathBuf::from(format!("/f{n}"))).collect();
+        assert_eq!(plan(&many).len(), 4);
+    }
 }

@@ -3194,6 +3194,39 @@ mod session_tests {
         manager.stop_all();
     }
 
+    #[tokio::test]
+    async fn each_recent_folder_keeps_a_warm_runtime() {
+        let (manager, _home, workspace) = manager(50);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let a = std::fs::canonicalize(workspace.path()).unwrap().join("a");
+        let b = std::fs::canonicalize(workspace.path()).unwrap().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        pool.aim(&a);
+        pool.aim(&b);
+        let count = |folder: &Path| {
+            pool.status()["slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|slot| slot["ready"] == true && slot["workspace"] == folder.to_string_lossy().as_ref())
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while pool.status()["ready"] != 4 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(pool.status()["ready"], 4, "{}", pool.status());
+        assert_eq!(count(&b), 3, "{}", pool.status());
+        assert_eq!(count(&a), 1, "{}", pool.status());
+        // A session in the older folder gets that folder's runtime.
+        let session = manager.create_pending(a.to_str().unwrap(), None, None).unwrap();
+        session.send("in-a", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        assert_eq!(pool.folders()[0], a, "opening a session makes its folder the most recent");
+        manager.stop_all();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn an_old_session_runs_in_the_folder_text_its_file_records() {

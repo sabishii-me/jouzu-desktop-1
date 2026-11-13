@@ -10,7 +10,7 @@ import { changedFiles, snapshotComplete, type WorkspaceSnapshot } from "./worksp
 import { loadCollapsed, saveCollapsed, toggleCollapsed } from "./sidebar-state";
 import { ArtifactsPanel } from "./artifacts-panel";
 import { useApi } from "./api/context";
-import type { SessionSummary as ApiSessionSummary } from "./api/jouzu-api";
+import type { JouzuApi, SessionSummary as ApiSessionSummary } from "./api/jouzu-api";
 import { collectOutputReferences } from "./artifact-references";
 import { PanelStart } from "./panel-start";
 import { FilesPanel } from "./files-panel";
@@ -76,6 +76,22 @@ function relativeTime(updated: number) {
   return `${Math.floor(seconds / 86400)}d`;
 }
 
+function entryKey(workspace: string) {
+  return `jouzu.chat.entry.${normalizedPath(workspace)}`;
+}
+
+/** The last selected session of this folder if it still exists, else its most recent one. */
+async function chooseEntry(api: JouzuApi, workspace: string): Promise<string | null> {
+  let remembered: string | null = null;
+  try { remembered = localStorage.getItem(entryKey(workspace)); } catch { /* no storage */ }
+  const here = (await api.sessions.list()).filter(item =>
+    !!item.sessionPath && !item.archived && normalizedPath(item.workspacePath ?? "") === normalizedPath(workspace));
+  if (remembered && here.some(item => normalizedPath(item.sessionPath!) === normalizedPath(remembered!))) return remembered;
+  const titled = here.filter(item => (item.title?.trim() ?? "") !== "" && item.title !== item.sessionPath!.split(/[\\/]/u).at(-1)?.replace(/\.jsonl$/u, ""));
+  const latest = titled.sort((a, b) => (Date.parse(b.updatedAt ?? "") || 0) - (Date.parse(a.updatedAt ?? "") || 0))[0];
+  return latest?.sessionPath ?? null;
+}
+
 export function ChatWorkspace({ path, revision = 0, newSession = true, locked = false, onStartSession, onRetry, onBusyChange, onBootChange, catalogRefreshing = false, canRefreshModels = false, onModelsMissing, onRetryModels, workspaces, onSelect, onAddFolder, onRemove, onSettings, onUpdate, updateAvailable = false, updateBusy = false }: ChatWorkspaceProps) {
   const api = useApi();
   // The host starts this workspace's runtime ahead of need; loading waits for it.
@@ -132,6 +148,14 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [turnChangedFiles, setTurnChangedFiles] = useState<string[]>([]);
   const turnBaseline = useRef<WorkspaceSnapshot | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
+  // The entry session (ADR 0004 / 0049): the app opens the last selected session of
+  // this folder, else its most recent one, else a new one, while it is loading, so
+  // chat is ready when loading ends. True until that session is open (or failed).
+  const [entryOpening, setEntryOpening] = useState(true);
+  const entryTarget = useRef<string | null>(null);
+  const entryChosen = useRef(false);
+  const [entryAttaching, setEntryAttaching] = useState(false);
+  const [entryExisting, setEntryExisting] = useState(false);
   useEffect(() => {
     if (!notification) return;
     const timer = setTimeout(() => setNotification(""), 3000);
@@ -250,14 +274,30 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setSnapshot({ projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [] });
     let client: ChatConnection | undefined;
     let disposed = false;
+    const choosing = !entryChosen.current;
+    entryChosen.current = true;
     void (async () => {
       try {
-        const leased = await chatPool.lease(path);
+        const [leased, entry] = await Promise.all([
+          chatPool.lease(path),
+          choosing ? chooseEntry(api, path).catch(() => null) : Promise.resolve(null),
+        ]);
         if (disposed) { void leased.close().catch(() => {}); return; }
         client = leased;
+        // Queue the entry before the connection reports ready: the queued switch
+        // runs as soon as it does.
+        if (entry && !selectedSessionRef.current && !queuedSwitch.current) {
+          entryTarget.current = entry;
+          setEntryExisting(true);
+          queuedSwitch.current = entry;
+          selectedSessionRef.current = entry;
+          setSelectedSession(entry);
+          setHero(false);
+        } else if (choosing) setEntryOpening(false);
         bindClient(leased);
       } catch (error) {
         if (!disposed) setSnapshot(current => ({ ...current, error: describeError(error) }));
+        if (choosing) setEntryOpening(false);
       }
     })();
     return () => {
@@ -295,7 +335,31 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   useEffect(() => { onBusyChange?.(snapshot.pending || snapshot.projection.running); }, [snapshot.pending, snapshot.projection.running, onBusyChange]);
   // The app keeps its own loader up until the entry session is connected and the
   // runtime is warm, so the start-up cost is paid here, not on the first message.
-  useEffect(() => { onBootChange?.(!chatUnavailable && (!snapshot.connected || warmBlocks(warm)), warm, retryWarm); }, [snapshot.connected, onBootChange, chatUnavailable, warm]);
+  // With an entry session to open, loading lasts until it is open (its runtime is
+  // attached and its history shown) or failed; a failure is shown in the chat.
+  // A new entry session needs a warm runtime for its first message; an existing one
+  // has its own runtime once open, so it does not wait for the pool.
+  useEffect(() => { onBootChange?.(!chatUnavailable && (!snapshot.connected || entryOpening || (!entryExisting && warmBlocks(warm))), warm, retryWarm); }, [snapshot.connected, onBootChange, chatUnavailable, warm, entryOpening, entryExisting]);
+  useEffect(() => {
+    const target = entryTarget.current;
+    if (!entryAttaching || !target) return;
+    const attached = snapshot.connected && normalizedPath(snapshot.sessionFile ?? "") === normalizedPath(target)
+      && !["pending", "starting", "recovering"].includes(snapshot.status ?? "");
+    if (attached || snapshot.error || sessionError) {
+      entryTarget.current = null;
+      setEntryAttaching(false);
+      setEntryOpening(false);
+    }
+  }, [entryAttaching, snapshot.connected, snapshot.sessionFile, snapshot.status, snapshot.error, sessionError]);
+  // Remember the session on screen for the next start; a new session forgets it.
+  useEffect(() => {
+    if (entryOpening) return;
+    const key = entryKey(path);
+    try {
+      if (selectedSession) localStorage.setItem(key, selectedSession);
+      else if (hero) localStorage.removeItem(key);
+    } catch { /* without storage the most recent session is the entry */ }
+  }, [selectedSession, hero, path, entryOpening]);
   useEffect(() => {
     const key = normalizedPath(snapshot.sessionFile ?? "");
     if (!key) return;
@@ -740,6 +804,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       setHero(false);
       return;
     }
+    let landed = false;
+    let retried = false;
     switchingRef.current = true;
     switchingTarget.current = target;
     setSwitching(true);
@@ -750,6 +816,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (connection.current !== previous) return;
       if (previous && previous !== next) parkPrevious(previous);
       if (connection.current !== next) bindClient(next);
+      landed = true;
       const loaded = next.snapshot.sessionFile ?? target;
       // A click that arrived while this switch was running owns the selection.
       if (!queuedSwitch.current && normalizedPath(loaded) !== normalizedPath(selectedSessionRef.current ?? "")) setSelectedSession(loaded);
@@ -770,7 +837,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         chatPool.forget(target);
         switchingRef.current = false;
         switchingTarget.current = null;
-        return switchSession(target, true);
+        // Awaited, so this call's cleanup runs after the retry, not during it.
+        retried = true;
+        return await switchSession(target, true);
       }
       const readable = previewRef.current && normalizedPath(previewRef.current.path) === normalizedPath(target);
       if (readable) {
@@ -793,6 +862,16 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       switchingTarget.current = null;
       setSwitching(false);
       onStartSession?.();
+      // The entry is open when its runtime is attached (see the effect below); a
+      // switch that did not land on it ends the wait now, its error on screen.
+      // A retry settles the entry itself.
+      if (!retried && entryTarget.current && normalizedPath(entryTarget.current) === normalizedPath(target)) {
+        if (landed) setEntryAttaching(true);
+        else {
+          entryTarget.current = null;
+          setEntryOpening(false);
+        }
+      }
     }
   }
   function loadPreview(sessionPath: string) {

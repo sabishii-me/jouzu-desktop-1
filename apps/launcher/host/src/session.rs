@@ -935,7 +935,17 @@ impl Session {
             self.end_turn_without_run(response_id);
             return;
         }
-        if reply == pi::Reply::GetState {
+        // A state answer that arrives while the runtime is switching to this
+        // session's file describes the runtime before the switch: a warm runtime
+        // reports its own blank file. Only answers after the switch are this session's.
+        let switching = matches!(
+            *self
+                .handshake
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Handshake::Switch
+        );
+        if reply == pi::Reply::GetState && !switching {
             if let Some(data) = value.get("data") {
                 let state = pi::State::read(data);
                 if let Some(path) = state.session_file.as_deref() {
@@ -4579,9 +4589,9 @@ impl SessionManager {
     /// them loads every extension again. A folder keeps the spelling it already
     /// has: the warm runtime's, else its latest session's, else the plain form.
     pub fn folder_text(&self, workspace: &Path) -> String {
-        if let Some(target) = self.warm_runtime().and_then(|pool| pool.target()) {
-            if same_place(&target, workspace) {
-                return target.to_string_lossy().into_owned();
+        if let Some(pool) = self.warm_runtime() {
+            if let Some(known) = pool.folders().into_iter().find(|folder| same_place(folder, workspace)) {
+                return known.to_string_lossy().into_owned();
             }
         }
         let plain = canonical_path(&workspace.to_string_lossy());
