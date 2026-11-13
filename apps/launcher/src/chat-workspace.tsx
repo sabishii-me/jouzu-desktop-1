@@ -768,7 +768,18 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setSelectedSession(null);
     // Do not leave the previous transcript under a hero titled "Default workspace"
     // while the new host session is attaching.
-    setSnapshot({ projection: emptyProjection(), connected: false, pending: false, error: null, models: snapshot.models, thinkingLevels: snapshot.thinkingLevels });
+    setSnapshot({
+      projection: emptyProjection(),
+      connected: false,
+      pending: false,
+      error: null,
+      models: snapshot.models,
+      model: snapshot.model,
+      modelProvider: snapshot.modelProvider,
+      modelId: snapshot.modelId,
+      thinkingLevel: snapshot.thinkingLevel,
+      thinkingLevels: snapshot.thinkingLevels,
+    });
     previewRequest.current += 1;
     setPreview(null);
     switchingRef.current = true;
