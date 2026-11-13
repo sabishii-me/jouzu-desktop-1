@@ -542,11 +542,11 @@ export class SessionPool {
     for (const listener of this.statusListeners) listener();
   }
 
-  /** Only the visible session and sessions with a running turn hold streams. */
+  /** Only the visible session holds an SSE stream; switching resumes/replays it. */
   focus(sessionPath: string | null | undefined): void {
     const activeKey = sessionPath ? entryKey(sessionPath) : "";
     for (const [key, store] of this.entries) {
-      if (key === activeKey || store.snapshot.projection.running) store.resume();
+      if (key === activeKey) store.resume();
       else store.detachStream();
     }
   }
