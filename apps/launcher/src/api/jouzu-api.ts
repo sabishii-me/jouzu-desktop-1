@@ -201,8 +201,22 @@ export interface PromptApi {
   answer(questionId: string, answers: Record<string, string>): Promise<void>;
 }
 
+/** The runtime the host starts ahead of need (see the host's warm pool). */
+export interface WarmRuntime {
+  state: "off" | "starting" | "ready" | "failed";
+  /** Milliseconds since this warm-up started. */
+  elapsedMs?: number | null;
+  readyMs?: number | null;
+  error?: string | null;
+  workspace?: string | null;
+}
+
 export interface RuntimeApi {
   status(): Promise<RuntimeStatus>;
+  /** Warm the runtime for this workspace; returns the warm-up state. */
+  warm(workspacePath: string): Promise<WarmRuntime>;
+  /** The warm-up state, waiting up to `waitMs` for it to settle. */
+  warmState(waitMs: number): Promise<WarmRuntime>;
   components(): Promise<Record<string, unknown>>;
   diagnostics(): Promise<unknown | null>;
 }

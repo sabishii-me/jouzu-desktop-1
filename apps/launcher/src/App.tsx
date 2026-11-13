@@ -19,6 +19,7 @@ import { catalogChangeSummary, parseControlState, type ControlState, type HeldCa
 
 import { controlCancel, controlRequest, subscribeControl } from "./api/control-client";
 import { useApi } from "./api/context";
+import type { WarmView } from "./warm-runtime";
 import { Switch } from "./components/ui/switch";
 import { listen } from "@tauri-apps/api/event";
 import jouzuIcon from "./assets/jouzu.svg";
@@ -76,6 +77,13 @@ export function App() {
   // The entry session connects behind the same loader the launcher starts with; after
   // that first connect, a session switch shows the chat's own "Starting session…".
   const [entryBooting, setEntryBooting] = useState(false);
+  const [entryWarm, setEntryWarm] = useState<WarmView | null>(null);
+  const [bootNow, setBootNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!entryBooting || entryReady.current) return;
+    const timer = window.setInterval(() => setBootNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [entryBooting]);
   const entryReady = useRef(false);
   const [restartPending, setRestartPending] = useState(false);
   const [catalogRefreshing, setCatalogRefreshing] = useState(false);
@@ -652,8 +660,13 @@ export function App() {
         </DialogContent>
       </Dialog>
       {entryBooting && !entryReady.current && <div className="fixed inset-0 z-40 flex h-screen w-full flex-col bg-background">
-      {onboardingBanner(t.connecting, undefined, 0.7, true)}
-      <div className="flex shrink-0 justify-center px-6 pb-14 pt-8"><Progress value={null} className="w-full max-w-xl" /></div>
+      {onboardingBanner(entryWarm?.state === "starting" ? t.warming : t.connecting, entryWarm?.state === "starting" ? t.warmingHint : undefined, 0.7, true)}
+      <div className="flex shrink-0 flex-col items-center gap-3 px-6 pb-14 pt-8">
+        <Progress value={null} className="w-full max-w-xl" />
+        {entryWarm?.state === "starting" && entryWarm.since !== null && <span className="text-xs tabular-nums text-muted-foreground">{t.warmingElapsed.replace("{s}", String(Math.max(0, Math.round((bootNow - entryWarm.since) / 1000))))}</span>}
+        {/* The user can always go in; the runtime keeps starting and the chat shows that it is still starting. */}
+        {entryWarm?.state === "starting" && entryWarm.since !== null && bootNow - entryWarm.since > 15000 && <Button variant="outline" onClick={() => { entryReady.current = true; setEntryBooting(false); }}>{t.warmingSkip}</Button>}
+      </div>
     </div>}
     {errorBanner}
     {activePath && <div className="flex min-h-0 flex-1">
@@ -664,13 +677,10 @@ export function App() {
         onStartSession={() => setNewSession(false)}
         onRetry={() => setSessionRevision(value => value + 1)}
         onBusyChange={setChatBusy}
-        onBootChange={booting => {
+        onBootChange={(booting, warm) => {
+          setEntryWarm(warm);
           setEntryBooting(booting);
-          if (!booting) { entryReady.current = true; return; }
-          // Safety: a session that never reports "connected" must not keep the
-          // whole window behind the loader. The chat then shows its own line.
-          if (entryReady.current) return;
-          window.setTimeout(() => { if (!entryReady.current) { entryReady.current = true; setEntryBooting(false); } }, 8000);
+          if (!booting) entryReady.current = true;
         }}
         catalogRefreshing={catalogRefreshing}
         canRefreshModels={setup?.account.signedIn === true}

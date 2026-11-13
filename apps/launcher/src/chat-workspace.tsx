@@ -28,6 +28,7 @@ import { SessionStatsBar } from "./session-stats-bar";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import type { TextGuardMode } from "./session-notices";
 import { opensLive } from "./session-open";
+import { useWarmRuntime, warmBlocks, type WarmView } from "./warm-runtime";
 
 /** The side pane starts at half the window so chat and pane have equal room. */
 function defaultPaneWidth() {
@@ -44,7 +45,7 @@ export interface ChatWorkspaceProps {
   onStartSession?: () => void;
   onRetry?: () => void;
   onBusyChange?: (busy: boolean) => void;
-  onBootChange?: (booting: boolean) => void;
+  onBootChange?: (booting: boolean, warm: WarmView) => void;
   catalogRefreshing?: boolean;
   canRefreshModels?: boolean;
   onModelsMissing?: () => void;
@@ -77,6 +78,8 @@ function relativeTime(updated: number) {
 
 export function ChatWorkspace({ path, revision = 0, newSession = true, locked = false, onStartSession, onRetry, onBusyChange, onBootChange, catalogRefreshing = false, canRefreshModels = false, onModelsMissing, onRetryModels, workspaces, onSelect, onAddFolder, onRemove, onSettings, onUpdate, updateAvailable = false, updateBusy = false }: ChatWorkspaceProps) {
   const api = useApi();
+  // The host starts this workspace's runtime ahead of need; loading waits for it.
+  const warm = useWarmRuntime(api.runtime, path);
   const chatUnavailable = !api.capabilities.features.includes("chat");
   const [snapshot, setSnapshot] = useState<ChatSnapshot>({ projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [] });
   const [now, setNow] = useState(Date.now());
@@ -290,9 +293,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // Only a live turn blocks a runtime restart. A saved draft does not: it lives in
   // localStorage and must not make a model refresh wait for the composer to empty.
   useEffect(() => { onBusyChange?.(snapshot.pending || snapshot.projection.running); }, [snapshot.pending, snapshot.projection.running, onBusyChange]);
-  // The app keeps its own loader up until the entry session is connected, so the
-  // workspace never opens on a second, still-blocked "Starting session…" state.
-  useEffect(() => { onBootChange?.(!chatUnavailable && !snapshot.connected); }, [snapshot.connected, onBootChange, chatUnavailable]);
+  // The app keeps its own loader up until the entry session is connected and the
+  // runtime is warm, so the start-up cost is paid here, not on the first message.
+  useEffect(() => { onBootChange?.(!chatUnavailable && (!snapshot.connected || warmBlocks(warm)), warm); }, [snapshot.connected, onBootChange, chatUnavailable, warm]);
   useEffect(() => {
     const key = normalizedPath(snapshot.sessionFile ?? "");
     if (!key) return;
@@ -315,6 +318,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   useEffect(() => { setAnswer(""); setPromptError(null); setPromptBusy(false); }, [prompt?.id]);
   // Runtime command replies and other transient notices become the toast.
   useEffect(() => { if (snapshot.notice) setNotification(snapshot.notice.text); }, [snapshot.notice?.id]);
+  useEffect(() => { if (warm.state === "failed") setNotification(`The runtime could not start in the background. It will start again when you send a message. ${warm.error ?? ""}`.trim()); }, [warm.state, warm.error]);
   useEffect(() => {
     if (!pickerOpen) return;
     const close = (event: MouseEvent) => { if (!picker.current?.contains(event.target as Node)) setPickerOpen(false); };

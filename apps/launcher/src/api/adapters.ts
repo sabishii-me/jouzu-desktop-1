@@ -87,6 +87,8 @@ function hostGroups(client: HostClient) {
 
   const runtime: RuntimeApi = {
     status: () => client.status(),
+    warm: workspacePath => client.warm(workspacePath),
+    warmState: waitMs => client.warmState(waitMs),
     components: async () => ({}),
     diagnostics: async () => null,
   };

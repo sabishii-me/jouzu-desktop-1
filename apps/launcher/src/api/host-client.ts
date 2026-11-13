@@ -16,6 +16,7 @@ import {
   type Model,
   type Receipt,
   type RuntimeStatus,
+  type WarmRuntime,
   type SessionHandle,
   type SessionSummary,
   type Workspace,
@@ -392,6 +393,17 @@ export class HostClient {
       method: "POST",
       body: JSON.stringify({ sessionPath }),
     }).then(body => body.sessionPath);
+  }
+
+  warm(workspacePath: string): Promise<WarmRuntime> {
+    return this.request<WarmRuntime>("/v1/runtime/warm", {
+      method: "POST",
+      body: JSON.stringify({ workspacePath }),
+    });
+  }
+
+  warmState(waitMs: number): Promise<WarmRuntime> {
+    return this.request<WarmRuntime>(`/v1/runtime/warm?waitMs=${Math.max(0, Math.round(waitMs))}`);
   }
 
   timing(sessionPath: string): Promise<unknown> {
