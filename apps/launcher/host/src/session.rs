@@ -840,10 +840,18 @@ impl Session {
                 "error",
                 json!({ "code": "runtime-error", "message": message, "retryable": false }),
             );
-            if matches!(self.status(), Status::Starting | Status::Recovering) {
+            // Only a failed handshake makes the session unusable. Any other
+            // command fails alone: its caller gets the error, and a failed
+            // prompt ends its turn. A rejected model switch used to stop the
+            // whole session, and every later message got "session-stopped".
+            let handshake = matches!(command, "get_state" | "switch_session" | "get_messages");
+            if handshake && matches!(self.status(), Status::Starting | Status::Recovering) {
                 self.recovery_failed(message.to_string());
-            } else {
-                self.set_status(Status::Error);
+            } else if command == "prompt" {
+                self.end_turn(
+                    response_id,
+                    json!({ "aborted": true, "reason": "runtime-error", "message": message }),
+                );
             }
             return;
         }
@@ -928,6 +936,11 @@ impl Session {
     /// input its Flow control retained). No agent events will follow, so the turn
     /// ends here instead of waiting for `agent_settled`.
     fn end_turn_without_run(self: &Arc<Self>, client_message_id: &str) {
+        self.end_turn(client_message_id, json!({ "status": "handled" }));
+    }
+
+    /// End the active turn for this message without a runtime run.
+    fn end_turn(self: &Arc<Self>, client_message_id: &str, outcome: Value) {
         let matches_active = self
             .active_client_message
             .lock()
@@ -957,7 +970,11 @@ impl Session {
         self.cancelling.store(false, Ordering::SeqCst);
         self.turn_running.store(false, Ordering::SeqCst);
         if let Some(turn) = turn {
-            self.publish("turn.end", json!({ "turnId": turn, "status": "handled" }));
+            let mut data = json!({ "turnId": turn });
+            if let (Some(data), Some(outcome)) = (data.as_object_mut(), outcome.as_object()) {
+                data.extend(outcome.clone());
+            }
+            self.publish("turn.end", data);
         }
         if !self.start_queued_turn() {
             self.set_status(Status::Idle);

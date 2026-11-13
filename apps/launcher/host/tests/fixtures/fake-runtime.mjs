@@ -202,6 +202,10 @@ lines.on("line", line => {
         failure(value.id, "set_model", "set_model requires modelId");
         break;
       }
+      if (value.modelId === "missing") {
+        failure(value.id, "set_model", "Model not found: missing");
+        break;
+      }
       response(value.id, "set_model", { model: { name: "fixture-model", provider: String(value.provider ?? "fixture"), id: value.modelId } });
       break;
     case "set_thinking_level":

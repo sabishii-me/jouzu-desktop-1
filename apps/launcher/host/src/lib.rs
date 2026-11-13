@@ -2768,6 +2768,21 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_rejected_model_switch_leaves_the_session_usable() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        assert!(session.select_model("fixture", "missing").await.is_err());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(session.status(), Status::Idle);
+        session.send("after-switch", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        assert!(session.send("again", "hello").is_ok());
+    }
+
+    #[tokio::test]
     async fn attach_history_waits_for_the_starting_runtime() {
         let (manager, _home, workspace) = manager(50);
         let path = workspace.path().join("attached.jsonl");
