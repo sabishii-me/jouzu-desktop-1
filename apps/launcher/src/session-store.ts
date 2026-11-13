@@ -223,10 +223,12 @@ export class SessionStore {
       // when that pending row is cleared.
       let accepted = this.state.projection.messages;
       if (!echo) {
-        const row = { role: "user", content, timestamp: now };
+        const turnId = typeof receipt.messageId === "string" ? receipt.messageId : undefined;
+        const row = { role: "user", content, timestamp: now, ...(turnId ? { turnId } : {}) };
         // A fast reply can start streaming before the POST returns. The user row
-        // belongs before the assistant row of its own turn (not of a running one).
-        const at = _running ? -1 : accepted.findIndex(message => message.role === "assistant" && (message.timestamp ?? 0) >= now);
+        // belongs before the assistant row of its own turn, never before the reply
+        // of a turn that was already running.
+        const at = turnId ? accepted.findIndex(message => message.role === "assistant" && message.turnId === turnId) : -1;
         accepted = at >= 0 ? [...accepted.slice(0, at), row, ...accepted.slice(at)] : [...accepted, row];
         if (at >= 0 && this.active >= at) this.active += 1;
       }
@@ -495,8 +497,15 @@ export class SessionStore {
         this.update({ pending: true });
         break;
       case "message.start": {
-        const messages = [...this.state.projection.messages, { role: "assistant", content: [], timestamp: Date.now() }];
-        this.active = messages.length - 1;
+        const turnId = typeof data.turnId === "string" ? data.turnId : undefined;
+        const current = this.state.projection.messages;
+        // A follow-up can be accepted (and shown) before the running turn's reply
+        // starts. The reply belongs to its own turn, ahead of later user rows.
+        const own = turnId ? current.findIndex(message => message.role === "user" && message.turnId === turnId) : -1;
+        const later = own < 0 ? -1 : current.findIndex((message, index) => index > own && message.role === "user" && message.turnId !== turnId);
+        const at = later < 0 ? current.length : later;
+        const messages = [...current.slice(0, at), { role: "assistant", content: [], timestamp: Date.now(), ...(turnId ? { turnId } : {}) }, ...current.slice(at)];
+        this.active = at;
         this.update({ projection: { ...this.state.projection, messages, activeMessage: this.active, running: true } });
         break;
       }

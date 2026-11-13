@@ -405,7 +405,12 @@ impl Session {
                         .cloned()
                         .unwrap_or(Value::Null);
                 }
-                page.insert(0, row);
+                // Follow-ups queued behind this turn are newer than its reply.
+                let at = page
+                    .iter()
+                    .take_while(|row| row.get("queued").and_then(Value::as_bool) == Some(true))
+                    .count();
+                page.insert(at, row);
             }
         }
         json!({ "messages": page, "nextBefore": next_before })

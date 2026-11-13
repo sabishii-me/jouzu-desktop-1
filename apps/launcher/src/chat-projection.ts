@@ -2,7 +2,7 @@
 // Agent history and completion remain authoritative in the runtime.
 export type WireObject = Record<string, unknown>;
 export interface ChatBlock { type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: unknown; data?: string; mimeType?: string; content?: ChatBlock[]; toolCallId?: string; isError?: boolean }
-export interface ChatMessage { role: string; content: ChatBlock[]; details?: unknown; timestamp?: number; endedAt?: number; stopReason?: string; errorMessage?: string; toolCallId?: string; toolName?: string; isError?: boolean; provider?: string; model?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number; totalTokens?: number } }
+export interface ChatMessage { role: string; content: ChatBlock[]; turnId?: string; details?: unknown; timestamp?: number; endedAt?: number; stopReason?: string; errorMessage?: string; toolCallId?: string; toolName?: string; isError?: boolean; provider?: string; model?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number; totalTokens?: number } }
 export interface ToolView { id: string; name: string; args: unknown; phase: "running" | "complete" | "error"; result?: unknown; interrupted?: boolean }
 export interface FlowReportRecord { kind: string; text: string; timestamp?: number }
 export interface ChatProjection {
@@ -68,6 +68,7 @@ export function historyRowsProjection(rows: unknown): ChatProjection {
         role: kind,
         content,
         timestamp: Number.isFinite(timestamp) ? timestamp : undefined,
+        ...(typeof row.turnId === "string" ? { turnId: row.turnId } : {}),
         ...(typeof row.model === "string" ? { model: row.model } : {}),
         ...(typeof row.provider === "string" ? { provider: row.provider } : {}),
       });

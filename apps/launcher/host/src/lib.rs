@@ -2303,6 +2303,32 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_queued_follow_up_is_listed_after_the_partial_reply() {
+        let (manager, _home, workspace) = manager_with_env(50, &[("FAKE_RUNTIME_DELAY_MS", "150")]);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("first", "one").unwrap();
+        wait_until(|| {
+            session.history(50, None)["messages"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["partial"] == true))
+        })
+        .await;
+        session.send("second", "two").unwrap();
+        let history = session.history(50, None);
+        let mut rows: Vec<String> = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| format!("{}{}", row["kind"].as_str().unwrap_or(""), if row["partial"] == true { "*" } else { "" }))
+            .collect();
+        rows.reverse();
+        assert_eq!(rows, vec!["user", "assistant*", "user"], "{history}");
+    }
+
+    #[tokio::test]
     async fn a_handled_prompt_ends_the_turn_without_a_run() {
         let (manager, _home, workspace) = manager_with_env(50, &[("FAKE_RUNTIME_HANDLED", "1")]);
         let session = manager

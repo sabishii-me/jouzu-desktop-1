@@ -93,6 +93,20 @@ describe("SessionStore", () => {
     expect(messages[1].content).toEqual([{ type: "text", text: "hi!" }]);
   });
 
+  it("keeps a reply with its own turn when a follow-up was accepted first", async () => {
+    const session = fakeSession();
+    let next = 0;
+    session.send = async message => { session.sent.push(message); next += 1; return { messageId: `m-${next}`, receipt: "queued" }; };
+    const store = SessionStore.attach(session);
+    await store.sendOrSteer("one", [], false, "c-1", false);
+    await store.sendOrSteer("two", [], true, "c-2", false);
+    session.emit(event(1, "message.start", { messageId: "m-1", turnId: "m-1", role: "assistant" }));
+    session.emit(event(2, "message.done", { messageId: "m-1", blocks: [{ type: "text", text: "a1" }], stopReason: "completed" }));
+    session.emit(event(3, "message.start", { messageId: "m-2", turnId: "m-2", role: "assistant" }));
+    session.emit(event(4, "message.done", { messageId: "m-2", blocks: [{ type: "text", text: "a2" }], stopReason: "completed" }));
+    expect(store.snapshot.projection.messages.map(message => `${message.role}:${message.turnId}`)).toEqual(["user:m-1", "assistant:m-1", "user:m-2", "assistant:m-2"]);
+  });
+
   it("disposes exactly once", () => {
     const onDispose = vi.fn();
     const store = SessionStore.attach(fakeSession(), onDispose);

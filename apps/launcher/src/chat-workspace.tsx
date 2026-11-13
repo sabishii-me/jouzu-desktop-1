@@ -101,7 +101,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [snapshot.projection.running]);
-  const elapsed = workingStartedAt ? `${String(Math.floor((now - workingStartedAt) / 60000)).padStart(2, "0")}:${String(Math.floor(((now - workingStartedAt) % 60000) / 1000)).padStart(2, "0")}` : undefined;
+  // The clock ticks once a second, so a turn can start after the last tick.
+  const workingMs = workingStartedAt ? Math.max(0, now - workingStartedAt) : 0;
+  const elapsed = workingStartedAt ? `${String(Math.floor(workingMs / 60000)).padStart(2, "0")}:${String(Math.floor((workingMs % 60000) / 1000)).padStart(2, "0")}` : undefined;
   const [draft, setDraft] = useState("");
   const draftRef = useRef(draft);
   draftRef.current = draft;
