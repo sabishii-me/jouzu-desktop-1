@@ -10,7 +10,7 @@ pub mod supervisor;
 pub mod warm;
 
 pub use supervisor::{RequestError, RuntimeEvent, RuntimeSupervisor};
-pub use warm::WarmPool;
+pub use warm::{same_place, WarmPool};
 
 use std::ffi::OsString;
 use std::path::PathBuf;

@@ -1183,10 +1183,9 @@ async fn aim_warm_runtime(
     if !workspace.is_dir() || !state.sessions.workspace_allowed(&request.workspace_path) {
         return Err(ApiError::bad_request("workspacePath must be a known folder"));
     }
-    // The plain form, which is what new sessions record and start in.
-    let plain = workspace.to_string_lossy();
-    let plain = plain.strip_prefix("\\\\?\\").unwrap_or(&plain);
-    pool.aim(std::path::Path::new(plain));
+    // In the spelling this folder's sessions already use.
+    let text = state.sessions.folder_text(&workspace);
+    pool.aim(std::path::Path::new(&text));
     Ok(Json(pool.status()))
 }
 
@@ -3019,6 +3018,34 @@ mod session_tests {
         let next = pool.wait_settled(Duration::from_secs(10)).await;
         assert_eq!(next["workspace"], spelled.to_string_lossy().as_ref(), "{next}");
         manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_new_session_in_a_folder_keeps_the_spelling_its_sessions_use() {
+        let (manager, _home, workspace) = manager(50);
+        let folder = std::fs::canonicalize(workspace.path()).unwrap();
+        // An older session spells the folder differently (as \\?\C:\x vs C:\x on Windows).
+        let spelled = format!("{}/", folder.to_string_lossy());
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("older.jsonl"),
+            format!(
+                "{}\n",
+                json!({ "type": "session", "version": 3, "id": "older", "timestamp": "2026-01-01T00:00:00Z", "cwd": spelled })
+            ),
+        )
+        .unwrap();
+        assert_eq!(manager.folder_text(&folder), spelled);
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        let path = session.info()["sessionPath"].as_str().unwrap().to_string();
+        let header: Value = serde_json::from_str(
+            std::fs::read_to_string(&path).unwrap().lines().next().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(header["cwd"], spelled.as_str());
     }
 
     #[tokio::test]

@@ -376,6 +376,11 @@ impl WarmPool {
         self.fill();
     }
 
+    /// The folder text the pool warms for.
+    pub fn target(&self) -> Option<PathBuf> {
+        self.lock().target.clone()
+    }
+
     /// A session needs a runtime but none is warm: allow the pool to try again
     /// after earlier failures.
     pub fn reset_failures(&self) {
@@ -439,6 +444,22 @@ fn same_folder(left: &Path, right: &Path) -> bool {
             text.to_lowercase()
         } else {
             text
+        }
+    };
+    normalize(left) == normalize(right)
+}
+
+/// Whether two texts name one folder, whatever their spelling (`\\?\` or not).
+/// Pi itself would treat them as two; this is for choosing which spelling to use.
+pub fn same_place(left: &Path, right: &Path) -> bool {
+    let normalize = |path: &Path| {
+        let text = path.to_string_lossy().replace('\\', "/");
+        let text = text.strip_prefix("//?/").unwrap_or(&text);
+        let text = text.trim_end_matches('/');
+        if cfg!(windows) {
+            text.to_lowercase()
+        } else {
+            text.to_string()
         }
     };
     normalize(left) == normalize(right)

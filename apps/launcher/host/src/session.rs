@@ -46,7 +46,7 @@ use tokio::sync::broadcast;
 
 use crate::log;
 use crate::runtime::adapter::pi::{self, DeltaKind, Record as PiRecord};
-use crate::runtime::{RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec, WarmPool};
+use crate::runtime::{same_place, RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec, WarmPool};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct SessionPreference {
@@ -4346,9 +4346,7 @@ impl SessionManager {
                     "version": 3,
                     "id": random_id(),
                     "timestamp": Session::now_iso(),
-                    // The plain form, as Pi itself writes it; the runtime starts in
-                    // the same text (see `session_header_cwd`).
-                    "cwd": canonical_path(&workspace.to_string_lossy()),
+                    "cwd": self.folder_text(&workspace),
                 });
                 if std::fs::write(&file, format!("{header}\n")).is_ok() {
                     Some(file.to_string_lossy().into_owned())
@@ -4414,6 +4412,28 @@ impl SessionManager {
         });
         pool.fill();
         Some(pool.clone())
+    }
+
+    /// How to spell `workspace` for a runtime and a new session header. Pi
+    /// treats `\\?\C:\x` and `C:\x` as two folders, and a runtime switched across
+    /// them loads every extension again. A folder keeps the spelling it already
+    /// has: the warm runtime's, else its latest session's, else the plain form.
+    pub fn folder_text(&self, workspace: &Path) -> String {
+        if let Some(target) = self.warm_runtime().and_then(|pool| pool.target()) {
+            if same_place(&target, workspace) {
+                return target.to_string_lossy().into_owned();
+            }
+        }
+        let plain = canonical_path(&workspace.to_string_lossy());
+        let latest = self
+            .persisted(Some(&plain), false)
+            .into_iter()
+            .filter_map(|entry| entry.get("sessionPath").and_then(Value::as_str).map(str::to_string))
+            .find_map(|path| session_header_cwd(&path));
+        match latest {
+            Some(text) if same_place(Path::new(&text), workspace) => text,
+            _ => plain,
+        }
     }
 
     pub fn warm_runtime(&self) -> Option<Arc<WarmPool>> {
