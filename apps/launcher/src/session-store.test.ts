@@ -73,6 +73,22 @@ describe("SessionStore", () => {
     expect(store.snapshot.projection.messages.map(message => `${message.role}:${message.turnId}`)).toEqual(["user:m-1"]);
   });
 
+  it("puts the message back when Stop does not reach the host", async () => {
+    let release: () => void = () => {};
+    const session = fakeSession();
+    const send = session.send;
+    session.send = async message => { await new Promise<void>(resolve => { release = resolve; }); return send(message); };
+    session.cancel = async () => { throw new Error("host unreachable"); };
+    const store = SessionStore.attach(session);
+    const pending = store.send("hello", [], "client-1");
+    await store.stop();
+    expect(store.snapshot.outbox).toMatchObject([{ clientMessageId: "client-1", text: "hello", state: "sending" }]);
+    expect(store.snapshot.error).toContain("host unreachable");
+    release();
+    await pending;
+    expect(store.snapshot.outbox).toEqual([]);
+  });
+
   it("keeps a failed send as not sent, and retries it with the same id", async () => {
     const session = fakeSession();
     const send = session.send;
@@ -98,6 +114,17 @@ describe("SessionStore", () => {
     expect(store.snapshot.projection.running).toBe(true);
     session.emit(event(3, "session.updated", { activeTurn: null }));
     expect(store.snapshot.projection.running).toBe(false);
+  });
+
+  it("shows the model the host reports for the session", () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "session.updated", { model: { provider: "shisa", id: "qwen-3.8", name: "Qwen 3.8" } }));
+    expect(store.snapshot.model).toBe("Qwen 3.8");
+    expect(store.snapshot.modelProvider).toBe("shisa");
+    expect(store.snapshot.modelId).toBe("qwen-3.8");
+    session.emit(event(2, "session.updated", { model: null }));
+    expect(store.snapshot.modelId).toBe("qwen-3.8");
   });
 
   it("shows a tool call in the live reply as soon as it starts", () => {

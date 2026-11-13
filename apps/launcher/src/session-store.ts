@@ -410,6 +410,12 @@ export class SessionStore {
       if (ids.size) await Promise.all([...ids].map(id => this.session.cancel(id)));
       else if (turn) await this.session.interrupt();
     } catch (error) {
+      // Stop did not take effect: put back what it took away. The messages
+      // still being sent finish or fail on their own, as if Stop was not pressed.
+      const outbox = this.state.outbox ?? [];
+      const restore = pending.filter(entry => !outbox.some(item => item.clientMessageId === entry.clientMessageId));
+      if (restore.length) this.setOutbox([...outbox, ...restore]);
+      if (turn && this.state.activeTurn?.turnId === turn.turnId && this.state.activeTurn.phase === "cancelling") this.update({ activeTurn: turn });
       this.update({ error: describeError(error) });
     }
   }
@@ -539,7 +545,13 @@ export class SessionStore {
   private applySummary(data: Data): void {
     const prompts = promptsOf(data.pendingApprovals, data.pendingQuestions);
     const failed = record(data.failedTurn);
+    // The host owns the session's model; show what it reports.
+    const selected = record(data.model);
+    const provider = selected ? text(selected.provider) : undefined;
+    const id = selected ? text(selected.id) : undefined;
+    const name = provider && id ? this.state.models?.find(model => model.provider === provider && model.id === id)?.name ?? text(selected?.name) ?? id : undefined;
     this.update({
+      ...(provider && id ? { model: name, modelProvider: provider, modelId: id } : {}),
       sessionId: text(data.sessionId) ?? this.state.sessionId,
       sessionFile: text(data.sessionPath) ?? this.state.sessionFile,
       status: text(data.status) ?? this.state.status,

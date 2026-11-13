@@ -27,6 +27,7 @@ import { BackgroundMenu, deriveFlow, deriveSubagents, FlowMenu, latestFlowError,
 import { SessionStatsBar } from "./session-stats-bar";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import type { TextGuardMode } from "./session-notices";
+import { opensLive } from "./session-open";
 
 /** The side pane starts at half the window so chat and pane have equal room. */
 function defaultPaneWidth() {
@@ -866,9 +867,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setSelectedSession(sessionPath);
     setHero(false);
     const summary = sessions.find(item => normalizedPath(item.path) === normalizedPath(sessionPath));
-    if (client && (summary?.running || summary?.status === "recovering")) {
-      // The disk preview has no in-flight assistant text. A live/running session
-      // must attach through the host store so the partial row and deltas survive.
+    if (client && opensLive(summary)) {
       startSwitch(sessionPath);
       return;
     }
