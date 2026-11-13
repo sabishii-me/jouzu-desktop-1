@@ -625,6 +625,16 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (clientMessageId) void connection.current?.cancel(clientMessageId);
     else if (!switchingRef.current) void connection.current?.abort();
   }
+  async function awaitConnection(limitMs = 15000): Promise<ChatConnection | null> {
+    const end = Date.now() + limitMs;
+    while (Date.now() < end && !sendCancelRef.current) {
+      const current = connection.current;
+      if (current?.snapshot.connected) return current;
+      if (current?.snapshot.error && !current.snapshot.connected && !switchingRef.current) return null;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    return connection.current?.snapshot.connected ? connection.current : null;
+  }
   async function send() {
     // A send is locally accepted before the session attach and the host round-trip.
     // The Stop button and the pending row must exist during that window.
@@ -632,6 +642,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     sendClientIdRef.current = crypto.randomUUID();
     setSendPending(true);
     setLocalSubmitted(draft);
+    // The hero screen has no transcript. Leave it on local acceptance, before any
+    // await (session create, attach), so the submitted row renders at once.
+    const wasHero = hero;
+    if (wasHero) { setHero(false); onStartSession?.(); }
     // A new session replaces the connection after it attaches. Waiting here keeps
     // an early send from entering the previous (now closed) transport handle.
     if (switchingRef.current) {
@@ -639,6 +653,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!pending) { setSendPending(false); setNotification("The session is still opening."); return; }
       await pending;
       if (sendCancelRef.current) { setSendPending(false); return; }
+    }
+    // The composer is usable while a new session is still being created. Hold the
+    // locally accepted send until the session exists instead of dropping it.
+    if (!connection.current?.snapshot.connected) {
+      const ready = await awaitConnection();
+      if (sendCancelRef.current) { setSendPending(false); return; }
+      if (!ready) { setSendPending(false); setLocalSubmitted(""); setNotification("The session is still opening. Your message was not sent."); return; }
     }
     let client = connection.current;
     if (!client || readingRef.current) { setSendPending(false); return; }
@@ -652,10 +673,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const submittedVideos = videoRef.current;
     const value = [...submittedVideos.map(videoMarker), typed].filter(Boolean).join("\n");
     const submitted = attachmentRef.current;
-    const wasHero = hero;
-    // The hero screen has no transcript. Switch to the conversation on local
-    // acceptance so the submitted row can render before any host await.
-    if (wasHero) { setHero(false); onStartSession?.(); }
     // The host owns the queue for a turn that is already starting/running. Do
     // not keep the only copy in the client; the POST below carries it to the host.
     // Capture the owner of this send. Clearing must never depend on which session is
@@ -1494,7 +1511,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       {snapshot.historyError && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">This session is connected, but its transcript could not be loaded. {humanizeRuntimeError(snapshot.historyError)}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void connection.current?.retryHistory()}>Retry</Button></div>}
       {capacityError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">{humanizeRuntimeError(sessionError ?? snapshot.error ?? "")}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void startNewSession()}>New session</Button></div>}
       {flowHistoryError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">Flow request history is full. Clear it before sending again.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void runExtensionCommand("/flow clear")}>Clear Flow history</Button></div>}
-      {booting && !hero ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-8 sm:px-8">
+      {booting && !hero && !sendPending ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-8 sm:px-8">
         <div className="w-full max-w-3xl">
           <div className="mb-7 flex flex-col items-center gap-3 text-center">
             <span className="flex size-12 items-center justify-center rounded-2xl border border-border bg-card"><Sparkles className="size-6 text-primary" aria-hidden="true" /></span>
@@ -1503,7 +1520,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           </div>
           <div className="mb-2 flex flex-wrap items-center gap-2 px-1">{workspacePicker}</div>
           {dialogNode && <div className="mb-3">{dialogNode}</div>}
-          <Composer hero connected={snapshot.connected} pending={snapshot.pending || commandBusy || switching || locked } opening={switching || opening} starting={composerStarting} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={cancelSend} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} compatibility={snapshot.projection.compatibility} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} videos={videoUrls} queued={queuedSteers} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
+          <Composer hero connected={snapshot.connected} pending={snapshot.pending || commandBusy || locked } opening={switching || opening || booting} starting={composerStarting} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={cancelSend} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} compatibility={snapshot.projection.compatibility} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} videos={videoUrls} queued={queuedSteers} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
           <SessionStatsBar stats={snapshot.stats} timing={timing} />
         </div>
       </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
