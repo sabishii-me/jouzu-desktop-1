@@ -172,7 +172,9 @@ export class HostClient {
     onEvent: (event: ApiEvent) => void,
     onError?: (error: unknown) => void,
   ): Unsubscribe {
-    const query = new URLSearchParams({ clientId });
+    // The host registers this client's capabilities from the stream it opens;
+    // without "prompts" every approval or answer from this window is refused.
+    const query = new URLSearchParams({ clientId, capabilities: "view,control,prompts" });
     if (after > 0) query.set("after", String(after));
     return this.stream(`/v1/events?${query}`, (id, event, data) => {
       onEvent({

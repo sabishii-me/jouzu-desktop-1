@@ -138,4 +138,18 @@ describe("HostClient", () => {
       { id: 5, event: "message.done" },
     ]);
   });
+  test("registers prompt capabilities on the global event stream", async () => {
+    let url = "";
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      url = String(input);
+      return new Response(new ReadableStream({ start(controller) { controller.close(); } }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    const client = new HostClient({ baseUrl: "http://host", fetchImpl });
+    const stop = client.subscribeEvents("ui-1", 0, () => {});
+    await new Promise(resolve => setTimeout(resolve, 10));
+    stop();
+    const query = new URL(url).searchParams;
+    expect(query.get("clientId")).toBe("ui-1");
+    expect(query.get("capabilities")?.split(",")).toEqual(expect.arrayContaining(["prompts", "control"]));
+  });
 });

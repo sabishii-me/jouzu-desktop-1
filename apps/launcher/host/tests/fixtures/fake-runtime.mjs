@@ -147,6 +147,13 @@ function prompt(id, text) {
     beginTurn(text);
     return;
   }
+  if (uiMethod === "notices") {
+    out({ type: "extension_ui_request", id: "n-1", method: "notify", message: "Flow control is holding your message: test.", notifyType: "warning" });
+    out({ type: "extension_ui_request", id: "n-2", method: "setStatus", statusKey: "flow", statusText: "held 1" });
+    out({ type: "extension_ui_request", id: "n-3", method: "setWidget", widgetKey: "flow", widgetLines: ["line a", "line b"] });
+    beginTurn(text);
+    return;
+  }
   if (uiMethod) {
     requestUi(text);
     return;

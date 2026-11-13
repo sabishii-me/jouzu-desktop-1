@@ -1,14 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUpCircle, ArrowUpDown, Archive, ArchiveRestore, ChevronDown, ChevronRight, Copy, FolderOpen, FolderPlus, GitFork, Images, MessageSquare, MoreHorizontal, PanelLeft, Columns2, PanelRight, Pencil, Pin, Plus, RefreshCw, Search, Settings, Sparkles, X } from "lucide-react";
-import { confirm, save } from "@tauri-apps/plugin-dialog";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { ArrowUpCircle, ArrowUpDown, Archive, ArchiveRestore, ChevronDown, ChevronRight, Copy, FolderOpen, FolderPlus, Images, MessageSquare, MoreHorizontal, PanelLeft, Columns2, PanelRight, Pencil, Pin, Plus, RefreshCw, Search, Settings, Sparkles, X } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { McpMenu } from "./mcp-menu";
 import { ChatConversation } from "./chat-conversation";
 import { AgentAction } from "./chat-live";
 import { Composer } from "./composer";
-import { clearPending, pendingFor, setPending, type PendingBySession } from "./pending-prompt";
 import { changedFiles, snapshotComplete, type WorkspaceSnapshot } from "./workspace-diff";
 import { loadCollapsed, saveCollapsed, toggleCollapsed } from "./sidebar-state";
 import { ArtifactsPanel } from "./artifacts-panel";
@@ -19,21 +16,17 @@ import { PanelStart } from "./panel-start";
 import { FilesPanel } from "./files-panel";
 import { ToolReviewDialog } from "./tool-review-dialog";
 import { SessionStore as ChatConnection, chatPool } from "./session-store";
-import { flowNoticeText, type ChatModel, type ChatSnapshot, type SessionTiming } from "./chat-types";
+import type { ChatModel, ChatSnapshot, PendingPrompt, SessionTiming } from "./chat-types";
 import { eventRouter } from "./event-router";
 import { fitsSendBudget, readImageAttachment, removeSubmittedImages, validateImageSelection, type ImageAttachment } from "./chat-attachments";
 import { normalizeVideoUrl, videoMarker } from "./video-url";
-import { emptyProjection, historyProjection, interruptUnfinishedTools, type ChatProjection, type FlowReportRecord, type WireObject } from "./chat-projection";
+import { emptyProjection, historyProjection, interruptUnfinishedTools, type ChatProjection, type FlowReportRecord } from "./chat-projection";
 import { clearDraft, draftKey, readDraft, writeDraft } from "./drafts";
-import { humanizeRuntimeError, isCapacityError, isFlowHistoryError } from "./runtime-errors";
-import { beginDialogResponse, emptyDialogQueue, enqueueDialog, expireDialogs, nextDialogDeadline, removeDialog, type DialogAnswer, type DialogQueue } from "./dialog-queue";
+import { describeError, isCapacityError, isFlowHistoryError } from "./runtime-errors";
 import { BackgroundMenu, deriveFlow, deriveSubagents, FlowMenu, latestFlowError, SubagentMenu } from "./tool-renderers";
 import { SessionStatsBar } from "./session-stats-bar";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
-import { parseTextGuardNotice, parseTextGuardResult, TextGuardBar, type TextGuardData, type TextGuardItem } from "./textguard-bar";
-
-type TextGuardView = { data: TextGuardData | null; seen: boolean; historical: boolean; open: boolean; busy: boolean; error: string | null; loading: boolean };
-const emptyTextGuardView: TextGuardView = { data: null, seen: false, historical: false, open: false, busy: false, error: null, loading: false };
+import type { TextGuardMode } from "./session-notices";
 
 /** The side pane starts at half the window so chat and pane have equal room. */
 function defaultPaneWidth() {
@@ -68,12 +61,6 @@ const lastSegment = (path: string) => path.replaceAll("\\", "/").split("/").filt
 const workspaceLabel = (path: string) => lastSegment(path) === "default-workspace" ? "Default workspace" : lastSegment(path);
 const isDefaultWorkspace = (path: string) => lastSegment(path) === "default-workspace";
 const normalizedPath = (path: string) => path.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
-/**
- * One identity for a session wherever it is stored. The runtime's session file is
- * authoritative once attached; the selected row covers a session that is still
- * opening. Queue, pending and draft state must all agree on this key.
- */
-const sessionKeyOf = (sessionFile: string | undefined, selected: string | null | undefined) => normalizedPath(sessionFile ?? selected ?? "");
 /** The UUID at the end of a session file stem; a preview has no live session state. */
 const sessionIdFromFile = (path?: string): string | undefined => {
   const name = path?.replaceAll("\\", "/").split("/").filter(Boolean).at(-1)?.replace(/\.jsonl$/u, "") ?? "";
@@ -91,17 +78,14 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const api = useApi();
   const chatUnavailable = !api.capabilities.features.includes("chat");
   const [snapshot, setSnapshot] = useState<ChatSnapshot>({ projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [] });
-  const [workingStartedAt, setWorkingStartedAt] = useState<number>();
-  // A pending prompt belongs to the session that accepted it. A single value made an
-  // unsettled message from one session render in every other session.
-  const [pendingBySession, setPendingBySession] = useState<PendingBySession>({});
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     if (!snapshot.projection.running) return;
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [snapshot.projection.running]);
-  // The clock ticks once a second, so a turn can start after the last tick.
+  // The host stamps when the turn started; the clock ticks once a second.
+  const workingStartedAt = snapshot.projection.running ? snapshot.projection.turnStartedAt : undefined;
   const workingMs = workingStartedAt ? Math.max(0, now - workingStartedAt) : 0;
   const elapsed = workingStartedAt ? `${String(Math.floor(workingMs / 60000)).padStart(2, "0")}:${String(Math.floor((workingMs % 60000) / 1000)).padStart(2, "0")}` : undefined;
   const [draft, setDraft] = useState("");
@@ -112,46 +96,15 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const attachmentRef = useRef(attachments);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [videoUrls, setVideoUrls] = useState<string[]>([]);
-  const [queuedBySession, setQueuedBySession] = useState<Record<string, string[]>>({});
   const videoRef = useRef(videoUrls);
   videoRef.current = videoUrls;
   const [readingImages, setReadingImages] = useState(false);
   const readingRef = useRef(false);
   const [switching, setSwitching] = useState(false);
   const [commandBusy, setCommandBusy] = useState(false);
-  const [sendPending, setSendPending] = useState(false);
   const [localSubmitted, setLocalSubmitted] = useState("");
   const sendCancelRef = useRef(false);
-  const sendKeyRef = useRef<string | null>(null);
-  const sendClientIdRef = useRef<string | null>(null);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
-  const queueSessionKey = sessionKeyOf(snapshot.sessionFile, selectedSession ?? path);
-  const queuedSteers = queueSessionKey ? queuedBySession[queueSessionKey] ?? [] : [];
-  const pendingUser = pendingFor(pendingBySession, queueSessionKey) || localSubmitted;
-  // Queued steering is owned by the session, not by the composer. Keep it visible
-  // until the host can accept it; clearing it on idle would silently lose input.
-  // Once a send has returned, the host queue is the source of truth: an item the
-  // host no longer reports as queued has started (or was discarded) and must not
-  // stay in the composer as "Queued".
-  const hostQueueTexts = (snapshot.queue ?? []).map(item => item.text).join("\u0000");
-  useEffect(() => {
-    if (sendPending || !queueSessionKey) return;
-    setQueuedBySession(previous => {
-      const items = previous[queueSessionKey];
-      if (!items?.length) return previous;
-      const remaining = hostQueueTexts ? hostQueueTexts.split("\u0000") : [];
-      const kept = items.filter(text => {
-        const at = remaining.indexOf(text);
-        if (at < 0) return false;
-        remaining.splice(at, 1);
-        return true;
-      });
-      if (kept.length === items.length) return previous;
-      const next = { ...previous };
-      if (kept.length) next[queueSessionKey] = kept; else delete next[queueSessionKey];
-      return next;
-    });
-  }, [hostQueueTexts, sendPending, queueSessionKey]);
   const selectedRowRef = useRef<HTMLDivElement | null>(null);
   const switchingRef = useRef(false);
   const switchingTarget = useRef<string | "new" | null>(null);
@@ -163,10 +116,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const projectionCache = useRef(new Map<string, ChatProjection>());
   const selectedSessionRef = useRef<string | null>(null);
   selectedSessionRef.current = selectedSession;
-  const [dialogs, setDialogs] = useState(emptyDialogQueue);
-  const queue = useRef(dialogs);
-  const dialog = dialogs.items[0] ?? null;
   const [answer, setAnswer] = useState("");
+  const [promptBusy, setPromptBusy] = useState(false);
+  const [promptError, setPromptError] = useState<string | null>(null);
   const [notification, setNotification] = useState("");
   // The provider refused an image already in the history; the session stays usable only
   // after the offending image is removed, so offer that instead of a dead end.
@@ -176,17 +128,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [turnChangedFiles, setTurnChangedFiles] = useState<string[]>([]);
   const turnBaseline = useRef<WorkspaceSnapshot | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
-  const [textguardBySession, setTextguardBySession] = useState<Record<string, TextGuardView>>({});
-  const textguardRef = useRef(textguardBySession);
-  textguardRef.current = textguardBySession;
-  const activeSessionIdRef = useRef("");
-  activeSessionIdRef.current = snapshot.sessionId ?? "";
   useEffect(() => {
     if (!notification) return;
     const timer = setTimeout(() => setNotification(""), 3000);
     return () => clearTimeout(timer);
   }, [notification]);
-  const [flowNotice, setFlowNotice] = useState("");
   const [dropActive, setDropActive] = useState(false);
   const chatRoot = useRef<HTMLDivElement>(null);
   const [sidebar, setSidebarState] = useState(() => {
@@ -228,19 +174,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const picker = useRef<HTMLDivElement>(null);
   const connection = useRef<ChatConnection | null>(null);
   const unsubscribeRef = useRef<null | (() => void)>(null);
-  const dialogRef = useRef<(request: WireObject, client: ChatConnection) => void>(() => {});
-  const dialogQueues = useRef(new Map<ChatConnection, DialogQueue>());
   const previousNewSession = useRef(newSession);
-  const newSessionOnStart = useRef(newSession);
-  newSessionOnStart.current = newSession;
-  const freshOnPath = useRef(false);
   const queuedSwitch = useRef<string | "new" | null>(null);
-  function writeDialogs(next: DialogQueue) { queue.current = next; setDialogs(next); }
-  function updateDialogs(next: DialogQueue) {
-    const owner = connection.current;
-    if (owner) dialogQueues.current.set(owner, next);
-    writeDialogs(next);
-  }
   function updateAttachments(next: ImageAttachment[]) {
     attachmentRef.current = next;
     setAttachments(next);
@@ -282,25 +217,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   function bindClient(next: ChatConnection) {
     unsubscribeRef.current?.();
     connection.current = next;
-    // A dialog belongs to the runtime that raised it: the view shows the queue of
-    // the client it is bound to, and a background dialog waits here until then.
-    const pending = expireDialogs(dialogQueues.current.get(next) ?? emptyDialogQueue(), Date.now());
-    dialogQueues.current.set(next, pending);
-    writeDialogs(pending);
-    unsubscribeRef.current = next.subscribe(state => {
-      setSnapshot(state);
-      if (!state.connected && state.error) {
-        dialogQueues.current.set(next, emptyDialogQueue());
-        if (connection.current === next) writeDialogs(emptyDialogQueue());
-      }
-    });
-  }
-  function updateTextGuard(sessionId: string, change: Partial<TextGuardView>) {
-    setTextguardBySession(current => {
-      const next = { ...current, [sessionId]: { ...(current[sessionId] ?? emptyTextGuardView), ...change } };
-      textguardRef.current = next;
-      return next;
-    });
+    unsubscribeRef.current = next.subscribe(setSnapshot);
   }
   useEffect(() => {
     if (chatUnavailable) return;
@@ -326,81 +243,23 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setSessionError(null);
     setSwitching(false);
     if (selected) setHero(false);
-    writeDialogs(emptyDialogQueue());
     setSnapshot({ projection: emptyProjection(), connected: false, pending: false, error: null, models: [], thinkingLevels: [] });
-    setFlowNotice("");
     let client: ChatConnection | undefined;
     let disposed = false;
-    const handleDialog = (request: WireObject, owner: ChatConnection) => {
-      if (["select", "confirm", "input", "editor"].includes(String(request.method))) {
-        const pending = expireDialogs(dialogQueues.current.get(owner) ?? emptyDialogQueue(), Date.now());
-        const result = enqueueDialog(pending, request, Date.now());
-        dialogQueues.current.set(owner, result.queue);
-        if (connection.current === owner) writeDialogs(result.queue);
-        if (result.status === "full" && typeof request.id === "string") {
-          setNotification("Too many extension requests to display. The additional request was cancelled.");
-          void owner.reply(request.id, { cancelled: true }).catch(error => {
-            if (connection.current === owner) setNotification(`The additional request could not be cancelled. ${String(error)}`);
-          });
-        }
-        else if (result.status === "invalid") setNotification("An invalid extension request could not be displayed.");
-      }
-      else if (request.method === "notify") {
-        const message = String(request.message ?? "");
-        // The runtime already raises a plain-text alert as content is withheld; it carries no
-        // items, so mark the session seen and let the panel's inspect fetch the review.
-        if (/^TextGuard (?:withheld|flagged)\b/u.test(message) || /^TextGuard: \d+ items? waiting for your review/u.test(message)) {
-          const id = activeSessionIdRef.current;
-          if (id) updateTextGuard(id, { seen: true, historical: false, error: null, loading: false });
-          return;
-        }
-        const textguard = parseTextGuardNotice(message);
-        if (textguard) {
-          const id = textguard.sessionId ?? owner.snapshot.sessionId;
-          if (id) {
-            const view = textguardRef.current[id];
-            if (!textguard.items.length && !view?.data && view?.historical) {
-              updateTextGuard(id, { error: "This review is no longer available in the runtime.", loading: false, seen: true });
-              return;
-            }
-            updateTextGuard(id, { data: textguard, seen: true, historical: false, error: null, loading: false });
-          }
-          return;
-        }
-        const textguardResult = parseTextGuardResult(message);
-        if (textguardResult) {
-          const id = owner.snapshot.sessionId;
-          if (id) updateTextGuard(id, { error: textguardResult.ok ? null : textguardResult.error ?? "TextGuard request failed.", loading: false });
-          return;
-        }
-        // A background session keeps working; its notices must not surface as the
-        // visible session's toast or Flow notice.
-        if (connection.current !== owner) return;
-        const flow = flowNoticeText(message);
-        if (flow) setFlowNotice(flow);
-        else setNotification(message);
-      }
-      else if (request.method === "set_editor_text") {
-        if (connection.current === owner) updateDraft(String(request.text ?? ""));
-      }
-    };
     void (async () => {
       try {
-        const leased = await chatPool.lease(path, undefined, handleDialog, newSessionOnStart.current || freshOnPath.current);
+        const leased = await chatPool.lease(path);
         if (disposed) { void leased.close().catch(() => {}); return; }
         client = leased;
-        dialogRef.current = handleDialog;
         bindClient(leased);
       } catch (error) {
-        if (!disposed) setSnapshot(current => ({ ...current, error: String(error) }));
+        if (!disposed) setSnapshot(current => ({ ...current, error: describeError(error) }));
       }
     })();
-    freshOnPath.current = false;
     return () => {
       disposed = true;
       unsubscribeRef.current?.();
       connection.current = null;
-      if (client) dialogQueues.current.delete(client);
       // The same rule as every other view change: a session with a transcript is
       // kept, a blank one is closed instead of being parked under a provisional path.
       if (client?.snapshot.error) void client.close().catch(() => {});
@@ -450,13 +309,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   useEffect(() => {
     if (snapshot.connected && snapshot.modelsLoaded === true && (snapshot.models?.length ?? 0) === 0 && canRefreshModels) onModelsMissing?.();
   }, [snapshot.connected, snapshot.models, snapshot.modelsLoaded, canRefreshModels, onModelsMissing]);
-  useEffect(() => { setAnswer(dialog?.prefill ?? ""); }, [dialog?.id, dialog?.prefill]);
-  useEffect(() => {
-    const deadline = nextDialogDeadline(dialogs);
-    if (deadline === null) return;
-    const timer = setTimeout(() => updateDialogs(expireDialogs(queue.current, Date.now())), Math.min(2147483647, Math.max(0, deadline - Date.now())));
-    return () => clearTimeout(timer);
-  }, [dialogs]);
+  // Approvals and questions are host state; the first one waiting is shown.
+  const prompt: PendingPrompt | null = snapshot.prompts?.[0] ?? null;
+  useEffect(() => { setAnswer(""); setPromptError(null); setPromptBusy(false); }, [prompt?.id]);
+  // Runtime command replies and other transient notices become the toast.
+  useEffect(() => { if (snapshot.notice) setNotification(snapshot.notice.text); }, [snapshot.notice?.id]);
   useEffect(() => {
     if (!pickerOpen) return;
     const close = (event: MouseEvent) => { if (!picker.current?.contains(event.target as Node)) setPickerOpen(false); };
@@ -501,7 +358,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     try {
       await api.sessions.update(sessionPath, change);
       await refreshSessions();
-    } catch (error) { setNotification(String(error)); }
+    } catch (error) { setNotification(describeError(error)); }
   }
   async function renameSession(session: SessionSummary) {
     const title = window.prompt("Rename session", session.title);
@@ -514,7 +371,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       else { const area = document.createElement("textarea"); area.value = id; area.style.position = "fixed"; area.style.opacity = "0"; document.body.appendChild(area); area.select(); document.execCommand("copy"); area.remove(); }
       setNotification("Session ID copied.");
       setSessionMenu(null);
-    } catch (error) { setNotification(String(error)); }
+    } catch (error) { setNotification(describeError(error)); }
   }
   useEffect(() => {
     if (!sessionMenu) return;
@@ -534,12 +391,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   useEffect(() => { if (snapshot.connected) void refreshSessions(); }, [snapshot.connected, snapshot.sessionFile]);
   useEffect(() => {
     if (!localSubmitted) return;
-    const hasSubmitted = snapshot.projection.messages.some(message => {
-      if (message.role !== "user") return false;
-      return message.content.some(block => block.type === "text" && block.text === localSubmitted);
-    });
-    if (hasSubmitted) setLocalSubmitted("");
-  }, [snapshot.projection.messages, localSubmitted]);
+    // The store's outbox shows the message once the session takes it.
+    if (snapshot.outbox?.some(item => item.text === localSubmitted)) setLocalSubmitted("");
+  }, [snapshot.outbox, localSubmitted]);
   useEffect(() => eventRouter.subscribe(event => {
     if (event.event === "session.updated" || event.event === "resync") void refreshSessions();
   }), []);
@@ -558,16 +412,15 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       .catch(() => { if (!disposed) setTiming(undefined); });
     return () => { disposed = true; };
   }, [snapshot.sessionFile, snapshot.projection.messages.length]);
-  async function reply(fields: DialogAnswer) {
+  /** Answer with the exact option the host offered; the card stays until the host accepts. */
+  async function answerPrompt(value: string) {
     const client = connection.current;
-    if (!dialog || !client || !snapshot.transportReady) return;
-    const id = dialog.id;
-    const claimed = beginDialogResponse(queue.current, id, fields, Date.now());
-    updateDialogs(claimed.queue);
-    if (!claimed.response) return;
-    try { await client.reply(id, claimed.response); }
-    catch (error) { if (connection.current === client) setNotification(`The response could not be confirmed. ${String(error)}`); }
-    finally { if (connection.current === client) updateDialogs(removeDialog(queue.current, id)); }
+    if (!prompt || !client || promptBusy) return;
+    setPromptBusy(true);
+    setPromptError(null);
+    try { await client.answer(prompt, value); }
+    catch (error) { if (connection.current === client) setPromptError(describeError(error)); }
+    finally { if (connection.current === client) setPromptBusy(false); }
   }
   async function addImages(files: File[]) {
     if (readingRef.current || !files.length) return;
@@ -578,7 +431,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       validateImageSelection(attachmentRef.current, added.map(item => ({ size: item.size, type: item.image.mimeType })));
       if (!fitsSendBudget([...attachmentRef.current, ...added])) throw new Error("These images are too large to send together. Send fewer, or smaller ones.");
       updateAttachments([...attachmentRef.current, ...added]);
-    } catch (error) { setAttachmentError(error instanceof Error ? error.message : String(error)); }
+    } catch (error) { setAttachmentError(describeError(error)); }
     finally { readingRef.current = false; setReadingImages(false); }
   }
   // "Quote" on an image artifact feeds the artifact through the same attachment
@@ -596,7 +449,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           const bytes = new Uint8Array(binary.length);
           for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
           await addImagesRef.current([new File([bytes], data.name, { type: data.mimeType })]);
-        } catch (error) { setAttachmentError(error instanceof Error ? error.message : String(error)); }
+        } catch (error) { setAttachmentError(describeError(error)); }
       })();
     };
     window.addEventListener("jouzu:use-artifact", handler);
@@ -614,7 +467,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         const bytes = new Uint8Array(binary.length);
         for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
         images.push(new File([bytes], data.name, { type: data.mimeType }));
-      } catch (error) { setAttachmentError(error instanceof Error ? error.message : String(error)); }
+      } catch (error) { setAttachmentError(describeError(error)); }
     }
     if (images.length) await addImages(images);
     if (files.length) {
@@ -623,31 +476,19 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       setNotification(`${files.length} file${files.length === 1 ? "" : "s"} added to the message.`);
     }
   }
-  useEffect(() => {
-    if (!api.capabilities.native) return;
-    let disposed = false;
-    const subscription = getCurrentWindow().onDragDropEvent(event => {
-      const payload = event.payload;
-      if (payload.type === "leave") { setDropActive(false); return; }
-      const rect = chatRoot.current?.getBoundingClientRect();
-      const x = payload.position.x / window.devicePixelRatio;
-      const y = payload.position.y / window.devicePixelRatio;
-      const inside = !!rect && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-      setDropActive(inside && payload.type !== "drop");
-      if (payload.type === "drop" && inside) void addDropped(payload.paths);
-    });
-    subscription.then(unlisten => { if (disposed) unlisten(); }).catch(error => setNotification(String(error)));
-    return () => { disposed = true; subscription.then(unlisten => unlisten()).catch(() => {}); };
-  }, [path, revision]);
-  function cancelSend() {
+  useEffect(() => api.native.onFileDrop(event => {
+    if (event.type === "leave") { setDropActive(false); return; }
+    const rect = chatRoot.current?.getBoundingClientRect();
+    const position = event.position;
+    const inside = !!rect && !!position && position.x >= rect.left && position.x <= rect.right && position.y >= rect.top && position.y <= rect.bottom;
+    setDropActive(inside && event.type !== "drop");
+    if (event.type === "drop" && inside) void addDropped(event.paths);
+  }), [api, path, revision]);
+  /** Stop: drop a send still waiting for its session, then stop what the host has. */
+  function stop() {
     sendCancelRef.current = true;
-    setSendPending(false);
     setLocalSubmitted("");
-    const key = sendKeyRef.current;
-    if (key) setPendingBySession(previous => clearPending(previous, key));
-    const clientMessageId = sendClientIdRef.current;
-    if (clientMessageId) void connection.current?.cancel(clientMessageId);
-    else if (!switchingRef.current) void connection.current?.abort();
+    void connection.current?.stop();
   }
   async function awaitConnection(limitMs = 15000): Promise<ChatConnection | null> {
     const end = Date.now() + limitMs;
@@ -659,104 +500,54 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     }
     return connection.current?.snapshot.connected ? connection.current : null;
   }
+  /**
+   * Hand the message to the session's outbox. Until a session exists (a new
+   * session still attaching) the message is shown locally; once the store has
+   * it, the outbox owns it: "sending", then a transcript row, or "not sent"
+   * with Retry. The composer is cleared as soon as the store has the message.
+   */
   async function send() {
-    // A send is locally accepted before the session attach and the host round-trip.
-    // The Stop button and the pending row must exist during that window.
-    sendCancelRef.current = false;
-    sendClientIdRef.current = crypto.randomUUID();
-    setSendPending(true);
-    setLocalSubmitted(draft);
-    // The hero screen has no transcript. Leave it on local acceptance, before any
-    // await (session create, attach), so the submitted row renders at once.
-    const wasHero = hero;
-    if (wasHero) { setHero(false); onStartSession?.(); }
-    // A new session replaces the connection after it attaches. Waiting here keeps
-    // an early send from entering the previous (now closed) transport handle.
-    if (switchingRef.current) {
-      const pending = switchPromise.current;
-      if (!pending) { setSendPending(false); setNotification("The session is still opening."); return; }
-      await pending;
-      if (sendCancelRef.current) { setSendPending(false); return; }
-    }
-    // The composer is usable while a new session is still being created. Hold the
-    // locally accepted send until the session exists instead of dropping it.
-    if (!connection.current?.snapshot.connected) {
-      const ready = await awaitConnection();
-      if (sendCancelRef.current) { setSendPending(false); return; }
-      if (!ready) { setSendPending(false); setLocalSubmitted(""); setNotification("The session is still opening. Your message was not sent."); return; }
-    }
-    let client = connection.current;
-    if (!client || readingRef.current) { setSendPending(false); return; }
-    if (!client.snapshot.modelId) {
-      setSendPending(false);
-      setNotification("Choose a model before sending.");
-      return;
-    }
-    if (isFlowHistoryError(client.snapshot.error)) { setSendPending(false); setNotification("Clear Flow request history before sending again."); return; }
-    const typed = draft;
+    const typed = draftRef.current;
     const submittedVideos = videoRef.current;
     const value = [...submittedVideos.map(videoMarker), typed].filter(Boolean).join("\n");
+    if (!value.trim() || readingRef.current) return;
     const submitted = attachmentRef.current;
-    // The host owns the queue for a turn that is already starting/running. Do
-    // not keep the only copy in the client; the POST below carries it to the host.
-    // Capture the owner of this send. Clearing must never depend on which session is
-    // on screen when it settles, and it must never touch another session's entry.
-    const pendingKey = sessionKeyOf(client.snapshot.sessionFile, selectedSession ?? path);
     const submitDraftKey = draftKeyRef.current;
-    sendKeyRef.current = pendingKey;
-    setSendPending(true);
-    setWorkingStartedAt(Date.now());
-    setPendingBySession(previous => setPending(previous, pendingKey, value));
-    setCommandBusy(true);
+    sendCancelRef.current = false;
+    setLocalSubmitted(value);
+    if (hero) { setHero(false); onStartSession?.(); }
     try {
-      if (!await ensureSelectedSession(client)) { setNotification("The session is still opening."); return; }
-      if (sendCancelRef.current) { connection.current?.cancel(sendClientIdRef.current ?? ""); return; }
-      client = connection.current;
-      if (!client) return;
-      if (sendCancelRef.current) { void client.cancel(sendClientIdRef.current ?? ""); return; }
-      const running = client.snapshot.projection.running;
-      const queueKey = sessionKeyOf(client.snapshot.sessionFile, selectedSession ?? path);
-      if (running && queueKey) setQueuedBySession(previous => ({ ...previous, [queueKey]: [...(previous[queueKey] ?? []), value] }));
-      try { await client.sendOrSteer(value, submitted.map(item => item.image), running, sendClientIdRef.current ?? undefined, false); }
-      catch (error) {
-        if (running && queueKey) setQueuedBySession(previous => {
-          const items = previous[queueKey] ?? [];
-          const at = items.lastIndexOf(value);
-          if (at < 0) return previous;
-          return { ...previous, [queueKey]: [...items.slice(0, at), ...items.slice(at + 1)] };
-        });
-        throw error;
-      }
-      if (connection.current !== client) return;
+      if (switchingRef.current) await switchPromise.current;
+      const ready = connection.current?.snapshot.connected ? connection.current : await awaitConnection();
+      if (sendCancelRef.current) return;
+      if (!ready || !await ensureSelectedSession(ready)) { setNotification("The session is still opening. Your message was not sent."); return; }
+      const client = connection.current;
+      if (!client || sendCancelRef.current) return;
+      if (!client.snapshot.modelId) { setNotification("Choose a model before sending."); return; }
+      if (isFlowHistoryError(client.snapshot.error)) { setNotification("Clear Flow request history before sending again."); return; }
+      const receipt = client.send(value, submitted.map(item => item.image));
+      // The outbox now shows the message; the composer is free for the next one.
+      setLocalSubmitted("");
       if (videoRef.current.join("\n") === submittedVideos.join("\n")) { videoRef.current = []; setVideoUrls([]); }
-      // Only a successful send clears the sent key; text typed during the send and
-      // attachments that were not submitted stay. Clear the key that submitted, not
-      // whatever session happens to be on screen now.
-      if (draftRef.current === value && draftKeyRef.current === submitDraftKey) {
+      if (draftRef.current === typed && draftKeyRef.current === submitDraftKey) {
         clearDraft(submitDraftKey);
         draftRef.current = "";
         setDraft("");
       }
-      else saveDraft(draftRef.current, attachmentRef.current);
       updateAttachments(removeSubmittedImages(attachmentRef.current, submitted));
-    } catch (error) {
-      // Keep the draft and images available after rejection, but do not hide why it failed.
-      const message = String(error).replace(/^Error:\s*/u, "");
-      if (connection.current === client && /Flow attachment is closed|Flow session metadata is missing/u.test(message)) {
-        try { if (await recoverSession()) return; } catch (recoveryError) { setNotification(String(recoveryError).replace(/^Error:\s*/u, "")); return; }
-      }
-      if (connection.current === client) {
+      try { await receipt; }
+      catch (error) {
+        // The failure is shown on the message itself (not sent, with Retry).
+        const message = describeError(error);
+        if (connection.current === client && /Flow attachment is closed|Flow session metadata is missing/u.test(message)) {
+          try { await recoverSession(); } catch (recoveryError) { setNotification(describeError(recoveryError)); }
+        }
         // A refused image lives in the history, so every later request fails the same
         // way. Offer the repair rather than leaving a session that cannot continue.
         if (/image[^.]{0,80}(must be larger|too small|minimum|below)|(must be larger|minimum)[^.]{0,40}image/iu.test(message)) setImageRepair(true);
-        setNotification(humanizeRuntimeError(message));
       }
     } finally {
-      setCommandBusy(false);
-      setSendPending(false);
-      setLocalSubmitted("");
-      // Settling clears this send's own entry even after the user switched session.
-      setPendingBySession(previous => clearPending(previous, pendingKey));
+      setLocalSubmitted(current => current === value ? "" : current);
     }
   }
   /** Remove the images the provider refuses, keeping the original session file. */
@@ -769,7 +560,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!result.removed) { setNotification("No image in this session is below the model's minimum."); return; }
       setNotification(`Removed ${result.removed} image${result.removed === 1 ? "" : "s"} the model cannot read. The original file is kept as a backup.`);
       await reloadSession();
-    } catch (error) { setNotification(String(error)); }
+    } catch (error) { setNotification(describeError(error)); }
   }
   const name = workspaceLabel(path);
   function parkPrevious(previous: ChatConnection | null) {
@@ -829,10 +620,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setSessionError(null);
     const promise = (async () => {
       try {
-        const next = await chatPool.lease(path, undefined, dialogRef.current, true);
+        const next = await chatPool.lease(path);
         parkPrevious(previous);
         bindClient(next);
-        updateDialogs(emptyDialogQueue());
         setDiskReports([]); setReportsSession(""); setTiming(undefined);
         setNotification("");
         onStartSession?.();
@@ -844,7 +634,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         setHero(!previousFile);
         setSelectedSession(previousFile);
         setPreview(null);
-        setNotification(humanizeRuntimeError(String(error).replace(/^Error:\s*/u, "")));
+        setNotification(describeError(error));
       } finally {
         switchingRef.current = false;
         switchingTarget.current = null;
@@ -865,28 +655,34 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!active) return;
       await active.reloadSession();
       setNotification("Session reloaded.");
-    } catch (error) { setNotification(String(error).replace(/^Error:\s*/u, "")); }
+    } catch (error) { setNotification(describeError(error)); }
     finally { setCommandBusy(false); }
   }
-  async function runExtensionCommand(command: string) {
+  /** Run an action on the attached session; errors become the toast. */
+  async function withSession(action: (session: ChatConnection) => Promise<void>, attachError: string) {
     const client = connection.current;
     if (!client || commandBusy) return;
     setCommandBusy(true);
     try {
-      if (!await ensureSelectedSession(client)) { setNotification("Could not attach this session for the command."); return; }
+      if (!await ensureSelectedSession(client)) { setNotification(attachError); return; }
       const active = connection.current;
-      if (!active) return;
-      await active.runCommand(command);
-      if (command === "/flow clear") {
-        setFlowNotice("");
-        setSessionError(null);
-        const key = normalizedPath(active.snapshot.sessionFile ?? queueSessionKey);
-        if (key) setQueuedBySession(previous => { const next = { ...previous }; delete next[key]; return next; });
-        active.clearError();
-      }
+      if (active) await action(active);
     }
-    catch (error) { setNotification(String(error).replace(/^Error:\s*/u, "")); }
+    catch (error) { setNotification(describeError(error)); }
     finally { setCommandBusy(false); }
+  }
+  function runFlow(verb: "clear" | "resume" | "off" | "on" | "status") {
+    return withSession(async active => {
+      await active.flow(verb);
+      if (verb === "clear") { setSessionError(null); active.clearError(); }
+    }, "Could not attach this session for Flow control.");
+  }
+  /** The Flow panel sends raw `/flow …` commands (details, retry, cancel, reset). */
+  function runFlowCommand(command: string) {
+    return withSession(active => active.runCommand(command), "Could not attach this session for Flow control.");
+  }
+  function setTextGuardMode(mode: TextGuardMode) {
+    return withSession(active => active.setTextGuardMode(mode), "Could not attach this session to change TextGuard.");
   }
   async function selectSessionModel(provider: string, id: string) {
     const client = connection.current;
@@ -898,7 +694,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!active) return;
       await active.selectModel(provider, id);
     }
-    catch (error) { setNotification(String(error).replace(/^Error:\s*/u, "")); }
+    catch (error) { setNotification(describeError(error)); }
     finally { setCommandBusy(false); }
   }
   async function selectThinkingLevel(level: string) {
@@ -911,41 +707,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!active) return;
       await active.setThinkingLevel(level);
     }
+    catch (error) { setNotification(describeError(error)); }
     finally { setCommandBusy(false); }
-  }
-  function inspectTextGuard(sessionId: string) {
-    const client = connection.current;
-    if (!client || !client.snapshot.connected || textguardRef.current[sessionId]?.loading) return;
-    updateTextGuard(sessionId, { loading: true, error: null });
-    void client.runCommand(`/textguard-desktop ${JSON.stringify({ action: "inspect" })}`)
-      .catch(error => updateTextGuard(sessionId, { loading: false, error: String(error).replace(/^Error:\s*/u, "") }));
-  }
-  async function requestTextGuardReview() {
-    const client = connection.current;
-    if (!client) return;
-    if (!await ensureSelectedSession(client)) return;
-    const id = activeSessionIdRef.current;
-    if (id) inspectTextGuard(id);
-  }
-  async function runTextGuard(action: "approve" | "dismiss" | "mode", item: TextGuardItem | null, extra: Record<string, unknown> = {}) {
-    const client = connection.current;
-    const sessionId = activeSessionIdRef.current;
-    if (!client || !sessionId || textguardRef.current[sessionId]?.busy) return;
-    updateTextGuard(sessionId, { busy: true, error: null });
-    try {
-      await client.runCommand(`/textguard-desktop ${JSON.stringify({ action, ...(item ? { id: item.id, ticket: item.ticket } : {}), ...extra })}`);
-      if (action === "approve" || action === "dismiss") {
-        const previous = textguardRef.current[sessionId]?.data;
-        if (previous) updateTextGuard(sessionId, { data: { ...previous, items: [] }, error: null });
-      }
-      // Approve and mode replies are delivered before the runtime reloads resources.
-      if (action !== "dismiss") await new Promise(resolve => setTimeout(resolve, 300));
-      await client.runCommand(`/textguard-desktop ${JSON.stringify({ action: "inspect" })}`);
-    } catch (error) {
-      updateTextGuard(sessionId, { error: String(error).replace(/^Error:\s*/u, "") });
-    } finally {
-      updateTextGuard(sessionId, { busy: false, loading: false });
-    }
   }
   async function recoverSession(sourcePath?: string): Promise<boolean> {
     const client = connection.current;
@@ -974,10 +737,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     switchingTarget.current = target;
     setSwitching(true);
     setSessionError(null);
-    setFlowNotice("");
     try {
       const previous = connection.current;
-      const next = await chatPool.enter(path, target, dialogRef.current);
+      const next = await chatPool.enter(path, target);
       if (connection.current !== previous) return;
       if (previous && previous !== next) parkPrevious(previous);
       if (connection.current !== next) bindClient(next);
@@ -996,7 +758,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       void refreshSessions();
     } catch (error) {
       if (connection.current !== client) return;
-      const message = String(error).replace(/^Error:\s*/u, "");
+      const message = describeError(error);
       if (!recovered && /owned|busy|unavailable|exited|disposed/iu.test(message)) {
         chatPool.forget(target);
         switchingRef.current = false;
@@ -1018,7 +780,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       }
       previewRequest.current += 1;
       setPreview(null);
-      setNotification(humanizeRuntimeError(message));
+      setNotification(message);
     } finally {
       switchingRef.current = false;
       switchingTarget.current = null;
@@ -1038,9 +800,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (previewRequest.current !== request) return;
       if (normalizedPath(selectedSessionRef.current ?? "") !== normalizedPath(sessionPath)) return;
       try { setPreview({ path: sessionPath, projection: interruptUnfinishedTools(historyProjection(messages)) }); }
-      catch (error) { setSessionError(String(error)); }
+      catch (error) { setSessionError(describeError(error)); }
     }).catch(error => {
-      if (previewRequest.current === request) setSessionError(String(error));
+      if (previewRequest.current === request) setSessionError(describeError(error));
     });
   }
   /** Start the runtime switch and expose the one promise a send can wait for. */
@@ -1143,7 +905,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       setSelectedSession(branch);
       setHero(false);
       setNotification("Branched into a new conversation.");
-    } catch (error) { setNotification(String(error).replace(/^Error:\s*/u, "")); }
+    } catch (error) { setNotification(describeError(error)); }
     finally { switchingRef.current = false; setSwitching(false); }
   }
   useEffect(() => {
@@ -1158,26 +920,18 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (target === "new") void startNewSession();
     else startSwitch(target);
   }, [switching, snapshot.connected, snapshot.pending]);
-  async function compactConversation() {
-    const client = connection.current;
-    if (!client || commandBusy) return;
-    setCommandBusy(true);
-    const target = selectedSessionRef.current || undefined;
-    try {
-      // Compact attaches the target without loading its transcript: get_messages on
-      // a large session exceeds the desktop's JSONL frame limit before compact runs.
-      const pooled = target ? chatPool.client(target) : undefined;
-      const active = pooled ?? client;
-      if (active !== client) { parkPrevious(client); bindClient(active); }
-      await active.compactSession(target);
+  function compactConversation() {
+    return withSession(async active => {
+      await active.compactSession();
       if (connection.current === active) setNotification("Earlier conversation compacted.");
-    } catch (error) { setNotification(String(error).replace(/^Error:\s*/u, "")); }
-    finally { setCommandBusy(false); }
+    }, "Could not attach this session to compact it.");
   }
   async function exportConversation() {
     const client = connection.current;
     if (!client || !snapshot.connected || commandBusy) return;
-    const selected = await save({ title: "Export conversation", defaultPath: `${name}-conversation.html`, filters: [{ name: "HTML", extensions: ["html"] }] });
+    let selected: string | null;
+    try { selected = await api.native.saveFile({ title: "Export conversation", defaultPath: `${name}-conversation.html`, filters: [{ name: "HTML", extensions: ["html"] }] }); }
+    catch (error) { setNotification(describeError(error)); return; }
     if (typeof selected !== "string" || connection.current !== client) return;
     setCommandBusy(true);
     try {
@@ -1186,14 +940,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!active) return;
       await active.exportHtml(selected);
       if (connection.current === active) setNotification(`Conversation exported to ${selected}`);
-    } catch (error) { if (connection.current) setNotification(String(error)); }
+    } catch (error) { if (connection.current) setNotification(describeError(error)); }
     finally { setCommandBusy(false); }
   }
   async function switchWorkspace(next: string) {
     setAppView("chat");
     if (next === path) { setPickerOpen(false); return; }
-    if (snapshot.projection.running && !await confirm("Stop the current run and switch workspace?", { title: "Switch workspace", kind: "warning" })) return;
-    freshOnPath.current = true;
+    if (snapshot.projection.running && !await api.native.confirm({ message: "Stop the current run and switch workspace?", title: "Switch workspace" }).catch(() => false)) return;
     setSelectedSession(null);
     setHero(true);
     onStartSession?.();
@@ -1224,37 +977,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   }, [workspaces, sessions, search, sort, showArchived]);
   const defaultGroup = groups.find(group => isDefaultWorkspace(group.path));
   const regularGroups = defaultGroup ? groups.filter(group => group !== defaultGroup) : groups;
-  const renderGroup = (group: (typeof groups)[number]) => {
-    const open = !!search.trim() || !collapsedGroups.has(group.id);
-    return <section key={group.id} className="mb-1">
-      <div className={`group flex items-center gap-1 rounded-lg ${(selectedWorkspace ? normalizedPath(selectedWorkspace) === normalizedPath(group.path) : !selectedKey && normalizedPath(group.path) === normalizedPath(path)) ? "bg-accent/70" : "hover:bg-muted/60"}`}>
-        <button type="button" aria-label={`${open ? "Collapse" : "Expand"} ${group.name}`} onClick={() => setCollapsedGroups(current => { const next = toggleCollapsed(current, group.id); saveCollapsed(next); return next; })} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
-          {open ? <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" /> : <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />}
-          <FolderOpen className="size-4 shrink-0 text-muted-foreground" /><span className="truncate text-sm">{group.name}</span>
-        </button>
-        <Button variant="ghost" className="mr-1 size-6 p-0 opacity-0 group-hover:opacity-100 focus:opacity-100" aria-label={`Remove ${group.path}`} onClick={() => { const workspace = workspaces.find(item => normalizedPath(item.path) === normalizedPath(group.path)); if (workspace) onRemove(workspace.id); }}><X className="size-3" /></Button>
-      </div>
-      {open && <div className="ml-4 border-l border-border pl-1.5">
-        {group.sessions.map(session => <div key={session.path} ref={node => { if (selectedKey === normalizedPath(session.path)) selectedRowRef.current = node; }} data-session-selected={selectedKey === normalizedPath(session.path) || undefined} className={`group/session relative flex items-center rounded-md text-sm ${selectedKey === normalizedPath(session.path) ? "bg-accent text-foreground before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded-full before:bg-primary" : "hover:bg-muted/60"} ${session.archived ? "opacity-60" : ""}`}>
-          <button type="button" onClick={() => void openSession(session.path)} title={session.path} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left">
-            {session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label="Pinned" /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span className="min-w-0 flex-1 truncate">{session.title}</span>{chatPool.isRunning(session.path) && <span role="img" aria-label="Running" title="Running" data-session-running className="size-1.5 shrink-0 rounded-full bg-primary" />}<span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={`${artifactCount(session.path)} artifact${artifactCount(session.path) === 1 ? "" : "s"}`}>{artifactCount(session.path)}</span>}
-          </button>
-          <div className={`relative flex shrink-0 items-center gap-0.5 pr-1 transition-opacity focus-within:opacity-100 group-hover/session:opacity-100 ${sessionMenu === session.path ? "opacity-100" : "opacity-0"}`} data-session-menu>
-            <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={session.pinned ? "Unpin session" : "Pin session"} title={session.pinned ? "Unpin session" : "Pin session"} onClick={() => void updateSession(session.path, { pinned: !session.pinned })}><Pin className={`size-3.5 ${session.pinned ? "text-primary" : "text-muted-foreground"}`} /></button>
-            <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label="Session actions" title="Session actions" aria-haspopup="menu" aria-expanded={sessionMenu === session.path} onClick={() => setSessionMenu(value => value === session.path ? null : session.path)}><MoreHorizontal className="size-4 text-muted-foreground" /></button>
-            {sessionMenu === session.path && <div role="menu" aria-label={`Actions for ${session.title}`} className="absolute right-0 top-full z-40 mt-1 w-52 rounded-xl border border-border bg-popover p-1 text-sm shadow-xl">
-              <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { pinned: !session.pinned }); setSessionMenu(null); }}><Pin className="size-4 text-muted-foreground" />{session.pinned ? "Unpin session" : "Pin session"}</button>
-              <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void renameSession(session)}><Pencil className="size-4 text-muted-foreground" />Rename</button>
-              <button type="button" role="menuitem" disabled title="Fork is not available in the runtime yet" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent disabled:opacity-50"><GitFork className="size-4 text-muted-foreground" />Fork session</button>
-              <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { archived: !session.archived }); setSessionMenu(null); }}>{session.archived ? <ArchiveRestore className="size-4 text-muted-foreground" /> : <Archive className="size-4 text-muted-foreground" />}{session.archived ? "Restore session" : "Archive session"}</button>
-              <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void copySessionId(session)}><Copy className="size-4 text-muted-foreground" />Copy Session ID</button>
-            </div>}
-          </div>
-        </div>)}
-        {!group.sessions.length && <p className="px-2 py-1.5 text-xs text-muted-foreground">No sessions yet</p>}
-      </div>}
-    </section>;
-  };
   const activeSession = normalizedPath(snapshot.sessionFile ?? "");
   const selectedKey = normalizedPath(selectedSession ?? snapshot.sessionFile ?? "");
   const selectedSessionWorkspace = sessions.find(item => normalizedPath(item.path) === selectedKey)?.workspace ?? path;
@@ -1268,7 +990,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const composerRunning = snapshot.projection.running;
   // A cancel token is sent with the clientMessageId, so Stop can be offered as
   // soon as the local outbox exists.
-  const composerStarting = (snapshot.pending || sendPending) && !composerRunning;
+  const composerStarting = (snapshot.pending || !!localSubmitted) && !composerRunning;
   const [appView, setAppView] = useState<"chat" | "artifacts">("chat");
   const [artifactCounts, setArtifactCounts] = useState<Record<string, number>>({});
   const [panes, setPanes] = useState<Array<{ tabs: string[]; active: string; width: number }>>([]);
@@ -1355,11 +1077,25 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     });
   }
 
-  const reviewBody = dialog?.title.startsWith("Review tool call") ? dialog.title.split("\n").slice(1).join("\n") : null;
-  const dialogNode = !dialog ? null : reviewBody !== null
-    ? <ToolReviewDialog title="Review tool call" body={reviewBody} options={dialog.options ?? []} disabled={dialog.responding || !snapshot.transportReady} onSelect={value => void reply({ value })} onCancel={() => void reply({ cancelled: true })} />
-    : <section role="dialog" aria-modal="false" aria-label={dialog.title.split("\n")[0]} className="rounded-xl border border-primary bg-card p-4 shadow-2xl"><h3 className="font-semibold">{dialog.title.split("\n")[0]}</h3>{dialog.title.split("\n").slice(1).join("\n") && <p className="my-2 whitespace-pre-line text-sm">{dialog.title.split("\n").slice(1).join("\n")}</p>}{dialog.message && <p className="my-2 text-sm">{dialog.message}</p>}{["input", "editor"].includes(dialog.method) && <textarea aria-label="Response" disabled={dialog.responding} className="my-2 w-full rounded border border-border bg-background p-2" value={answer} onChange={event => setAnswer(event.target.value)} />}
-      <fieldset disabled={dialog.responding || !snapshot.transportReady} className="mt-3 flex flex-wrap justify-end gap-2"><Button variant="outline" onClick={() => void reply({ cancelled: true })}>Cancel</Button>{dialog.method === "confirm" ? <><Button variant="outline" onClick={() => void reply({ confirmed: false })}>No</Button><Button onClick={() => void reply({ confirmed: true })}>Yes</Button></> : dialog.method === "select" ? (dialog.options ?? []).map(option => <Button key={option} onClick={() => void reply({ value: option })}>{option}</Button>) : <Button onClick={() => void reply({ value: answer })}>Submit</Button>}</fieldset></section>;
+  // One card for whatever the host is waiting on. Options are the host's exact
+  // strings; a failed answer keeps the card and says why.
+  const reviewBody = prompt?.title.startsWith("Review tool call") ? prompt.title.split("\n").slice(1).join("\n") || prompt.message : null;
+  const promptNode = !prompt ? null : <div>
+    {reviewBody !== null
+      ? <ToolReviewDialog title="Review tool call" body={reviewBody} options={prompt.options} disabled={promptBusy} onSelect={value => void answerPrompt(value)} />
+      : <section role="dialog" aria-modal="false" aria-label={prompt.title.split("\n")[0]} className="rounded-xl border border-primary bg-card p-4 shadow-2xl">
+        <h3 className="font-semibold">{prompt.title.split("\n")[0]}</h3>
+        {prompt.title.split("\n").slice(1).join("\n") && <p className="my-2 whitespace-pre-line text-sm">{prompt.title.split("\n").slice(1).join("\n")}</p>}
+        {prompt.message && <p className="my-2 whitespace-pre-line text-sm">{prompt.message}</p>}
+        {!prompt.options.length && <textarea aria-label="Response" disabled={promptBusy} className="my-2 w-full rounded border border-border bg-background p-2" value={answer} onChange={event => setAnswer(event.target.value)} />}
+        <fieldset disabled={promptBusy} className="mt-3 flex flex-wrap justify-end gap-2">
+          {prompt.options.length
+            ? prompt.options.map(option => <Button key={option} variant={option === "Deny" ? "outline" : "default"} onClick={() => void answerPrompt(option)}>{option}</Button>)
+            : <Button onClick={() => void answerPrompt(answer)}>Submit</Button>}
+        </fieldset>
+      </section>}
+    {promptError && <p role="alert" className="mt-1 text-xs text-destructive">{promptError}</p>}
+  </div>;
   const selectedTitle = sessions.find(session => normalizedPath(session.path) === selectedKey)?.title;
   const activePreview = preview && normalizedPath(preview.path) === selectedKey ? preview : null;
   // A preview is read from disk, so the live connection has no sessionId yet.
@@ -1393,15 +1129,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const flow = useMemo(() => showingAttached ? deriveFlow(snapshot.projection.tools) : deriveFlow({}), [showingAttached, snapshot.projection.tools]);
   const subagents = useMemo(() => showingAttached ? deriveSubagents(snapshot.projection.tools) : [], [showingAttached, snapshot.projection.tools]);
   const flowError = useMemo(() => showingAttached ? latestFlowError(snapshot.projection.messages) : undefined, [showingAttached, snapshot.projection.messages]);
-  const textguardWithheld = useMemo(() => Object.values(snapshot.projection.tools).some(tool => {
-    const result = JSON.stringify(tool.result ?? "");
-    return result.includes("TextGuard withheld") || result.includes("TextGuard advisory");
-  }), [snapshot.projection.tools]);
-  useEffect(() => {
-    const id = snapshot.sessionId;
-    if (!id || !textguardWithheld || switching || hero) return;
-    updateTextGuard(id, { seen: true, historical: !textguardRef.current[id]?.data });
-  }, [textguardWithheld, snapshot.sessionId, switching, hero]);
   const workspacePicker = <div ref={picker} className="relative">
     <Button type="button" variant="outline" className="h-8 max-w-64 gap-2 px-2 text-xs" aria-label="Choose workspace" aria-expanded={pickerOpen} onClick={() => setPickerOpen(value => !value)}>
       <FolderOpen className="size-4 shrink-0" aria-hidden="true" /><span className="truncate">{name}</span><ChevronDown className="size-3 shrink-0" aria-hidden="true" />
@@ -1420,43 +1147,44 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // store cannot be retried, so the banner offers the only way out.
   const capacityError = isCapacityError(sessionError) || isCapacityError(snapshot.error);
   const flowHistoryError = isFlowHistoryError(sessionError) || isFlowHistoryError(snapshot.error);
-  const readableError = (message: string) => humanizeRuntimeError(message);
-  const textguardKey = snapshot.sessionId && selectedKey === activeSession ? snapshot.sessionId : "";
-  const textguardView = textguardKey ? textguardBySession[textguardKey] : undefined;
-  const textguardItems = textguardView?.data?.items.length ?? 0;
-  const textguardExpired = !!textguardView?.historical && !!textguardView?.error;
-  const textguardBlocked = !!textguardView?.seen && !textguardExpired && (textguardView.data ? textguardItems > 0 : true);
-  const [textguardMode, setTextguardMode] = useState<"on" | "strict" | "off">("on");
+  // TextGuard: three modes, and the content it withheld. The runtime confirms the
+  // mode; until it has, the default (on) is shown.
+  const textguardMode: TextGuardMode = (showingAttached ? snapshot.textguard?.mode : undefined) ?? "on";
+  const textguardAlert = showingAttached ? snapshot.textguard?.alert : undefined;
   const textguardControl = snapshot.sessionId ? {
-    label: textguardBlocked ? `${textguardItems || 1} blocked` : "TextGuard",
-    title: textguardBlocked ? `${textguardItems || 1} item(s) withheld from the model` : "TextGuard",
-    tone: (textguardBlocked ? "blocked" : textguardExpired || textguardView?.historical ? "expired" : "idle") as "blocked" | "expired" | "idle",
-    disabled: !textguardKey,
-    blocked: false,
     mode: textguardMode,
-    onMode: (mode: "on" | "strict" | "off") => {
-      setTextguardMode(mode);
-      void runExtensionCommand(`/textguard ${mode}`);
-    },
-    onOpen: () => {},
+    alert: !!textguardAlert,
+    disabled: !showingAttached || commandBusy || composerRunning,
+    onMode: (mode: TextGuardMode) => void setTextGuardMode(mode),
   } : undefined;
-
-  // A review created by the running turn can only be inspected after it settles.
-  useEffect(() => {
-    if (!textguardKey || snapshot.projection.running || !textguardView?.open || textguardView.data) return;
-    inspectTextGuard(textguardKey);
-  }, [textguardKey, snapshot.projection.running, textguardView?.open, textguardView?.data]);
-  const textguardPanel = textguardKey && textguardView?.seen && textguardView.open
-    ? <aside role="region" aria-label="TextGuard review" className="relative z-20 flex h-full w-[480px] max-w-[90vw] shrink-0 flex-col border-l border-border bg-background">
-        <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-          <h2 className="text-sm font-semibold">TextGuard</h2>
-          <Button variant="ghost" className="size-8 p-0" aria-label="Close TextGuard" onClick={() => updateTextGuard(textguardKey, { open: false })}><X className="size-4" /></Button>
-        </div>
-        <div className="min-h-0 flex-1 overflow-y-auto p-3">
-          <TextGuardBar data={textguardView.data} open busy={textguardView.busy} running={composerRunning} error={textguardView.error} historical={textguardView.historical} onToggle={() => updateTextGuard(textguardKey, { open: false })} onStop={cancelSend} onAction={(action, item, extra) => void runTextGuard(action, item, extra)} />
-        </div>
-      </aside>
-    : null;
+  const flowHold = showingAttached ? snapshot.flowHold : null;
+  const failedTurn = showingAttached ? snapshot.failedTurn : null;
+  const pausedQueue = showingAttached && snapshot.queue?.some(item => item.state === "paused") ? snapshot.queue : undefined;
+  // Every session-level notice lives in one stack above the composer, in the order
+  // the user needs to act on them. Transient replies use the toast instead.
+  const banners = <div className="space-y-1">
+    {flowHold && <div role="alert" aria-label="Flow control" className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-300">
+      <span className="min-w-0 flex-1">{flowHold.text}</span>
+      {flowHold.paused && <Button variant="outline" className="h-6 px-2 text-[10px]" disabled={commandBusy} onClick={() => void runFlow("resume")}>Resume</Button>}
+      <Button variant="outline" className="h-6 px-2 text-[10px]" disabled={commandBusy} onClick={() => void runFlow("clear")}>Release</Button>
+      <Button variant="outline" className="h-6 px-2 text-[10px]" disabled={commandBusy} title="Turn Flow control off for this session; held messages run normally" onClick={() => void runFlow("off")}>Turn off Flow</Button>
+      <Button variant="ghost" className="size-6 p-0" aria-label="Dismiss" onClick={() => connection.current?.dismissFlowHold()}><X className="size-3" /></Button>
+    </div>}
+    {textguardAlert && <div role="alert" aria-label="TextGuard" className="flex flex-wrap items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px]">
+      <span className="min-w-0 flex-1">{textguardAlert}</span>
+      {textguardMode !== "off" && <Button variant="outline" className="h-6 px-2 text-[10px]" disabled={commandBusy || composerRunning} title="Admit content unscanned for this session, then retry" onClick={() => void setTextGuardMode("off")}>Turn off TextGuard</Button>}
+      <Button variant="ghost" className="size-6 p-0" aria-label="Dismiss" onClick={() => connection.current?.dismissTextGuardAlert()}><X className="size-3" /></Button>
+    </div>}
+    {failedTurn && <div role="alert" className="flex flex-wrap items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px]">
+      <span className="min-w-0 flex-1">This message did not get a reply{failedTurn.text ? `: “${failedTurn.text.length > 80 ? `${failedTurn.text.slice(0, 80)}…` : failedTurn.text}”` : "."}</span>
+      <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void connection.current?.queue("retry")}>Retry</Button>
+    </div>}
+    {pausedQueue && <div role="status" aria-label="Queued messages" className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-[11px]">
+      <span className="min-w-0 flex-1">{pausedQueue.length === 1 ? "1 message is waiting" : `${pausedQueue.length} messages are waiting`} after the stopped turn.</span>
+      <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void connection.current?.queue("continue")}>Send now</Button>
+      <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void connection.current?.queue("discard")}>Discard</Button>
+    </div>}
+  </div>;
   return <div ref={chatRoot} className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
     {dropActive && <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-primary bg-background/85 text-sm font-medium text-primary">Drop images or files</div>}
     {sidebar && <aside aria-label="Workspaces" className="absolute inset-y-0 left-0 z-20 flex w-80 max-w-[85%] flex-col border-r border-border bg-background shadow-xl md:static md:z-auto md:shadow-none">
@@ -1494,7 +1222,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
                   {sessionMenu === session.path && <div role="menu" aria-label={`Actions for ${session.title}`} className="absolute right-0 top-full z-40 mt-1 w-52 rounded-xl border border-border bg-popover p-1 text-sm shadow-xl">
                     <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { pinned: !session.pinned }); setSessionMenu(null); }}><Pin className="size-4 text-muted-foreground" />{session.pinned ? "Unpin session" : "Pin session"}</button>
                     <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void renameSession(session)}><Pencil className="size-4 text-muted-foreground" />Rename</button>
-                    <button type="button" role="menuitem" disabled title="Fork is not available in the runtime yet" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent disabled:opacity-50"><GitFork className="size-4 text-muted-foreground" />Fork session</button>
                     <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { archived: !session.archived }); setSessionMenu(null); }}>{session.archived ? <ArchiveRestore className="size-4 text-muted-foreground" /> : <Archive className="size-4 text-muted-foreground" />}{session.archived ? "Restore session" : "Archive session"}</button>
                     <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void copySessionId(session)}><Copy className="size-4 text-muted-foreground" />Copy Session ID</button>
                   </div>}
@@ -1522,7 +1249,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           <div className="hidden min-w-0 items-center gap-1.5 md:flex">
             <SubagentMenu agents={subagents} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} />
             <BackgroundMenu jobs={flow.background} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} />
-            <FlowMenu key={snapshot.sessionId ?? path} flow={flow} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} notice={showingAttached ? flowNotice : ""} error={flowError} reports={reportsSession && normalizedPath(reportsSession) === activeSession ? diskReports : []} onCommand={command => void runExtensionCommand(command)} busy={commandBusy} />
+            <FlowMenu key={snapshot.sessionId ?? path} flow={flow} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} notice={flowHold?.text} error={flowError} reports={reportsSession && normalizedPath(reportsSession) === activeSession ? diskReports : []} onCommand={command => void runFlowCommand(command)} busy={commandBusy || composerRunning} />
             <McpMenu onReload={() => void reloadSession()} onAsk={() => updateDraft("Add an MCP server to this workspace. Ask me for the name, transport, target, and any required environment variables.")} />
           </div>
         </div>
@@ -1532,10 +1259,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       </div>}
       {notification && <div role="status" aria-live="polite" className="pointer-events-none fixed left-1/2 top-16 z-50 w-max max-w-[min(40rem,calc(100vw-2rem))] -translate-x-1/2 rounded-lg bg-popover px-4 py-2 text-xs text-foreground shadow-xl">{notification}</div>}
       {imageRepair && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">This session contains an image the model refuses, so every request fails. Removing it keeps the rest of the transcript.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void repairSessionImages()}>Remove the image</Button></div>}
-      {snapshot.historyError && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">This session is connected, but its transcript could not be loaded. {humanizeRuntimeError(snapshot.historyError)}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void connection.current?.retryHistory()}>Retry</Button></div>}
-      {capacityError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">{humanizeRuntimeError(sessionError ?? snapshot.error ?? "")}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void startNewSession()}>New session</Button></div>}
-      {flowHistoryError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">Flow request history is full. Clear it before sending again.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void runExtensionCommand("/flow clear")}>Clear Flow history</Button></div>}
-      {booting && !hero && !sendPending ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-8 sm:px-8">
+      {snapshot.historyError && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">This session is connected, but its transcript could not be loaded. {snapshot.historyError}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void connection.current?.retryHistory()}>Retry</Button></div>}
+      {capacityError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">{sessionError ?? snapshot.error ?? ""}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void startNewSession()}>New session</Button></div>}
+      {flowHistoryError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">Flow request history is full. Clear it before sending again.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void runFlow("clear")}>Clear Flow history</Button></div>}
+      {booting && !hero && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-8 sm:px-8">
         <div className="w-full max-w-3xl">
           <div className="mb-7 flex flex-col items-center gap-3 text-center">
             <span className="flex size-12 items-center justify-center rounded-2xl border border-border bg-card"><Sparkles className="size-6 text-primary" aria-hidden="true" /></span>
@@ -1543,35 +1270,21 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
             <p className="max-w-md text-sm text-muted-foreground">Choose a workspace, then describe the task. Jouzu can explore code, explain it, or make a change.</p>
           </div>
           <div className="mb-2 flex flex-wrap items-center gap-2 px-1">{workspacePicker}</div>
-          {dialogNode && <div className="mb-3">{dialogNode}</div>}
-          <Composer hero connected={snapshot.connected} pending={snapshot.pending || commandBusy || locked } opening={switching || opening || booting} starting={composerStarting} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={cancelSend} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} compatibility={snapshot.projection.compatibility} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} videos={videoUrls} queued={queuedSteers} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
+          {promptNode && <div className="mb-3">{promptNode}</div>}
+          <Composer hero connected={snapshot.connected} pending={snapshot.pending || commandBusy || locked } opening={switching || opening || booting} starting={composerStarting} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
           <SessionStatsBar stats={snapshot.stats} timing={timing} />
         </div>
       </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
-{snapshot.gap && <p role="status" className="mx-auto mb-2 max-w-3xl text-xs text-muted-foreground">The transcript was refreshed after a display backlog.</p>}
-          <ChatConversation key={conversationKey} projection={conversationProjection} workspace={path} busy={snapshot.pending} pendingUser={pendingUser} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={turnChangedFiles} />
+          <ChatConversation key={conversationKey} projection={conversationProjection} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onRetrySend={id => void connection.current?.retry(id)?.catch(() => {})} onDiscardSend={id => connection.current?.discard(id)} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={turnChangedFiles} />
         </div>
         <div className="relative">
           <div className="mx-auto w-full max-w-3xl">
-            {showingAttached && flowNotice && <div role="alert" className="mb-1 flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">
-              <span className="min-w-0 flex-1">{/holding|reconciliation|waiting for recovery/iu.test(flowNotice) ? "Flow is holding your message. Clear it to continue." : flowNotice}</span>
-              {/paused/iu.test(flowNotice) && <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void runExtensionCommand("/flow resume")}>Resume</Button>}
-              <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void runExtensionCommand("/flow clear")}>Clear</Button>
-            </div>}
+            {banners}
             <AgentAction thinking={liveThinking} label="Working…" running={conversationProjection.running} elapsed={elapsed} settled={settled} />
-            {!!snapshot.failedTurn && <div role="alert" className="mt-1 flex flex-wrap items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px]">
-              <span className="min-w-0 flex-1">{snapshot.failedTurn.text || "The last turn failed."}</span>
-              <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void connection.current?.queue("retry")}>Retry</Button>
-            </div>}
-            {!!snapshot.queue?.length && <div role="status" aria-label="Queued messages" className="mt-1 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-[11px]">
-              <span className="min-w-0 flex-1">{snapshot.queue.map(item => item.text || "Queued message").join(" · ")}</span>
-              <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void connection.current?.queue("continue")}>Continue</Button>
-              <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void connection.current?.queue("discard")}>Discard</Button>
-            </div>}
           </div>
-          {dialogNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{dialogNode}</div>}
-          <Composer connected={snapshot.connected || !!activePreview} pending={snapshot.pending || commandBusy || (opening && !activePreview) || locked } opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={cancelSend} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} compatibility={snapshot.projection.compatibility} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} videos={videoUrls} queued={queuedSteers} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
+          {promptNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{promptNode}</div>}
+          <Composer connected={snapshot.connected || !!activePreview} pending={snapshot.pending || commandBusy || (opening && !activePreview) || locked } opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
         </div>
         <SessionStatsBar stats={snapshot.stats} timing={timing} />
         </div>
@@ -1600,7 +1313,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {appView === "artifacts" && <section className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div className="min-h-0 flex-1 overflow-auto p-4"><div className="mx-auto max-w-5xl"><ArtifactsPanel /></div></div>
     </section>}
-    {textguardPanel}
   </div>;
 }
 

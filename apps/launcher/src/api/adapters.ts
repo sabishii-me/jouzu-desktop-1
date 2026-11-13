@@ -27,7 +27,7 @@ import {
 } from "./jouzu-api";
 
 function unsupported(): never {
-  throw new ApiError("invalid-request", "This host method is not implemented yet.", false);
+  throw new ApiError("invalid-request", "This action is not available in this version of Jouzu.", false);
 }
 
 function unavailableNative(): NativeApi {
@@ -38,6 +38,8 @@ function unavailableNative(): NativeApi {
     confirm: async options =>
       typeof window !== "undefined" ? window.confirm(options.message) : false,
     pickFolder: fail,
+    saveFile: fail,
+    onFileDrop: () => () => {},
     reveal: fail,
     openExternal: fail,
     terminal: fail,

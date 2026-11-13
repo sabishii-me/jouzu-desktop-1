@@ -19,6 +19,7 @@ export type ApiErrorCode =
   | "capability-unavailable"
   | "unauthorized"
   | "forbidden"
+  | "prompt-forbidden"
   | "invalid-request"
   | "session-not-found"
   | "prompt-resolved"
@@ -264,6 +265,13 @@ export interface SettingsApi {
 export interface NativeApi {
   confirm(options: { message: string; title?: string }): Promise<boolean>;
   pickFolder(): Promise<string | null>;
+  /** Ask where to save a file; null when the user cancels. */
+  saveFile(options: { title: string; defaultPath: string; filters?: Array<{ name: string; extensions: string[] }> }): Promise<string | null>;
+  /**
+   * Files dropped onto the window. `position` is in CSS pixels. Returns an
+   * unsubscribe function; a shell without native drag and drop never calls back.
+   */
+  onFileDrop(listener: (event: { type: "over" | "drop" | "leave"; paths: string[]; position?: { x: number; y: number } }) => void): () => void;
   reveal(path: string): Promise<void>;
   openExternal(url: string): Promise<void>;
   terminal(path?: string): Promise<void>;

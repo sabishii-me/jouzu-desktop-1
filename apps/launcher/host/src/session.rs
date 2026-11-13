@@ -2,7 +2,7 @@
 //! bounded event log, and an exclusive lifecycle independent of any page.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{
@@ -261,6 +261,10 @@ pub struct Session {
     ready: tokio::sync::Notify,
     pending_approvals: Mutex<HashMap<String, PendingApproval>>,
     pending_questions: Mutex<HashMap<String, PendingQuestion>>,
+    /// Extension status lines (`setStatus`), keyed by the extension's status key.
+    ui_statuses: Mutex<BTreeMap<String, String>>,
+    /// Extension widgets (`setWidget`), keyed by the extension's widget key.
+    ui_widgets: Mutex<BTreeMap<String, Vec<String>>>,
     approval_outcomes: Mutex<HashMap<String, String>>,
     question_outcomes: Mutex<HashMap<String, String>>,
     next_prompt: AtomicU64,
@@ -572,8 +576,24 @@ impl Session {
                     .clone(),
                 "pendingApprovals": self.pending_approvals(),
                 "pendingQuestions": self.pending_questions(),
+                "statuses": self.ui_statuses(),
+                "widgets": self.ui_widgets(),
             }),
         }
+    }
+
+    fn ui_statuses(&self) -> Value {
+        json!(*self
+            .ui_statuses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+
+    fn ui_widgets(&self) -> Value {
+        json!(*self
+            .ui_widgets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 
     pub fn events_after(&self, after: u64) -> (Vec<SessionEvent>, u64) {
@@ -1322,6 +1342,81 @@ impl Session {
         match value.get("method").and_then(Value::as_str).unwrap_or("") {
             "confirm" => self.request_approval(value),
             "select" | "input" | "editor" => self.request_question(value),
+            // Fire-and-forget notices: the runtime's only channel for command replies
+            // (`/flow`, `/textguard`) and for Flow holds. Dropping them leaves a held
+            // message looking like an endless stall.
+            "notify" => {
+                let message = value.get("message").and_then(Value::as_str).unwrap_or("");
+                if message.trim().is_empty() {
+                    return;
+                }
+                let level = match value.get("notifyType").and_then(Value::as_str) {
+                    Some("error") => "error",
+                    Some("warning") => "warning",
+                    _ => "info",
+                };
+                self.publish(
+                    "session.notice",
+                    json!({ "message": message, "level": level }),
+                );
+            }
+            "setStatus" => {
+                let Some(key) = value.get("statusKey").and_then(Value::as_str) else {
+                    return;
+                };
+                let text = value
+                    .get("statusText")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty());
+                let changed = {
+                    let mut statuses = self
+                        .ui_statuses
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match text {
+                        Some(text) => {
+                            statuses
+                                .insert(key.to_string(), text.to_string())
+                                .as_deref()
+                                != Some(text)
+                        }
+                        None => statuses.remove(key).is_some(),
+                    }
+                };
+                if changed {
+                    self.publish_summary();
+                }
+            }
+            "setWidget" => {
+                let Some(key) = value.get("widgetKey").and_then(Value::as_str) else {
+                    return;
+                };
+                let lines: Vec<String> = value
+                    .get("widgetLines")
+                    .and_then(Value::as_array)
+                    .map(|lines| {
+                        lines
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let changed = {
+                    let mut widgets = self
+                        .ui_widgets
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if lines.is_empty() {
+                        widgets.remove(key).is_some()
+                    } else {
+                        widgets.insert(key.to_string(), lines.clone()).as_ref() != Some(&lines)
+                    }
+                };
+                if changed {
+                    self.publish_summary();
+                }
+            }
             method => log(
                 &self.home,
                 "debug",
@@ -2565,6 +2660,10 @@ impl Session {
             "sessionSeq": self.cursor(),
             "status": status.as_str(),
             "activeTurn": active_turn,
+            "pendingApprovals": self.pending_approvals(),
+            "pendingQuestions": self.pending_questions(),
+            "statuses": self.ui_statuses(),
+            "widgets": self.ui_widgets(),
             "queue": queue,
             "failedTurn": self
                 .failed_turn
@@ -2643,6 +2742,8 @@ impl Session {
             ready: tokio::sync::Notify::new(),
             pending_approvals: Mutex::new(HashMap::new()),
             pending_questions: Mutex::new(HashMap::new()),
+            ui_statuses: Mutex::new(BTreeMap::new()),
+            ui_widgets: Mutex::new(BTreeMap::new()),
             approval_outcomes: Mutex::new(HashMap::new()),
             question_outcomes: Mutex::new(HashMap::new()),
             next_prompt: AtomicU64::new(0),

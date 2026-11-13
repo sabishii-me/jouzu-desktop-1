@@ -977,6 +977,25 @@ async fn global_events(
         .and_then(|value| value.parse::<u64>().ok())
         .or(query.after)
         .unwrap_or(0);
+    // The global stream is the production path for every client: register the
+    // client's capabilities here too, or prompt answers are refused (403).
+    if let Some(client_id) = query
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let capabilities: Vec<String> = query
+            .capabilities
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        state.sessions.register_client(client_id, &capabilities);
+    }
     let latest = state.events.latest_seq();
     let summaries = state.sessions.summaries();
     let sessions = state.sessions.clone();
@@ -3291,6 +3310,42 @@ mod session_tests {
         assert_eq!(missing.0, StatusCode::NOT_FOUND);
     }
     #[tokio::test]
+    async fn extension_notices_status_and_widgets_reach_clients() {
+        let (manager, _home, workspace) = manager_with_ui("notices", None);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let (mut rx, reader) =
+            subscribe_as(app.clone(), &session.id, "viewer", "view").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        session.send("client-1", "go").unwrap();
+        let notice = next_event(&mut rx, "session.notice").await;
+        assert_eq!(notice["level"], "warning");
+        assert!(notice["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Flow control is holding"));
+        for _ in 0..50 {
+            if session.summary()["widgets"]["flow"].is_array() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let summary = session.summary();
+        assert_eq!(summary["statuses"]["flow"], "held 1");
+        assert_eq!(summary["widgets"]["flow"], json!(["line a", "line b"]));
+        reader.abort();
+        let (mut snap_rx, snap_reader) =
+            subscribe_as(app.clone(), &session.id, "late", "view").await;
+        let snapshot = next_event(&mut snap_rx, "session.snapshot").await;
+        assert_eq!(snapshot["statuses"]["flow"], "held 1");
+        snap_reader.abort();
+    }
+
+    #[tokio::test]
     async fn approval_confirm_decision_resumes_and_duplicate_is_resolved() {
         let (manager, _home, workspace) = manager_with_ui("confirm", None);
         let session = manager
@@ -3362,6 +3417,67 @@ mod session_tests {
             session_info(&app, &session.id).await["pendingApprovalCount"],
             0
         );
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn global_stream_client_can_answer_approvals() {
+        let (manager, _home, workspace) = manager_with_ui("confirm", None);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                request(
+                    Method::GET,
+                    "/v1/events?clientId=global-ui&capabilities=view,control,prompts",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let reader = tokio::spawn(read_sse(response, tx));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        session.send("client-1", "go").unwrap();
+        let mut approval_id = String::new();
+        for _ in 0..100 {
+            let summary = session.summary();
+            if let Some(id) = summary["pendingApprovals"][0]["approvalId"].as_str() {
+                approval_id = id.to_string();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !approval_id.is_empty(),
+            "summary carries the pending approval"
+        );
+
+        let (status, _) = post_json(
+            app.clone(),
+            &format!("/v1/approvals/{approval_id}/decision"),
+            json!({ "clientId": "never-connected", "decision": "Approve" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, body) = post_json(
+            app.clone(),
+            &format!("/v1/approvals/{approval_id}/decision"),
+            json!({ "clientId": "global-ui", "decision": "Approve" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "allowed");
+        wait_status(&session, Status::Idle).await;
+        assert_eq!(session.summary()["pendingApprovals"], json!([]));
         reader.abort();
     }
 

@@ -17,3 +17,30 @@ export function isFlowHistoryError(message: string | null | undefined): boolean 
 export function humanizeRuntimeError(message: string): string {
   return isCapacityError(message) ? CAPACITY_MESSAGE : message;
 }
+
+const CODE_MESSAGES: Partial<Record<string, string>> = {
+  "runtime-unavailable": "The model runtime is not available right now. Try again in a moment.",
+  "runtime-timeout": "The model runtime did not respond in time. Try again.",
+  "session-not-found": "This session is no longer open. Select it in the sidebar to reopen it.",
+  unauthorized: "This window lost its connection to Jouzu. Reload the app.",
+  forbidden: "This window is not allowed to do that. Reload the app.",
+  "prompt-forbidden": "This window is not allowed to answer requests. Reload the app.",
+  "prompt-resolved": "This request was already answered.",
+  "prompt-expired": "This request expired before it was answered.",
+};
+
+/**
+ * The one place that turns a thrown value into text a user reads. Host errors
+ * carry a code; a known code gets a fixed sentence, anything else keeps the
+ * host's message without the JavaScript class prefix.
+ */
+export function describeError(error: unknown): string {
+  if (error && typeof error === "object") {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string" && CODE_MESSAGES[code]) return CODE_MESSAGES[code]!;
+  }
+  if (error instanceof TypeError && /fetch|network/iu.test(error.message)) return "Cannot reach Jouzu. Check that the app is still running.";
+  const raw = error instanceof Error ? error.message : String(error ?? "");
+  const text = raw.replace(/^(?:Api)?Error:\s*/u, "").trim();
+  return humanizeRuntimeError(text || "Something went wrong.");
+}

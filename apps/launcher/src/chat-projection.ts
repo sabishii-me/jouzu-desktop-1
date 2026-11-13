@@ -47,6 +47,31 @@ export function historyProjection(messages: unknown): ChatProjection {
   }
   return { ...emptyProjection(), messages: parsed, tools };
 }
+/** Host history/`message.done` blocks in the shape the transcript renders. */
+export function hostBlocks(blocks: unknown): ChatBlock[] {
+  if (!Array.isArray(blocks)) return [];
+  return blocks.flatMap((block): ChatBlock[] => {
+    if (!object(block) || typeof block.type !== "string") return [];
+    if (block.type === "text" && typeof block.text === "string") return [{ type: "text", text: block.text }];
+    if (block.type === "thinking") return [{ type: "thinking", thinking: typeof block.text === "string" ? block.text : typeof block.thinking === "string" ? block.thinking : "" }];
+    if (block.type === "toolCall") {
+      const id = typeof block.toolCallId === "string" ? block.toolCallId : typeof block.id === "string" ? block.id : "";
+      return id ? [{ type: "toolCall", id, name: typeof block.name === "string" ? block.name : "tool", arguments: block.input ?? block.arguments }] : [];
+    }
+    if (block.type === "toolResult" && typeof block.toolCallId === "string") return [{ type: "toolResult", toolCallId: block.toolCallId, content: [{ type: "text", text: typeof block.result === "string" ? block.result : JSON.stringify(block.result ?? "") }], isError: block.ok === false }];
+    if (block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string") return [{ type: "image", data: block.data, mimeType: block.mimeType }];
+    return [];
+  });
+}
+
+/** Images the user attached, as stored by the host with the user row. */
+function attachmentBlocks(attachments: unknown): ChatBlock[] {
+  if (!Array.isArray(attachments)) return [];
+  return attachments.flatMap((item): ChatBlock[] => object(item) && typeof item.data === "string" && typeof item.mimeType === "string" && item.mimeType.startsWith("image/")
+    ? [{ type: "image", data: item.data, mimeType: item.mimeType }]
+    : []);
+}
+
 export function historyRowsProjection(rows: unknown): ChatProjection {
   if (!Array.isArray(rows)) throw new Error("Invalid host history");
   const messages: ChatMessage[] = [];
@@ -56,14 +81,7 @@ export function historyRowsProjection(rows: unknown): ChatProjection {
     const kind = typeof row.kind === "string" ? row.kind : "";
     const timestamp = typeof row.createdAt === "string" ? Date.parse(row.createdAt) : undefined;
     if (kind === "user" || kind === "assistant") {
-      const content = Array.isArray(row.blocks) ? row.blocks.flatMap(block => {
-        if (!object(block) || typeof block.type !== "string") return [];
-        if (block.type === "text" && typeof block.text === "string") return [{ type: "text", text: block.text }];
-        if (block.type === "thinking" && typeof block.text === "string") return [{ type: "thinking", thinking: block.text }];
-        if (block.type === "toolCall" && typeof block.toolCallId === "string") return [{ type: "toolCall", id: block.toolCallId, name: typeof block.name === "string" ? block.name : "tool", arguments: block.input }];
-        if (block.type === "toolResult" && typeof block.toolCallId === "string") return [{ type: "toolResult", toolCallId: block.toolCallId, content: [{ type: "text", text: typeof block.result === "string" ? block.result : JSON.stringify(block.result ?? "") }], isError: block.ok === false } as ChatBlock];
-        return [];
-      }) : [];
+      const content = [...hostBlocks(row.blocks), ...attachmentBlocks(row.attachments)];
       messages.push({
         role: kind,
         content,
@@ -102,7 +120,7 @@ export function interruptUnfinishedTools(state: ChatProjection): ChatProjection 
       ...tool,
       phase: "error" as const,
       interrupted: true,
-      result: { content: [{ type: "text", text: "Interrupted: the runtime has no result for this tool call." }] },
+      result: { content: [{ type: "text", text: "Interrupted" }] },
     }];
   }));
   return changed ? { ...state, tools } : state;

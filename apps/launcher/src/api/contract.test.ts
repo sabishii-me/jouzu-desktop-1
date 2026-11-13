@@ -112,6 +112,8 @@ function bridge() {
   const native: NativeApi = {
     confirm: vi.fn(async () => true),
     pickFolder: vi.fn(async () => "C:/picked"),
+    saveFile: vi.fn(async () => "C:/saved.html"),
+    onFileDrop: vi.fn(() => () => {}),
     reveal: vi.fn(async () => undefined),
     openExternal: vi.fn(async () => undefined),
     terminal: vi.fn(async () => undefined),

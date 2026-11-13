@@ -1,4 +1,5 @@
 import type { ChatProjection } from "./chat-projection";
+import type { TextGuardMode } from "./session-notices";
 
 /** One id per page load: handles from an older page are released by the host. */
 export const pageGeneration = globalThis.crypto.randomUUID();
@@ -24,15 +25,6 @@ export interface SessionStats {
 export interface SessionTiming { modelMs: number; toolMs: number; turns: number; steps: number; outputTokens: number }
 const MODEL_PREFERENCE_KEY = "jouzu.chat.model";
 
-/** Flow notices belong in the Flow panel; strip their terminal-command instruction. */
-export function flowNoticeText(message: string): string | undefined {
-  if (!/\/flow\b/iu.test(message)) return undefined;
-  const text = message
-    .replace(/\s*Run \/flow[^.]*\.?/giu, "")
-    .replace(/\s*Inspect with \/flow[^.]*\.?/giu, "")
-    .trim();
-  return text || "Flow needs attention.";
-}
 export function readModelPreference(): { provider: string; id: string } | undefined {
   try {
     const value = JSON.parse(localStorage.getItem(MODEL_PREFERENCE_KEY) ?? "null");
@@ -46,29 +38,73 @@ export function writeModelPreference(value: { provider: string; id: string } | u
   } catch { /* A webview without storage keeps the selection for this session only. */ }
 }
 
+/** The host's view of the turn in progress (`session.updated.activeTurn`). */
+export interface ActiveTurn {
+  turnId: string;
+  clientMessageId?: string;
+  phase: string;
+  startedAt?: number;
+}
+export interface QueuedMessage { clientMessageId: string; text: string; state: string }
+/** An approval or question the host is waiting on; rendered from host data only. */
+export interface PendingPrompt {
+  kind: "approval" | "question";
+  id: string;
+  title: string;
+  message: string;
+  /** Exact option strings the host accepts; sent back unchanged. */
+  options: string[];
+  /** For a question: the host's item id the answer is keyed by. */
+  itemId?: string;
+  expiresAt?: number;
+}
+/**
+ * A message the user sent that the host has not confirmed yet. It is the only
+ * UI-owned piece of session state and is keyed by clientMessageId.
+ */
+export interface OutboxItem {
+  clientMessageId: string;
+  text: string;
+  images: ChatImage[];
+  state: "sending" | "failed";
+  error?: string;
+  at: number;
+}
+
 export interface ChatSnapshot {
   projection: ChatProjection;
   connected: boolean;
-  transportReady?: boolean;
+  /** True while one of the user's own messages has not been confirmed by the host. */
   pending: boolean;
+  /** The last error for this session, shown in the banner area. */
   error: string | null;
-  /** The runtime is reachable but its transcript could not be read. */
+  /** The session is open but its transcript could not be read. */
   historyError?: string;
   sessionId?: string;
   sessionFile?: string;
+  /** Host status: pending, starting, idle, running, waiting_approval, waiting_question, recovering, stopped, error. */
+  status?: string;
+  /** Host-owned; null when no turn is in progress. The only source of "running". */
+  activeTurn?: ActiveTurn | null;
+  prompts?: PendingPrompt[];
+  outbox?: OutboxItem[];
   model?: string;
   modelProvider?: string;
   modelId?: string;
   models?: ChatModel[];
   modelsLoaded?: boolean;
-  widgets?: Record<string, string[]>;
-  statuses?: Record<string, string>;
-  flowNotice?: string;
   stats?: SessionStats;
   thinkingLevel?: string;
   thinkingLevels?: string[];
-  queue?: Array<{ clientMessageId: string; text: string; state: string }>;
+  queue?: QueuedMessage[];
   failedTurn?: { clientMessageId: string; text: string } | null;
-  /** The transcript was compacted after a display backlog and will be reloaded. */
-  gap?: boolean;
+  /** Extension widgets and status lines, as the host last reported them. */
+  widgets?: Record<string, string[]>;
+  statuses?: Record<string, string>;
+  /** Flow control is holding input; the UI offers the controls that release it. */
+  flowHold?: { text: string; paused: boolean } | null;
+  /** TextGuard's mode as last confirmed by the runtime, and any content it withheld. */
+  textguard?: { mode?: TextGuardMode; alert?: string };
+  /** The latest transient runtime notice (command replies and the like). */
+  notice?: { id: number; text: string; level: "info" | "warning" | "error" } | null;
 }

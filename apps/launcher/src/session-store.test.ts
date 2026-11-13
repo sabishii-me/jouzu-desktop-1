@@ -56,23 +56,122 @@ describe("SessionStore", () => {
     expect(projection.running).toBe(false);
   });
 
-  it("marks a queued send pending and clears it on done", async () => {
+  it("shows a send in the outbox until the host confirms it", async () => {
+    let release: () => void = () => {};
     const session = fakeSession();
+    const send = session.send;
+    session.send = async message => { await new Promise<void>(resolve => { release = resolve; }); return send(message); };
     const store = SessionStore.attach(session);
-    await store.send("hello", [], "client-1");
-    expect(session.sent).toEqual([{ clientMessageId: "client-1", text: "hello", attachments: [] }]);
+    const pending = store.send("hello", [], "client-1");
     expect(store.snapshot.pending).toBe(true);
-    session.emit(event(1, "message.done", { messageId: "m-1", blocks: [], stopReason: "completed" }));
+    expect(store.snapshot.outbox).toMatchObject([{ clientMessageId: "client-1", text: "hello", state: "sending" }]);
+    release();
+    await pending;
+    expect(session.sent).toEqual([{ clientMessageId: "client-1", text: "hello", attachments: [] }]);
     expect(store.snapshot.pending).toBe(false);
+    expect(store.snapshot.outbox).toEqual([]);
+    expect(store.snapshot.projection.messages.map(message => `${message.role}:${message.turnId}`)).toEqual(["user:m-1"]);
   });
 
-  it("keeps an accepted send in the transcript when the caller owns the pending row", async () => {
+  it("keeps a failed send as not sent, and retries it with the same id", async () => {
+    const session = fakeSession();
+    const send = session.send;
+    let fail = true;
+    session.send = async message => { if (fail) throw new Error("network down"); return send(message); };
+    const store = SessionStore.attach(session);
+    await expect(store.send("hello", [], "client-1")).rejects.toThrow();
+    expect(store.snapshot.outbox).toMatchObject([{ clientMessageId: "client-1", state: "failed" }]);
+    expect(store.snapshot.pending).toBe(false);
+    fail = false;
+    await store.retry("client-1");
+    expect(session.sent).toEqual([{ clientMessageId: "client-1", text: "hello", attachments: [] }]);
+    expect(store.snapshot.outbox).toEqual([]);
+  });
+
+  it("takes running and its start time only from the host summary", () => {
     const session = fakeSession();
     const store = SessionStore.attach(session);
-    await store.sendOrSteer("hello", [], false, "client-1", false);
-    session.emit(event(1, "message.start", { messageId: "m-1", turnId: "m-1", role: "assistant" }));
+    session.emit(event(1, "session.updated", { activeTurn: { turnId: "m-1", phase: "running", startedAt: "2026-11-13T00:00:00.000Z" } }));
+    expect(store.snapshot.projection.running).toBe(true);
+    expect(store.snapshot.projection.turnStartedAt).toBe(Date.parse("2026-11-13T00:00:00.000Z"));
     session.emit(event(2, "message.done", { messageId: "m-1", blocks: [{ type: "text", text: "hi" }], stopReason: "completed" }));
-    expect(store.snapshot.projection.messages.map(message => message.role)).toEqual(["user", "assistant"]);
+    expect(store.snapshot.projection.running).toBe(true);
+    session.emit(event(3, "session.updated", { activeTurn: null }));
+    expect(store.snapshot.projection.running).toBe(false);
+  });
+
+  it("shows a tool call in the live reply as soon as it starts", () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "session.updated", { activeTurn: { turnId: "m-1", phase: "running" } }));
+    session.emit(event(2, "tool.start", { toolCallId: "call-1", toolName: "bash", args: { command: "ls" } }));
+    const last = store.snapshot.projection.messages.at(-1);
+    expect(last?.role).toBe("assistant");
+    expect(last?.content).toContainEqual(expect.objectContaining({ type: "toolCall", id: "call-1", name: "bash" }));
+  });
+
+  it("answers a prompt with the host's exact option and keeps the card when that fails", async () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    const approve = vi.fn(async () => { throw Object.assign(new Error("forbidden"), { code: "prompt-forbidden" }); });
+    (store as unknown as { api: unknown }).api = { prompts: { approve, answer: vi.fn() } };
+    session.emit(event(1, "approval.requested", { approvalId: "a-1", tool: "Allow?", args: { title: "Allow?", message: "Run it" }, options: ["Approve", "Deny"] }));
+    const prompt = store.snapshot.prompts![0]!;
+    expect(prompt.options).toEqual(["Approve", "Deny"]);
+    await expect(store.answer(prompt, "Approve")).rejects.toThrow();
+    expect(approve).toHaveBeenCalledWith("a-1", "Approve");
+    expect(store.snapshot.prompts).toHaveLength(1);
+    approve.mockImplementation(async () => undefined as never);
+    await store.answer(prompt, "Approve");
+    expect(store.snapshot.prompts).toHaveLength(0);
+  });
+
+  it("hydrates pending prompts from the host summary", () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "session.updated", { pendingApprovals: [{ approvalId: "a-2", tool: "Allow?", args: { title: "Allow?", message: "" }, options: ["Approve", "Deny"] }], pendingQuestions: [] }));
+    expect(store.snapshot.prompts?.map(item => item.id)).toEqual(["a-2"]);
+    session.emit(event(2, "approval.resolved", { approvalId: "a-2" }));
+    expect(store.snapshot.prompts).toEqual([]);
+  });
+
+  it("routes runtime notices to TextGuard, Flow, or the toast", () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "session.notice", { message: "TextGuard now withholds every flagged input until you approve it with /textguard.", level: "info" }));
+    expect(store.snapshot.textguard?.mode).toBe("strict");
+    session.emit(event(2, "session.notice", { message: "Flow control is holding your message: budget. Run /flow for the control that releases it.", level: "info" }));
+    expect(store.snapshot.flowHold).toEqual({ text: "Flow control is holding your message: budget.", paused: false });
+    session.emit(event(3, "session.notice", { message: "Cleared flow reservation r-1.", level: "info" }));
+    expect(store.snapshot.notice).toMatchObject({ text: "Cleared flow reservation r-1." });
+    session.emit(event(4, "session.updated", { statuses: { flow: "held 1" }, widgets: { flow: ["a"], empty: [] } }));
+    expect(store.snapshot.statuses).toEqual({ flow: "held 1" });
+    expect(store.snapshot.widgets).toEqual({ flow: ["a"] });
+  });
+
+  it("releases a Flow hold through /flow and ends the banner", async () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "session.notice", { message: "Flow control is holding your message: budget. Run /flow for the control that releases it." }));
+    await store.flow("clear");
+    expect(session.sent).toMatchObject([{ text: "/flow clear" }]);
+    expect(store.snapshot.flowHold).toBeNull();
+    await store.setTextGuardMode("off");
+    expect(session.sent).toMatchObject([{ text: "/flow clear" }, { text: "/textguard off" }]);
+  });
+
+  it("keeps a reply with its own turn when a follow-up was accepted first", async () => {
+    const session = fakeSession();
+    let next = 0;
+    session.send = async message => { session.sent.push(message); next += 1; return { messageId: `m-${next}`, receipt: "queued" }; };
+    const store = SessionStore.attach(session);
+    await store.send("one", [], "c-1");
+    await store.send("two", [], "c-2");
+    session.emit(event(1, "message.start", { messageId: "m-1", turnId: "m-1", role: "assistant" }));
+    session.emit(event(2, "message.done", { messageId: "m-1", blocks: [{ type: "text", text: "a1" }], stopReason: "completed" }));
+    session.emit(event(3, "message.start", { messageId: "m-2", turnId: "m-2", role: "assistant" }));
+    session.emit(event(4, "message.done", { messageId: "m-2", blocks: [{ type: "text", text: "a2" }], stopReason: "completed" }));
+    expect(store.snapshot.projection.messages.map(message => `${message.role}:${message.turnId}`)).toEqual(["user:m-1", "assistant:m-1", "user:m-2", "assistant:m-2"]);
   });
 
   it("puts the accepted user row before a reply that started first", async () => {
@@ -81,7 +180,7 @@ describe("SessionStore", () => {
     const send = session.send;
     session.send = async message => { await new Promise<void>(resolve => { release = resolve; }); return send(message); };
     const store = SessionStore.attach(session);
-    const pending = store.sendOrSteer("hello", [], false, "client-1", false);
+    const pending = store.send("hello", [], "client-1");
     await new Promise(resolve => setTimeout(resolve, 2));
     session.emit(event(1, "message.start", { messageId: "m-1", turnId: "m-1", role: "assistant" }));
     session.emit(event(2, "message.delta", { messageId: "m-1", text: "hi" }));
@@ -91,20 +190,6 @@ describe("SessionStore", () => {
     const messages = store.snapshot.projection.messages;
     expect(messages.map(message => message.role)).toEqual(["user", "assistant"]);
     expect(messages[1].content).toEqual([{ type: "text", text: "hi!" }]);
-  });
-
-  it("keeps a reply with its own turn when a follow-up was accepted first", async () => {
-    const session = fakeSession();
-    let next = 0;
-    session.send = async message => { session.sent.push(message); next += 1; return { messageId: `m-${next}`, receipt: "queued" }; };
-    const store = SessionStore.attach(session);
-    await store.sendOrSteer("one", [], false, "c-1", false);
-    await store.sendOrSteer("two", [], true, "c-2", false);
-    session.emit(event(1, "message.start", { messageId: "m-1", turnId: "m-1", role: "assistant" }));
-    session.emit(event(2, "message.done", { messageId: "m-1", blocks: [{ type: "text", text: "a1" }], stopReason: "completed" }));
-    session.emit(event(3, "message.start", { messageId: "m-2", turnId: "m-2", role: "assistant" }));
-    session.emit(event(4, "message.done", { messageId: "m-2", blocks: [{ type: "text", text: "a2" }], stopReason: "completed" }));
-    expect(store.snapshot.projection.messages.map(message => `${message.role}:${message.turnId}`)).toEqual(["user:m-1", "assistant:m-1", "user:m-2", "assistant:m-2"]);
   });
 
   it("disposes exactly once", () => {
