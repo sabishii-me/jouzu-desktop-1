@@ -19,6 +19,23 @@ fn canonical_path(path: &str) -> String {
     path.strip_prefix("\\\\?\\").unwrap_or(path).to_string()
 }
 
+/// The folder a session file says it belongs to (its header's `cwd`), exactly as
+/// written. Pi compares folders as text (resolved and lower-cased, but `\\?\C:\x`
+/// and `C:\x` differ), and a runtime switched to a session whose folder differs
+/// from its own loads every extension again; so the runtime starts in this form.
+fn session_header_cwd(session_path: &str) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(session_path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(file).read_line(&mut line).ok()?;
+    let header: Value = serde_json::from_str(line.trim()).ok()?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    let cwd = header.get("cwd").and_then(Value::as_str)?.to_string();
+    Path::new(&cwd).is_dir().then_some(cwd)
+}
+
 fn is_scratch_workspace(path: &str) -> bool {
     path.split(|character| character == '\\' || character == '/')
         .any(|part| part.starts_with("jouzu-warm-"))
@@ -969,7 +986,7 @@ impl Session {
         // runtime booting beside this one would slow down the one the user waits for.
         if let Some(pool) = self.config.warm.get() {
             let pool = pool.clone();
-            let workspace = PathBuf::from(&self.workspace_path);
+            let workspace = PathBuf::from(self.runtime_cwd());
             tokio::spawn(async move { pool.aim(&workspace) });
         }
         // A cancelled starting turn has no prompt to flush. Complete the
@@ -2915,12 +2932,23 @@ impl Session {
         self.spawn_runtime(true, from_pending);
     }
 
+    /// The folder the runtime starts in: the session file's own folder text when
+    /// it has one, so the handshake's switch keeps the loaded extensions.
+    fn runtime_cwd(&self) -> String {
+        self.session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .and_then(|path| session_header_cwd(&path))
+            .unwrap_or_else(|| canonical_path(&self.workspace_path))
+    }
+
     fn spawn_spec(&self) -> SpawnSpec {
         SpawnSpec {
             program: self.config.spec.program.clone(),
             args: self.config.spec.args.clone(),
             env: self.environment(),
-            workspace: PathBuf::from(&self.workspace_path),
+            workspace: PathBuf::from(self.runtime_cwd()),
             low_priority: false,
         }
     }
@@ -2937,7 +2965,7 @@ impl Session {
         if let (true, Some(pool)) = (has_file, self.config.warm.get()) {
             let before = pool.status();
             if let Some((runtime, matched)) =
-                pool.take(event_tx.clone(), Path::new(&self.workspace_path))
+                pool.take(event_tx.clone(), Path::new(&self.runtime_cwd()))
             {
                 log(
                     &self.home,
@@ -4318,7 +4346,9 @@ impl SessionManager {
                     "version": 3,
                     "id": random_id(),
                     "timestamp": Session::now_iso(),
-                    "cwd": workspace.to_string_lossy(),
+                    // The plain form, as Pi itself writes it; the runtime starts in
+                    // the same text (see `session_header_cwd`).
+                    "cwd": canonical_path(&workspace.to_string_lossy()),
                 });
                 if std::fs::write(&file, format!("{header}\n")).is_ok() {
                     Some(file.to_string_lossy().into_owned())
@@ -4352,7 +4382,7 @@ impl SessionManager {
             tokio::spawn(async move { starting.start(false) });
         } else if let Some(pool) = config.warm.get() {
             // A new session: the user is typing; warm for its folder meanwhile.
-            pool.aim(&workspace);
+            pool.aim(Path::new(&session.runtime_cwd()));
         }
         Ok(session)
     }

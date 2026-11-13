@@ -1183,7 +1183,10 @@ async fn aim_warm_runtime(
     if !workspace.is_dir() || !state.sessions.workspace_allowed(&request.workspace_path) {
         return Err(ApiError::bad_request("workspacePath must be a known folder"));
     }
-    pool.aim(&workspace);
+    // The plain form, which is what new sessions record and start in.
+    let plain = workspace.to_string_lossy();
+    let plain = plain.strip_prefix("\\\\?\\").unwrap_or(&plain);
+    pool.aim(std::path::Path::new(plain));
     Ok(Json(pool.status()))
 }
 
@@ -2983,6 +2986,38 @@ mod session_tests {
         // The next warm runtime is for the same folder, and remembered.
         let next = pool.wait_settled(Duration::from_secs(10)).await;
         assert_eq!(next["workspace"], aimed["workspace"]);
+        manager.stop_all();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_old_session_runs_in_the_folder_text_its_file_records() {
+        // Pi treats two spellings of one folder as two folders; the runtime must
+        // start in the spelling the session file records, and warm for it next.
+        let (manager, _home, workspace) = manager(50);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let alias = tempfile::tempdir().unwrap();
+        let spelled = alias.path().join("same-folder");
+        std::os::unix::fs::symlink(workspace.path(), &spelled).unwrap();
+        let file = workspace.path().join("old.jsonl");
+        std::fs::write(
+            &file,
+            format!(
+                "{}\n",
+                json!({ "type": "session", "version": 3, "id": "old", "timestamp": "2026-01-01T00:00:00Z", "cwd": spelled.to_string_lossy() })
+            ),
+        )
+        .unwrap();
+        let session = manager
+            .create(
+                workspace.path().to_str().unwrap(),
+                Some(file.to_string_lossy().into_owned()),
+                None,
+            )
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let next = pool.wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(next["workspace"], spelled.to_string_lossy().as_ref(), "{next}");
         manager.stop_all();
     }
 

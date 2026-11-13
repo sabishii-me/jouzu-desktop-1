@@ -433,7 +433,8 @@ impl WarmPool {
 fn same_folder(left: &Path, right: &Path) -> bool {
     let normalize = |path: &Path| {
         let text = path.to_string_lossy().replace('\\', "/");
-        let text = text.strip_prefix("//?/").unwrap_or(&text).trim_end_matches('/').to_string();
+        // Like Pi: `\\?\` is significant, so it is kept.
+        let text = text.trim_end_matches('/').to_string();
         if cfg!(windows) {
             text.to_lowercase()
         } else {
