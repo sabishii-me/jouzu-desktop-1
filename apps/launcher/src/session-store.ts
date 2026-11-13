@@ -148,6 +148,11 @@ const userRow = (item: Pick<OutboxItem, "text" | "images" | "at">, turnId?: stri
   ...(turnId ? { turnId } : {}),
 });
 
+function firstOutputOf(value: Record<string, unknown>) {
+  const ms = (field: unknown) => typeof field === "number" && Number.isFinite(field) ? field : null;
+  return { turns: ms(value.turns) ?? 0, avgMs: ms(value.avgMs), lastMs: ms(value.lastMs) };
+}
+
 export class SessionStore {
   private state: ChatSnapshot = emptySnapshot();
   private readonly listeners = new Set<(state: ChatSnapshot) => void>();
@@ -572,6 +577,7 @@ export class SessionStore {
       sessionFile: text(data.sessionPath) ?? this.state.sessionFile,
       status: text(data.status) ?? this.state.status,
       ...(text(data.thinkingLevel) ? { thinkingLevel: text(data.thinkingLevel) } : {}),
+      ...(record(data.firstOutput) ? { firstOutput: firstOutputOf(record(data.firstOutput)!) } : {}),
       ...("queue" in data ? { queue: queueOf(data.queue) } : {}),
       ...("failedTurn" in data ? { failedTurn: failed && text(failed.clientMessageId) ? { clientMessageId: text(failed.clientMessageId)!, text: text(failed.text) ?? "" } : null } : {}),
       ...(prompts ? { prompts } : {}),

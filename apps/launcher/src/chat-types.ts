@@ -99,6 +99,8 @@ export interface ChatSnapshot {
   stats?: SessionStats;
   thinkingLevel?: string;
   thinkingLevels?: string[];
+  /** Host-measured time from a prompt reaching the runtime to its first output. */
+  firstOutput?: { turns: number; avgMs: number | null; lastMs: number | null };
   queue?: QueuedMessage[];
   failedTurn?: { clientMessageId: string; text: string } | null;
   /** Extension widgets and status lines, as the host last reported them. */

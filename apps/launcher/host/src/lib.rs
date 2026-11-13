@@ -4522,6 +4522,22 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn the_summary_reports_time_to_first_output() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        assert_eq!(session.summary()["firstOutput"]["turns"], 0);
+        assert!(session.summary()["firstOutput"]["avgMs"].is_null());
+        session.send("ttft", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        let first = &session.summary()["firstOutput"];
+        assert_eq!(first["turns"], 1, "{first}");
+        assert!(first["avgMs"].as_u64().is_some(), "{first}");
+    }
+
+    #[tokio::test]
     async fn assistant_history_records_model_and_provider() {
         let (manager, _home, workspace) = manager(50);
         let session = manager

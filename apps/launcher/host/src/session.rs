@@ -277,6 +277,16 @@ enum Handshake {
     Ready,
 }
 
+/// Time from a prompt reaching the runtime to its first output, over this
+/// host run. The runtime's own start is not in it.
+#[derive(Default)]
+struct FirstOutput {
+    sent: Option<Instant>,
+    count: u64,
+    total_ms: u64,
+    last_ms: Option<u64>,
+}
+
 struct SentMessage {
     message_id: String,
     text: String,
@@ -310,6 +320,7 @@ pub struct Session {
     messages: Mutex<HashMap<String, SentMessage>>,
     queued_turns: Mutex<VecDeque<(String, Value)>>,
     first_output_turn: Mutex<Option<String>>,
+    first_output: Mutex<FirstOutput>,
     queue_paused: AtomicBool,
     pending_prompts: Mutex<Vec<Value>>,
     next_message: AtomicU64,
@@ -729,6 +740,25 @@ impl Session {
     /// in every build, so a report from any installation can be timed afterwards.
     /// Content is never logged, only the event and its ids.
     fn record_timing(&self, event: &str, data: &Value) {
+        // The prompt reaches the runtime when the turn runs: at its start, or when a
+        // turn that waited for the runtime starts running.
+        let running = (event == "turn.start" && data.get("phase").and_then(Value::as_str) == Some("running"))
+            || (event == "session.status" && data.get("status").and_then(Value::as_str) == Some("running"));
+        if running {
+            let mut first = self
+                .first_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if first.sent.is_none() {
+                first.sent = Some(Instant::now());
+            }
+        }
+        if event == "turn.end" {
+            self.first_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .sent = None;
+        }
         let mark = match event {
             "message.accepted" | "turn.start" | "message.done" | "turn.end" | "session.status" => event,
             "message.delta" => {
@@ -741,6 +771,16 @@ impl Session {
                     return;
                 }
                 *last = Some(id.to_string());
+                let mut first = self
+                    .first_output
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(sent) = first.sent.take() {
+                    let ms = sent.elapsed().as_millis() as u64;
+                    first.count += 1;
+                    first.total_ms += ms;
+                    first.last_ms = Some(ms);
+                }
                 "message.first_delta"
             }
             _ => return,
@@ -2924,6 +2964,17 @@ impl Session {
                 })
             })
             .collect();
+        let first_output = {
+            let first = self
+                .first_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            json!({
+                "turns": first.count,
+                "avgMs": (first.count > 0).then(|| first.total_ms / first.count),
+                "lastMs": first.last_ms,
+            })
+        };
         json!({
             "sessionId": self.id,
             "sessionPath": self
@@ -2968,6 +3019,7 @@ impl Session {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
+            "firstOutput": first_output,
             "runtime": {
                 "attached": self.runtime_pid().is_some(),
                 "recovering": status == Status::Recovering,
@@ -3036,6 +3088,7 @@ impl Session {
             pending_model: Mutex::new(None),
             pending_model_request: Mutex::new(None),
             pending_thinking: Mutex::new(None),
+            first_output: Mutex::new(FirstOutput::default()),
             thinking_level: Mutex::new(None),
             subscribers: AtomicU64::new(0),
             next_client: AtomicU64::new(0),
