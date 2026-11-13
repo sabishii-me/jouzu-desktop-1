@@ -23,15 +23,26 @@ fn canonical_path(path: &str) -> String {
 /// written. Pi compares folders as text (resolved and lower-cased, but `\\?\C:\x`
 /// and `C:\x` differ), and a runtime switched to a session whose folder differs
 /// from its own loads every extension again; so the runtime starts in this form.
-fn session_header_cwd(session_path: &str) -> Option<String> {
+fn session_header(session_path: &str) -> Option<Value> {
     use std::io::BufRead;
     let file = std::fs::File::open(session_path).ok()?;
     let mut line = String::new();
     std::io::BufReader::new(file).read_line(&mut line).ok()?;
     let header: Value = serde_json::from_str(line.trim()).ok()?;
-    if header.get("type").and_then(Value::as_str) != Some("session") {
-        return None;
-    }
+    (header.get("type").and_then(Value::as_str) == Some("session")).then_some(header)
+}
+
+/// The conversation id a session file carries. A copied file keeps it, and the
+/// runtime lets only one attachment own a conversation at a time.
+fn session_header_id(session_path: &str) -> Option<String> {
+    session_header(session_path)?
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn session_header_cwd(session_path: &str) -> Option<String> {
+    let header = session_header(session_path)?;
     let cwd = header.get("cwd").and_then(Value::as_str)?.to_string();
     Path::new(&cwd).is_dir().then_some(cwd)
 }
@@ -4349,6 +4360,38 @@ impl SessionManager {
                     .clone();
                 current.is_some_and(|current| same_session_file(&current, requested))
             };
+            // A different file carrying the same conversation (a copy) cannot be
+            // open twice: the runtime refuses the second owner after loading for
+            // seconds. Say so at once instead.
+            if let Some(requested_id) = session_path.as_deref().and_then(session_header_id) {
+                let twin = sessions.values().find(|session| {
+                    if same_file(session)
+                        || matches!(session.status(), Status::Stopped | Status::Cancelled | Status::Error)
+                    {
+                        return false;
+                    }
+                    let path = session
+                        .session_path
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    path.and_then(|path| session_header_id(&path)).as_deref() == Some(requested_id.as_str())
+                });
+                if let Some(twin) = twin {
+                    let other = twin
+                        .session_path
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                        .unwrap_or_default();
+                    return Err(ApiError::new(
+                        axum::http::StatusCode::CONFLICT,
+                        "session-open-elsewhere",
+                        format!("This conversation is already open from another file ({other}). Close that one first."),
+                        false,
+                    ));
+                }
+            }
             if let Some(existing) = sessions
                 .values()
                 .find(|session| session.key == key || same_file(session))

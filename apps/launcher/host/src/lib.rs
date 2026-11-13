@@ -3079,6 +3079,31 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_copy_of_an_open_conversation_is_refused_at_once() {
+        let (manager, _home, workspace) = manager(50);
+        let header = json!({ "type": "session", "version": 3, "id": "same-conversation", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let first = workspace.path().join("first.jsonl");
+        let copy = workspace.path().join("copy.jsonl");
+        std::fs::write(&first, format!("{header}\n")).unwrap();
+        std::fs::write(&copy, format!("{header}\n")).unwrap();
+        let open = manager
+            .create(workspace.path().to_str().unwrap(), Some(first.to_string_lossy().into_owned()), None)
+            .unwrap();
+        wait_status(&open, Status::Idle).await;
+        let error = manager
+            .create(workspace.path().to_str().unwrap(), Some(copy.to_string_lossy().into_owned()), None)
+            .err()
+            .expect("a second owner is refused");
+        assert_eq!(error.code, "session-open-elsewhere");
+        // The same file again is the same session, not a conflict.
+        let again = manager
+            .create(workspace.path().to_str().unwrap(), Some(first.to_string_lossy().into_owned()), None)
+            .unwrap();
+        assert_eq!(again.id, open.id);
+        manager.stop_all();
+    }
+
+    #[tokio::test]
     async fn attach_history_waits_for_the_starting_runtime() {
         let (manager, _home, workspace) = manager(50);
         let path = workspace.path().join("attached.jsonl");
