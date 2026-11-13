@@ -46,6 +46,7 @@ pub const COOKIE_NAME: &str = "jouzu_host";
 pub const HOST_SCHEMA: u32 = 1;
 /// Stamped by `scripts/build-app.mjs`; the shell checks it matches its own.
 pub const BUILD_ID: &str = env!("JOUZU_BUILD_ID");
+pub const COMMIT: &str = env!("JOUZU_COMMIT");
 
 #[derive(Clone)]
 pub struct AppState {
@@ -231,6 +232,7 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/status", get(host_status))
+        .route("/timing", axum::routing::post(record_ui_timing))
         .route("/runtime/warm", get(warm_runtime).post(aim_warm_runtime))
         .route(
             "/environment",
@@ -1155,6 +1157,40 @@ async fn root(State(state): State<AppState>, uri: Uri) -> Response {
     } else {
         serve_index(&state).await
     }
+}
+
+/// Moments only the client can see: the loading page giving way, the user's own
+/// message on screen, the first words painted, Stop shown. They land in host.log
+/// beside the host's own `timing` lines, so one log times what the user saw.
+#[derive(Deserialize)]
+struct UiTiming {
+    mark: String,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    #[serde(rename = "clientMessageId")]
+    client_message_id: Option<String>,
+}
+
+const UI_TIMING_MARKS: &[&str] = &["loading.ready", "message.shown", "first_output.shown", "stop.shown"];
+
+async fn record_ui_timing(
+    State(state): State<AppState>,
+    Json(body): Json<UiTiming>,
+) -> Result<Json<Value>, ApiError> {
+    if !UI_TIMING_MARKS.contains(&body.mark.as_str()) {
+        return Err(ApiError::bad_request("Unknown timing mark"));
+    }
+    log(
+        state.sessions.home(),
+        "info",
+        "timing.ui",
+        json!({
+            "mark": body.mark,
+            "session": body.session_id,
+            "clientMessageId": body.client_message_id,
+        }),
+    );
+    Ok(Json(json!({ "recorded": true })))
 }
 
 async fn health(State(state): State<AppState>) -> Response {
@@ -3526,6 +3562,28 @@ mod session_tests {
         assert_eq!(receipt["receipt"], "cancelled");
         let history = session.history(10, None);
         assert_eq!(history["messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_turn_leaves_timing_lines_without_content() {
+        let (manager, home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("timed", "secret words").unwrap();
+        wait_status(&session, Status::Idle).await;
+        let log = std::fs::read_to_string(home.path().join("logs").join("host.log")).unwrap();
+        let marks: Vec<String> = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|line| line["event"] == "timing" && line["fields"]["clientMessageId"] == "timed")
+            .map(|line| line["fields"]["mark"].as_str().unwrap_or_default().to_string())
+            .collect();
+        for expected in ["message.accepted", "turn.start", "message.first_delta", "turn.end"] {
+            assert!(marks.iter().any(|mark| mark == expected), "{expected} missing from {marks:?}");
+        }
+        assert!(!log.contains("secret words"), "timing must not log content");
     }
 
     #[tokio::test]

@@ -15,7 +15,12 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const buildId = `${new Date().toISOString().replace(/[-:.]/gu, "")}-${randomBytes(4).toString("hex")}`;
 writeFileSync(join(root, ".build-id"), `${buildId}\n`);
-console.log(`Jouzu Desktop build ${buildId}`);
+// The commit goes in beside the id, so every report names the exact source.
+const git = (args) => spawnSync(`git ${args}`, { cwd: root, shell: true, encoding: "utf8" });
+const head = git("rev-parse --short=12 HEAD").stdout?.trim() || "unknown";
+const dirty = git("status --porcelain --untracked-files=no").stdout?.trim() ? "-dirty" : "";
+writeFileSync(join(root, ".build-commit"), `${head}${dirty}\n`);
+console.log(`Jouzu Desktop build ${buildId} commit ${head}${dirty}`);
 
 function run(command) {
   const result = spawnSync(command, { cwd: root, stdio: "inherit", shell: true });

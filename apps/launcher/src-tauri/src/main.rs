@@ -498,6 +498,8 @@ fn component_versions(app: tauri::AppHandle) -> Result<serde_json::Value, String
         "jouzu": value.get("version").and_then(|v| v.as_str()),
         "development": cfg!(debug_assertions),
         "launcherUpdaterConfigured": launcher_updater,
+        "build": env!("JOUZU_BUILD_ID"),
+        "commit": env!("JOUZU_COMMIT"),
     }))
 }
 
@@ -582,7 +584,13 @@ fn main() {
                 logs::append(
                     &managed,
                     "launcher.log",
-                    &format!("launcher start version={}", env!("CARGO_PKG_VERSION")),
+                    &format!(
+                        "launcher start version={} build={} commit={} channel={:?}",
+                        env!("CARGO_PKG_VERSION"),
+                        env!("JOUZU_BUILD_ID"),
+                        env!("JOUZU_COMMIT"),
+                        update_channel::read(&managed)
+                    ),
                 );
             }
             if let Ok(executable) = std::env::current_exe() {

@@ -17,6 +17,7 @@ import {
   type Receipt,
   type RuntimeStatus,
   type WarmRuntime,
+  type TimingMark,
   type SessionHandle,
   type SessionSummary,
   type Workspace,
@@ -400,6 +401,13 @@ export class HostClient {
       method: "POST",
       body: JSON.stringify({ workspacePath }),
     });
+  }
+
+  mark(mark: TimingMark, ids: { sessionId?: string; clientMessageId?: string } = {}): void {
+    void this.request("/v1/timing", {
+      method: "POST",
+      body: JSON.stringify({ mark, ...ids }),
+    }).catch(() => undefined);
   }
 
   warmState(waitMs: number): Promise<WarmRuntime> {

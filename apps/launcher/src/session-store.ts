@@ -8,7 +8,7 @@
  */
 import { HostChatSession } from "./api/chat-session";
 import { eventRouter } from "./event-router";
-import type { ApiEvent, Attachment, HistoryPage, JouzuApi, Receipt } from "./api/jouzu-api";
+import type { ApiEvent, Attachment, HistoryPage, JouzuApi, Receipt, TimingMark } from "./api/jouzu-api";
 import { emptyProjection, historyRowsProjection, hostBlocks, type ChatBlock, type ChatMessage, type ToolView } from "./chat-projection";
 import { describeError } from "./runtime-errors";
 import { classifyNotice, type TextGuardMode } from "./session-notices";
@@ -158,6 +158,7 @@ export class SessionStore {
   private preferred = readModelPreference();
   private api?: JouzuApi;
   private noticeSeq = 0;
+  private shownOutput: string | null = null;
 
   private constructor(
     readonly session: SessionPort,
@@ -205,6 +206,16 @@ export class SessionStore {
     this.routerUnsubscribe?.();
     this.routerUnsubscribe = undefined;
     this.following = false;
+  }
+
+  /** Record, after the next paint, a moment the user saw (see host.log `timing.ui`). */
+  private markShown(mark: TimingMark, clientMessageId?: string): void {
+    const runtime = this.api?.runtime;
+    if (!runtime?.mark) return;
+    const sessionId = this.session.id;
+    const record = () => runtime.mark?.(mark, { sessionId, clientMessageId });
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => record());
+    else record();
   }
 
   private async load(): Promise<void> {
@@ -272,6 +283,7 @@ export class SessionStore {
       ? { ...existing, state: "sending", error: undefined }
       : { clientMessageId, text: messageText, images: [...images], state: "sending", at: Date.now() };
     this.setOutbox([...(this.state.outbox ?? []).filter(entry => entry.clientMessageId !== clientMessageId), item]);
+    if (!existing) this.markShown("message.shown", clientMessageId);
     try {
       const receipt = await this.session.send({
         clientMessageId,
@@ -406,6 +418,7 @@ export class SessionStore {
     if (turn?.clientMessageId) ids.add(turn.clientMessageId);
     if (pending.length) this.setOutbox((this.state.outbox ?? []).filter(entry => entry.state !== "sending"));
     if (turn) this.update({ activeTurn: { ...turn, phase: "cancelling" } });
+    if (turn || pending.length) this.markShown("stop.shown", turn?.clientMessageId ?? pending[0]?.clientMessageId);
     try {
       if (ids.size) await Promise.all([...ids].map(id => this.session.cancel(id)));
       else if (turn) await this.session.interrupt();
@@ -657,6 +670,11 @@ export class SessionStore {
           return { ...message, content };
         });
         this.update({ projection: { ...this.state.projection, messages } });
+        const turnId = text(data.turnId) ?? text(data.messageId) ?? "";
+        if (!thinking && this.shownOutput !== turnId) {
+          this.shownOutput = turnId;
+          this.markShown("first_output.shown", this.state.activeTurn?.clientMessageId);
+        }
         break;
       }
       case "message.done": {

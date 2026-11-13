@@ -310,6 +310,7 @@ pub struct Session {
     lease_path: PathBuf,
     messages: Mutex<HashMap<String, SentMessage>>,
     queued_turns: Mutex<VecDeque<(String, Value)>>,
+    first_output_turn: Mutex<Option<String>>,
     queue_paused: AtomicBool,
     pending_prompts: Mutex<Vec<Value>>,
     next_message: AtomicU64,
@@ -696,8 +697,55 @@ impl Session {
         (events, cursor)
     }
 
+    /// One `timing` line in host.log for each moment a user would notice: accepted,
+    /// started, first output, done, and status changes. The same lines are written
+    /// in every build, so a report from any installation can be timed afterwards.
+    /// Content is never logged, only the event and its ids.
+    fn record_timing(&self, event: &str, data: &Value) {
+        let mark = match event {
+            "message.accepted" | "turn.start" | "message.done" | "turn.end" | "session.status" => event,
+            "message.delta" => {
+                let id = data.get("messageId").and_then(Value::as_str).unwrap_or_default();
+                let mut last = self
+                    .first_output_turn
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if last.as_deref() == Some(id) {
+                    return;
+                }
+                *last = Some(id.to_string());
+                "message.first_delta"
+            }
+            _ => return,
+        };
+        let turn = data
+            .get("turnId")
+            .or_else(|| data.get("messageId"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let client_message = self
+            .active_client_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        log(
+            &self.home,
+            "info",
+            "timing",
+            json!({
+                "session": self.id,
+                "mark": mark,
+                "turnId": turn,
+                "clientMessageId": client_message,
+                "status": data.get("status").cloned().unwrap_or(Value::Null),
+                "phase": data.get("phase").cloned().unwrap_or(Value::Null),
+            }),
+        );
+    }
+
     fn publish(&self, event: &str, data: Value) -> SessionEvent {
         self.touch();
+        self.record_timing(event, &data);
         let stored = {
             let mut log_guard = self
                 .events
@@ -2922,6 +2970,7 @@ impl Session {
             messages: Mutex::new(HashMap::new()),
             queued_turns: Mutex::new(VecDeque::new()),
             queue_paused: AtomicBool::new(false),
+            first_output_turn: Mutex::new(None),
             pending_prompts: Mutex::new(Vec::new()),
             next_message: AtomicU64::new(0),
             next_request: AtomicU64::new(0),
@@ -3464,6 +3513,11 @@ impl Drop for ClientStream {
 }
 
 impl SessionManager {
+    /// The host home: host.json, host.log.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
     pub fn new(
         spec: Option<RuntimeSpec>,
         home: PathBuf,

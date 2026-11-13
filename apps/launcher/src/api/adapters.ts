@@ -89,6 +89,7 @@ function hostGroups(client: HostClient) {
     status: () => client.status(),
     warm: workspacePath => client.warm(workspacePath),
     warmState: waitMs => client.warmState(waitMs),
+    mark: (mark, ids) => client.mark(mark, ids),
     components: async () => ({}),
     diagnostics: async () => null,
   };

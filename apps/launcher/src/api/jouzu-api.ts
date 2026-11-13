@@ -214,12 +214,16 @@ export interface WarmRuntime {
   workspace?: string | null;
 }
 
+export type TimingMark = "loading.ready" | "message.shown" | "first_output.shown" | "stop.shown";
+
 export interface RuntimeApi {
   status(): Promise<RuntimeStatus>;
   /** Warm the runtime for this workspace; returns the warm-up state. */
   warm(workspacePath: string): Promise<WarmRuntime>;
   /** The warm-up state, waiting up to `waitMs` for it to settle. */
   warmState(waitMs: number): Promise<WarmRuntime>;
+  /** Record a moment the user saw (host.log `timing.ui`). Best effort: never throws. */
+  mark?(mark: TimingMark, ids?: { sessionId?: string; clientMessageId?: string }): void;
   components(): Promise<Record<string, unknown>>;
   diagnostics(): Promise<unknown | null>;
 }

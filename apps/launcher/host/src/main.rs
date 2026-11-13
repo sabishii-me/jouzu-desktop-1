@@ -162,7 +162,7 @@ async fn main() -> ExitCode {
         &home,
         "info",
         "host.start",
-        json!({ "port": port, "pid": std::process::id(), "dist": dist.to_string_lossy() }),
+        json!({ "port": port, "pid": std::process::id(), "dist": dist.to_string_lossy(), "version": env!("CARGO_PKG_VERSION"), "build": jouzu_host::BUILD_ID, "commit": jouzu_host::COMMIT }),
     );
     println!(
         "jouzu-host listening on http://127.0.0.1:{port}/ (token in host.json; open /?token=<token>)"
