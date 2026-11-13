@@ -155,15 +155,18 @@ export class SessionStore {
   async refreshHistory(): Promise<void> {
     try {
       const page = await this.session.history({ limit: 200 });
+      // The host pages newest first (its in-flight partial row leads the page).
+      // The transcript reads oldest first, so the partial reply ends up last.
+      const rows = [...(page.messages as unknown as Array<Record<string, unknown>>)].reverse();
       let active = -1;
       let messageIndex = -1;
       let partial = false;
-      for (const row of page.messages as unknown as Array<Record<string, unknown>>) {
+      for (const row of rows) {
         if (row.kind === "user" || row.kind === "assistant") messageIndex += 1;
         if (row.partial === true) { active = messageIndex; partial = true; }
       }
       this.active = active;
-      const projection = historyRowsProjection(page.messages);
+      const projection = historyRowsProjection(rows);
       this.update({
         projection: partial ? { ...projection, running: true, turnStartedAt: projection.turnStartedAt ?? Date.now() } : projection,
         pending: partial || this.state.pending,

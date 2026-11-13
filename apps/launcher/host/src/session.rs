@@ -3071,6 +3071,16 @@ impl Session {
     }
 }
 
+fn same_session_file(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 pub struct SessionManager {
     config: Option<SessionConfig>,
     home: PathBuf,
@@ -3923,9 +3933,23 @@ impl SessionManager {
                 .sessions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // One live host session per session file: a client that re-attaches
+            // by path (after a reload, from the sidebar) joins the session that
+            // already owns the file instead of starting a second runtime on it.
+            let same_file = |session: &Arc<Session>| {
+                let Some(requested) = session_path.as_deref() else {
+                    return false;
+                };
+                let current = session
+                    .session_path
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                current.is_some_and(|current| same_session_file(&current, requested))
+            };
             if let Some(existing) = sessions
                 .values()
-                .find(|session| session.key == key)
+                .find(|session| session.key == key || same_file(session))
                 .cloned()
             {
                 if !matches!(
