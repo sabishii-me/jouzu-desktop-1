@@ -174,7 +174,7 @@ export class SessionStore {
     }
   }
 
-  async sendOrSteer(text: string, images: readonly ChatImage[] = [], _running = false, clientMessageId: string = crypto.randomUUID()): Promise<Receipt> {
+  async sendOrSteer(text: string, images: readonly ChatImage[] = [], _running = false, clientMessageId: string = crypto.randomUUID(), echo = true): Promise<Receipt> {
     // A running turn accepts a follow-up too; the host queues it and delivers it
     // after the current turn. The client only owns a local echo for display.
     const now = Date.now();
@@ -182,7 +182,9 @@ export class SessionStore {
       ...(text ? [{ type: "text" as const, text }] : []),
       ...images.map(image => ({ type: "image" as const, image })),
     ];
-    const messages = [...this.state.projection.messages, { role: "user", content, timestamp: now }];
+    const messages = echo
+      ? [...this.state.projection.messages, { role: "user", content, timestamp: now }]
+      : this.state.projection.messages;
     this.update({
       pending: true,
       error: null,

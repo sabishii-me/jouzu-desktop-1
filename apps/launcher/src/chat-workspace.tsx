@@ -41,7 +41,7 @@ function defaultPaneWidth() {
 }
 
 interface WorkspaceItem { id: string; path: string }
-interface SessionSummary { path: string; title: string; workspace: string; updated: number; pinned: boolean; archived: boolean }
+interface SessionSummary { path: string; title: string; workspace: string; updated: number; pinned: boolean; archived: boolean; running: boolean; status: string }
 export interface ChatWorkspaceProps {
   path: string;
   revision?: number;
@@ -457,6 +457,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       updated,
       pinned: value.pinned,
       archived: value.archived,
+      running: value.running,
+      status: value.status,
     };
   }
 
@@ -674,7 +676,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       const running = client.snapshot.projection.running;
       const queueKey = sessionKeyOf(client.snapshot.sessionFile, selectedSession ?? path);
       if (running && queueKey) setQueuedBySession(previous => ({ ...previous, [queueKey]: [...(previous[queueKey] ?? []), value] }));
-      try { await client.sendOrSteer(value, submitted.map(item => item.image), running, sendClientIdRef.current ?? undefined); }
+      try { await client.sendOrSteer(value, submitted.map(item => item.image), running, sendClientIdRef.current ?? undefined, false); }
       catch (error) {
         if (running && queueKey) setQueuedBySession(previous => {
           const items = previous[queueKey] ?? [];
@@ -1049,6 +1051,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setSessionError(null);
     setSelectedSession(sessionPath);
     setHero(false);
+    const summary = sessions.find(item => normalizedPath(item.path) === normalizedPath(sessionPath));
+    if (client && (summary?.running || summary?.status === "recovering")) {
+      // The disk preview has no in-flight assistant text. A live/running session
+      // must attach through the host store so the partial row and deltas survive.
+      startSwitch(sessionPath);
+      return;
+    }
     loadPreview(sessionPath);
   }
   async function forkTurn(prompt: string, messageIndex: number) {
