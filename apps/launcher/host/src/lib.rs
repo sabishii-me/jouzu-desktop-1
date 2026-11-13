@@ -2930,6 +2930,21 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_pre_send_cancel_leaves_a_tombstone() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let tombstone = session.cancel_message("before-host").unwrap();
+        assert_eq!(tombstone["status"], "tombstoned");
+        let receipt = session.send("before-host", "hello").unwrap();
+        assert_eq!(receipt["receipt"], "cancelled");
+        let history = session.history(10, None);
+        assert_eq!(history["messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn idempotent_send_and_conflict() {
         let (manager, _home, workspace) = manager(50);
         let session = manager
