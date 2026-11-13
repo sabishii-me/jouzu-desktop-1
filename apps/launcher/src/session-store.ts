@@ -52,6 +52,7 @@ export class SessionStore {
   private state: ChatSnapshot = emptySnapshot();
   private readonly listeners = new Set<(state: ChatSnapshot) => void>();
   private active = -1;
+  private following = false;
   private disposed = false;
   private preferred = readModelPreference();
   private api?: JouzuApi;
@@ -80,8 +81,21 @@ export class SessionStore {
   static attach(session: SessionPort, onDispose?: () => void, api?: JouzuApi): SessionStore {
     const store = new SessionStore(session, onDispose);
     store.api = api;
-    session.follow(event => store.handle(event), error => store.fail(error));
+    store.resume();
     return store;
+  }
+
+  /** Open the SSE stream for the session that is visible or still running. */
+  resume(): void {
+    if (this.disposed || this.following) return;
+    this.following = true;
+    this.session.follow(event => this.handle(event), error => this.fail(error));
+  }
+
+  /** Close only the SSE stream; the host session keeps running. */
+  detachStream(): void {
+    this.session.detach();
+    this.following = false;
   }
 
   private async load(): Promise<void> {
@@ -528,6 +542,15 @@ export class SessionPool {
     for (const listener of this.statusListeners) listener();
   }
 
+  /** Only the visible session and sessions with a running turn hold streams. */
+  focus(sessionPath: string | null | undefined): void {
+    const activeKey = sessionPath ? entryKey(sessionPath) : "";
+    for (const [key, store] of this.entries) {
+      if (key === activeKey || store.snapshot.projection.running) store.resume();
+      else store.detachStream();
+    }
+  }
+
   async lease(
     path: string,
     sessionPath?: string,
@@ -598,6 +621,7 @@ export const chatPool = {
   enter: (...args: Parameters<SessionPool["enter"]>) => pool().enter(...args),
   client: (path: string) => pool().client(path),
   isRunning: (path: string) => pool().isRunning(path),
+  focus: (path: string | null | undefined) => pool().focus(path),
   remember: (path: string, store: SessionStore) => pool().remember(path, store),
   forget: (path: string) => pool().forget(path),
   subscribeStatus: (listener: () => void) => pool().subscribeStatus(listener),

@@ -246,6 +246,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setAttachmentError(null);
   }
   function bindClient(next: ChatConnection) {
+    chatPool.focus(next.snapshot.sessionFile);
     unsubscribeRef.current?.();
     connection.current = next;
     // A dialog belongs to the runtime that raised it: the view shows the queue of
@@ -433,15 +434,16 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   }, [pickerOpen]);
   function fromApiSession(value: ApiSessionSummary): SessionSummary | null {
     if (!value.sessionPath) return null;
-    // A host entry without a title is an empty/provisional session, not a
-    // transcript the sidebar should offer. The fallback to an id title made
-    // empty page-load sessions look real.
-    if (!value.title?.trim()) return null;
+    const title = value.title?.trim() ?? "";
+    const fileId = value.sessionPath.split(/[\\/]/u).at(-1)?.replace(/\.jsonl$/u, "") ?? "";
+    // Empty page-load sessions can come back from the persisted index with the
+    // file id as a title. That is not a user-facing title.
+    if (!title || title === fileId) return null;
     const parsed = value.updatedAt ? Date.parse(value.updatedAt) : NaN;
     const updated = Number.isFinite(parsed) && parsed > 0 ? parsed / 1000 : Date.now() / 1000;
     return {
       path: value.sessionPath,
-      title: value.title?.trim() || "New session",
+      title,
       workspace: value.workspacePath,
       updated,
       pinned: value.pinned,
@@ -495,6 +497,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     return () => clearTimeout(timer);
   }, [snapshot.connected, snapshot.projection.messages.length]);
   useEffect(() => { if (snapshot.connected) void refreshSessions(); }, [snapshot.connected, snapshot.sessionFile]);
+  useEffect(() => { if (snapshot.sessionFile) chatPool.focus(snapshot.sessionFile); }, [snapshot.sessionFile, snapshot.projection.running]);
   useEffect(() => { if (snapshot.connected) void connection.current?.loadStats(); }, [snapshot.connected, snapshot.sessionFile, snapshot.projection.messages.length, snapshot.projection.running]);
   useEffect(() => {
     // Reports belong to the loaded session, not to a selected session that is still opening.
@@ -1180,7 +1183,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // sessionFile: a new pending session has no file yet, which hid Stop during
   // the first turn.
   const composerRunning = snapshot.projection.running;
-  const composerStarting = snapshot.pending && !composerRunning;
+  // Stop belongs to a host-accepted turn. The optimistic pending flag must not
+  // create a Stop before the host can actually cancel the send.
+  const composerStarting = false;
   const [appView, setAppView] = useState<"chat" | "artifacts">("chat");
   const [artifactCounts, setArtifactCounts] = useState<Record<string, number>>({});
   const [panes, setPanes] = useState<Array<{ tabs: string[]; active: string; width: number }>>([]);
