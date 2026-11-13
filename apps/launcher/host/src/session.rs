@@ -197,6 +197,8 @@ impl EventLog {
     }
 }
 
+const FLOW_RELEASE_ID: &str = "host-flow-release";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Handshake {
     Switch,
@@ -246,6 +248,10 @@ pub struct Session {
     turn_started_at: Mutex<Option<String>>,
     cancelling: AtomicBool,
     turn_running: AtomicBool,
+    /// A model request was cut off by a runtime exit. The runtime's Flow control
+    /// withholds it (and any new input) until someone decides; the host already
+    /// decided (the turn failed), so recovery releases the hold before going idle.
+    release_flow_hold: AtomicBool,
     cancelled: Mutex<HashMap<String, Instant>>,
     failed_turn: Mutex<Option<Value>>,
     listed: Mutex<bool>,
@@ -714,6 +720,26 @@ impl Session {
 
     fn handle_response(self: &Arc<Self>, value: &Value) {
         let command = value.get("command").and_then(Value::as_str).unwrap_or("");
+        let response_id = value.get("id").and_then(Value::as_str).unwrap_or("");
+        if response_id == FLOW_RELEASE_ID {
+            log(
+                &self.home,
+                "info",
+                "runtime.flow_released",
+                json!({ "success": value.get("success"), "error": value.get("error") }),
+            );
+            if matches!(self.status(), Status::Starting | Status::Recovering) {
+                self.finish_handshake();
+            }
+            return;
+        }
+        if command == "prompt"
+            && value.get("success").and_then(Value::as_bool) == Some(true)
+            && value.pointer("/data/disposition").and_then(Value::as_str) == Some("handled")
+        {
+            self.end_turn_without_run(response_id);
+            return;
+        }
         if command == "get_state" {
             if let Some(data) = value.get("data") {
                 if let Some(path) = data.get("sessionFile").and_then(Value::as_str) {
@@ -796,7 +822,16 @@ impl Session {
                 self.request_messages();
             }
             "get_messages" => {
-                if let Some(data) = value.get("data") {
+                // The host's history is the record. After a runtime restart it
+                // already holds every row (including an interrupted reply the
+                // runtime never saved), so only a fresh attach imports.
+                let keep_host_history = matches!(self.status(), Status::Recovering)
+                    && !self
+                        .history
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_empty();
+                if let (false, Some(data)) = (keep_host_history, value.get("data")) {
                     self.import_history(data);
                 }
                 *self
@@ -805,21 +840,78 @@ impl Session {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Handshake::Ready;
                 self.ready.notify_waiters();
                 if matches!(self.status(), Status::Starting | Status::Recovering) {
-                    self.recovery_succeeded();
-                    self.apply_pending_preferences();
-                    self.flush_pending_prompts();
-                    // A cancelled starting turn has no prompt to flush. Complete the
-                    // handshake bookkeeping first, then go idle; never go idle while
-                    // an accepted turn still has an active message.
-                    if self.active_turn().is_none() && !matches!(self.status(), Status::Running) {
-                        if !self.start_queued_turn() {
-                            self.set_status(Status::Idle);
+                    if self.release_flow_hold.swap(false, Ordering::SeqCst) {
+                        // `/flow clear` releases the withheld request and keeps its
+                        // receipts. Finish the handshake when the runtime answers.
+                        let release = json!({
+                            "id": FLOW_RELEASE_ID,
+                            "type": "prompt",
+                            "message": "/flow clear",
+                        });
+                        if self.write_command(release).is_ok() {
+                            return;
                         }
                     }
+                    self.finish_handshake();
                 }
             }
             _ => {}
         }
+    }
+
+    fn finish_handshake(self: &Arc<Self>) {
+        self.recovery_succeeded();
+        self.apply_pending_preferences();
+        self.flush_pending_prompts();
+        // A cancelled starting turn has no prompt to flush. Complete the
+        // handshake bookkeeping first, then go idle; never go idle while
+        // an accepted turn still has an active message.
+        if self.active_turn().is_none() && !matches!(self.status(), Status::Running) {
+            if !self.start_queued_turn() {
+                self.set_status(Status::Idle);
+            }
+        }
+    }
+
+    /// A prompt the runtime consumed without starting a run (a slash command, or
+    /// input its Flow control retained). No agent events will follow, so the turn
+    /// ends here instead of waiting for `agent_settled`.
+    fn end_turn_without_run(self: &Arc<Self>, client_message_id: &str) {
+        let matches_active = self
+            .active_client_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_deref()
+            == Some(client_message_id);
+        if !matches_active {
+            return;
+        }
+        let turn = self
+            .active_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        *self
+            .active_client_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .turn_started_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .active_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.cancelling.store(false, Ordering::SeqCst);
+        self.turn_running.store(false, Ordering::SeqCst);
+        if let Some(turn) = turn {
+            self.publish("turn.end", json!({ "turnId": turn, "status": "handled" }));
+        }
+        if !self.start_queued_turn() {
+            self.set_status(Status::Idle);
+        }
+        self.publish_summary();
     }
 
     fn import_history(&self, data: &Value) {
@@ -2518,6 +2610,7 @@ impl Session {
             turn_started_at: Mutex::new(None),
             cancelling: AtomicBool::new(false),
             turn_running: AtomicBool::new(false),
+            release_flow_hold: AtomicBool::new(false),
             cancelled: Mutex::new(HashMap::new()),
             failed_turn: Mutex::new(None),
             listed: Mutex::new(false),
@@ -2896,6 +2989,7 @@ impl Session {
                                 | Status::WaitingQuestion
                         );
                     if finalize {
+                        self.release_flow_hold.store(true, Ordering::SeqCst);
                         let turn = self
                             .active_message
                             .lock()
