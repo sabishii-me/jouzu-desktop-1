@@ -79,6 +79,7 @@ export function App() {
   const [entryBooting, setEntryBooting] = useState(false);
   const [entryWarm, setEntryWarm] = useState<WarmView | null>(null);
   const [bootNow, setBootNow] = useState(() => Date.now());
+  const bootStarted = useRef(Date.now());
   useEffect(() => {
     if (!entryBooting || entryReady.current) return;
     const timer = window.setInterval(() => setBootNow(Date.now()), 1000);
@@ -665,7 +666,7 @@ export function App() {
         <Progress value={null} className="w-full max-w-xl" />
         {entryWarm?.state === "starting" && entryWarm.since !== null && <span className="text-xs tabular-nums text-muted-foreground">{t.warmingElapsed.replace("{s}", String(Math.max(0, Math.round((bootNow - entryWarm.since) / 1000))))}</span>}
         {/* The user can always go in; the runtime keeps starting and the chat shows that it is still starting. */}
-        {entryWarm?.state === "starting" && entryWarm.since !== null && bootNow - entryWarm.since > 15000 && <Button variant="outline" onClick={() => { entryReady.current = true; setEntryBooting(false); }}>{t.warmingSkip}</Button>}
+        {bootNow - Math.min(bootStarted.current, entryWarm?.since ?? Infinity) > 15000 && <Button variant="outline" onClick={() => { entryReady.current = true; setEntryBooting(false); }}>{t.warmingSkip}</Button>}
       </div>
     </div>}
     {errorBanner}
