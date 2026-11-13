@@ -8,7 +8,7 @@
 // different id, instead of running a mixed install.
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -23,4 +23,14 @@ function run(command) {
 }
 
 run("npm run build");
-run("cargo build --release --locked --manifest-path host/Cargo.toml");
+
+// Tauri passes the triple it is building for. Build the host for the same
+// target, then stage it at the one path tauri.conf.json bundles from.
+const target = process.env.TAURI_ENV_TARGET_TRIPLE;
+const native = /^host: (.+)$/mu.exec(spawnSync("rustc -vV", { shell: true, encoding: "utf8" }).stdout ?? "")?.[1];
+const cross = target && target !== native ? target : "";
+run(`cargo build --release --locked --manifest-path host/Cargo.toml${cross ? ` --target ${cross}` : ""}`);
+const windows = (cross || native || "").includes("windows");
+const built = join(root, "host", "target", ...(cross ? [cross] : []), "release", windows ? "jouzu-host.exe" : "jouzu-host");
+mkdirSync(join(root, "host", "target", "package"), { recursive: true });
+copyFileSync(built, join(root, "host", "target", "package", "jouzu-host.exe"));
