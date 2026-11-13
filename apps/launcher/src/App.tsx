@@ -607,6 +607,7 @@ export function App() {
                     errors:[jouzuUpdater.error,updater.error],
                     notes:[jouzuUpdater.notes ?? '',updater.notes ?? ''],
                     sources:[jouzuUpdater.notesSource ?? '', ''],
+                    channel: updater.channel && components?.launcherUpdaterConfigured ? { value: updater.channel, set: value => void updater.setChannel(value), downgrade: updater.downgrade } : undefined,
                     repair: components?.jouzu || import.meta.env.DEV ? undefined : { label: recoveryText[locale].action, run: () => { void (async () => {
                       if (!await confirm(recoveryText[locale].description, {title: recoveryText[locale].title, kind: "warning"})) return;
                       setOperation("saving"); setError(null);

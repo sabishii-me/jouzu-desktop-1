@@ -23,6 +23,7 @@ mod jouzu_update;
 mod environment;
 mod runtime;
 mod image_tool;
+mod update_channel;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -573,6 +574,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(update_channel::Pending::default())
         .setup(|app| {
             migration::migrate_legacy_launcher_data()
                 .map_err(std::io::Error::other)?;
@@ -691,6 +693,10 @@ fn main() {
             forget_workspace,
             add_workspaces,
             component_versions,
+            update_channel::update_channel,
+            update_channel::update_channel_set,
+            update_channel::update_check,
+            update_channel::update_install,
             model_catalog,
             runtime_report,
             runtime_install,
