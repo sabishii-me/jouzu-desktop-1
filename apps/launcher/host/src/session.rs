@@ -354,6 +354,52 @@ impl Session {
         } else {
             None
         };
+        let mut page = page;
+        // A resync while a turn is streaming must include what the assistant has
+        // already said. This row is synthetic: it is not appended to history until
+        // turn.end.
+        let active = self
+            .active_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(turn) = active {
+            let text = self
+                .assistant_text
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let blocks = self
+                .assistant_blocks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if !text.is_empty() || !blocks.is_empty() {
+                let mut row = json!({
+                    "kind": "assistant",
+                    "id": format!("{turn}:assistant"),
+                    "turnId": turn,
+                    "text": text,
+                    "blocks": if blocks.is_empty() { json!([{ "type": "text", "text": text }]) } else { json!(blocks) },
+                    "createdAt": Self::now_iso(),
+                    "partial": true,
+                    "cursor": 0,
+                });
+                if let Some(model) = self
+                    .model
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                {
+                    row["model"] = model
+                        .get("name")
+                        .or_else(|| model.get("id"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                }
+                page.insert(0, row);
+            }
+        }
         json!({ "messages": page, "nextBefore": next_before })
     }
 

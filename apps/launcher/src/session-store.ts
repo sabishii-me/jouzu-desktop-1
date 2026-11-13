@@ -154,7 +154,13 @@ export class SessionStore {
   async refreshHistory(): Promise<void> {
     try {
       const page = await this.session.history({ limit: 200 });
-      this.active = -1;
+      let active = -1;
+      let messageIndex = -1;
+      for (const row of page.messages as unknown as Array<Record<string, unknown>>) {
+        if (row.kind === "user" || row.kind === "assistant") messageIndex += 1;
+        if (row.partial === true) active = messageIndex;
+      }
+      this.active = active;
       this.update({ projection: historyRowsProjection(page.messages), historyError: undefined });
     } catch (error) {
       this.update({ historyError: String(error) });
