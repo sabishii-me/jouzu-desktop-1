@@ -2254,7 +2254,10 @@ mod session_tests {
         let log = tempfile::NamedTempFile::new().unwrap();
         let log_path = log.path().to_str().unwrap().to_string();
         let (manager, _home, workspace) =
-            manager_with_env(50, &[("FAKE_RUNTIME_PROMPT_LOG", &log_path)]);
+            manager_with_env(50, &[
+                ("FAKE_RUNTIME_PROMPT_LOG", &log_path),
+                ("FAKE_RUNTIME_DELAY_MS", "1000"),
+            ]);
         let session = manager
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();

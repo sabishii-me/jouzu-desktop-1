@@ -709,12 +709,6 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        log(
-            &self.home,
-            "debug",
-            "session.handshake",
-            json!({ "status": self.status().as_str(), "existing": existing }),
-        );
         match existing {
             Some(path) => {
                 let id = self.request_id();
