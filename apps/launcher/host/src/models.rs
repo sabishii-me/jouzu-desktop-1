@@ -157,6 +157,20 @@ impl Models {
             .unwrap_or(false)
     }
 
+    /// The runtime's default model, which a new session uses until the user
+    /// picks another. A session that has not started its runtime yet reports
+    /// this, so the user can send without picking a model first.
+    pub fn default_model(&self) -> Option<Value> {
+        let snapshot = self.load()?;
+        let provider = snapshot.get("defaultProvider").and_then(Value::as_str)?;
+        let id = snapshot.get("defaultModel").and_then(Value::as_str)?;
+        if !self.allows(provider, id) {
+            return None;
+        }
+        let name = self.display_name(provider, id).unwrap_or_else(|| id.to_string());
+        Some(json!({ "provider": provider, "id": id, "name": name }))
+    }
+
     /// The name for a pair, for the session model state.
     pub fn display_name(&self, provider: &str, id: &str) -> Option<String> {
         let snapshot = self.load()?;
@@ -175,4 +189,43 @@ impl Models {
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[cfg(test)]
+mod default_model_tests {
+    use super::*;
+
+    fn write(home: &Path, default_model: &str) -> Models {
+        let directory = home.join("host-state");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("models.json"),
+            json!({
+                "schemaVersion": SCHEMA_VERSION,
+                "models": [{ "provider": "shisa", "id": "qwen", "name": "Qwen 3.8" }],
+                "defaultProvider": "shisa",
+                "defaultModel": default_model,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        Models::new(home)
+    }
+
+    #[test]
+    fn a_new_session_starts_from_the_listed_default() {
+        let home = tempfile::tempdir().unwrap();
+        let models = write(home.path(), "qwen");
+        assert_eq!(
+            models.default_model(),
+            Some(json!({ "provider": "shisa", "id": "qwen", "name": "Qwen 3.8" }))
+        );
+    }
+
+    #[test]
+    fn a_default_missing_from_the_list_is_not_offered() {
+        let home = tempfile::tempdir().unwrap();
+        let models = write(home.path(), "gone");
+        assert_eq!(models.default_model(), None);
+    }
 }

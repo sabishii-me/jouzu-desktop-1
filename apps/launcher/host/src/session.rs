@@ -578,6 +578,11 @@ impl Session {
                 "pendingQuestions": self.pending_questions(),
                 "statuses": self.ui_statuses(),
                 "widgets": self.ui_widgets(),
+                "model": self
+                    .model
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
             }),
         }
     }
@@ -2499,6 +2504,21 @@ impl Session {
             self.set_model(Some(selected.clone()));
         }
         Ok(selected)
+    }
+
+    /// A session with no model yet starts from the runtime's default.
+    pub fn adopt_default_model(&self, model: Option<Value>) {
+        let Some(model) = model else {
+            return;
+        };
+        let unset = self
+            .model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none();
+        if unset {
+            self.set_model(Some(model));
+        }
     }
 
     /// The model is part of the session summary; publish it when it changes.

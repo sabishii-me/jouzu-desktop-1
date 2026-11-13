@@ -610,6 +610,7 @@ async fn create_session(
             .sessions
             .create(&request.workspace_path, request.session_path, request.key)?
     };
+    session.adopt_default_model(state.models.default_model());
     if let Some(client_id) = client_id
         .as_deref()
         .filter(|value| !value.trim().is_empty())
