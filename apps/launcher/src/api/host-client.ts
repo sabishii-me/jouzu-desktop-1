@@ -165,10 +165,32 @@ export class HostClient {
     }).then(() => undefined);
   }
 
+  /** Follow the one global session/control stream. */
+  subscribeEvents(
+    clientId: string,
+    after: number,
+    onEvent: (event: ApiEvent) => void,
+    onError?: (error: unknown) => void,
+  ): Unsubscribe {
+    const query = new URLSearchParams({ clientId });
+    if (after > 0) query.set("after", String(after));
+    return this.stream(`/v1/events?${query}`, (id, event, data) => {
+      onEvent({
+        id,
+        event,
+        data,
+        seq: typeof data.seq === "number" ? data.seq : id,
+        sessionId: typeof data.sessionId === "string" ? data.sessionId : undefined,
+        sessionSeq: typeof data.sessionSeq === "number" ? data.sessionSeq : undefined,
+      });
+    }, onError);
+  }
+
   /** Follow a server-sent event stream with the bearer token in a header. */
   stream(
     path: string,
     onEvent: (id: number, event: string, data: Record<string, unknown>) => void,
+    onError?: (error: unknown) => void,
   ): Unsubscribe {
     const controller = new AbortController();
     void (async () => {
@@ -178,7 +200,10 @@ export class HostClient {
           credentials: "same-origin",
           signal: controller.signal,
         });
-        if (!response.ok) return;
+        if (!response.ok) {
+          onError?.(new ApiError("runtime-unavailable", `Event stream failed (${response.status})`, true, response.status));
+          return;
+        }
         const reader = response.body?.getReader();
         if (!reader) return;
         const decoder = new TextDecoder();
@@ -209,8 +234,8 @@ export class HostClient {
             onEvent(id, event, payload);
           }
         }
-      } catch {
-        /* A closed page or host stops the stream; nothing to report. */
+      } catch (error) {
+        if (!controller.signal.aborted) onError?.(error);
       }
     })();
     return () => controller.abort();

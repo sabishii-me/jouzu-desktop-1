@@ -235,6 +235,7 @@ pub fn router(state: AppState) -> Router {
         .route("/control", axum::routing::post(control_request))
         .route("/control/cancel", axum::routing::post(control_cancel))
         .route("/control/events", get(control_events))
+        .route("/events", get(global_events))
         .route("/models", get(models))
         .route("/models/refresh", axum::routing::post(refresh_models))
         .route("/tools", get(tools_snapshot).put(update_tools))
@@ -919,6 +920,86 @@ fn control_sse_event(event: control::ControlEvent) -> SseEvent {
         .id(event.seq.to_string())
         .event(event.event)
         .data(serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// One stream for every session and control event. The UI no longer opens a
+/// connection per session; `Last-Event-ID` resumes from the hub ring.
+async fn global_events(
+    State(state): State<AppState>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let after = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(query.after)
+        .unwrap_or(0);
+    let latest = state.events.latest_seq();
+    let summaries = state.sessions.summaries();
+    let mut receiver = state.events.subscribe();
+    let events = state.events.clone();
+    let stream = async_stream::stream! {
+        let mut last = after;
+        if after == 0 {
+            // A fresh client gets current summaries, not the entire history ring.
+            for mut summary in summaries {
+                if let Some(object) = summary.as_object_mut() {
+                    object.insert("seq".to_string(), json!(latest));
+                }
+                yield Ok::<_, Infallible>(sse_data("session.updated", latest, summary));
+            }
+            last = latest;
+        } else {
+            let (replay, resync, latest) = events.replay_after(after);
+            if resync {
+                last = latest;
+                yield Ok::<_, Infallible>(sse_data(
+                    "resync",
+                    latest,
+                    json!({ "reason": "event-gap", "latestSeq": latest }),
+                ));
+            } else {
+                for event in replay {
+                    last = event.seq;
+                    yield Ok::<_, Infallible>(hub_sse_event(event));
+                }
+            }
+        }
+        loop {
+            match receiver.recv().await {
+                Ok(event) if event.seq > last => {
+                    last = event.seq;
+                    yield Ok::<_, Infallible>(hub_sse_event(event));
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let latest = events.latest_seq();
+                    last = latest;
+                    yield Ok::<_, Infallible>(sse_data(
+                        "resync",
+                        latest,
+                        json!({ "reason": "slow-client", "latestSeq": latest }),
+                    ));
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+fn hub_sse_event(event: events::HubEvent) -> SseEvent {
+    sse_data(&event.event, event.seq, event.data)
+}
+
+fn sse_data(event: &str, seq: u64, data: Value) -> SseEvent {
+    SseEvent::default()
+        .id(seq.to_string())
+        .event(event)
+        .data(serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_string()))
 }
 
 fn session_not_found() -> ApiError {

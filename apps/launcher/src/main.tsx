@@ -5,6 +5,7 @@ import { createJouzuApi } from "./api/adapters";
 import { HostClient } from "./api/host-client";
 import { configureSessionPool } from "./session-store";
 import { configureControlClient } from "./api/control-client";
+import { configureEventRouter } from "./event-router";
 import "./styles.css";
 
 /**
@@ -32,6 +33,7 @@ if (!endpoint.baseUrl) {
 const client = new HostClient({ baseUrl: endpoint.baseUrl, token: endpoint.token });
 const api = createJouzuApi(client);
 configureSessionPool(api);
+configureEventRouter(client);
 configureControlClient(client);
 
 async function boot() {

@@ -386,6 +386,8 @@ impl Session {
             let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
             *title = compact.chars().take(80).collect();
         }
+        drop(title);
+        self.publish_summary();
     }
 
     fn append_assistant_block(&self, kind: &str, text: &str) {
@@ -525,6 +527,12 @@ impl Session {
         stored
     }
 
+    fn publish_summary(&self) {
+        if let Some(hub) = &self.config.events {
+            hub.publish_session(&self.id, self.cursor(), "session.updated", self.summary());
+        }
+    }
+
     fn set_status(&self, status: Status) {
         let changed = {
             let mut guard = self
@@ -549,6 +557,7 @@ impl Session {
             }
             self.ready.notify_waiters();
             self.publish("session.status", json!({ "status": status.as_str() }));
+            self.publish_summary();
         }
     }
 
@@ -1093,9 +1102,18 @@ impl Session {
                     .active_message
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                *self
+                    .active_client_message
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                *self
+                    .turn_started_at
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                 if !self.start_queued_turn() {
                     self.set_status(Status::Idle);
                 }
+                self.publish_summary();
             }
             PiRecord::ExtensionUiRequest => self.handle_extension_ui_request(&value),
             PiRecord::ExtensionError => {
@@ -1729,8 +1747,8 @@ impl Session {
                     text: text.to_string(),
                 },
             );
-            return Ok(json!({ "messageId": message_id, "receipt": "queued" }));
-        }
+            self.publish_summary();
+            return Ok(json!({ "messageId": message_id, "receipt": "queued" }));        }
         let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
         let message_id = format!("m-{counter}");
         *self
@@ -1801,6 +1819,7 @@ impl Session {
                 "phase": if was_pending { "starting" } else { "running" },
             }),
         );
+        self.publish_summary();
         let mut prompt = json!({
             "id": client_message_id,
             "type": "prompt",
@@ -2214,6 +2233,11 @@ impl Session {
             .collect();
         json!({
             "sessionId": self.id,
+            "sessionPath": self
+                .session_path
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
             "sessionSeq": self.cursor(),
             "status": status.as_str(),
             "activeTurn": active_turn,
@@ -2503,11 +2527,21 @@ impl Session {
             .active_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(turn.clone());
+        *self
+            .active_client_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(prompt.get("id").and_then(Value::as_str).unwrap_or_default().to_string());
+        *self
+            .turn_started_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Self::now_iso());
         self.publish(
             "turn.start",
             json!({ "turnId": turn, "phase": "running" }),
         );
         self.set_status(Status::Running);
+        self.publish_summary();
         if let Err(error) = self.write_command(prompt) {
             self.publish(
                 "error",
@@ -3431,6 +3465,15 @@ impl SessionManager {
             "Question does not exist",
             false,
         ))
+    }
+
+    pub fn summaries(&self) -> Vec<Value> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|session| session.summary())
+            .collect()
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {

@@ -6,6 +6,7 @@
  * second transport or runtime command layer behind it.
  */
 import { HostChatSession } from "./api/chat-session";
+import { eventRouter } from "./event-router";
 import type { ApiEvent, Attachment, HistoryPage, JouzuApi, Receipt } from "./api/jouzu-api";
 import { emptyProjection, historyRowsProjection, type ToolView, type WireObject } from "./chat-projection";
 import {
@@ -53,6 +54,7 @@ export class SessionStore {
   private readonly listeners = new Set<(state: ChatSnapshot) => void>();
   private active = -1;
   private following = false;
+  private routerUnsubscribe?: () => void;
   private disposed = false;
   private preferred = readModelPreference();
   private api?: JouzuApi;
@@ -85,16 +87,24 @@ export class SessionStore {
     return store;
   }
 
-  /** Open the SSE stream for the session that is visible or still running. */
+  /** Subscribe to the one router stream; the store owns no socket. */
   resume(): void {
     if (this.disposed || this.following) return;
     this.following = true;
-    this.session.follow(event => this.handle(event), error => this.fail(error));
+    this.routerUnsubscribe = eventRouter.subscribe(event => {
+      if (event.event === "resync") {
+        void this.refreshHistory();
+        return;
+      }
+      if (event.sessionId !== this.session.id) return;
+      this.handle(event);
+    });
   }
 
-  /** Close only the SSE stream; the host session keeps running. */
+  /** Stop listening to the router; this does not close any host session. */
   detachStream(): void {
-    this.session.detach();
+    this.routerUnsubscribe?.();
+    this.routerUnsubscribe = undefined;
     this.following = false;
   }
 
@@ -282,6 +292,7 @@ export class SessionStore {
   close(): Promise<void> {
     if (this.disposed) return Promise.resolve();
     this.disposed = true;
+    this.detachStream();
     this.session.detach();
     this.listeners.clear();
     return this.session.stop().catch(() => {});
@@ -290,6 +301,7 @@ export class SessionStore {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.detachStream();
     this.session.detach();
     this.onDispose?.();
     this.listeners.clear();
@@ -365,6 +377,23 @@ export class SessionStore {
         // snapshot cursor is authoritative; reload the transcript instead of
         // waiting for live deltas that are already in the past.
         if (empty && typeof data.cursor === "number" && data.cursor > 0) void this.refreshHistory();
+        break;
+      }
+      case "session.updated": {
+        const activeTurn = data.activeTurn && typeof data.activeTurn === "object" ? data.activeTurn : null;
+        const status = typeof data.status === "string" ? data.status : undefined;
+        const active = !!activeTurn;
+        this.update({
+          sessionId: typeof data.sessionId === "string" ? data.sessionId : this.state.sessionId,
+          sessionFile: typeof data.sessionPath === "string" ? data.sessionPath : this.state.sessionFile,
+          pending: active,
+          projection: {
+            ...this.state.projection,
+            running: active,
+            turnStartedAt: active ? this.state.projection.turnStartedAt ?? Date.now() : undefined,
+          },
+        });
+        this.applyStatus(status);
         break;
       }
       case "session.attached":

@@ -20,6 +20,7 @@ import { FilesPanel } from "./files-panel";
 import { ToolReviewDialog } from "./tool-review-dialog";
 import { SessionStore as ChatConnection, chatPool } from "./session-store";
 import { flowNoticeText, type ChatModel, type ChatSnapshot, type SessionTiming } from "./chat-types";
+import { eventRouter } from "./event-router";
 import { fitsSendBudget, readImageAttachment, removeSubmittedImages, validateImageSelection, type ImageAttachment } from "./chat-attachments";
 import { normalizeVideoUrl, videoMarker } from "./video-url";
 import { emptyProjection, historyProjection, interruptUnfinishedTools, type ChatProjection, type FlowReportRecord, type WireObject } from "./chat-projection";
@@ -254,7 +255,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setAttachmentError(null);
   }
   function bindClient(next: ChatConnection) {
-    chatPool.focus(next.snapshot.sessionFile);
     unsubscribeRef.current?.();
     connection.current = next;
     // A dialog belongs to the runtime that raised it: the view shows the queue of
@@ -505,7 +505,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     return () => clearTimeout(timer);
   }, [snapshot.connected, snapshot.projection.messages.length]);
   useEffect(() => { if (snapshot.connected) void refreshSessions(); }, [snapshot.connected, snapshot.sessionFile]);
-  useEffect(() => { if (snapshot.sessionFile) chatPool.focus(snapshot.sessionFile); }, [snapshot.sessionFile, snapshot.projection.running]);
+  useEffect(() => eventRouter.subscribe(event => {
+    if (event.event === "session.updated" || event.event === "resync") void refreshSessions();
+  }), []);
   useEffect(() => { if (snapshot.connected) void connection.current?.loadStats(); }, [snapshot.connected, snapshot.sessionFile, snapshot.projection.messages.length, snapshot.projection.running]);
   useEffect(() => {
     // Reports belong to the loaded session, not to a selected session that is still opening.

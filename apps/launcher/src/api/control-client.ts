@@ -6,6 +6,7 @@
  * shell configured. The shell no longer runs control.mjs.
  */
 import type { HostClient } from "./host-client";
+import { eventRouter } from "../event-router";
 
 export interface ControlDevice {
   /** Set for a provider OAuth device flow; absent for Shisa.AI sign-in. */
@@ -36,8 +37,9 @@ export async function controlCancel(requestId?: string): Promise<void> {
 
 /** Device codes from an in-flight sign-in. Returns the unsubscribe function. */
 export function subscribeControl(onDevice: (device: ControlDevice) => void): () => void {
-  return control().stream("/v1/control/events", (_id, event, data) => {
-    if (event !== "control.device") return;
+  return eventRouter.subscribe(event => {
+    if (event.event !== "control.device") return;
+    const data = event.data;
     if (typeof data.url !== "string") return;
     onDevice({
       url: data.url,
