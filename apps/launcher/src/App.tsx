@@ -292,11 +292,11 @@ export function App() {
     setSettingsTab("system");
     setSettingsOpen(true);
   }
-  async function copyStatusError() {
-    if (!statusError) return;
+  async function copyStatusError(text = statusError) {
+    if (!text) return;
     try {
-      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(statusError);
-      else { const area = document.createElement("textarea"); area.value = statusError; area.style.position = "fixed"; area.style.opacity = "0"; document.body.appendChild(area); area.select(); document.execCommand("copy"); area.remove(); }
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+      else { const area = document.createElement("textarea"); area.value = text; area.style.position = "fixed"; area.style.opacity = "0"; document.body.appendChild(area); area.select(); document.execCommand("copy"); area.remove(); }
       setStatusCopied(true); setTimeout(() => setStatusCopied(false), 2000);
     } catch (error) { setError(describeError(error)); }
   }
@@ -507,15 +507,18 @@ export function App() {
     <Button variant="ghost" aria-label={t.minimize} title={t.minimize} onClick={() => getCurrentWindow().minimize().catch(error => setError(describeError(error)))}><Minus /></Button>
     <Button variant="ghost" aria-label="Close launcher" title={t.dismiss} onClick={() => getCurrentWindow().close().catch(error => setError(describeError(error)))}><X /></Button>
   </>}</div>;
-  const connectingScreen = <main className="flex h-screen w-full flex-col overflow-hidden bg-background">
+  // The one loading page: its title line says what is happening; a failure shows
+  // below it with the detail to copy and a retry.
+  const loadingScreen = (title: string, failure?: { message: string; detail: string; onRetry: () => void }) => <main className="fixed inset-0 z-40 flex h-screen w-full flex-col overflow-hidden bg-background">
     {firstRunControls}
-    {onboardingBanner(t.connecting, undefined, 0.7, true)}
-    <section aria-label={t.connecting} className="flex shrink-0 flex-col items-center gap-4 px-6 pb-14 pt-8">
-      <span role="status" aria-live="polite" className="sr-only">{t.connecting}</span>
+    {onboardingBanner(title, undefined, 0.7, true)}
+    <section aria-label={title} className="flex shrink-0 flex-col items-center gap-4 px-6 pb-14 pt-8">
+      <span role="status" aria-live="polite" className="sr-only">{title}</span>
       <Progress value={null} className="w-full max-w-xl" />
-      {statusError && <div className="flex w-full max-w-xl flex-col items-center gap-3"><p className="text-sm text-muted-foreground" role="alert">{t.connectFailed}</p><div className="flex w-full items-center gap-2 rounded-lg border border-border bg-card py-2 pl-3 pr-1"><code className="select-text min-w-0 flex-1 truncate text-xs text-muted-foreground" title={statusError}>{statusError}</code><Button variant="ghost" className="shrink-0" aria-label={t.copy} title={t.copy} onClick={() => void copyStatusError()}>{statusCopied ? <Check className="text-primary" /> : <Copy />}</Button></div><Button onClick={() => void readStatus()}>{t.retry}</Button></div>}
+      {failure && <div className="flex w-full max-w-xl flex-col items-center gap-3"><p className="text-sm text-muted-foreground" role="alert">{failure.message}</p><div className="flex w-full items-center gap-2 rounded-lg border border-border bg-card py-2 pl-3 pr-1"><code className="select-text min-w-0 flex-1 truncate text-xs text-muted-foreground" title={failure.detail}>{failure.detail}</code><Button variant="ghost" className="shrink-0" aria-label={t.copy} title={t.copy} onClick={() => void copyStatusError(failure.detail)}>{statusCopied ? <Check className="text-primary" /> : <Copy />}</Button></div><Button onClick={failure.onRetry}>{t.retry}</Button></div>}
     </section>
   </main>;
+  const connectingScreen = loadingScreen(t.connecting, statusError ? { message: t.connectFailed, detail: statusError, onRetry: () => void readStatus() } : undefined);
   const preparePercent = prepare.phase === "node" && prepare.total ? Math.max(3, (prepare.downloaded / prepare.total) * 40) : prepare.phase === "packages" ? 55 : prepare.phase === "verify" ? 90 : prepare.phase === "tools" ? 95 : 6;
   // A launcher-style prepare page: banner, one bar, no choices. It belongs to the
   // runtime step of the same state machine.
@@ -660,15 +663,10 @@ export function App() {
           </div>
         </DialogContent>
       </Dialog>
-      {entryBooting && !entryReady.current && <div className="fixed inset-0 z-40 flex h-screen w-full flex-col bg-background">
-      {onboardingBanner(entryWarm?.state === "failed" ? t.warmingFailed : entryWarm?.state === "starting" ? t.warming : t.connecting, entryWarm?.state === "starting" ? t.warmingHint : undefined, 0.7, true)}
-      <div className="flex shrink-0 flex-col items-center gap-3 px-6 pb-14 pt-8">
-        {entryWarm?.state !== "failed" && <Progress value={null} className="w-full max-w-xl" />}
-        {entryWarm?.state === "starting" && entryWarm.since !== null && <span className="text-xs tabular-nums text-muted-foreground">{t.warmingElapsed.replace("{s}", String(Math.max(0, Math.round((bootNow - entryWarm.since) / 1000))))}</span>}
-        {/* A failed start stays here with its reason and a retry: a chat without a runtime would only stall. */}
-        {entryWarm?.state === "failed" && <><p className="max-w-xl whitespace-pre-wrap break-words text-center text-xs text-destructive">{entryWarm.error}</p><Button variant="outline" onClick={() => retryEntryWarm.current()}>{t.warmingRetry}</Button></>}
-      </div>
-    </div>}
+      {entryBooting && !entryReady.current && loadingScreen(
+        entryWarm?.state === "starting" && entryWarm.since !== null ? t.warming.replace("{s}", String(Math.max(0, Math.round((bootNow - entryWarm.since) / 1000)))) : t.connecting,
+        entryWarm?.state === "failed" ? { message: t.warmingFailed, detail: entryWarm.error ?? "", onRetry: () => retryEntryWarm.current() } : undefined,
+      )}
     {errorBanner}
     {activePath && <div className="flex min-h-0 flex-1">
       <ChatWorkspace
