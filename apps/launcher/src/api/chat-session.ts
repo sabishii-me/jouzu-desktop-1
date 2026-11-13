@@ -51,6 +51,10 @@ export class HostChatSession {
     return this.api.sessions.cancel(this.id, clientMessageId);
   }
 
+  queue(action: "continue" | "discard"): Promise<void> {
+    return this.api.sessions.queue(this.id, action);
+  }
+
   /** Close this client's stream. The session itself keeps running. */
   detach(): void {
     this.unsubscribe?.();

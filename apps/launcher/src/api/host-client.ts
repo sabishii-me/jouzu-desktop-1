@@ -360,6 +360,13 @@ export class HostClient {
     });
   }
 
+  queue(sessionId: string, action: "continue" | "discard"): Promise<unknown> {
+    return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/queue`, {
+      method: "POST",
+      body: JSON.stringify({ action }),
+    });
+  }
+
   stop(sessionId: string): Promise<unknown> {
     return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/stop`, { method: "POST" });
   }

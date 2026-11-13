@@ -21,6 +21,7 @@ function fakeSession(): SessionPort & { emit: (event: ApiEvent) => void; sent: u
     },
     interrupt: async () => {},
     cancel: async () => {},
+    queue: async () => {},
     stop: async () => { session.stopped = true; },
     detach: () => { listener = undefined; },
     follow: (onEvent: (event: ApiEvent) => void) => { listener = onEvent; },

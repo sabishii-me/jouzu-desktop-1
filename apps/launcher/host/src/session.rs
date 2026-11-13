@@ -2371,6 +2371,7 @@ impl Session {
                 json!({
                     "turnId": turn_id,
                     "clientMessageId": prompt.get("id").and_then(Value::as_str),
+                    "text": prompt.get("message").and_then(Value::as_str),
                     "state": if self.queue_paused.load(Ordering::Relaxed) { "paused" } else { "queued" },
                 })
             })

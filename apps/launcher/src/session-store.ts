@@ -24,6 +24,7 @@ export interface SessionPort {
   send(message: { clientMessageId: string; text: string; attachments?: Attachment[] }): Promise<Receipt>;
   interrupt(): Promise<void>;
   cancel(clientMessageId: string): Promise<void>;
+  queue(action: "continue" | "discard"): Promise<void>;
   stop(): Promise<void>;
   detach(): void;
   follow(onEvent: (event: ApiEvent) => void, onError: (error: unknown) => void): void;
@@ -284,6 +285,11 @@ export class SessionStore {
     catch (error) { this.update({ error: String(error) }); }
   }
 
+  async queue(action: "continue" | "discard"): Promise<void> {
+    try { await this.session.queue(action); }
+    catch (error) { this.update({ error: String(error) }); }
+  }
+
   async compactSession(_sessionPath?: string): Promise<void> {
     if (!this.api) throw new Error("The host API is unavailable.");
     await this.api.commands.compact(this.session.id);
@@ -418,6 +424,17 @@ export class SessionStore {
           sessionId: typeof data.sessionId === "string" ? data.sessionId : this.state.sessionId,
           sessionFile: typeof data.sessionPath === "string" ? data.sessionPath : this.state.sessionFile,
           pending: active,
+          queue: Array.isArray(data.queue)
+            ? data.queue.flatMap(item => {
+              if (!item || typeof item !== "object") return [];
+              const row = item as Record<string, unknown>;
+              return typeof row.clientMessageId === "string" ? [{
+                clientMessageId: row.clientMessageId,
+                text: typeof row.text === "string" ? row.text : "",
+                state: typeof row.state === "string" ? row.state : "queued",
+              }] : [];
+            })
+            : [],
           projection: {
             ...this.state.projection,
             running: active,

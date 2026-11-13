@@ -61,6 +61,9 @@ function hostGroups(client: HostClient) {
     async cancel(sessionId, clientMessageId) {
       await client.cancel(sessionId, clientMessageId);
     },
+    async queue(sessionId, action) {
+      await client.queue(sessionId, action);
+    },
     async stop(sessionId) {
       await client.stop(sessionId);
     },

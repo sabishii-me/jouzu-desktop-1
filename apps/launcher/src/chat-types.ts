@@ -67,6 +67,7 @@ export interface ChatSnapshot {
   stats?: SessionStats;
   thinkingLevel?: string;
   thinkingLevels?: string[];
+  queue?: Array<{ clientMessageId: string; text: string; state: string }>;
   /** The transcript was compacted after a display backlog and will be reloaded. */
   gap?: boolean;
 }
