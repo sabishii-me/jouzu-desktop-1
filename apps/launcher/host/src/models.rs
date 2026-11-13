@@ -153,7 +153,7 @@ fn unusable_reason(model: &Value) -> Option<&'static str> {
         .is_some_and(|provider| provider.starts_with("catalog:"));
     let no_limit = model.get("maxTokens").map(Value::is_null).unwrap_or(true);
     (catalog && no_limit).then_some(
-        "The model catalog gives no output limit for this model, so Jouzu cannot use it yet.",
+        "Not a chat model: the catalog gives it no output limit, so the runtime does not offer it for chat.",
     )
 }
 

@@ -47,7 +47,9 @@ function ModelMenu({ open, onOpenChange, models, model, onSelect, thinkingLevel,
     document.addEventListener("keydown", escape);
     return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", escape); };
   }, [open, onOpenChange]);
-  const visible = models.filter(item => `${item.provider} ${item.name} ${item.id}`.toLowerCase().includes(query.toLowerCase()));
+  // Models the runtime cannot chat with (e.g. translation-only offerings) are not offered here.
+  const usable = models.filter(item => item.available !== false);
+  const visible = usable.filter(item => `${item.provider} ${item.name} ${item.id}`.toLowerCase().includes(query.toLowerCase()));
   const providers = [...new Set(visible.map(item => item.provider))];
   return <div ref={root} className="relative">
     <Button type="button" variant="ghost" className="h-8 gap-1 px-2 text-xs" aria-label="Model" aria-expanded={open} onClick={() => { const next = !open; onOpenChange(next); if (next) { setQuery(""); onOpen?.(); } }}>
@@ -58,8 +60,8 @@ function ModelMenu({ open, onOpenChange, models, model, onSelect, thinkingLevel,
     {open && <div role="menu" aria-label="Model selection" className="absolute bottom-full right-0 z-30 mb-2 w-80 max-w-[calc(100vw-2rem)] rounded-xl border border-border bg-popover p-2 shadow-xl">
       <Input autoFocus aria-label="Search models" placeholder="Search models" value={query} onChange={event => setQuery(event.target.value)} className="mb-2" />
       <div className="max-h-72 overflow-y-auto">
-        {!models.length && <div className="px-2 py-3"><p className="text-sm text-muted-foreground">No models available. Configure a provider in Settings.</p>{onRetry && <Button type="button" variant="outline" className="mt-2 h-7 px-2 text-xs" onClick={onRetry}>Retry models</Button>}</div>}
-        {!!models.length && !visible.length && <p className="px-2 py-3 text-sm text-muted-foreground">No matching models</p>}
+        {!usable.length && <div className="px-2 py-3"><p className="text-sm text-muted-foreground">No models available. Configure a provider in Settings.</p>{onRetry && <Button type="button" variant="outline" className="mt-2 h-7 px-2 text-xs" onClick={onRetry}>Retry models</Button>}</div>}
+        {!!usable.length && !visible.length && <p className="px-2 py-3 text-sm text-muted-foreground">No matching models</p>}
         {providers.map(provider => <section key={provider} className="mb-2">
           <h3 className="px-2 pb-1 pt-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">{providerLabel(provider)}</h3>
           {visible.filter(item => item.provider === provider).map(item => <button key={`${item.provider}/${item.id}`} type="button" role="menuitemradio" aria-checked={item.name === model} disabled={item.available === false} title={item.available === false ? item.unavailableReason ?? undefined : undefined} onClick={() => { onSelect(item.provider, item.id); onOpenChange(false); }} className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent focus-visible:bg-accent disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent">
