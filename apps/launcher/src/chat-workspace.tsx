@@ -128,6 +128,28 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const pendingUser = pendingFor(pendingBySession, queueSessionKey) || localSubmitted;
   // Queued steering is owned by the session, not by the composer. Keep it visible
   // until the host can accept it; clearing it on idle would silently lose input.
+  // Once a send has returned, the host queue is the source of truth: an item the
+  // host no longer reports as queued has started (or was discarded) and must not
+  // stay in the composer as "Queued".
+  const hostQueueTexts = (snapshot.queue ?? []).map(item => item.text).join("\u0000");
+  useEffect(() => {
+    if (sendPending || !queueSessionKey) return;
+    setQueuedBySession(previous => {
+      const items = previous[queueSessionKey];
+      if (!items?.length) return previous;
+      const remaining = hostQueueTexts ? hostQueueTexts.split("\u0000") : [];
+      const kept = items.filter(text => {
+        const at = remaining.indexOf(text);
+        if (at < 0) return false;
+        remaining.splice(at, 1);
+        return true;
+      });
+      if (kept.length === items.length) return previous;
+      const next = { ...previous };
+      if (kept.length) next[queueSessionKey] = kept; else delete next[queueSessionKey];
+      return next;
+    });
+  }, [hostQueueTexts, sendPending, queueSessionKey]);
   const selectedRowRef = useRef<HTMLDivElement | null>(null);
   const switchingRef = useRef(false);
   const switchingTarget = useRef<string | "new" | null>(null);
