@@ -102,11 +102,13 @@ async fn main() -> ExitCode {
     let install = arg_value(&args, "--install")
         .map(PathBuf::from)
         .unwrap_or_else(|| managed.clone());
+    let events = jouzu_host::events::EventHub::new();
     let control = match jouzu_host::control::ControlManager::new(
         &install,
         &managed,
         &home,
         &runtime_home,
+        Some(events.clone()),
     ) {
         Ok(manager) => std::sync::Arc::new(manager),
         Err(error) => {
@@ -120,6 +122,7 @@ async fn main() -> ExitCode {
         runtime_home,
         bash,
         jouzu_host::session::DEFAULT_REPLAY_LIMIT,
+        Some(events.clone()),
     ));
     {
         let sessions = sessions.clone();
@@ -170,6 +173,7 @@ async fn main() -> ExitCode {
         version: VERSION.to_string(),
         sessions: sessions.clone(),
         control,
+        events,
         models: std::sync::Arc::new(jouzu_host::models::Models::new(&home)),
     };
     let app = router(state);

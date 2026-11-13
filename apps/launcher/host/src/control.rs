@@ -61,15 +61,17 @@ struct EventBus {
     seq: AtomicU64,
     sender: broadcast::Sender<ControlEvent>,
     history: Mutex<VecDeque<ControlEvent>>,
+    hub: Option<Arc<crate::events::EventHub>>,
 }
 
 impl EventBus {
-    fn new() -> Self {
+    fn new(hub: Option<Arc<crate::events::EventHub>>) -> Self {
         let (sender, _) = broadcast::channel(256);
         Self {
             seq: AtomicU64::new(0),
             sender,
             history: Mutex::new(VecDeque::with_capacity(REPLAY)),
+            hub,
         }
     }
 
@@ -89,6 +91,9 @@ impl EventBus {
                 history.pop_front();
             }
             history.push_back(frame.clone());
+        }
+        if let Some(hub) = &self.hub {
+            hub.publish_control(&frame.event, frame.data.clone());
         }
         let _ = self.sender.send(frame);
     }
@@ -129,6 +134,7 @@ impl ControlManager {
         managed: &Path,
         host_home: &Path,
         runtime_home: &Path,
+        events: Option<Arc<crate::events::EventHub>>,
     ) -> Result<Self, String> {
         let app = app::resolve_app(install, managed)?;
         let node = app::node_executable(managed);
@@ -146,7 +152,7 @@ impl ControlManager {
                 environment,
             },
             inflight: Mutex::new(None),
-            bus: Arc::new(EventBus::new()),
+            bus: Arc::new(EventBus::new(events)),
         })
     }
 

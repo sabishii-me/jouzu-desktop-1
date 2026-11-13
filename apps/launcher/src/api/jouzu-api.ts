@@ -276,6 +276,10 @@ export interface ApiEvent {
   id: number;
   event: string;
   data: Record<string, unknown>;
+  /** Global event-hub sequence; absent on legacy per-session streams. */
+  seq?: number;
+  sessionId?: string;
+  sessionSeq?: number;
 }
 
 export abstract class JouzuApi {

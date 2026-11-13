@@ -15,6 +15,7 @@ use std::{
 mod artifacts;
 pub mod control;
 mod environment;
+pub mod events;
 mod files;
 pub mod models;
 pub mod runtime;
@@ -53,6 +54,7 @@ pub struct AppState {
     pub version: String,
     pub sessions: Arc<SessionManager>,
     pub control: Arc<control::ControlManager>,
+    pub events: Arc<events::EventHub>,
     pub models: Arc<models::Models>,
 }
 
@@ -1505,7 +1507,7 @@ mod tests {
 
     fn control_manager(home: &Path) -> Arc<control::ControlManager> {
         Arc::new(
-            control::ControlManager::new(home, home, home, &home.join("data"))
+            control::ControlManager::new(home, home, home, &home.join("data"), None)
                 .expect("control manager"),
         )
     }
@@ -1523,8 +1525,10 @@ mod tests {
                 dist.clone(),
                 None,
                 10,
+                None,
             )),
             control: control_manager(&dist),
+            events: events::EventHub::new(),
             models: Arc::new(models::Models::new(&dist)),
         }
     }
@@ -1873,6 +1877,7 @@ mod session_tests {
             home.path().join("data"),
             None,
             replay,
+            None,
         ));
         (manager, home, workspace)
     }
@@ -1929,7 +1934,8 @@ mod session_tests {
             started: Instant::now(),
             version: "0.1.0".to_string(),
             sessions: manager,
-            control: Arc::new(control::ControlManager::new(&home, &home, &home, &home.join("data")).expect("control manager")),
+            control: Arc::new(control::ControlManager::new(&home, &home, &home, &home.join("data"), None).expect("control manager")),
+            events: events::EventHub::new(),
             models: Arc::new(models::Models::new(&home)),
         }
         .pipe(router)
@@ -2831,6 +2837,7 @@ mod session_tests {
             home.path().join("data"),
             None,
             50,
+            None,
         ));
         let session = manager
             .create(workspace.path().to_str().unwrap(), None, None)

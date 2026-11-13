@@ -90,6 +90,7 @@ pub struct SessionConfig {
     pub runtime_home: PathBuf,
     pub bash: Option<PathBuf>,
     pub replay_limit: usize,
+    pub events: Option<Arc<crate::events::EventHub>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -240,6 +241,9 @@ pub struct Session {
     next_message: AtomicU64,
     next_request: AtomicU64,
     active_message: Mutex<Option<String>>,
+    active_client_message: Mutex<Option<String>>,
+    turn_started_at: Mutex<Option<String>>,
+    listed: Mutex<bool>,
     title: Mutex<String>,
     updated_at: Mutex<Option<String>>,
     handshake: Mutex<Handshake>,
@@ -366,6 +370,10 @@ impl Session {
     }
 
     fn remember_turn(&self, text: &str) {
+        *self
+            .listed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
         *self
             .updated_at
             .lock()
@@ -511,6 +519,9 @@ impl Session {
             log_guard.push(&self.id, event, data)
         };
         let _ = self.tx.send(stored.clone());
+        if let Some(hub) = &self.config.events {
+            hub.publish_session(&self.id, stored.id, event, stored.data.clone());
+        }
         stored
     }
 
@@ -1731,6 +1742,14 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = client_id.map(str::to_string);
         *self
+            .active_client_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(client_message_id.to_string());
+        *self
+            .turn_started_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Self::now_iso());
+        *self
             .assistant_text
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = String::new();
@@ -2152,6 +2171,80 @@ impl Session {
         })
     }
 
+    pub fn summary(&self) -> Value {
+        let status = self.status();
+        let active_turn = self
+            .active_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .map(|turn| {
+                let phase = match status {
+                    Status::Starting | Status::Recovering => "starting",
+                    Status::Running | Status::WaitingApproval | Status::WaitingQuestion => "running",
+                    _ => "accepted",
+                };
+                json!({
+                    "turnId": turn,
+                    "clientMessageId": self
+                        .active_client_message
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone(),
+                    "phase": phase,
+                    "startedAt": self
+                        .turn_started_at
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone(),
+                })
+            });
+        let queue: Vec<Value> = self
+            .queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(turn_id, prompt)| {
+                json!({
+                    "turnId": turn_id,
+                    "clientMessageId": prompt.get("id").and_then(Value::as_str),
+                    "state": "queued",
+                })
+            })
+            .collect();
+        json!({
+            "sessionId": self.id,
+            "sessionSeq": self.cursor(),
+            "status": status.as_str(),
+            "activeTurn": active_turn,
+            "queue": queue,
+            "listed": *self
+                .listed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            "title": self
+                .title
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            "updatedAt": self
+                .updated_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            "model": self
+                .model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            "thinkingLevel": Value::Null,
+            "runtime": {
+                "attached": self.runtime_pid().is_some(),
+                "recovering": status == Status::Recovering,
+            },
+        })
+    }
+
     fn new(
         id: String,
         workspace_path: String,
@@ -2182,6 +2275,9 @@ impl Session {
             next_message: AtomicU64::new(0),
             next_request: AtomicU64::new(0),
             active_message: Mutex::new(None),
+            active_client_message: Mutex::new(None),
+            turn_started_at: Mutex::new(None),
+            listed: Mutex::new(false),
             title: Mutex::new(String::new()),
             updated_at: Mutex::new(None),
             handshake: Mutex::new(Handshake::Messages),
@@ -2557,6 +2653,7 @@ impl SessionManager {
         runtime_home: PathBuf,
         bash: Option<PathBuf>,
         replay_limit: usize,
+        events: Option<Arc<crate::events::EventHub>>,
     ) -> Self {
         let config = spec.map(|spec| SessionConfig {
             spec,
@@ -2564,6 +2661,7 @@ impl SessionManager {
             runtime_home: runtime_home.clone(),
             bash,
             replay_limit,
+            events,
         });
         Self {
             config,

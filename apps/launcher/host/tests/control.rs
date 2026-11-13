@@ -29,7 +29,7 @@ fn manager(app: &PathBuf, home: &PathBuf) -> Arc<ControlManager> {
     let install = app.parent().expect("app has a parent");
     let runtime_home = home.join("data");
     std::fs::create_dir_all(&runtime_home).unwrap();
-    Arc::new(ControlManager::new(install, install, home, &runtime_home).expect("control manager"))
+    Arc::new(ControlManager::new(install, install, home, &runtime_home, None).expect("control manager"))
 }
 
 #[tokio::test]
