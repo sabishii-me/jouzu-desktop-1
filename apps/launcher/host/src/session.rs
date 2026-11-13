@@ -2753,21 +2753,42 @@ impl Session {
                     json!({ "code": code }),
                 );
                 if !matches!(self.status(), Status::Stopped) {
-                    let turn = self
-                        .active_message
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take();
-                    self.pending_prompts
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clear();
-                    if let Some(turn) = turn {
-                        self.publish(
-                            "turn.end",
-                            json!({ "turnId": turn, "aborted": true, "reason": "runtime-exited" }),
-                        );
+                    let status = self.status();
+                    if matches!(
+                        status,
+                        Status::Running
+                            | Status::WaitingApproval
+                            | Status::WaitingQuestion
+                    ) {
+                        let turn = self
+                            .active_message
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take();
+                        *self
+                            .active_client_message
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                        *self
+                            .turn_started_at
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                        self.cancelling.store(false, Ordering::SeqCst);
+                        self.queue_paused.store(true, Ordering::SeqCst);
+                        if let Some(turn) = turn {
+                            self.publish(
+                                "turn.end",
+                                json!({
+                                    "turnId": turn,
+                                    "status": "failed",
+                                    "reason": "runtime-exited",
+                                }),
+                            );
+                        }
+                        self.publish_summary();
                     }
+                    // accepted/starting: nothing reached the model. Keep the
+                    // active turn and parked prompt; recovery will run it.
                     self.schedule_recovery(format!("runtime exited with code {code:?}"));
                 }
             }
