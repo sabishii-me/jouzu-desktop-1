@@ -105,15 +105,15 @@ describe("HostClient", () => {
     expect(JSON.parse(String(calls[1].init?.body))).toEqual({ image: { provider: "shisa" } });
   });
 
-  test("unwraps command data and maps error envelopes", async () => {
+  test("unwraps session stats and maps error envelopes", async () => {
     const fetchImpl = (async (input: RequestInfo | URL) => {
-      if (String(input).endsWith("/v1/sessions/h1/command")) {
-        return response({ data: { models: [] } });
+      if (String(input).endsWith("/v1/sessions/h1/stats")) {
+        return response({ stats: null });
       }
       return response({ error: { code: "prompt-resolved", message: "already", retryable: false } }, 409);
     }) as typeof fetch;
     const client = new HostClient({ fetchImpl });
-    await expect(client.command("h1", { type: "get_available_models" })).resolves.toEqual({ models: [] });
+    await expect(client.stats("h1")).resolves.toBeNull();
     await expect(client.approve("a1", "Approve")).rejects.toMatchObject<Partial<ApiError>>({
       code: "prompt-resolved",
       retryable: false,

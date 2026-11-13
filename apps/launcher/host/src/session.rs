@@ -353,6 +353,8 @@ pub struct Session {
     /// failure is reported to the user, since nobody is waiting on it.
     pending_model_request: Mutex<Option<(String, Value)>>,
     pending_thinking: Mutex<Option<String>>,
+    /// The reasoning level the runtime reports (or the one chosen and not yet applied).
+    thinking_level: Mutex<Option<String>>,
     subscribers: AtomicU64,
     next_client: AtomicU64,
     last_activity: Mutex<Instant>,
@@ -364,6 +366,27 @@ impl Session {
             .status
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A runtime is up and answering. Starting, recovering or never started
+    /// sessions have none, and questions about the runtime have no answer yet.
+    pub fn has_runtime(&self) -> bool {
+        !matches!(
+            self.status(),
+            Status::Pending | Status::Starting | Status::Recovering | Status::Stopped | Status::Error
+        ) && self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    /// The session's own saved file, once the runtime has written one.
+    pub fn saved_path(&self) -> Option<String> {
+        self.session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn cursor(&self) -> u64 {
@@ -658,6 +681,11 @@ impl Session {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone(),
+                "thinkingLevel": self
+                    .thinking_level
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
             }),
         }
     }
@@ -941,6 +969,16 @@ impl Session {
                 if let (Some(model), false) = (data.get("model"), choice_waiting) {
                     self.set_model(Some(model.clone()));
                 }
+                let level_waiting = self
+                    .pending_thinking
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some();
+                if let (Some(level), false) =
+                    (data.get("thinkingLevel").and_then(Value::as_str), level_waiting)
+                {
+                    self.set_thinking_level(Some(level.to_string()));
+                }
             }
         }
         let success = value
@@ -990,6 +1028,10 @@ impl Session {
                     }),
                 );
                 self.set_model(None);
+                self.request_state();
+            }
+            // A refused level leaves the runtime's own; ask which one that is.
+            if command == "set_thinking_level" {
                 self.request_state();
             }
             let handshake = matches!(command, "get_state" | "switch_session" | "get_messages");
@@ -2707,6 +2749,22 @@ impl Session {
         self.set_model(Some(model));
     }
 
+    /// The reasoning level is part of the session summary; publish it when it changes.
+    fn set_thinking_level(&self, level: Option<String>) {
+        let changed = {
+            let mut current = self
+                .thinking_level
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let changed = *current != level;
+            *current = level;
+            changed
+        };
+        if changed {
+            self.publish_summary();
+        }
+    }
+
     /// The model is part of the session summary; publish it when it changes.
     fn set_model(&self, model: Option<Value>) {
         let changed = {
@@ -2735,6 +2793,7 @@ impl Session {
                 .pending_thinking
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(level.to_string());
+            self.set_thinking_level(Some(level.to_string()));
             return Ok(json!({ "level": level }));
         }
         self.request(
@@ -2742,6 +2801,7 @@ impl Session {
             Duration::from_secs(30),
         )
         .await?;
+        self.set_thinking_level(Some(level.to_string()));
         Ok(json!({ "level": level }))
     }
 
@@ -2935,7 +2995,11 @@ impl Session {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
-            "thinkingLevel": Value::Null,
+            "thinkingLevel": self
+                .thinking_level
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
             "runtime": {
                 "attached": self.runtime_pid().is_some(),
                 "recovering": status == Status::Recovering,
@@ -3005,6 +3069,7 @@ impl Session {
             pending_model: Mutex::new(None),
             pending_model_request: Mutex::new(None),
             pending_thinking: Mutex::new(None),
+            thinking_level: Mutex::new(None),
             subscribers: AtomicU64::new(0),
             next_client: AtomicU64::new(0),
             last_activity: Mutex::new(Instant::now()),

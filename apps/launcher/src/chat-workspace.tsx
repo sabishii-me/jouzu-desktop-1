@@ -722,11 +722,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (!client || !source) return false;
     const recovered = await api.sessions.recover(source);
     if (!recovered || recovered === source) return false;
+    // The recovered copy is its own saved session: open it the way a sidebar click does.
+    selectedSessionRef.current = recovered;
     setSelectedSession(recovered);
-    await client.resumeSession(recovered);
-    await client.loadModels();
-    setHero(false);
-    void refreshSessions();
+    await refreshSessions();
+    await switchSession(recovered);
+    if (normalizedPath(connection.current?.snapshot.sessionFile ?? "") !== normalizedPath(recovered)) return false;
     setNotification("Recovered the session without the interrupted tool call.");
     return true;
   }
@@ -879,38 +880,27 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     loadPreview(sessionPath);
   }
   async function forkTurn(prompt: string, messageIndex: number) {
-    let client = connection.current;
+    const client = connection.current;
     if (!client || !prompt.trim()) return;
     if (switchingRef.current || snapshot.pending || !snapshot.connected) { setNotification("Wait for the session to finish loading."); return; }
-    // Fork is an explicit action on the selected session: attach it first, the same
-    // way Review does, so the branch is copied from the session on screen.
-    const target = selectedSessionRef.current;
-    const attach = !!target && normalizedPath(target) !== normalizedPath(client.snapshot.sessionFile ?? "");
-    switchingRef.current = true;
-    setSwitching(true);
+    let branch: string;
     try {
-      if (attach) {
-        // Fork attaches on the current runtime: the fork must run against the session
-        // on screen, and a pool swap here would clear the branch notification.
-        await client.resumeSession(target);
-        if (!client || normalizedPath(target ?? "") !== normalizedPath(client.snapshot.sessionFile ?? "")) {
-          setNotification("Could not attach this session for forking.");
-          return;
-        }
-      }
-      const source = client.snapshot.sessionFile;
+      // Fork copies the session on screen, so that session is attached first, the same way
+      // every other command on it does.
+      if (!await ensureSelectedSession(client)) { setNotification("Could not attach this session for forking."); return; }
+      const source = connection.current?.snapshot.sessionFile;
       if (!source) throw new Error("This session has no file to branch yet.");
-      // Copy the session through the clicked message (the turn end) into a new
-      // session, then switch the runtime to it. No runtime fork semantics change.
-      const branch = await api.sessions.branch(source, messageIndex);
-      await client.resumeSession(branch);
-      await refreshSessions();
-      setPreview(null);
-      setSelectedSession(branch);
-      setHero(false);
-      setNotification("Branched into a new conversation.");
-    } catch (error) { setNotification(describeError(error)); }
-    finally { switchingRef.current = false; setSwitching(false); }
+      // Copy the session through the clicked message (the turn end) into a new saved
+      // session. No runtime fork semantics change.
+      branch = await api.sessions.branch(source, messageIndex);
+    } catch (error) { setNotification(describeError(error)); return; }
+    // The branch is an ordinary saved session: open it the way a sidebar click does.
+    selectedSessionRef.current = branch;
+    setSelectedSession(branch);
+    setPreview(null);
+    await refreshSessions();
+    await switchSession(branch);
+    if (normalizedPath(connection.current?.snapshot.sessionFile ?? "") === normalizedPath(branch)) setNotification("Branched into a new conversation.");
   }
   useEffect(() => {
     if (switching || !snapshot.connected || snapshot.pending || !queuedSwitch.current) return;

@@ -128,18 +128,15 @@ function hostGroups(client: HostClient) {
     async run(sessionId, command) {
       await client.send(sessionId, command, `cmd-${crypto.randomUUID()}`);
     },
-    raw: (sessionId, command) => client.command(sessionId, command),
+    stats: sessionId => client.stats(sessionId),
     async compact(sessionId) {
-      await client.command(sessionId, { type: "compact" });
+      await client.compact(sessionId);
     },
     async exportHtml(sessionId, outputPath) {
-      await client.command(sessionId, { type: "export_html", outputPath });
+      await client.exportHtml(sessionId, outputPath);
     },
-    async reload(sessionId, sessionPath) {
-      if (!sessionPath) {
-        throw new ApiError("invalid-request", "sessionPath is required to reload a session.", false);
-      }
-      await client.command(sessionId, { type: "switch_session", sessionPath });
+    async reload(sessionId) {
+      await client.reload(sessionId);
     },
   };
 

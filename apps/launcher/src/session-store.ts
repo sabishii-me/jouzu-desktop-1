@@ -382,7 +382,7 @@ export class SessionStore {
   async loadStats(): Promise<void> {
     try {
       if (!this.api) return;
-      const data = await this.api.commands.raw(this.session.id, { type: "get_session_stats" });
+      const data = await this.api.commands.stats(this.session.id);
       this.update({ stats: data && typeof data === "object" ? data as SessionStats : undefined });
     } catch { /* Session counters are ancillary; chat remains usable. */ }
   }
@@ -461,16 +461,9 @@ export class SessionStore {
 
   async reloadSession(): Promise<void> {
     if (!this.api) return;
-    await this.api.commands.reload(this.session.id, this.state.sessionFile);
+    await this.api.commands.reload(this.session.id);
     await this.refreshHistory();
     await this.loadModels();
-  }
-
-  async resumeSession(sessionPath: string): Promise<void> {
-    if (!this.api) return;
-    await this.api.commands.raw(this.session.id, { type: "switch_session", sessionPath });
-    await this.refreshHistory();
-    this.update({ sessionFile: sessionPath });
   }
 
   /**
@@ -578,6 +571,7 @@ export class SessionStore {
       sessionId: text(data.sessionId) ?? this.state.sessionId,
       sessionFile: text(data.sessionPath) ?? this.state.sessionFile,
       status: text(data.status) ?? this.state.status,
+      ...(text(data.thinkingLevel) ? { thinkingLevel: text(data.thinkingLevel) } : {}),
       ...("queue" in data ? { queue: queueOf(data.queue) } : {}),
       ...("failedTurn" in data ? { failedTurn: failed && text(failed.clientMessageId) ? { clientMessageId: text(failed.clientMessageId)!, text: text(failed.text) ?? "" } : null } : {}),
       ...(prompts ? { prompts } : {}),

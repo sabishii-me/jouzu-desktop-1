@@ -312,6 +312,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/sessions/{id}/stop", axum::routing::post(stop_session))
         .route("/sessions/{id}/view", axum::routing::post(view_session))
+        .route("/sessions/{id}/stats", get(session_stats))
+        .route("/sessions/{id}/compact", axum::routing::post(compact_session))
+        .route("/sessions/{id}/export", axum::routing::post(export_session))
+        .route("/sessions/{id}/reload", axum::routing::post(reload_session))
         .route(
             "/sessions/{id}/command",
             axum::routing::post(session_command),
@@ -328,6 +332,10 @@ pub fn router(state: AppState) -> Router {
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_auth,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            log_failures,
         ));
 
     Router::new()
@@ -734,6 +742,76 @@ async fn session_command(
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
     let data = session
         .request(command, Duration::from_secs(30))
+        .await?;
+    Ok(Json(json!({ "data": data })))
+}
+
+/// Usage counters for the status line. A session without a runtime yet has no
+/// counters, which is an answer (`null`), not an error.
+async fn session_stats(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    if !session.has_runtime() {
+        return Ok(Json(json!({ "stats": null })));
+    }
+    let stats = session
+        .request(json!({ "type": "get_session_stats" }), Duration::from_secs(10))
+        .await?;
+    Ok(Json(json!({ "stats": stats })))
+}
+
+async fn compact_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    let data = session
+        .request(json!({ "type": "compact" }), Duration::from_secs(300))
+        .await?;
+    Ok(Json(json!({ "data": data })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportRequest {
+    output_path: String,
+}
+
+async fn export_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ExportRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if request.output_path.trim().is_empty() {
+        return Err(ApiError::bad_request("outputPath is required"));
+    }
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    let data = session
+        .request(
+            json!({ "type": "export_html", "outputPath": request.output_path }),
+            Duration::from_secs(60),
+        )
+        .await?;
+    Ok(Json(json!({ "data": data })))
+}
+
+/// Re-read the session's own saved file into its runtime. The host knows which
+/// file that is, so the client does not name a path.
+async fn reload_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    let path = session
+        .saved_path()
+        .ok_or_else(|| ApiError::bad_request("This session has no saved file yet"))?;
+    let data = session
+        .request(
+            json!({ "type": "switch_session", "sessionPath": path }),
+            Duration::from_secs(30),
+        )
         .await?;
     Ok(Json(json!({ "data": data })))
 }
@@ -1570,6 +1648,31 @@ async fn history(
 ) -> Result<Json<Value>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
     Ok(Json(session.history(query.limit.unwrap_or(200), query.before)))
+}
+
+/// A request the host could not serve leaves a line in host.log with what the
+/// client was told, so no failure exists only in a UI that may not show it.
+async fn log_failures(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let response = next.run(request).await;
+    if !response.status().is_server_error() {
+        return response;
+    }
+    let status = response.status();
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap_or_default();
+    let error = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("error").cloned())
+        .unwrap_or(Value::Null);
+    log(
+        &state.sessions.home(),
+        "error",
+        "request.failed",
+        json!({ "method": method, "path": path, "status": status.as_u16(), "error": error }),
+    );
+    Response::from_parts(parts, axum::body::Body::from(bytes))
 }
 
 async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -2931,6 +3034,20 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn the_summary_carries_the_reasoning_level() {
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().to_str().unwrap();
+        let pending = manager.create_pending(path, None, None).unwrap();
+        pending.select_thinking("low").await.unwrap();
+        assert_eq!(pending.summary()["thinkingLevel"], "low");
+
+        let session = manager.create(path, None, None).unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.select_thinking("high").await.unwrap();
+        assert_eq!(session.summary()["thinkingLevel"], "high");
+    }
+
+    #[tokio::test]
     async fn a_rejected_model_switch_leaves_the_session_usable() {
         let (manager, _home, workspace) = manager(50);
         let session = manager
@@ -3663,6 +3780,18 @@ mod session_tests {
         manager.hold("window", &other.id);
         assert!(super::withheld(&manager, Some("window"), &event(&shown.id, "message.delta")));
         assert!(!super::withheld(&manager, Some("window"), &event(&other.id, "message.delta")));
+    }
+
+    #[tokio::test]
+    async fn only_a_session_with_a_runtime_answers_stats() {
+        let (manager, _home, workspace) = manager(50);
+        let pending = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        assert!(!pending.has_runtime());
+        let started = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        wait_status(&started, Status::Idle).await;
+        assert!(started.has_runtime());
     }
 
     #[tokio::test]

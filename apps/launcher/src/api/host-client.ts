@@ -353,11 +353,24 @@ export class HostClient {
     });
   }
 
-  command(sessionId: string, command: Record<string, unknown>): Promise<unknown> {
-    return this.request<{ data: unknown }>(
-      `/v1/sessions/${encodeURIComponent(sessionId)}/command`,
-      { method: "POST", body: JSON.stringify(command) },
-    ).then(body => body.data);
+  stats(sessionId: string): Promise<unknown> {
+    return this.request<{ stats: unknown }>(`/v1/sessions/${encodeURIComponent(sessionId)}/stats`)
+      .then(body => body.stats ?? null);
+  }
+
+  compact(sessionId: string): Promise<unknown> {
+    return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/compact`, { method: "POST" });
+  }
+
+  exportHtml(sessionId: string, outputPath: string): Promise<unknown> {
+    return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/export`, {
+      method: "POST",
+      body: JSON.stringify({ outputPath }),
+    });
+  }
+
+  reload(sessionId: string): Promise<unknown> {
+    return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/reload`, { method: "POST" });
   }
 
   interrupt(sessionId: string): Promise<unknown> {

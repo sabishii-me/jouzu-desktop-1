@@ -255,10 +255,12 @@ export interface McpApi {
 
 export interface CommandApi {
   run(sessionId: string, command: string): Promise<void>;
-  raw(sessionId: string, command: Record<string, unknown>): Promise<unknown>;
+  /** Usage counters; null while the session has no runtime yet. */
+  stats(sessionId: string): Promise<unknown>;
   compact(sessionId: string): Promise<void>;
   exportHtml(sessionId: string, outputPath: string): Promise<void>;
-  reload(sessionId: string, sessionPath?: string): Promise<void>;
+  /** Re-read the session's own saved file; the host knows which file that is. */
+  reload(sessionId: string): Promise<void>;
 }
 
 export interface ArtifactApi {
