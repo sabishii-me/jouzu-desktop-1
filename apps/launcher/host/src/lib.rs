@@ -2783,6 +2783,22 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn the_default_model_shown_on_a_new_session_is_the_one_the_runtime_uses() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        session.adopt_default_model(Some(json!({ "provider": "fixture", "id": "default-x" })));
+        session.send("first", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        let state = session
+            .request(json!({ "type": "get_state" }), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(state["model"]["id"], "default-x", "{state}");
+    }
+
+    #[tokio::test]
     async fn attach_history_waits_for_the_starting_runtime() {
         let (manager, _home, workspace) = manager(50);
         let path = workspace.path().join("attached.jsonl");

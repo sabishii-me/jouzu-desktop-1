@@ -2533,9 +2533,23 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_none();
-        if unset {
-            self.set_model(Some(model));
+        if !unset {
+            return;
         }
+        // The shown model is the one the runtime uses: apply it on start like a choice.
+        if let (Some(provider), Some(id)) = (
+            model.get("provider").and_then(Value::as_str),
+            model.get("id").and_then(Value::as_str),
+        ) {
+            let mut pending = self
+                .pending_model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if pending.is_none() {
+                *pending = Some(json!({ "provider": provider, "model": id }));
+            }
+        }
+        self.set_model(Some(model));
     }
 
     /// The model is part of the session summary; publish it when it changes.

@@ -161,6 +161,8 @@ function prompt(id, text) {
   beginTurn(text);
 }
 
+let currentModel = { name: "fixture-model", provider: "fixture", id: "model" };
+
 const lines = readline.createInterface({ input: process.stdin });
 if (process.env.FAKE_RUNTIME_IGNORE_STDIN === "1") {
   lines.pause();
@@ -189,7 +191,7 @@ lines.on("line", line => {
       response(value.id, "get_messages", { messages });
       break;
     case "get_state":
-      response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: { name: "fixture-model", provider: "fixture", id: "model" }, thinkingLevel: "off", sessionFile: null });
+      response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: currentModel, thinkingLevel: "off", sessionFile: null });
       break;
     case "get_available_models":
       response(value.id, "get_available_models", { models: [] });
@@ -206,7 +208,8 @@ lines.on("line", line => {
         failure(value.id, "set_model", "Model not found: missing");
         break;
       }
-      response(value.id, "set_model", { model: { name: "fixture-model", provider: String(value.provider ?? "fixture"), id: value.modelId } });
+      currentModel = { name: "fixture-model", provider: String(value.provider ?? "fixture"), id: value.modelId };
+      response(value.id, "set_model", { model: currentModel });
       break;
     case "set_thinking_level":
       response(value.id, "set_thinking_level", { level: String(value.level ?? "off") });
