@@ -124,6 +124,9 @@ async fn main() -> ExitCode {
         jouzu_host::session::DEFAULT_REPLAY_LIMIT,
         Some(events.clone()),
     ));
+    // Start a runtime now, while the window shows loading, not when the user
+    // sends the first message.
+    sessions.enable_warm_runtime();
     {
         let sessions = sessions.clone();
         tokio::spawn(async move {

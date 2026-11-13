@@ -7,8 +7,10 @@ pub mod adapter;
 pub mod job;
 pub mod process;
 pub mod supervisor;
+pub mod warm;
 
 pub use supervisor::{RequestError, RuntimeEvent, RuntimeSupervisor};
+pub use warm::WarmPool;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -20,4 +22,6 @@ pub struct SpawnSpec {
     pub args: Vec<String>,
     pub env: Vec<(OsString, OsString)>,
     pub workspace: PathBuf,
+    /// Start below normal priority (a warm-up nobody waits for yet).
+    pub low_priority: bool,
 }

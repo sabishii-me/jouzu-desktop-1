@@ -231,6 +231,7 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/status", get(host_status))
+        .route("/runtime/warm", get(warm_runtime))
         .route(
             "/environment",
             get(read_environment).put(save_environment),
@@ -914,7 +915,23 @@ async fn control_request(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    state.control.request(body).await.map(Json)
+    let reads_only = matches!(
+        body.get("action").and_then(Value::as_str),
+        Some("status" | "available-models")
+    );
+    let result = state.control.request(body).await;
+    // Sign-ins, providers, profiles and catalogs change what a runtime loads at
+    // start; an unused warm runtime would still have the old ones.
+    if !reads_only && result.is_ok() {
+        recycle_warm_runtime(&state);
+    }
+    result.map(Json)
+}
+
+fn recycle_warm_runtime(state: &AppState) {
+    if let Some(pool) = state.sessions.warm_runtime() {
+        pool.recycle();
+    }
 }
 
 #[derive(Deserialize)]
@@ -1141,6 +1158,28 @@ async fn health(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
+#[derive(Deserialize)]
+struct WarmQuery {
+    #[serde(rename = "waitMs")]
+    wait_ms: Option<u64>,
+}
+
+/// The warm runtime's state. With `waitMs`, waits until it is ready or failed
+/// (at most that long), so the loading screen can wait without polling.
+async fn warm_runtime(
+    State(state): State<AppState>,
+    Query(query): Query<WarmQuery>,
+) -> Json<Value> {
+    let Some(pool) = state.sessions.warm_runtime() else {
+        return Json(json!({ "state": "off" }));
+    };
+    let wait = Duration::from_millis(query.wait_ms.unwrap_or(0).min(120_000));
+    if wait.is_zero() {
+        return Json(pool.status());
+    }
+    Json(pool.wait_settled(wait).await)
+}
+
 async fn host_status(State(state): State<AppState>) -> Json<Value> {
     Json(state.sessions.status())
 }
@@ -1157,9 +1196,9 @@ async fn save_environment(
     State(state): State<AppState>,
     Json(entries): Json<Vec<environment::Entry>>,
 ) -> Result<Json<Value>, ApiError> {
-    environment::save(state.sessions.runtime_home(), &entries)
-        .map(|()| Json(json!({ "entries": entries })))
-        .map_err(ApiError::bad_request)
+    environment::save(state.sessions.runtime_home(), &entries).map_err(ApiError::bad_request)?;
+    recycle_warm_runtime(&state);
+    Ok(Json(json!({ "entries": entries })))
 }
 
 async fn models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -1248,6 +1287,7 @@ async fn update_tools(
     }
     std::fs::write(&path, format!("{}\n", value))
         .map_err(|error| ApiError::internal(format!("Could not save tools: {error}")))?;
+    recycle_warm_runtime(&state);
     Ok(Json(value))
 }
 
@@ -2796,6 +2836,105 @@ mod session_tests {
             .await
             .unwrap();
         assert_eq!(state["model"]["id"], "default-x", "{state}");
+    }
+
+    #[tokio::test]
+    async fn a_new_session_takes_the_warm_runtime_and_the_pool_starts_the_next() {
+        let (manager, _home, workspace) = manager(50);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let status = pool.wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(status["state"], "ready", "{status}");
+        let warm_pid = status["pid"].as_u64().unwrap() as u32;
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        session.send("first", "hello").unwrap();
+        assert_eq!(session.runtime_pid(), Some(warm_pid));
+        wait_status(&session, Status::Idle).await;
+        let state = session
+            .request(json!({ "type": "get_state" }), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(state.is_object(), "{state}");
+        let next = pool.wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(next["state"], "ready", "{next}");
+        assert_ne!(next["pid"].as_u64().unwrap() as u32, warm_pid);
+        assert_eq!(next["taken"], 1);
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn opening_an_old_session_takes_the_warm_runtime() {
+        let (manager, _home, workspace) = manager(50);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let status = pool.wait_settled(Duration::from_secs(10)).await;
+        let warm_pid = status["pid"].as_u64().unwrap() as u32;
+        let path = workspace.path().join("old.jsonl");
+        let session = manager
+            .create(
+                workspace.path().to_str().unwrap(),
+                Some(path.to_string_lossy().into_owned()),
+                None,
+            )
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        assert_eq!(session.runtime_pid(), Some(warm_pid));
+        session.send("old", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_session_takes_a_warm_runtime_that_is_still_starting() {
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_START_DELAY_MS", "500")]);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        assert_eq!(pool.status()["state"], "starting");
+        let warm_pid = pool.status()["pid"].as_u64().unwrap() as u32;
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        session.send("first", "hello").unwrap();
+        assert_eq!(session.runtime_pid(), Some(warm_pid));
+        wait_status(&session, Status::Idle).await;
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_warm_runtime_that_exits_is_reported_and_sessions_still_start() {
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_EXIT_ON_START_MS", "5"), ("FAKE_RUNTIME_START_DELAY_MS", "50")]);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        pool.wait_settled(Duration::from_secs(10)).await;
+        // The fixture answers, then exits: a warm runtime that dies unused is
+        // dropped and reported, never handed to a session.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let status = pool.status();
+        assert_eq!(status["state"], "failed", "{status}");
+        assert!(status["pid"].is_null(), "{status}");
+        assert!(status["error"].as_str().unwrap().contains("exited"), "{status}");
+        manager.stop_all();
+        let _ = workspace;
+    }
+
+    #[tokio::test]
+    async fn the_warm_runtime_state_is_served_and_can_be_waited_for() {
+        let (manager, _home, _workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_START_DELAY_MS", "300")]);
+        manager.enable_warm_runtime();
+        let app = app(manager.clone());
+        let (status, _, body) = call(
+            app,
+            request(Method::GET, "/v1/runtime/warm?waitMs=10000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["state"], "ready", "{value}");
+        assert!(value["readyMs"].as_u64().unwrap() >= 300, "{value}");
+        manager.stop_all();
     }
 
     #[tokio::test]

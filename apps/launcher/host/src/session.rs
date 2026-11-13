@@ -29,7 +29,7 @@ use tokio::sync::broadcast;
 
 use crate::log;
 use crate::runtime::adapter::pi::{self, DeltaKind, Record as PiRecord};
-use crate::runtime::{RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec};
+use crate::runtime::{RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec, WarmPool};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct SessionPreference {
@@ -91,6 +91,49 @@ pub struct SessionConfig {
     pub bash: Option<PathBuf>,
     pub replay_limit: usize,
     pub events: Option<Arc<crate::events::EventHub>>,
+    /// The runtime started ahead of need, shared by every session.
+    pub warm: Arc<std::sync::OnceLock<Arc<WarmPool>>>,
+}
+
+impl SessionConfig {
+    /// The runtime's environment. Session-specific variables are left out for
+    /// a warm runtime, which does not belong to a session yet.
+    fn environment(
+        &self,
+        session_id: Option<&str>,
+        session_path: Option<&str>,
+    ) -> Vec<(OsString, OsString)> {
+        let mut environment: HashMap<String, (OsString, OsString)> = std::env::vars_os()
+            .filter(|(name, _)| {
+                let text = name.to_string_lossy();
+                !text.is_empty() && !text.contains('=') && !text.contains('\0')
+            })
+            .map(|(key, value)| (key.to_string_lossy().to_ascii_uppercase(), (key, value)))
+            .collect();
+        for name in ["NODE_OPTIONS", "NODE_PATH"] {
+            environment.remove(name);
+        }
+        let mut set = |name: &str, value: OsString| {
+            environment.insert(name.to_ascii_uppercase(), (OsString::from(name), value));
+        };
+        set("JOUZU_HOME", self.runtime_home.as_os_str().to_os_string());
+        set("JOUZU_NO_UPDATE", OsString::from("1"));
+        set("PI_SKIP_VERSION_CHECK", OsString::from("1"));
+        set("JOUZU_TEXTGUARD_DESKTOP", OsString::from("1"));
+        if let Some(id) = session_id {
+            set("JOUZU_HOST_SESSION_ID", OsString::from(id));
+        }
+        if let Some(bash) = &self.bash {
+            set("JOUZU_LAUNCHER_BASH", bash.as_os_str().to_os_string());
+        }
+        if let Some(path) = session_path {
+            set("JOUZU_SESSION_PATH", OsString::from(path));
+        }
+        for (key, value) in &self.spec.env {
+            set(key, OsString::from(value));
+        }
+        environment.into_values().collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -922,6 +965,12 @@ impl Session {
         self.recovery_succeeded();
         self.apply_pending_preferences();
         self.flush_pending_prompts();
+        // Start the next warm runtime only now: on a busy machine a second
+        // runtime booting beside this one would slow down the one the user waits for.
+        if let Some(pool) = self.config.warm.get() {
+            let pool = pool.clone();
+            tokio::spawn(async move { pool.fill() });
+        }
         // A cancelled starting turn has no prompt to flush. Complete the
         // handshake bookkeeping first, then go idle; never go idle while
         // an accepted turn still has an active message.
@@ -2871,11 +2920,39 @@ impl Session {
             args: self.config.spec.args.clone(),
             env: self.environment(),
             workspace: PathBuf::from(&self.workspace_path),
+            low_priority: false,
         }
     }
 
     fn spawn_runtime(self: &Arc<Self>, initial: bool, from_pending: bool) -> bool {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+        // A warm runtime is switched to this session's file by the handshake, so
+        // only a session with a file can take one.
+        let has_file = self
+            .session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        if let (true, Some(pool)) = (has_file, self.config.warm.get()) {
+            let before = pool.status();
+            if let Some(runtime) = pool.take(event_tx.clone()) {
+                log(
+                    &self.home,
+                    "info",
+                    "runtime.warm_taken",
+                    json!({ "session": self.id, "pid": runtime.pid(), "warm": before }),
+                );
+                self.install_runtime(runtime, event_rx);
+                return true;
+            }
+            pool.reset_failures();
+            log(
+                &self.home,
+                "info",
+                "runtime.cold_start",
+                json!({ "session": self.id, "warm": before }),
+            );
+        }
         match RuntimeSupervisor::start(self.spawn_spec(), event_tx) {
             Ok(runtime) => {
                 self.install_runtime(runtime, event_rx);
@@ -3113,42 +3190,12 @@ impl Session {
     }
 
     fn environment(&self) -> Vec<(OsString, OsString)> {
-        let mut environment: HashMap<String, (OsString, OsString)> = std::env::vars_os()
-            .filter(|(name, _)| {
-                let text = name.to_string_lossy();
-                !text.is_empty() && !text.contains('=') && !text.contains('\0')
-            })
-            .map(|(key, value)| (key.to_string_lossy().to_ascii_uppercase(), (key, value)))
-            .collect();
-        for name in ["NODE_OPTIONS", "NODE_PATH"] {
-            environment.remove(name);
-        }
-        let mut set = |name: &str, value: OsString| {
-            environment.insert(name.to_ascii_uppercase(), (OsString::from(name), value));
-        };
-        set(
-            "JOUZU_HOME",
-            self.config.runtime_home.as_os_str().to_os_string(),
-        );
-        set("JOUZU_NO_UPDATE", OsString::from("1"));
-        set("PI_SKIP_VERSION_CHECK", OsString::from("1"));
-        set("JOUZU_TEXTGUARD_DESKTOP", OsString::from("1"));
-        set("JOUZU_HOST_SESSION_ID", OsString::from(&self.id));
-        if let Some(bash) = &self.config.bash {
-            set("JOUZU_LAUNCHER_BASH", bash.as_os_str().to_os_string());
-        }
-        if let Some(path) = self
+        let path = self
             .session_path
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        {
-            set("JOUZU_SESSION_PATH", OsString::from(path));
-        }
-        for (key, value) in &self.config.spec.env {
-            set(key, OsString::from(value));
-        }
-        environment.into_values().collect()
+            .clone();
+        self.config.environment(Some(&self.id), path.as_deref())
     }
 
     fn handle_runtime_event(self: &Arc<Self>, event: RuntimeEvent) {
@@ -3345,6 +3392,7 @@ impl SessionManager {
             bash,
             replay_limit,
             events,
+            warm: Arc::new(std::sync::OnceLock::new()),
         });
         Self {
             config,
@@ -3682,6 +3730,7 @@ impl SessionManager {
             "bash": self.home.join("runtime").join("git").join("bin").join("bash.exe").is_file(),
             "git": self.home.join("runtime").join("git").exists(),
             "terminal": self.home.join("runtime").join("terminal").exists(),
+            "warmRuntime": self.warm_runtime().map(|pool| pool.status()),
         })
     }
 
@@ -4297,7 +4346,41 @@ impl SessionManager {
         Ok(session)
     }
 
+    /// Keep one runtime started ahead of need. Called once by the host binary;
+    /// tests opt in explicitly.
+    pub fn enable_warm_runtime(&self) -> Option<Arc<WarmPool>> {
+        let config = self.config.clone()?;
+        let scratch = WarmPool::scratch(&config.home);
+        let events = config.events.clone();
+        let spawn = config.clone();
+        let pool = config.warm.get_or_init(|| {
+            WarmPool::new(
+                move || SpawnSpec {
+                    program: spawn.spec.program.clone(),
+                    args: spawn.spec.args.clone(),
+                    env: spawn.environment(None, None),
+                    workspace: scratch.clone(),
+                    low_priority: true,
+                },
+                move |status| {
+                    if let Some(events) = &events {
+                        events.publish_control("runtime.warm", status);
+                    }
+                },
+            )
+        });
+        pool.fill();
+        Some(pool.clone())
+    }
+
+    pub fn warm_runtime(&self) -> Option<Arc<WarmPool>> {
+        self.config.as_ref().and_then(|config| config.warm.get().cloned())
+    }
+
     pub fn stop_all(&self) {
+        if let Some(pool) = self.warm_runtime() {
+            pool.stop();
+        }
         let sessions: Vec<Arc<Session>> = self
             .sessions
             .lock()
