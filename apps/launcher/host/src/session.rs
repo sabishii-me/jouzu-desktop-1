@@ -4284,6 +4284,15 @@ impl SessionManager {
         }
     }
 
+    /// The session this client shows now, if it has a connected stream.
+    pub fn viewing(&self, client_id: &str) -> Option<String> {
+        self.holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(client_id)
+            .and_then(|holder| holder.session.clone())
+    }
+
     pub fn client_can_prompt(&self, client_id: &str) -> bool {
         self.clients
             .lock()

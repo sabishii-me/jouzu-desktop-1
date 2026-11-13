@@ -276,6 +276,13 @@ export class HostClient {
     return [...byPath.values()];
   }
 
+  async view(sessionId: string): Promise<void> {
+    await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/view`, {
+      method: "POST",
+      body: JSON.stringify({ clientId: this.clientId }),
+    });
+  }
+
   attach(workspacePath: string, sessionPath?: string): Promise<SessionHandle> {
     return this.request<SessionHandle>("/v1/sessions", {
       method: "POST",

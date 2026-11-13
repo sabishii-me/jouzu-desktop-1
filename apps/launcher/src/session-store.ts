@@ -208,6 +208,16 @@ export class SessionStore {
     this.following = false;
   }
 
+  /**
+   * This store is on screen again. The host streams content only for the session
+   * a client shows, so a store that sat in the background catches up from history.
+   */
+  view(): void {
+    const view = this.api?.sessions.view;
+    if (!view) return;
+    void view(this.session.id).then(() => this.refreshHistory(), () => this.refreshHistory());
+  }
+
   /** Record, after the next paint, a moment the user saw (see host.log `timing.ui`). */
   private markShown(mark: TimingMark, clientMessageId?: string): void {
     const runtime = this.api?.runtime;
@@ -781,6 +791,7 @@ export class SessionPool {
     this.entries.delete(key);
     this.entries.set(key, store);
     this.watch(store);
+    store.view();
     return store;
   }
 
@@ -828,6 +839,7 @@ export class SessionPool {
       this.entries.delete(key);
       this.entries.set(key, cached);
       this.watch(cached);
+      cached.view();
       return cached;
     }
     if (cached) { this.entries.delete(key); this.unwatch(cached); void cached.close(); }

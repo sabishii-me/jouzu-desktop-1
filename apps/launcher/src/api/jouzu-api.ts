@@ -183,6 +183,8 @@ export interface EnvironmentEntry {
 export interface SessionApi {
   list(): Promise<SessionSummary[]>;
   attach(workspacePath: string, sessionPath?: string): Promise<SessionHandle>;
+  /** This client shows the session now; the host streams its content here again. */
+  view?(sessionId: string): Promise<void>;
   history(sessionId: string, page?: { limit?: number; before?: number }): Promise<HistoryPage>;
   messages(sessionPath: string, limit?: number): Promise<unknown[]>;
   send(sessionId: string, message: OutgoingMessage): Promise<Receipt>;

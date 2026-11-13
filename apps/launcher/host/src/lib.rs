@@ -311,6 +311,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(queue_session),
         )
         .route("/sessions/{id}/stop", axum::routing::post(stop_session))
+        .route("/sessions/{id}/view", axum::routing::post(view_session))
         .route(
             "/sessions/{id}/command",
             axum::routing::post(session_command),
@@ -635,6 +636,23 @@ async fn create_session(
             .unwrap_or_else(|_| HeaderValue::from_static("/v1/sessions")),
     );
     Ok(response)
+}
+
+#[derive(Deserialize)]
+struct ViewRequest {
+    #[serde(rename = "clientId")]
+    client_id: String,
+}
+
+/// The client now shows this session: its content streams to that client again.
+async fn view_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ViewRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    state.sessions.hold(request.client_id.trim(), &session.id);
+    Ok(Json(json!({ "sessionId": session.id, "cursor": session.cursor() })))
 }
 
 async fn get_session(
@@ -1049,6 +1067,12 @@ async fn global_events(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|client_id| state.sessions.connect_client(client_id));
+    let viewer = query
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     let latest = state.events.latest_seq();
     let summaries = state.sessions.summaries();
     let sessions = state.sessions.clone();
@@ -1084,6 +1108,7 @@ async fn global_events(
             } else {
                 for event in replay {
                     last = event.seq;
+                    if withheld(&sessions, viewer.as_deref(), &event) { continue; }
                     yield Ok::<_, Infallible>(hub_sse_event(event));
                 }
             }
@@ -1092,6 +1117,7 @@ async fn global_events(
             match receiver.recv().await {
                 Ok(event) if event.seq > last => {
                     last = event.seq;
+                    if withheld(&sessions, viewer.as_deref(), &event) { continue; }
                     yield Ok::<_, Infallible>(hub_sse_event(event));
                 }
                 Ok(_) => {}
@@ -1111,6 +1137,29 @@ async fn global_events(
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+/// What a session says, as opposed to what state it is in. Content goes only to a
+/// client viewing that session; state (status, turns, the summary) goes to every
+/// client, so a sidebar always knows which sessions are running. A client that
+/// opens a session catches up from its history, which includes the partial reply.
+const CONTENT_EVENTS: &[&str] = &[
+    "message.start",
+    "message.delta",
+    "message.done",
+    "message.custom",
+    "tool.start",
+    "tool.update",
+    "tool.result",
+    "runtime.event",
+];
+
+fn withheld(sessions: &SessionManager, viewer: Option<&str>, event: &events::HubEvent) -> bool {
+    let Some(viewer) = viewer else { return false };
+    if event.session_id.is_empty() || !CONTENT_EVENTS.contains(&event.event.as_str()) {
+        return false;
+    }
+    sessions.viewing(viewer).as_deref() != Some(event.session_id.as_str())
 }
 
 fn hub_sse_event(event: events::HubEvent) -> SseEvent {
@@ -3584,6 +3633,36 @@ mod session_tests {
             assert!(marks.iter().any(|mark| mark == expected), "{expected} missing from {marks:?}");
         }
         assert!(!log.contains("secret words"), "timing must not log content");
+    }
+
+    #[tokio::test]
+    async fn content_streams_only_to_the_viewer_and_state_to_everyone() {
+        let (manager, _home, workspace) = manager(50);
+        let shown = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        let other = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &shown.id);
+        let event = |session: &str, name: &str| crate::events::HubEvent {
+            seq: 1,
+            session_id: session.to_string(),
+            session_seq: 1,
+            event: name.to_string(),
+            data: json!({}),
+        };
+        assert!(!super::withheld(&manager, Some("window"), &event(&shown.id, "message.delta")));
+        assert!(super::withheld(&manager, Some("window"), &event(&other.id, "message.delta")));
+        assert!(super::withheld(&manager, Some("window"), &event(&other.id, "tool.update")));
+        for state in ["turn.start", "turn.end", "session.status", "session.updated", "message.accepted"] {
+            assert!(!super::withheld(&manager, Some("window"), &event(&other.id, state)), "{state}");
+        }
+        // A client that never opened a session sees state only; an anonymous stream sees everything.
+        let _quiet = manager.connect_client("quiet");
+        assert!(super::withheld(&manager, Some("quiet"), &event(&shown.id, "message.delta")));
+        assert!(!super::withheld(&manager, None, &event(&other.id, "message.delta")));
+        // Viewing another session moves the content with it.
+        manager.hold("window", &other.id);
+        assert!(super::withheld(&manager, Some("window"), &event(&shown.id, "message.delta")));
+        assert!(!super::withheld(&manager, Some("window"), &event(&other.id, "message.delta")));
     }
 
     #[tokio::test]
