@@ -6,11 +6,11 @@
 //! for one workspace: the one the user last worked in.
 //!
 //! Starting a runtime costs seconds to minutes on a busy machine (Node start plus
-//! extension imports). The pool starts one in the background, below normal
-//! priority, before anyone asks for it. A session that needs a runtime takes the
-//! warm one, raises it to normal priority and switches it to its own session
-//! file; the pool then starts the next one. Until a session takes it, the pool
-//! drains the runtime's output itself so its pipes never fill.
+//! extension imports). The pool starts one before anyone asks for it, plus a
+//! spare once that one is ready. A session that needs a runtime takes a warm
+//! one, raises it to normal priority and switches it to its own session file;
+//! once that session's runtime answers, the pool refills. Until a session takes
+//! a runtime, the pool drains its output itself so its pipes never fill.
 
 use std::{
     path::{Path, PathBuf},
@@ -58,20 +58,47 @@ struct Slot {
     runtime: Arc<RuntimeSupervisor>,
     /// Where the runtime's events go once a session takes it.
     target: Arc<Mutex<Option<mpsc::Sender<RuntimeEvent>>>>,
+    started_at: Instant,
+    ready_ms: Option<u64>,
 }
 
 struct Inner {
-    state: WarmState,
-    slot: Option<Slot>,
+    /// Warm runtimes, oldest first. At most `CAPACITY`, and at most one still
+    /// starting: two booting at once would slow the one someone waits for.
+    slots: Vec<Slot>,
     generation: u64,
-    started_at: Option<Instant>,
-    ready_ms: Option<u64>,
     error: Option<String>,
     failures: usize,
     taken: u64,
     /// The workspace to warm for; `None` warms in a scratch folder, which still
     /// saves the Node start.
     target: Option<PathBuf>,
+}
+
+/// One for the next session and a spare, so two sessions opened in a row both
+/// find a runtime that has started (a refill takes ~20 s on a busy machine).
+const CAPACITY: usize = 2;
+
+impl Inner {
+    fn state(&self) -> WarmState {
+        if self.slots.iter().any(|slot| slot.ready_ms.is_some()) {
+            WarmState::Ready
+        } else if !self.slots.is_empty() {
+            WarmState::Starting
+        } else if self.error.is_some() {
+            WarmState::Failed
+        } else {
+            WarmState::Off
+        }
+    }
+
+    /// The slot a session would take: a ready one first, else the oldest.
+    fn next(&self) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| slot.ready_ms.is_some())
+            .or_else(|| (!self.slots.is_empty()).then_some(0))
+    }
 }
 
 pub struct WarmPool {
@@ -102,11 +129,8 @@ impl WarmPool {
             spec: Box::new(spec),
             memory,
             inner: Mutex::new(Inner {
-                state: WarmState::Off,
-                slot: None,
+                slots: Vec::new(),
                 generation: 0,
-                started_at: None,
-                ready_ms: None,
                 error: None,
                 failures: 0,
                 taken: 0,
@@ -127,16 +151,16 @@ impl WarmPool {
     }
 
     fn describe(inner: &Inner) -> Value {
+        let next = inner.next().map(|index| &inner.slots[index]);
         json!({
-            "state": inner.state.as_str(),
-            "elapsedMs": inner.started_at.map(|at| at.elapsed().as_millis() as u64),
-            "readyMs": inner.ready_ms,
-            "error": inner.error,
+            "state": inner.state().as_str(),
+            "elapsedMs": next.map(|slot| slot.started_at.elapsed().as_millis() as u64),
+            "readyMs": next.and_then(|slot| slot.ready_ms),
+            "error": if inner.slots.is_empty() { inner.error.clone() } else { None },
             "taken": inner.taken,
-            "pid": inner.slot.as_ref().map(|slot| slot.runtime.pid()),
-            "workspace": inner
-                .slot
-                .as_ref()
+            "pid": next.map(|slot| slot.runtime.pid()),
+            "warm": inner.slots.len(),
+            "workspace": next
                 .and_then(|slot| slot.workspace.as_ref())
                 .or(inner.target.as_ref())
                 .map(|path| path.to_string_lossy().into_owned()),
@@ -148,21 +172,21 @@ impl WarmPool {
         (self.changed)(status);
     }
 
-    /// Start a warm runtime unless one is already there or starting.
+    /// Start a warm runtime when there is room and none is starting.
     pub fn fill(self: &Arc<Self>) {
         let (generation, workspace) = {
             let mut inner = self.lock();
-            if inner.slot.is_some() || inner.failures >= MAX_FAILURES {
+            let starting = inner.slots.iter().any(|slot| slot.ready_ms.is_none());
+            if starting || inner.slots.len() >= CAPACITY || inner.failures >= MAX_FAILURES {
                 return;
             }
             inner.generation += 1;
-            inner.state = WarmState::Starting;
-            inner.started_at = Some(Instant::now());
-            inner.ready_ms = None;
             inner.error = None;
             (inner.generation, inner.target.clone())
         };
         let mut spec = (self.spec)(workspace.as_deref());
+        // Below normal until someone waits for it (`hurry`, `take`): the spare
+        // stays there, the first one is hurried by the loading screen.
         spec.low_priority = true;
         if let Err(error) = std::fs::create_dir_all(&spec.workspace) {
             self.failed(generation, format!("Could not prepare the warm-up folder: {error}"));
@@ -179,11 +203,19 @@ impl WarmPool {
         let target: Arc<Mutex<Option<mpsc::Sender<RuntimeEvent>>>> = Arc::new(Mutex::new(None));
         {
             let mut inner = self.lock();
-            inner.slot = Some(Slot {
+            if inner.generation != generation {
+                // Retired while spawning (aimed elsewhere, recycled, stopped).
+                drop(inner);
+                runtime.terminate();
+                return;
+            }
+            inner.slots.push(Slot {
                 generation,
                 workspace,
                 runtime: runtime.clone(),
                 target: target.clone(),
+                started_at: Instant::now(),
+                ready_ms: None,
             });
         }
         self.notify();
@@ -243,26 +275,27 @@ impl WarmPool {
                 Ok(_) => {
                     {
                         let mut inner = pool.lock();
-                        if inner.slot.as_ref().map(|slot| slot.generation) != Some(generation) {
+                        let Some(slot) = inner.slots.iter_mut().find(|slot| slot.generation == generation) else {
                             return;
-                        }
-                        inner.state = WarmState::Ready;
-                        inner.failures = 0;
-                        inner.ready_ms = inner
-                            .started_at
-                            .map(|at| at.elapsed().as_millis() as u64);
+                        };
+                        // Failures are not forgiven here: a runtime that answers and
+                        // then dies would otherwise be restarted forever. A session
+                        // taking one, or a client asking again, resets them.
+                        slot.ready_ms = Some(slot.started_at.elapsed().as_millis() as u64);
                     }
                     pool.ready.notify_waiters();
                     pool.notify();
+                    // Room for the spare now that nothing else is starting.
+                    pool.fill();
                 }
                 Err(error) => {
                     // A runtime that a session already took is that session's
                     // business now; only a waiting one is retired here.
                     let waiting = pool
                         .lock()
-                        .slot
-                        .as_ref()
-                        .is_some_and(|slot| slot.generation == generation);
+                        .slots
+                        .iter()
+                        .any(|slot| slot.generation == generation);
                     if waiting {
                         runtime.terminate();
                         pool.failed(generation, format!("The warm runtime did not answer: {error:?}"));
@@ -275,19 +308,14 @@ impl WarmPool {
     fn failed(self: &Arc<Self>, generation: u64, message: String) {
         let retry = {
             let mut inner = self.lock();
-            if inner.generation != generation {
+            let before = inner.slots.len();
+            inner.slots.retain(|slot| slot.generation != generation);
+            let removed = inner.slots.len() != before;
+            // A spawn that failed before it had a slot is only news if it is the
+            // latest one; anything older was retired on purpose.
+            if !removed && inner.generation != generation {
                 return;
             }
-            if inner
-                .slot
-                .as_ref()
-                .is_some_and(|slot| slot.generation == generation)
-            {
-                inner.slot = None;
-            } else if inner.slot.is_some() {
-                return;
-            }
-            inner.state = WarmState::Failed;
             inner.error = Some(message);
             inner.failures += 1;
             inner.failures < MAX_FAILURES
@@ -303,10 +331,10 @@ impl WarmPool {
         }
     }
 
-    /// Hand the warm runtime to a session: its events go to `events` from now
-    /// on, it runs at normal priority, and the pool starts the next one. A
-    /// runtime that is still starting is handed over too: the session waits for
-    /// less than it would for a new one.
+    /// Hand a warm runtime to a session: its events go to `events` from now on
+    /// and it runs at normal priority. A ready one is preferred, one warmed for
+    /// `workspace` before another; a runtime that is still starting is handed
+    /// over too, since the session waits for less than it would for a new one.
     ///
     /// A runtime warmed for another folder is still handed over: the switch
     /// reloads the extensions, but the Node start is saved. The second value
@@ -318,11 +346,18 @@ impl WarmPool {
     ) -> Option<(Arc<RuntimeSupervisor>, bool)> {
         let slot = {
             let mut inner = self.lock();
-            let slot = inner.slot.take()?;
+            let matches = |slot: &Slot| {
+                slot.workspace
+                    .as_deref()
+                    .is_some_and(|warm| same_folder(warm, workspace))
+            };
+            let index = inner
+                .slots
+                .iter()
+                .position(|slot| slot.ready_ms.is_some() && matches(slot))
+                .or_else(|| inner.next())?;
+            let slot = inner.slots.remove(index);
             inner.taken += 1;
-            inner.state = WarmState::Off;
-            inner.started_at = None;
-            inner.ready_ms = None;
             // A session asking is a fresh reason to try again after failures.
             inner.failures = 0;
             slot
@@ -341,8 +376,8 @@ impl WarmPool {
         Some((slot.runtime, matched))
     }
 
-    /// Warm for `workspace` from now on. An unused runtime warmed for another
-    /// folder is replaced; then the pool fills.
+    /// Warm for `workspace` from now on. Unused runtimes warmed for another
+    /// folder are replaced; then the pool fills.
     pub fn aim(self: &Arc<Self>, workspace: &Path) {
         let stale = {
             let mut inner = self.lock();
@@ -356,31 +391,38 @@ impl WarmPool {
                     let _ = std::fs::write(file, workspace.to_string_lossy().as_bytes());
                 }
             }
-            let slot_elsewhere = inner.slot.as_ref().is_some_and(|slot| {
-                !slot
-                    .workspace
-                    .as_deref()
-                    .is_some_and(|warm| same_folder(warm, workspace))
-            });
-            if slot_elsewhere {
+            let (keep, stale): (Vec<Slot>, Vec<Slot>) =
+                std::mem::take(&mut inner.slots).into_iter().partition(|slot| {
+                    slot.workspace
+                        .as_deref()
+                        .is_some_and(|warm| same_folder(warm, workspace))
+                });
+            inner.slots = keep;
+            if !stale.is_empty() {
+                // Invalidates a spawn in flight for the old folder.
                 inner.generation += 1;
-                inner.state = WarmState::Off;
-                inner.slot.take()
-            } else {
-                None
             }
+            stale
         };
-        if let Some(slot) = stale {
+        let retired = !stale.is_empty();
+        for slot in stale {
             slot.runtime.terminate();
+        }
+        if retired {
+            self.notify();
         }
         self.fill();
     }
 
-    /// Someone is waiting for the warm runtime (the loading screen, a new
-    /// session): run it at normal priority. Below normal it starves on a busy
-    /// machine (measured: 83 s to ready using 9 s of CPU at 100% load).
+    /// Someone is waiting for a warm runtime (the loading screen, a new
+    /// session): run the one they would get at normal priority. Below normal it
+    /// starves on a busy machine (measured: 83 s to ready using 9 s of CPU at
+    /// 100% load).
     pub fn hurry(&self) {
-        let pid = self.lock().slot.as_ref().map(|slot| slot.runtime.pid());
+        let pid = {
+            let inner = self.lock();
+            inner.next().map(|index| inner.slots[index].runtime.pid())
+        };
         if let Some(pid) = pid {
             process::set_low_priority(pid, false);
         }
@@ -397,7 +439,7 @@ impl WarmPool {
         self.lock().failures = 0;
     }
 
-    /// Wait until the warm runtime is ready or the warm-up failed, up to
+    /// Wait until a warm runtime is ready or the warm-up failed, up to
     /// `timeout`. Returns the state at that point.
     pub async fn wait_settled(&self, timeout: Duration) -> Value {
         let deadline = Instant::now() + timeout;
@@ -405,7 +447,7 @@ impl WarmPool {
             let notified = self.ready.notified();
             {
                 let inner = self.lock();
-                if !matches!(inner.state, WarmState::Starting) {
+                if !matches!(inner.state(), WarmState::Starting) {
                     return Self::describe(&inner);
                 }
             }
@@ -416,25 +458,30 @@ impl WarmPool {
         }
     }
 
-    /// Settings the runtime reads at start changed: replace an unused warm
-    /// runtime so the next session does not get the old settings.
+    /// Settings the runtime reads at start changed: replace the unused warm
+    /// runtimes so the next session does not get the old settings.
     pub fn recycle(self: &Arc<Self>) {
-        let slot = {
+        let slots = {
             let mut inner = self.lock();
             inner.failures = 0;
             inner.generation += 1;
-            inner.state = WarmState::Off;
-            inner.slot.take()
+            inner.error = None;
+            std::mem::take(&mut inner.slots)
         };
-        if let Some(slot) = slot {
+        for slot in slots {
             slot.runtime.terminate();
         }
+        self.notify();
         self.fill();
     }
 
     pub fn stop(&self) {
-        let slot = self.lock().slot.take();
-        if let Some(slot) = slot {
+        let slots = {
+            let mut inner = self.lock();
+            inner.generation += 1;
+            std::mem::take(&mut inner.slots)
+        };
+        for slot in slots {
             slot.runtime.terminate();
         }
     }

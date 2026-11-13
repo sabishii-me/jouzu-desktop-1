@@ -2943,10 +2943,17 @@ mod session_tests {
         let (manager, _home, workspace) =
             manager_with_env(50, &[("FAKE_RUNTIME_EXIT_ON_START_MS", "5"), ("FAKE_RUNTIME_START_DELAY_MS", "50")]);
         let pool = manager.enable_warm_runtime().expect("warm pool");
-        pool.wait_settled(Duration::from_secs(10)).await;
+        let first = pool.wait_settled(Duration::from_secs(10)).await;
+        let dead = first["pid"].as_u64();
         // The fixture answers, then exits: a warm runtime that dies unused is
-        // dropped and reported, never handed to a session.
+        // dropped, never handed to a session; after repeated deaths the pool
+        // reports the failure and stops trying.
         tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_ne!(pool.status()["pid"].as_u64(), dead, "{}", pool.status());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while pool.status()["state"] != "failed" && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let status = pool.status();
         assert_eq!(status["state"], "failed", "{status}");
         assert!(status["pid"].is_null(), "{status}");
@@ -3105,6 +3112,28 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), Some(first.to_string_lossy().into_owned()), None)
             .unwrap();
         assert_eq!(again.id, open.id);
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn two_new_sessions_in_a_row_both_get_a_started_runtime() {
+        let (manager, _home, workspace) = manager(50);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let folder = std::fs::canonicalize(workspace.path()).unwrap();
+        pool.aim(&folder);
+        // The first is ready, then the spare starts and becomes ready.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(pool.status()["warm"] == 2 && pool.status()["state"] == "ready") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(pool.status()["warm"], 2, "{}", pool.status());
+        let first = manager.create_pending(workspace.path().to_str().unwrap(), None, Some("a".into())).unwrap();
+        first.send("one", "hello").unwrap();
+        let second = manager.create_pending(workspace.path().to_str().unwrap(), None, Some("b".into())).unwrap();
+        second.send("two", "hello").unwrap();
+        assert_ne!(first.runtime_pid(), second.runtime_pid());
+        wait_status(&first, Status::Idle).await;
+        wait_status(&second, Status::Idle).await;
         manager.stop_all();
     }
 
