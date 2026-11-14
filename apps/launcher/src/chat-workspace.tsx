@@ -1227,7 +1227,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const textguardControl = snapshot.sessionId ? {
     mode: textguardMode,
     alert: !!textguardAlert,
-    disabled: !showingAttached || commandBusy || composerRunning,
+    // A saved session on screen changes its mode the way it changes its model:
+    // the choice attaches it first (`withSession`).
+    disabled: commandBusy || composerRunning,
     onMode: (mode: TextGuardMode) => void setTextGuardMode(mode),
   } : undefined;
   const flowHold = showingAttached ? snapshot.flowHold : null;
