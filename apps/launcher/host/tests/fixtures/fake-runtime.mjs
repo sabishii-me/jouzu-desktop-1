@@ -173,6 +173,8 @@ function prompt(id, text) {
     return;
   }
   if (process.env.FAKE_RUNTIME_PROMPT_LOG) appendFileSync(process.env.FAKE_RUNTIME_PROMPT_LOG, `${text}\n`);
+  // "EXTERR <text>" first reports an extension failure, like a real extension would.
+  if (String(text).startsWith("EXTERR ")) out({ type: "extension_error", extensionPath: "fake", event: "turn_start", error: String(text).slice(7) });
   busy = true;
   interrupted = false;
   messages.push({ role: "user", content: [{ type: "text", text: String(text) }] });

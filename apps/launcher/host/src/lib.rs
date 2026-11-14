@@ -3143,6 +3143,41 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn an_extension_failure_is_reported_but_a_stale_context_race_is_not() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let (mut rx, reader) = subscribe(app, &session.id).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut errors = Vec::new();
+        for (id, text) in [
+            ("stale-1", "EXTERR extension ctx is stale after session replacement"),
+            ("boom-1", "EXTERR flow guard crashed"),
+        ] {
+            wait_status(&session, Status::Idle).await;
+            session.send(id, text).unwrap();
+            loop {
+                let (name, data) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("timed out")
+                    .expect("stream closed");
+                if name == "error" {
+                    errors.push(data);
+                } else if name == "turn.end" {
+                    break;
+                }
+            }
+        }
+        reader.abort();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["message"], "flow guard crashed");
+        assert_eq!(errors[0]["code"], "extension-error");
+    }
+
+    #[tokio::test]
     async fn model_and_thinking_endpoints_update_the_session() {
         let (manager, _home, workspace) = manager(50);
         let session = manager

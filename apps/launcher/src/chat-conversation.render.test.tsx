@@ -42,14 +42,14 @@ describe("the turn status line", () => {
   const since = Date.parse("2026-11-14T00:00:19Z");
   it("says the model has not answered yet, and for how long", () => {
     expect(turnLabel(turn({ n: 1, state: "waiting_model", since, tools: [] }), now)).toBe("Waiting for model · 0:41");
-    expect(turnLabel(turn({ n: 6, state: "waiting_model", since, tools: [] }), now)).toBe("Step 6 · Waiting for model · 0:41");
+    expect(turnLabel(turn({ n: 6, state: "waiting_model", since, tools: [] }), now)).toBe("Waiting for model · 0:41");
   });
   it("does not repeat the turn's own clock when the state began with the turn", () => {
     expect(turnLabel({ ...turn({ n: 1, state: "waiting_model", since, tools: [] }), startedAt: since }, now)).toBe("Waiting for model");
-    expect(turnLabel({ ...turn({ n: 2, state: "waiting_model", since, tools: [] }), startedAt: since - 5000 }, now)).toBe("Step 2 · Waiting for model · 0:41");
+    expect(turnLabel({ ...turn({ n: 2, state: "waiting_model", since, tools: [] }), startedAt: since - 5000 }, now)).toBe("Waiting for model · 0:41");
   });
   it("names the tools at work", () => {
-    expect(turnLabel(turn({ n: 2, state: "tools", since, tools: [{ id: "a", name: "write" }, { id: "b", name: "write" }] }), now)).toBe("Step 2 · Running write · 0:41");
+    expect(turnLabel(turn({ n: 2, state: "tools", since, tools: [{ id: "a", name: "write" }, { id: "b", name: "write" }] }), now)).toBe("Running write · 0:41");
   });
   it("says a failed model request is being retried", () => {
     expect(turnLabel(turn({ n: 1, state: "retrying", tools: [], retry: { attempt: 2, maxAttempts: 3, error: "overloaded" } }), now)).toBe("Model request failed, retrying 2/3 (overloaded)");

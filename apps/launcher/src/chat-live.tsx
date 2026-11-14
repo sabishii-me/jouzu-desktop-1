@@ -19,21 +19,20 @@ export function turnLabel(turn: ActiveTurn | null | undefined, now: number): str
   // once this state started later than the turn did.
   const ownClock = step.since !== undefined && (turn.startedAt === undefined || step.since - turn.startedAt >= 1000);
   const waited = ownClock ? ` · ${clock(Math.max(0, now - step.since!))}` : "";
-  const prefix = step.n > 1 ? `Step ${step.n} · ` : "";
   switch (step.state) {
-    case "waiting_model": return `${prefix}Waiting for model${waited}`;
-    case "thinking": return `${prefix}Thinking`;
-    case "writing": return `${prefix}Writing`;
-    case "calling_tool": return `${prefix}Preparing tool call`;
+    case "waiting_model": return `Waiting for model${waited}`;
+    case "thinking": return "Thinking";
+    case "writing": return "Writing";
+    case "calling_tool": return "Preparing tool call";
     case "tools": {
       const names = [...new Set(step.tools.map(tool => tool.name))];
-      return names.length ? `${prefix}Running ${names.join(", ")}${waited}` : `${prefix}Tools done`;
+      return names.length ? `Running ${names.join(", ")}${waited}` : "Tools done";
     }
     case "retrying": {
       const attempt = step.retry?.attempt !== undefined ? ` ${step.retry.attempt}${step.retry.maxAttempts !== undefined ? `/${step.retry.maxAttempts}` : ""}` : "";
-      return `${prefix}Model request failed, retrying${attempt}${step.retry?.error ? ` (${step.retry.error})` : ""}`;
+      return `Model request failed, retrying${attempt}${step.retry?.error ? ` (${step.retry.error})` : ""}`;
     }
-    case "compacting": return `${prefix}Compacting context${waited}`;
+    case "compacting": return `Compacting context${waited}`;
     default: return "Working…";
   }
 }

@@ -332,7 +332,7 @@ export class SessionStore {
   }
 
   /**
-   * Send (or steer, while a turn runs: the host queues it). The message is in
+   * Send (while a turn runs, the host queues it for after the reply). The message is in
    * the outbox, and on screen, before the request leaves; the host's receipt
    * turns it into a transcript row. A failure keeps it as "not sent".
    */

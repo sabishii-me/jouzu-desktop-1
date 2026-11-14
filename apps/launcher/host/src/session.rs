@@ -2113,6 +2113,13 @@ impl Session {
                     .get("error")
                     .and_then(Value::as_str)
                     .unwrap_or("extension error");
+                // A replaced session can leave one extension holding its previous context.
+                // That lifecycle race changes neither the transcript nor this session, so it
+                // is not a session failure (the same rule the UI kept before the host).
+                if message.to_lowercase().contains("extension ctx is stale") {
+                    log(&self.home, "warn", "extension.stale_ctx", json!({ "session": self.id, "message": message }));
+                    return;
+                }
                 self.publish(
                     "error",
                     json!({ "code": "extension-error", "message": message, "retryable": false }),
