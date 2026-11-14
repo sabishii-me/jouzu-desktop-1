@@ -196,6 +196,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     });
   };
   const [hero, setHero] = useState(newSession);
+  const [composerFocus, setComposerFocus] = useState(false);
+  // Only the hero -> session hand-off moves focus; opening a session later does not.
+  useEffect(() => { if (hero) setComposerFocus(false); }, [hero]);
   const [catalogModels, setCatalogModels] = useState<ChatModel[]>([]);
   useEffect(() => {
     let disposed = false;
@@ -617,7 +620,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const submitDraftKey = draftKeyRef.current;
     sendCancelRef.current = false;
     setLocalSubmitted(value);
-    if (hero) { setHero(false); onStartSession?.(); }
+    // Sending from the hero swaps it for the session's composer. Typing continues there
+    // (the next message is often a steer), so the focus moves with it.
+    if (hero) { setComposerFocus(document.activeElement instanceof HTMLTextAreaElement); setHero(false); onStartSession?.(); }
     try {
       if (switchingRef.current) await switchPromise.current;
       const ready = connection.current?.snapshot.connected ? connection.current : await awaitConnection();
@@ -632,8 +637,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       // The outbox now shows the message; the composer is free for the next one.
       setLocalSubmitted("");
       if (videoRef.current.join("\n") === submittedVideos.join("\n")) { videoRef.current = []; setVideoUrls([]); }
+      // A sent message leaves the slot it was typed in, even when the composer has moved
+      // on (a hero send moves from the new-session slot to the session's own); text typed
+      // after it stays.
+      if ((readDraft(submitDraftKey)?.text ?? typed) === typed) clearDraft(submitDraftKey);
       if (draftRef.current === typed && draftKeyRef.current === submitDraftKey) {
-        clearDraft(submitDraftKey);
         draftRef.current = "";
         setDraft("");
       }
@@ -1413,7 +1421,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
             <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now)} running={conversationProjection.running} elapsed={elapsed} settled={settled} />
           </div>
           {promptNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{promptNode}</div>}
-          <Composer connected={snapshot.connected || !!activePreview} pending={snapshot.pending || commandBusy || (opening && !activePreview) || locked } opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
+          <Composer autoFocus={composerFocus} connected={snapshot.connected || !!activePreview} pending={snapshot.pending || commandBusy || (opening && !activePreview) || locked } opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
         </div>
         <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>

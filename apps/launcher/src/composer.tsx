@@ -132,6 +132,8 @@ function AddMenu({ open, onOpenChange, onAddImage, onCompact, onModel, onExport,
 
 export interface ComposerProps {
   hero?: boolean;
+  /** Take focus when shown: the typing place moved here (hero composer -> session composer). */
+  autoFocus?: boolean;
   /** TextGuard's three modes; `alert` marks content it withheld. */
   textguard?: { mode: TextGuardMode; alert: boolean; disabled: boolean; onMode: (mode: TextGuardMode) => void };
   connected: boolean;
@@ -187,7 +189,7 @@ function TextGuardControl({ control }: { control: NonNullable<ComposerProps["tex
     </div>}
   </div>;
 }
-export function Composer({ hero = false, textguard, connected, pending, opening = false, starting = false, unavailable = false, running, draft, onDraft, onSend, onStop, onCompact, onExport, onReloadMcp, attachments = [], onAddImages, onRemoveImage, readingImages = false, attachmentError, videos = [], onAddVideo, onRemoveVideo, models, model, onSelectModel, onRefreshModels, onRetryModels, thinkingLevel, thinkingLevels, onThinkingLevel }: ComposerProps) {
+export function Composer({ hero = false, autoFocus = false, textguard, connected, pending, opening = false, starting = false, unavailable = false, running, draft, onDraft, onSend, onStop, onCompact, onExport, onReloadMcp, attachments = [], onAddImages, onRemoveImage, readingImages = false, attachmentError, videos = [], onAddVideo, onRemoveVideo, models, model, onSelectModel, onRefreshModels, onRetryModels, thinkingLevel, thinkingLevels, onThinkingLevel }: ComposerProps) {
   const active = running || starting;
   const imageInput = useRef<HTMLInputElement>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -230,7 +232,7 @@ export function Composer({ hero = false, textguard, connected, pending, opening 
       {slashQuery !== null && commandMatches.length > 0 && <div role="menu" aria-label="Commands" className="absolute bottom-full left-0 right-0 z-40 mb-2 max-h-56 overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-xl">
         {commandMatches.map((command, index) => <button key={command.id} type="button" role="menuitem" disabled={command.disabled} onMouseEnter={() => setCommandIndex(index)} onClick={() => runCommand(command)} className={`flex w-full items-start justify-between gap-3 rounded-md px-2 py-1.5 text-left ${index === commandIndex ? "bg-accent" : ""} disabled:opacity-45`}><span className="min-w-0"><span className="block text-sm">{command.label}</span><span className="block truncate text-xs text-muted-foreground">{command.description}</span></span><span className="text-[10px] text-muted-foreground">/{command.id}</span></button>)}
       </div>}
-      <textarea aria-label="Message Jouzu" placeholder="Message Jouzu…" value={draft} onChange={event => { onDraft(event.target.value); setCommandIndex(0); }} rows={3} className="max-h-60 min-h-16 w-full resize-y bg-transparent px-1 text-sm outline-none" onKeyDown={event => {
+      <textarea aria-label="Message Jouzu" placeholder="Message Jouzu…" autoFocus={autoFocus} value={draft} onChange={event => { onDraft(event.target.value); setCommandIndex(0); }} rows={3} className="max-h-60 min-h-16 w-full resize-y bg-transparent px-1 text-sm outline-none" onKeyDown={event => {
         if (slashQuery !== null && commandMatches.length) {
           if (event.key === "ArrowDown") { event.preventDefault(); setCommandIndex(index => Math.min(index + 1, commandMatches.length - 1)); return; }
           if (event.key === "ArrowUp") { event.preventDefault(); setCommandIndex(index => Math.max(0, index - 1)); return; }
