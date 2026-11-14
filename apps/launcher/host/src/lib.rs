@@ -212,12 +212,17 @@ pub fn log(home: &Path, level: &str, event: &str, fields: Value) {
         "fields": fields,
     });
     use std::io::Write;
+    // One whole line per write, one writer at a time: lines from concurrent
+    // sessions must never interleave (Windows appends are not atomic).
+    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let line = format!("{record}\n");
+    let _guard = WRITER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path.join("host.log"))
     {
-        let _ = writeln!(file, "{record}");
+        let _ = file.write_all(line.as_bytes());
     }
 }
 
@@ -2826,7 +2831,7 @@ mod session_tests {
         let first = directory.join("first.jsonl");
         std::fs::write(
             &first,
-            format!("{{\"type\":\"session\",\"cwd\":\"{cwd}\"}}\n"),
+            format!("{{\"type\":\"session\",\"cwd\":\"{cwd}\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"),
         )
         .unwrap();
         let app = app(manager);
@@ -2842,7 +2847,7 @@ mod session_tests {
         let second = directory.join("second.jsonl");
         std::fs::write(
             &second,
-            format!("{{\"type\":\"session\",\"cwd\":\"{cwd}\"}}\n"),
+            format!("{{\"type\":\"session\",\"cwd\":\"{cwd}\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"),
         )
         .unwrap();
         let cached = call(
@@ -3259,6 +3264,26 @@ mod session_tests {
         let next = pool.wait_settled(Duration::from_secs(10)).await;
         assert_eq!(next["workspace"], spelled.to_string_lossy().as_ref(), "{next}");
         manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_file_nobody_wrote_in_is_not_listed() {
+        // Warm runtimes and unused new sessions leave header-only files; they must
+        // not crowd conversations out of the saved list.
+        let (manager, _home, workspace) = manager(50);
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let cwd = workspace.path().to_string_lossy().replace('\\', "/");
+        std::fs::write(directory.join("blank.jsonl"), format!("{{\"type\":\"session\",\"cwd\":\"{cwd}\"}}\n")).unwrap();
+        std::fs::write(
+            directory.join("used.jsonl"),
+            format!("{{\"type\":\"session\",\"cwd\":\"{cwd}\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"),
+        )
+        .unwrap();
+        let listed = manager.persisted(None, true);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert!(listed[0]["sessionPath"].as_str().unwrap().ends_with("used.jsonl"));
+        assert!(listed[0].get("blank").is_none());
     }
 
     #[tokio::test]

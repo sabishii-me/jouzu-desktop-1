@@ -4369,6 +4369,10 @@ impl SessionManager {
                 let _ = normalized;
                 let key = canonical_path(&path.to_string_lossy());
                 let preference = preferences.get(&key);
+                // Nobody has written in it yet: a warm runtime's own file, or a new
+                // session never used. Kept for the folder spelling, never listed.
+                let blank = title.is_none()
+                    && preference.and_then(|preference| preference.title.as_ref()).is_none();
                 let title = preference
                     .and_then(|preference| preference.title.clone())
                     .unwrap_or_else(|| {
@@ -4396,13 +4400,36 @@ impl SessionManager {
                     "running": false,
                     "pinned": preference.map(|value| value.pinned).unwrap_or(false),
                     "archived": preference.map(|value| value.archived).unwrap_or(false),
+                    "blank": blank,
                 }))
             })
-            .take(300)
+            // Blank files never count toward the list's limit.
+            .scan(0usize, |listed, entry| {
+                if entry.get("blank").and_then(Value::as_bool) != Some(true) {
+                    *listed += 1;
+                }
+                Some((*listed <= 300).then_some(entry))
+            })
+            .flatten()
             .collect()
     }
 
+    /// Saved conversations, most recent first (at most 300).
     pub fn persisted(&self, workspace: Option<&str>, refresh: bool) -> Vec<Value> {
+        self.persisted_files(workspace, refresh)
+            .into_iter()
+            .filter(|entry| entry.get("blank").and_then(Value::as_bool) != Some(true))
+            .map(|mut entry| {
+                if let Some(object) = entry.as_object_mut() {
+                    object.remove("blank");
+                }
+                entry
+            })
+            .collect()
+    }
+
+    /// Every saved session file, blank ones included.
+    fn persisted_files(&self, workspace: Option<&str>, refresh: bool) -> Vec<Value> {
         let entries = {
             let mut cache = self
                 .persisted_cache
@@ -4785,7 +4812,7 @@ impl SessionManager {
         }
         let plain = canonical_path(&workspace.to_string_lossy());
         let latest = self
-            .persisted(Some(&plain), false)
+            .persisted_files(Some(&plain), false)
             .into_iter()
             .filter_map(|entry| entry.get("sessionPath").and_then(Value::as_str).map(str::to_string))
             .find_map(|path| session_header_cwd(&path));
