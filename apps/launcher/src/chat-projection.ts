@@ -84,6 +84,7 @@ export function hostToolResults(blocks: unknown, known: Record<string, ToolView>
         phase: block.ok === false ? "error" : "complete",
         // The same value `tool.result` carried live.
         result: block.result ?? known[id]?.result,
+        ...(block.interrupted === true ? { interrupted: true } : {}),
       };
     }
   }
@@ -115,6 +116,9 @@ export function historyRowsProjection(rows: unknown): ChatProjection {
         ...(typeof row.turnId === "string" ? { turnId: row.turnId } : {}),
         ...(typeof row.model === "string" ? { model: row.model } : {}),
         ...(typeof row.provider === "string" ? { provider: row.provider } : {}),
+        ...(typeof row.stopReason === "string" ? { stopReason: row.stopReason } : {}),
+        ...(typeof row.errorMessage === "string" ? { errorMessage: row.errorMessage } : {}),
+        ...(object(row.usage) ? { usage: row.usage as ChatMessage["usage"] } : {}),
       });
       for (const block of content) if (block.type === "toolCall" && typeof block.id === "string") tools[block.id] = { id: block.id, name: block.name ?? "tool", args: block.arguments, phase: tools[block.id]?.phase ?? "running", result: tools[block.id]?.result };
       Object.assign(tools, hostToolResults(row.blocks, tools));
@@ -129,8 +133,9 @@ export function historyRowsProjection(rows: unknown): ChatProjection {
         id,
         name: typeof tool.name === "string" ? tool.name : "tool",
         args: row.args,
-        phase: status === "error" ? "error" : status === "ok" ? "complete" : "running",
+        phase: status === "error" || status === "interrupted" ? "error" : status === "ok" ? "complete" : "running",
         result: row.result,
+        ...(status === "interrupted" ? { interrupted: true } : {}),
       };
     }
   }

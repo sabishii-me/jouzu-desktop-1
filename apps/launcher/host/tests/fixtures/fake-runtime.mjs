@@ -14,6 +14,12 @@ const handledPrompts = process.env.FAKE_RUNTIME_HANDLED === "1";
 const garbage = process.env.FAKE_RUNTIME_GARBAGE === "1";
 const uiMethod = process.env.FAKE_RUNTIME_UI ?? "";
 const uiTimeout = Number(process.env.FAKE_RUNTIME_UI_TIMEOUT_MS ?? 0);
+// A run of several steps, each a model call (reasoning, words, a tool call) and
+// its tool, as the real runtime reports it. Optional: one provider retry before
+// step 2, and a last tool that never finishes (only an abort ends the run).
+const steps = Number(process.env.FAKE_RUNTIME_STEPS ?? 0);
+const stepRetry = process.env.FAKE_RUNTIME_STEP_RETRY === "1";
+const hangTool = process.env.FAKE_RUNTIME_HANG_TOOL === "1";
 const out = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 const response = (id, command, data) =>
   out({ id, type: "response", command, success: true, data });
@@ -88,6 +94,48 @@ function tick() {
   settled(false);
 }
 
+function runSteps() {
+  const script = [{ type: "agent_start" }];
+  for (let n = 1; n <= steps; n += 1) {
+    const last = n === steps;
+    if (stepRetry && n === 2) {
+      script.push({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 10, errorMessage: "overloaded" });
+      script.push({ type: "auto_retry_end", success: true, attempt: 1 });
+    }
+    script.push({ type: "turn_start" });
+    script.push({ type: "message_start", message: { role: "assistant", content: [] } });
+    script.push({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: `think ${n}` } });
+    script.push({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: `say ${n}` } });
+    const content = [{ type: "thinking", thinking: `think ${n}` }, { type: "text", text: `say ${n}` }];
+    if (!last) {
+      script.push({ type: "message_update", assistantMessageEvent: { type: "toolcall_start", contentIndex: 2 } });
+      content.push({ type: "toolCall", id: `call-${n}`, name: "bash", arguments: { command: `echo ${n}` } });
+    }
+    const reply = { role: "assistant", content, model: "fixture-model", provider: "fixture", usage: { input: 10 * n, output: n }, stopReason: last ? "stop" : "toolUse" };
+    script.push({ type: "message_end", message: reply, record: reply });
+    if (!last) {
+      script.push({ type: "tool_execution_start", toolCallId: `call-${n}`, toolName: "bash", args: { command: `echo ${n}` } });
+      if (hangTool && n === steps - 1) { script.push({ type: "hang" }); break; }
+      const result = { content: [{ type: "text", text: `out ${n}` }] };
+      script.push({ type: "tool_execution_end", toolCallId: `call-${n}`, toolName: "bash", isError: false, result, record: { role: "toolResult", toolCallId: `call-${n}`, toolName: "bash", content: result.content, isError: false } });
+    }
+    script.push({ type: "turn_end" });
+  }
+  script.push({ type: "agent_end" });
+  const next = () => {
+    if (!busy) return;
+    if (interrupted) { settled(true); return; }
+    const event = script.shift();
+    if (!event) { settled(false); return; }
+    if (event.type === "hang") return;
+    const { record, ...wire } = event;
+    if (record) messages.push(record);
+    out(wire);
+    timer = setTimeout(next, delay);
+  };
+  next();
+}
+
 function beginTurn(text) {
   current = { parts: Array.from(String(text)), index: 0 };
   tick();
@@ -131,6 +179,10 @@ function prompt(id, text) {
   response(id, "prompt", { disposition: "started" });
   if (crashOnPrompt) {
     setTimeout(() => process.exit(8), 10);
+  }
+  if (steps > 0) {
+    runSteps();
+    return;
   }
   if (tool) {
     out({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "thinking" } });

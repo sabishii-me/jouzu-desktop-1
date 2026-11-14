@@ -2959,21 +2959,187 @@ mod session_tests {
         wait_status(&session, Status::Idle).await;
         let history = session.history(50, None);
         let rows = history["messages"].as_array().unwrap();
-        let assistant = rows
+        // Each step of the run is its own reply; together they hold everything.
+        let replies = rows
             .iter()
-            .find(|row| row["kind"] == "assistant")
-            .expect("assistant row");
-        let types = assistant["blocks"]
+            .filter(|row| row["kind"] == "assistant")
+            .collect::<Vec<_>>();
+        assert_eq!(replies.len(), 2, "{history}");
+        let types = replies
+            .iter()
+            .flat_map(|row| row["blocks"].as_array().unwrap().iter())
+            .filter_map(|block| block["type"].as_str())
+            .collect::<Vec<_>>();
+        assert!(types.contains(&"thinking"), "{history}");
+        assert!(types.contains(&"toolCall"), "{history}");
+        assert!(types.contains(&"toolResult"), "{history}");
+        let tool = rows.iter().find(|row| row["kind"] == "tool").unwrap();
+        assert_eq!(tool["tool"]["status"], "ok", "{tool}");
+    }
+
+    /// Polls the session summary while a run goes on and records each step state
+    /// it shows, in order, until the session is idle again.
+    async fn step_states(session: &crate::session::Session) -> Vec<Value> {
+        let mut seen: Vec<Value> = Vec::new();
+        for _ in 0..2000 {
+            let step = session.summary()["activeTurn"]["step"].clone();
+            if !step.is_null() && seen.last() != Some(&step) {
+                seen.push(step);
+            }
+            if session.status() == Status::Idle && !seen.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn a_run_of_several_steps_keeps_each_step_as_its_own_reply() {
+        let (manager, home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_STEPS", "3"), ("FAKE_RUNTIME_DELAY_MS", "25")]);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let (mut rx, reader) = subscribe(app, &session.id).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        session.send("steps-1", "go").unwrap();
+        let states = step_states(&session).await;
+        let mut starts = Vec::new();
+        let mut done = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event.0.as_str() {
+                "message.start" => starts.push(event.1["step"].clone()),
+                "message.done" => done.push((event.1["step"].clone(), event.1["stopReason"].clone())),
+                "turn.end" => break,
+                _ => {}
+            }
+        }
+        reader.abort();
+        // The client hears each step begin and end.
+        assert_eq!(starts, vec![json!(1), json!(2), json!(3)]);
+        assert_eq!(
+            done,
+            vec![(json!(1), json!("toolUse")), (json!(2), json!("toolUse")), (json!(3), json!("stop"))]
+        );
+        // The summary says which step runs and what it is doing.
+        let names = states.iter().map(|step| step["state"].as_str().unwrap_or("")).collect::<Vec<_>>();
+        for state in ["waiting_model", "thinking", "writing", "tools"] {
+            assert!(names.contains(&state), "{state} missing from {states:?}");
+        }
+        assert!(states.iter().any(|step| step["n"] == 3), "{states:?}");
+        assert!(
+            states.iter().any(|step| step["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "bash"))),
+            "{states:?}"
+        );
+        // History: one reply per step, in order, reasoning kept, results on their calls.
+        let history = session.history(50, None);
+        let mut replies = history["messages"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|block| block["type"].as_str())
+            .filter(|row| row["kind"] == "assistant")
+            .cloned()
             .collect::<Vec<_>>();
-        assert!(types.contains(&"thinking"), "{assistant}");
-        assert!(types.contains(&"toolCall"), "{assistant}");
-        assert!(types.contains(&"toolResult"), "{assistant}");
-        let tool = rows.iter().find(|row| row["kind"] == "tool").unwrap();
-        assert_eq!(tool["tool"]["status"], "ok", "{tool}");
+        replies.reverse();
+        assert_eq!(replies.len(), 3, "{history}");
+        for (index, reply) in replies.iter().enumerate() {
+            let n = index + 1;
+            assert_eq!(reply["step"], json!(n), "{reply}");
+            let blocks = reply["blocks"].as_array().unwrap();
+            assert!(blocks.iter().any(|block| block["type"] == "thinking" && block["text"] == format!("think {n}")), "{reply}");
+            if n < 3 {
+                let call = format!("call-{n}");
+                assert!(blocks.iter().any(|block| block["type"] == "toolCall" && block["toolCallId"] == call), "{reply}");
+                assert!(blocks.iter().any(|block| block["type"] == "toolResult" && block["toolCallId"] == call && block["ok"] == true), "{reply}");
+            }
+            assert_eq!(reply["usage"]["output"], json!(n), "{reply}");
+        }
+        // Each step's wait for the model is timed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let log = std::fs::read_to_string(home.path().join("logs").join("host.log")).unwrap_or_default();
+        assert_eq!(log.matches("\"step.start\"").count(), 3, "{log}");
+        assert_eq!(log.matches("\"step.first_output\"").count(), 3, "{log}");
+        assert_eq!(log.matches("\"tool.end\"").count(), 2, "{log}");
+    }
+
+    #[tokio::test]
+    async fn a_provider_retry_shows_while_it_waits() {
+        let (manager, _home, workspace) = manager_with_env(
+            50,
+            &[("FAKE_RUNTIME_STEPS", "2"), ("FAKE_RUNTIME_STEP_RETRY", "1"), ("FAKE_RUNTIME_DELAY_MS", "60")],
+        );
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("retry-1", "go").unwrap();
+        let states = step_states(&session).await;
+        let retry = states
+            .iter()
+            .find(|step| step["state"] == "retrying")
+            .unwrap_or_else(|| panic!("no retry in {states:?}"));
+        assert_eq!(retry["retry"]["attempt"], 1);
+        assert_eq!(retry["retry"]["maxAttempts"], 3);
+        assert_eq!(retry["retry"]["error"], "overloaded");
+        let after = states.iter().skip_while(|step| step["state"] != "retrying").nth(1).unwrap();
+        assert_eq!(after["state"], "waiting_model", "{states:?}");
+        assert!(after["retry"].is_null(), "{states:?}");
+    }
+
+    #[tokio::test]
+    async fn a_tool_cut_off_by_stop_reads_as_interrupted() {
+        let (manager, _home, workspace) = manager_with_env(
+            50,
+            &[("FAKE_RUNTIME_STEPS", "3"), ("FAKE_RUNTIME_HANG_TOOL", "1"), ("FAKE_RUNTIME_DELAY_MS", "15")],
+        );
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let app = app(manager.clone());
+        let (mut rx, reader) = subscribe(app, &session.id).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        session.send("hang-1", "go").unwrap();
+        for _ in 0..300 {
+            let step = session.summary()["activeTurn"]["step"].clone();
+            if step["state"] == "tools" && step["tools"][0]["id"] == "call-2" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(session.summary()["activeTurn"]["step"]["tools"][0]["id"], "call-2");
+        session.interrupt().unwrap();
+        let closed = loop {
+            let event = next_event(&mut rx, "tool.result").await;
+            if event["toolCallId"] == "call-2" {
+                break event;
+            }
+        };
+        assert_eq!(closed["interrupted"], true);
+        wait_status(&session, Status::Idle).await;
+        reader.abort();
+        let history = session.history(50, None);
+        let rows = history["messages"].as_array().unwrap();
+        let tool = rows.iter().find(|row| row["id"] == "tool:call-2").unwrap();
+        assert_eq!(tool["tool"]["status"], "interrupted", "{tool}");
+        let reply = rows
+            .iter()
+            .find(|row| row["kind"] == "assistant" && row["step"] == 2)
+            .unwrap();
+        assert!(
+            reply["blocks"].as_array().unwrap().iter().any(|block| block["type"] == "toolResult" && block["toolCallId"] == "call-2" && block["interrupted"] == true),
+            "{reply}"
+        );
+        // Nothing is left looking busy.
+        assert!(!rows.iter().any(|row| row["tool"]["status"] == "running"), "{history}");
     }
 
     #[tokio::test]
@@ -3325,6 +3491,39 @@ mod session_tests {
         );
         wait_status(&session, Status::Idle).await;
         assert_eq!(session.history(50, None)["messages"].as_array().unwrap().len(), 3);
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_saved_tool_call_with_no_result_reads_as_interrupted() {
+        // The app closed while a tool ran: the saved file has the call, no result.
+        let (manager, _home, shown) = manager(50);
+        let own = tempfile::tempdir().unwrap();
+        let file = own.path().join("cut.jsonl");
+        let lines = [
+            json!({ "type": "session", "version": 3, "id": "cut", "timestamp": "2026-01-01T00:00:00Z", "cwd": own.path().to_string_lossy() }),
+            json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": "build it" }] } }),
+            json!({ "type": "message", "message": { "role": "assistant", "content": [{ "type": "thinking", "thinking": "plan" }, { "type": "toolCall", "id": "call-9", "name": "bash", "arguments": {} }], "stopReason": "toolUse" } }),
+        ];
+        std::fs::write(&file, lines.iter().map(|line| format!("{line}\n")).collect::<String>()).unwrap();
+        let session = manager
+            .create(shown.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+        let history = session.history(50, None);
+        let reply = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "assistant")
+            .unwrap()
+            .clone();
+        let blocks = reply["blocks"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "thinking", "{reply}");
+        let result = blocks.iter().find(|block| block["type"] == "toolResult").unwrap();
+        assert_eq!(result["toolCallId"], "call-9");
+        assert_eq!(result["interrupted"], true);
+        assert_eq!(result["ok"], false);
+        assert_eq!(reply["stopReason"], "toolUse");
         manager.stop_all();
     }
 
@@ -3709,8 +3908,9 @@ mod session_tests {
                 .unwrap();
             match event.0.as_str() {
                 "message.delta" => deltas.push_str(event.1["text"].as_str().unwrap()),
-                "message.done" => {
-                    assert_eq!(event.1["stopReason"], "completed");
+                "message.done" => assert_eq!(event.1["stopReason"], "stop"),
+                "turn.end" => {
+                    assert_eq!(event.1["status"], "completed");
                     break;
                 }
                 _ => {}
@@ -3796,7 +3996,9 @@ mod session_tests {
         let _ = next_event(&mut rx, "message.delta").await;
         session.interrupt().unwrap();
         let done = next_event(&mut rx, "message.done").await;
-        assert_eq!(done["stopReason"], "interrupted");
+        assert_eq!(done["stopReason"], "aborted");
+        let end = next_event(&mut rx, "turn.end").await;
+        assert_eq!(end["status"], "interrupted");
         wait_status(&session, Status::Idle).await;
         reader.abort();
     }

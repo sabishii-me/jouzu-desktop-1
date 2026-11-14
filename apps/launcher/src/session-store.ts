@@ -9,7 +9,7 @@
 import { HostChatSession } from "./api/chat-session";
 import { eventRouter } from "./event-router";
 import type { ApiEvent, Attachment, HistoryPage, JouzuApi, Receipt, TimingMark } from "./api/jouzu-api";
-import { emptyProjection, historyRowsProjection, hostBlocks, hostToolResults, type ChatBlock, type ChatMessage, type ToolView } from "./chat-projection";
+import { emptyProjection, historyRowsProjection, hostBlocks, hostToolResults, type ChatBlock, type ChatMessage, type FlowReportRecord, type ToolView } from "./chat-projection";
 import { describeError } from "./runtime-errors";
 import { classifyNotice, type TextGuardMode } from "./session-notices";
 import {
@@ -23,6 +23,7 @@ import {
   type PendingPrompt,
   type QueuedMessage,
   type SessionStats,
+  type TurnStep,
 } from "./chat-types";
 
 export interface SessionPort {
@@ -75,7 +76,36 @@ function activeTurnOf(value: unknown): ActiveTurn | null {
   const turn = record(value);
   const turnId = text(turn?.turnId);
   if (!turn || !turnId) return null;
-  return { turnId, clientMessageId: text(turn.clientMessageId), phase: text(turn.phase) ?? "running", startedAt: time(turn.startedAt) };
+  return { turnId, clientMessageId: text(turn.clientMessageId), phase: text(turn.phase) ?? "running", startedAt: time(turn.startedAt), step: stepOf(turn.step) };
+}
+
+/** A displayable Flow report: a jouzu-flow message whose text is a JSON object with a kind. */
+export function flowReportOf(customType: string | undefined, display: unknown, body: string | undefined): FlowReportRecord | null {
+  if (!customType?.startsWith("jouzu-flow") || display === false || !body) return null;
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    const kind = record(parsed)?.kind;
+    return typeof kind === "string" ? { kind, text: body, timestamp: Date.now() } : null;
+  } catch {
+    return null;
+  }
+}
+
+function stepOf(value: unknown): TurnStep | undefined {
+  const step = record(value);
+  const state = text(step?.state);
+  if (!step || !state) return undefined;
+  const tools = Array.isArray(step.tools)
+    ? step.tools.flatMap(tool => { const item = record(tool); const id = text(item?.id); return id ? [{ id, name: text(item?.name) ?? "tool" }] : []; })
+    : [];
+  const retry = record(step.retry);
+  return {
+    n: typeof step.n === "number" ? step.n : 0,
+    state,
+    since: time(step.since),
+    tools,
+    ...(retry ? { retry: { attempt: typeof retry.attempt === "number" ? retry.attempt : undefined, maxAttempts: typeof retry.maxAttempts === "number" ? retry.maxAttempts : undefined, error: text(retry.error) } } : {}),
+  };
 }
 
 function widgetsOf(value: unknown): Record<string, string[]> {
@@ -713,6 +743,7 @@ export class SessionStore {
             ...(text(data.errorMessage) ? { errorMessage: text(data.errorMessage) } : {}),
             ...(text(data.model) ? { model: text(data.model) } : {}),
             ...(text(data.provider) ? { provider: text(data.provider) } : {}),
+            ...(record(data.usage) ? { usage: data.usage as ChatMessage["usage"] } : {}),
           }
           : message);
         // The turn may continue (more tools); only `turn.end` / the summary end it.
@@ -726,8 +757,10 @@ export class SessionStore {
         const id = text(data.toolCallId) ?? "";
         if (!id) break;
         const tool: ToolView = { id, name: text(data.toolName) ?? "tool", args: data.args, phase: "running" };
-        // Show the call where it happens, while it runs, not only when the reply completes.
-        const at = this.ensureAssistant(text(data.turnId));
+        // The call is in the step's reply once that reply is written; a call the
+        // reply does not hold yet is shown in the reply being written.
+        const holder = this.state.projection.messages.findIndex(message => message.role === "assistant" && message.content.some(block => block.type === "toolCall" && block.id === id));
+        const at = holder >= 0 ? holder : this.ensureAssistant(text(data.turnId));
         const messages = this.state.projection.messages.map((message, index) => index === at && !message.content.some(block => block.type === "toolCall" && block.id === id)
           ? { ...message, content: [...message.content, { type: "toolCall", id, name: tool.name, arguments: data.args }] }
           : message);
@@ -746,7 +779,7 @@ export class SessionStore {
         const id = text(data.toolCallId) ?? "";
         if (!id) break;
         const prior = this.state.projection.tools[id];
-        const tool: ToolView = { id, name: prior?.name ?? "tool", args: prior?.args, phase: data.ok === false ? "error" : "complete", result: data.result };
+        const tool: ToolView = { id, name: prior?.name ?? "tool", args: prior?.args, phase: data.ok === false ? "error" : "complete", result: data.result, ...(data.interrupted === true ? { interrupted: true } : {}) };
         this.update({ projection: { ...this.state.projection, tools: { ...this.state.projection.tools, [id]: tool } } });
         break;
       }
@@ -763,6 +796,13 @@ export class SessionStore {
       case "question.cancelled":
         this.removePrompt(data.questionId);
         break;
+      case "message.custom":
+      {
+        // A Flow report the runtime shows, as it arrives (saved ones come from the host's report list).
+        const report = flowReportOf(text(data.customType), data.display, text(data.text));
+        if (report) this.update({ projection: { ...this.state.projection, flowReports: [...this.state.projection.flowReports, report].slice(-30) } });
+        break;
+      }
       case "session.notice":
         this.applyNotice(text(data.message) ?? "", data.level);
         break;

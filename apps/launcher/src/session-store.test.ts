@@ -137,6 +137,42 @@ describe("SessionStore", () => {
     expect(last?.content).toContainEqual(expect.objectContaining({ type: "toolCall", id: "call-1", name: "bash" }));
   });
 
+  it("keeps each step of a run as its own reply, with its tool on it", () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "session.updated", { activeTurn: { turnId: "m-1", phase: "running", step: { n: 1, state: "thinking", tools: [] } } }));
+    session.emit(event(2, "message.start", { messageId: "m-1", turnId: "m-1", step: 1, role: "assistant" }));
+    session.emit(event(3, "message.delta", { messageId: "m-1", text: "plan", kind: "thinking" }));
+    session.emit(event(4, "message.done", { messageId: "m-1", step: 1, stopReason: "toolUse", blocks: [{ type: "thinking", text: "plan" }, { type: "toolCall", toolCallId: "call-1", name: "bash", input: {} }] }));
+    session.emit(event(5, "tool.start", { toolCallId: "call-1", toolName: "bash", args: {}, step: 1 }));
+    session.emit(event(6, "tool.result", { toolCallId: "call-1", ok: true, result: { output: "x" } }));
+    session.emit(event(7, "message.start", { messageId: "m-1", turnId: "m-1", step: 2, role: "assistant" }));
+    session.emit(event(8, "message.delta", { messageId: "m-1", text: "check", kind: "thinking" }));
+    const replies = store.snapshot.projection.messages.filter(message => message.role === "assistant");
+    expect(replies).toHaveLength(2);
+    expect(replies[0].content).toEqual([{ type: "thinking", thinking: "plan" }, { type: "toolCall", id: "call-1", name: "bash", arguments: {} }]);
+    expect(replies[1].content).toEqual([{ type: "thinking", thinking: "check" }]);
+    expect(store.snapshot.projection.tools["call-1"]).toMatchObject({ phase: "complete" });
+    expect(store.snapshot.activeTurn?.step).toMatchObject({ n: 1, state: "thinking" });
+  });
+
+  it("shows a tool the host closed as interrupted, not running", () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "tool.start", { toolCallId: "call-2", toolName: "bash", args: {} }));
+    session.emit(event(2, "tool.result", { toolCallId: "call-2", ok: false, interrupted: true, result: { content: [{ type: "text", text: "Interrupted" }] } }));
+    expect(store.snapshot.projection.tools["call-2"]).toMatchObject({ phase: "error", interrupted: true });
+  });
+
+  it("adds a Flow report the runtime shows as it arrives", () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "message.custom", { customType: "jouzu-flow-report", display: true, text: JSON.stringify({ kind: "budget", note: "x" }) }));
+    session.emit(event(2, "message.custom", { customType: "jouzu-flow-report", display: false, text: JSON.stringify({ kind: "hidden" }) }));
+    session.emit(event(3, "message.custom", { customType: "other", text: JSON.stringify({ kind: "nope" }) }));
+    expect(store.snapshot.projection.flowReports.map(report => report.kind)).toEqual(["budget"]);
+  });
+
   it("answers a prompt with the host's exact option and keeps the card when that fails", async () => {
     const session = fakeSession();
     const store = SessionStore.attach(session);

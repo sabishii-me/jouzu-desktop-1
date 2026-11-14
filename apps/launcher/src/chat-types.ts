@@ -42,11 +42,20 @@ export function writeModelPreference(value: { provider: string; id: string } | u
 }
 
 /** The host's view of the turn in progress (`session.updated.activeTurn`). */
+/** What the running turn is doing now, as the host reports it. */
+export interface TurnStep {
+  n: number;
+  state: string;
+  since?: number;
+  tools: Array<{ id: string; name: string }>;
+  retry?: { attempt?: number; maxAttempts?: number; error?: string };
+}
 export interface ActiveTurn {
   turnId: string;
   clientMessageId?: string;
   phase: string;
   startedAt?: number;
+  step?: TurnStep;
 }
 export interface QueuedMessage { clientMessageId: string; text: string; state: string }
 /** An approval or question the host is waiting on; rendered from host data only. */

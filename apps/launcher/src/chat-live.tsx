@@ -1,6 +1,42 @@
 import { useState } from "react";
 import { AlertTriangle, Brain, ChevronDown, LoaderCircle, Square } from "lucide-react";
 import { ChatMarkdown } from "./chat-markdown";
+import type { ActiveTurn } from "./chat-types";
+
+const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}`;
+
+/**
+ * The status line's words for a running turn, as the host reports it: which step,
+ * what it is doing, and for how long when the wait is the point.
+ */
+export function turnLabel(turn: ActiveTurn | null | undefined, now: number): string {
+  if (!turn) return "Working…";
+  if (turn.phase === "starting") return "Starting session…";
+  if (turn.phase === "cancelling") return "Stopping…";
+  const step = turn.step;
+  if (!step) return "Working…";
+  // The status line already shows the turn's own clock; a second one is only worth showing
+  // once this state started later than the turn did.
+  const ownClock = step.since !== undefined && (turn.startedAt === undefined || step.since - turn.startedAt >= 1000);
+  const waited = ownClock ? ` · ${clock(Math.max(0, now - step.since!))}` : "";
+  const prefix = step.n > 1 ? `Step ${step.n} · ` : "";
+  switch (step.state) {
+    case "waiting_model": return `${prefix}Waiting for model${waited}`;
+    case "thinking": return `${prefix}Thinking`;
+    case "writing": return `${prefix}Writing`;
+    case "calling_tool": return `${prefix}Preparing tool call`;
+    case "tools": {
+      const names = [...new Set(step.tools.map(tool => tool.name))];
+      return names.length ? `${prefix}Running ${names.join(", ")}${waited}` : `${prefix}Tools done`;
+    }
+    case "retrying": {
+      const attempt = step.retry?.attempt !== undefined ? ` ${step.retry.attempt}${step.retry.maxAttempts !== undefined ? `/${step.retry.maxAttempts}` : ""}` : "";
+      return `${prefix}Model request failed, retrying${attempt}${step.retry?.error ? ` (${step.retry.error})` : ""}`;
+    }
+    case "compacting": return `${prefix}Compacting context${waited}`;
+    default: return "Working…";
+  }
+}
 
 /**
  * One turn status line above the composer. It only carries turn state

@@ -11,11 +11,20 @@ pub const KIND: &str = "pi";
 pub enum Record {
     Response,
     AgentStart,
+    /// One step of a run: a model call and the tools it asks for.
+    TurnStart,
+    TurnEnd,
+    MessageStart,
+    MessageEnd,
     MessageUpdate,
     ToolStart,
     ToolUpdate,
     ToolEnd,
     AgentSettled,
+    RetryStart,
+    RetryEnd,
+    CompactionStart,
+    CompactionEnd,
     CustomMessage,
     ExtensionUiRequest,
     ExtensionError,
@@ -27,6 +36,8 @@ pub enum Record {
 pub enum DeltaKind {
     Text,
     Thinking,
+    /// The model is writing a tool call's arguments.
+    ToolCall,
     Other,
 }
 
@@ -34,6 +45,14 @@ pub fn classify(value: &Value) -> Record {
     match value.get("type").and_then(Value::as_str) {
         Some("response") => Record::Response,
         Some("agent_start") => Record::AgentStart,
+        Some("turn_start") => Record::TurnStart,
+        Some("turn_end") => Record::TurnEnd,
+        Some("message_start") => Record::MessageStart,
+        Some("message_end") => Record::MessageEnd,
+        Some("auto_retry_start") => Record::RetryStart,
+        Some("auto_retry_end") => Record::RetryEnd,
+        Some("compaction_start") => Record::CompactionStart,
+        Some("compaction_end") => Record::CompactionEnd,
         Some("message_update") => Record::MessageUpdate,
         Some("tool_execution_start") => Record::ToolStart,
         Some("tool_execution_update") => Record::ToolUpdate,
@@ -55,6 +74,7 @@ pub fn delta_kind(value: &Value) -> DeltaKind {
     {
         Some("text_delta") => DeltaKind::Text,
         Some("thinking_delta") => DeltaKind::Thinking,
+        Some("toolcall_start" | "toolcall_delta") => DeltaKind::ToolCall,
         _ => DeltaKind::Other,
     }
 }

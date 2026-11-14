@@ -289,11 +289,122 @@ impl EventLog {
 
 const FLOW_RELEASE_ID: &str = "host-flow-release";
 
+/// A runtime message's content as host history blocks: words, reasoning and tool
+/// calls. Live replies and replies read back from a saved file use this one
+/// mapping, so a conversation has the same shape either way.
+fn reply_blocks(message: &Value) -> Vec<Value> {
+    let mut blocks = Vec::new();
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return blocks;
+    };
+    for block in content {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": text }));
+                    }
+                }
+            }
+            Some("thinking") => {
+                if let Some(text) = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    if !text.is_empty() {
+                        blocks.push(json!({ "type": "thinking", "text": text }));
+                    }
+                }
+            }
+            Some("toolCall") => {
+                if let Some(id) = block
+                    .get("toolCallId")
+                    .or_else(|| block.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    blocks.push(json!({
+                        "type": "toolCall",
+                        "toolCallId": id,
+                        "name": block.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                        "input": block.get("arguments").or_else(|| block.get("input")).cloned().unwrap_or(Value::Null),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// What a tool that never finished shows: it was cut off, not still running.
+fn interrupted_result() -> Value {
+    json!({ "content": [{ "type": "text", "text": "Interrupted" }] })
+}
+
+/// Adds a result for every tool call in `blocks` that has none.
+fn close_unfinished_calls(blocks: &mut Vec<Value>) -> Vec<String> {
+    let finished: std::collections::HashSet<String> = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("toolResult"))
+        .filter_map(|block| block.get("toolCallId").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let open: Vec<String> = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("toolCall"))
+        .filter_map(|block| block.get("toolCallId").and_then(Value::as_str).map(str::to_string))
+        .filter(|id| !finished.contains(id))
+        .collect();
+    for id in &open {
+        blocks.push(json!({
+            "type": "toolResult",
+            "toolCallId": id,
+            "ok": false,
+            "interrupted": true,
+            "result": interrupted_result(),
+        }));
+    }
+    open
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Handshake {
     Switch,
     Messages,
     Ready,
+}
+
+/// Where the running turn is: which step (one model call and the tools it asks
+/// for) and what that step is doing. The host works this out from the runtime's
+/// events in one place; clients show it as given.
+struct StepState {
+    n: u64,
+    state: &'static str,
+    since: String,
+    since_at: Instant,
+    started_at: Instant,
+    first_output: bool,
+    /// The history row of this step's finished reply, once the model is done
+    /// writing it; the step's tool calls and results are added to it.
+    row: Option<String>,
+    tools: Vec<(String, String, Instant)>,
+    retry: Option<Value>,
+}
+
+impl StepState {
+    fn new() -> Self {
+        Self {
+            n: 0,
+            state: "waiting_model",
+            since: Session::now_iso(),
+            since_at: Instant::now(),
+            started_at: Instant::now(),
+            first_output: false,
+            row: None,
+            tools: Vec::new(),
+            retry: None,
+        }
+    }
 }
 
 /// Time from a prompt reaching the runtime to its first output, over this
@@ -377,6 +488,7 @@ pub struct Session {
     history_seq: AtomicU64,
     assistant_text: Mutex<String>,
     assistant_blocks: Mutex<Vec<Value>>,
+    step: Mutex<StepState>,
     active_client: Mutex<Option<String>>,
     model: Mutex<Option<Value>>,
     pending_model: Mutex<Option<Value>>,
@@ -496,9 +608,9 @@ impl Session {
             None
         };
         let mut page = page;
-        // A resync while a turn is streaming must include what the assistant has
-        // already said. This row is synthetic: it is not appended to history until
-        // turn.end.
+        // A resync while a step is streaming must include what it has already
+        // said. This row is synthetic: the step's reply is appended to history
+        // when the runtime finishes writing it.
         let active = self
             .active_message
             .lock()
@@ -516,10 +628,12 @@ impl Session {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             if !text.is_empty() || !blocks.is_empty() {
+                let n = self.step_guard().n.max(1);
                 let mut row = json!({
                     "kind": "assistant",
-                    "id": format!("{turn}:assistant"),
+                    "id": format!("{turn}:assistant:{n}"),
                     "turnId": turn,
+                    "step": n,
                     "text": text,
                     "blocks": if blocks.is_empty() { json!([{ "type": "text", "text": text }]) } else { json!(blocks) },
                     "createdAt": Self::now_iso(),
@@ -631,41 +745,301 @@ impl Session {
         blocks.push(json!({ "type": kind, "text": text }));
     }
 
-    fn push_assistant_tool_call(&self, call_id: &str, name: &str, input: Value) {
-        self.assistant_blocks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(json!({
-                "type": "toolCall",
-                "toolCallId": call_id,
-                "name": name,
-                "input": input,
-            }));
+    fn step_guard(&self) -> std::sync::MutexGuard<'_, StepState> {
+        self.step.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn push_assistant_tool_result(&self, call_id: &str, ok: bool, result: Value) {
-        self.assistant_blocks
+    fn active_turn_id(&self) -> Option<String> {
+        self.active_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(json!({
-                "type": "toolResult",
-                "toolCallId": call_id,
-                "ok": ok,
-                "result": result,
-            }));
+            .clone()
     }
 
-    fn take_assistant_blocks(&self, text: &str) -> Value {
-        let mut blocks = std::mem::take(
+    /// The turn in progress, as clients show it: which step and what it is doing.
+    fn step_view(&self) -> Value {
+        let step = self.step_guard();
+        json!({
+            "n": step.n,
+            "state": step.state,
+            "since": step.since,
+            "tools": step.tools.iter().map(|(id, name, _)| json!({ "id": id, "name": name })).collect::<Vec<_>>(),
+            "retry": step.retry,
+        })
+    }
+
+    fn reset_step(&self) {
+        *self.step_guard() = StepState::new();
+    }
+
+    fn set_step_state(&self, state: &'static str) {
+        let changed = {
+            let mut step = self.step_guard();
+            if step.state == state {
+                false
+            } else {
+                step.state = state;
+                step.since = Self::now_iso();
+                step.since_at = Instant::now();
+                true
+            }
+        };
+        if changed {
+            self.publish_summary();
+        }
+    }
+
+    fn log_step(&self, mark: &str, fields: Value) {
+        let mut data = json!({
+            "session": self.id,
+            "mark": mark,
+            "turnId": self.active_turn_id(),
+            "clientMessageId": self
+                .active_client_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        });
+        if let (Some(data), Some(fields)) = (data.as_object_mut(), fields.as_object()) {
+            for (key, value) in fields {
+                data.insert(key.clone(), value.clone());
+            }
+        }
+        log(&self.home, "info", "timing", data);
+    }
+
+    /// A new step: the runtime is asking the model again. Whatever the previous
+    /// step left unwritten is kept as its reply first.
+    fn begin_step(&self) {
+        let Some(turn) = self.active_turn_id() else {
+            return;
+        };
+        self.finish_step_reply(&turn, None, false);
+        let n = {
+            let mut step = self.step_guard();
+            step.n += 1;
+            step.state = "waiting_model";
+            step.since = Self::now_iso();
+            step.since_at = Instant::now();
+            step.started_at = Instant::now();
+            step.first_output = false;
+            step.row = None;
+            step.tools.clear();
+            step.retry = None;
+            step.n
+        };
+        self.log_step("step.start", json!({ "step": n }));
+        self.publish(
+            "message.start",
+            json!({ "messageId": turn, "turnId": turn, "step": n, "role": "assistant" }),
+        );
+        self.publish_summary();
+    }
+
+    /// Output that arrives with no step begun (a runtime that does not mark
+    /// steps) starts the first one.
+    fn ensure_step(&self) {
+        if self.step_guard().n == 0 {
+            self.begin_step();
+        }
+    }
+
+    /// The step shows something: its first output is timed against the moment it
+    /// asked the model.
+    fn step_output(&self, state: &'static str) {
+        let first = {
+            let mut step = self.step_guard();
+            if step.first_output {
+                None
+            } else {
+                step.first_output = true;
+                Some((step.n, step.started_at.elapsed().as_millis() as u64))
+            }
+        };
+        if let Some((n, wait)) = first {
+            self.log_step("step.first_output", json!({ "step": n, "waitMs": wait }));
+        }
+        self.set_step_state(state);
+    }
+
+    /// The step's reply is complete (or cut off): it becomes a history row of its
+    /// own. `message` is the runtime's own record of the reply when it has one.
+    fn finish_step_reply(&self, turn: &str, message: Option<&Value>, interrupted: bool) {
+        let text = std::mem::take(
+            &mut *self
+                .assistant_text
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let streamed = std::mem::take(
             &mut *self
                 .assistant_blocks
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
+        let mut blocks = message.map(reply_blocks).unwrap_or_default();
+        if blocks.is_empty() {
+            blocks = streamed;
+        } else {
+            // Calls and results the runtime reported apart from the reply.
+            for block in streamed {
+                let kind = block.get("type").and_then(Value::as_str);
+                let id = block.get("toolCallId").and_then(Value::as_str);
+                let known = blocks.iter().any(|known| {
+                    known.get("type").and_then(Value::as_str) == kind
+                        && known.get("toolCallId").and_then(Value::as_str) == id
+                });
+                if matches!(kind, Some("toolCall" | "toolResult")) && !known {
+                    blocks.push(block);
+                }
+            }
+        }
         if blocks.is_empty() && !text.is_empty() {
             blocks.push(json!({ "type": "text", "text": text }));
         }
-        Value::Array(blocks)
+        // A reply with nothing in it is still a reply when it carries an error.
+        let failed = message
+            .and_then(|message| message.get("errorMessage"))
+            .is_some_and(|error| !error.is_null());
+        if blocks.is_empty() && !failed {
+            return;
+        }
+        let n = self.step_guard().n.max(1);
+        let id = format!("{turn}:assistant:{n}");
+        let words = blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("");
+        let stop_reason = message
+            .and_then(|message| message.get("stopReason"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| if interrupted { "aborted" } else { "stop" }.to_string());
+        let mut row = json!({
+            "kind": "assistant",
+            "id": id,
+            "turnId": turn,
+            "step": n,
+            "text": words,
+            "blocks": blocks,
+            "stopReason": stop_reason,
+            "createdAt": Self::now_iso(),
+        });
+        if interrupted {
+            row["interrupted"] = json!(true);
+        }
+        if let Some(message) = message {
+            for field in ["model", "provider", "usage", "errorMessage"] {
+                if let Some(value) = message.get(field).filter(|value| !value.is_null()) {
+                    row[field] = value.clone();
+                }
+            }
+        }
+        if row.get("model").map(Value::is_null).unwrap_or(true) {
+            if let Some(model) = self
+                .model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            {
+                row["model"] = model
+                    .get("name")
+                    .or_else(|| model.get("id"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if let Some(provider) = model.get("provider") {
+                    row["provider"] = provider.clone();
+                }
+            }
+        }
+        self.push_history(row.clone());
+        self.step_guard().row = Some(id);
+        self.publish(
+            "message.done",
+            json!({
+                "messageId": turn,
+                "step": n,
+                "stopReason": stop_reason,
+                "blocks": row.get("blocks").cloned().unwrap_or_else(|| json!([])),
+                "model": row.get("model").cloned().unwrap_or(Value::Null),
+                "provider": row.get("provider").cloned().unwrap_or(Value::Null),
+                "usage": row.get("usage").cloned().unwrap_or(Value::Null),
+                "errorMessage": row.get("errorMessage").cloned().unwrap_or(Value::Null),
+            }),
+        );
+    }
+
+    /// A tool call or result belongs to the step's reply: in the history row once
+    /// the reply is written, otherwise with what is still streaming.
+    fn add_to_step_reply(&self, block: Value) {
+        let row = self.step_guard().row.clone();
+        if let Some(row) = row {
+            let mut history = self
+                .history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(blocks) = history
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(row.as_str()))
+                .and_then(|entry| entry.get_mut("blocks"))
+                .and_then(Value::as_array_mut)
+            {
+                let kind = block.get("type").and_then(Value::as_str);
+                let id = block.get("toolCallId").and_then(Value::as_str);
+                let known = blocks.iter().any(|known| {
+                    known.get("type").and_then(Value::as_str) == kind
+                        && known.get("toolCallId").and_then(Value::as_str) == id
+                });
+                if !known {
+                    blocks.push(block);
+                }
+                return;
+            }
+        }
+        self.assistant_blocks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(block);
+    }
+
+    /// When a turn ends, no tool of it is still at work: any without a result
+    /// was cut off, and says so, live and in history.
+    fn close_unfinished_tools(&self) {
+        let mut closed = Vec::new();
+        {
+            let mut history = self
+                .history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for entry in history.iter_mut() {
+                match entry.get("kind").and_then(Value::as_str) {
+                    Some("tool") if entry["tool"]["status"] == "running" => {
+                        entry["tool"]["status"] = json!("interrupted");
+                        entry["result"] = interrupted_result();
+                        if let Some(id) = entry["tool"]["callId"].as_str() {
+                            closed.push(id.to_string());
+                        }
+                    }
+                    Some("assistant") => {
+                        if let Some(blocks) = entry.get_mut("blocks").and_then(Value::as_array_mut) {
+                            closed.extend(close_unfinished_calls(blocks));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        closed.sort();
+        closed.dedup();
+        for id in closed {
+            self.publish(
+                "tool.result",
+                json!({ "toolCallId": id, "ok": false, "interrupted": true, "result": interrupted_result() }),
+            );
+        }
     }
 
     fn update_history_tool(&self, call_id: &str, status: &str, result: Value) {
@@ -1325,7 +1699,7 @@ impl Session {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             // A tool's result belongs on the reply that called it, as it does
-            // when the turn streams live (`push_assistant_tool_result`).
+            // when the turn streams live (`add_to_step_reply`).
             if role == "toolResult" {
                 let call_id = message.get("toolCallId").and_then(Value::as_str);
                 let reply = rows
@@ -1351,42 +1725,7 @@ impl Session {
             if role != "user" && role != "assistant" {
                 continue;
             }
-            let mut blocks = Vec::new();
-            if let Some(content) = message.get("content").and_then(Value::as_array) {
-                for block in content {
-                    match block.get("type").and_then(Value::as_str) {
-                        Some("text") => {
-                            if let Some(text) = block.get("text").and_then(Value::as_str) {
-                                blocks.push(json!({ "type": "text", "text": text }));
-                            }
-                        }
-                        Some("thinking") => {
-                            if let Some(text) = block
-                                .get("thinking")
-                                .or_else(|| block.get("text"))
-                                .and_then(Value::as_str)
-                            {
-                                blocks.push(json!({ "type": "thinking", "text": text }));
-                            }
-                        }
-                        Some("toolCall") => {
-                            if let Some(id) = block
-                                .get("toolCallId")
-                                .or_else(|| block.get("id"))
-                                .and_then(Value::as_str)
-                            {
-                                blocks.push(json!({
-                                    "type": "toolCall",
-                                    "toolCallId": id,
-                                    "name": block.get("name").and_then(Value::as_str).unwrap_or("tool"),
-                                    "input": block.get("arguments").or_else(|| block.get("input")).cloned().unwrap_or(Value::Null),
-                                }));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            let blocks = reply_blocks(message);
             let text = blocks
                 .iter()
                 .filter_map(|block| {
@@ -1421,9 +1760,36 @@ impl Session {
                     .map(str::to_string)
                     .unwrap_or_else(Self::now_iso),
             }));
+            if role == "assistant" {
+                if let Some(row) = rows.last_mut() {
+                    for field in ["model", "provider", "usage", "stopReason"] {
+                        if let Some(value) = message.get(field).filter(|value| !value.is_null()) {
+                            row[field] = value.clone();
+                        }
+                    }
+                }
+            }
         }
         if rows.is_empty() {
             return;
+        }
+        // A saved conversation is at rest: a tool call with no result was cut off
+        // (the app closed, the runtime stopped). While a turn runs, its own calls
+        // may still be at work, so they are left as they are.
+        let resting = self
+            .active_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none();
+        if resting {
+            for row in rows.iter_mut() {
+                if row.get("kind").and_then(Value::as_str) != Some("assistant") {
+                    continue;
+                }
+                if let Some(blocks) = row.get_mut("blocks").and_then(Value::as_array_mut) {
+                    close_unfinished_calls(blocks);
+                }
+            }
         }
         // Titled as the session list titles a saved file: by its first message.
         let first = rows
@@ -1456,16 +1822,39 @@ impl Session {
             PiRecord::Response => self.handle_response(&value),
             PiRecord::AgentStart => {
                 self.set_status(Status::Running);
-                if let Some(message_id) = self
-                    .active_message
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-                {
-                    self.publish(
-                        "message.start",
-                        json!({ "messageId": message_id, "turnId": message_id, "role": "assistant" }),
-                    );
+            }
+            PiRecord::TurnStart => {
+                if self.active_turn_id().is_some() {
+                    self.begin_step();
+                }
+            }
+            PiRecord::TurnEnd => {}
+            PiRecord::MessageStart => {
+                let assistant = value
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+                    == Some("assistant");
+                if assistant && self.active_turn_id().is_some() {
+                    // A second reply in one step is a step the runtime did not mark.
+                    let (n, written) = {
+                        let step = self.step_guard();
+                        (step.n, step.row.is_some())
+                    };
+                    if n == 0 || written {
+                        self.begin_step();
+                    }
+                }
+            }
+            PiRecord::MessageEnd => {
+                let message = value.get("message");
+                let assistant = message
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+                    == Some("assistant");
+                if let (true, Some(turn)) = (assistant, self.active_turn_id()) {
+                    self.ensure_step();
+                    self.finish_step_reply(&turn, message, false);
                 }
             }
             PiRecord::MessageUpdate => {
@@ -1476,23 +1865,20 @@ impl Session {
                     return;
                 };
                 let kind = pi::delta_kind(&value);
-                let active = self
-                    .active_message
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                let Some(message_id) = active else {
+                let Some(message_id) = self.active_turn_id() else {
                     return;
                 };
                 match kind {
                     DeltaKind::Text => {
                         let text = pi::delta_text(&value);
                         if !text.is_empty() {
+                            self.ensure_step();
                             self.assistant_text
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .push_str(text);
                             self.append_assistant_block("text", text);
+                            self.step_output("writing");
                             self.publish(
                                 "message.delta",
                                 json!({ "messageId": message_id, "text": text }),
@@ -1502,12 +1888,18 @@ impl Session {
                     DeltaKind::Thinking => {
                         let text = pi::delta_text(&value);
                         if !text.is_empty() {
+                            self.ensure_step();
                             self.append_assistant_block("thinking", text);
+                            self.step_output("thinking");
                             self.publish(
                                 "message.delta",
                                 json!({ "messageId": message_id, "text": text, "kind": "thinking" }),
                             );
                         }
+                    }
+                    DeltaKind::ToolCall => {
+                        self.ensure_step();
+                        self.step_output("calling_tool");
                     }
                     DeltaKind::Other => {}
                 }
@@ -1518,23 +1910,36 @@ impl Session {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                let name = value
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
                 if !call_id.is_empty() {
-                    self.push_assistant_tool_call(
-                        &call_id,
-                        value.get("toolName").and_then(Value::as_str).unwrap_or("tool"),
-                        value.get("args").cloned().unwrap_or(Value::Null),
-                    );
+                    if self.active_turn_id().is_some() {
+                        self.ensure_step();
+                    }
+                    self.add_to_step_reply(json!({
+                        "type": "toolCall",
+                        "toolCallId": call_id,
+                        "name": name,
+                        "input": value.get("args").cloned().unwrap_or(Value::Null),
+                    }));
                     self.push_history(json!({
                         "kind": "tool",
                         "id": format!("tool:{call_id}"),
+                        "turnId": self.active_turn_id(),
                         "tool": {
-                            "name": value.get("toolName").and_then(Value::as_str).unwrap_or("tool"),
+                            "name": name,
                             "callId": call_id,
                             "status": "running",
                         },
                         "args": value.get("args"),
                         "createdAt": Self::now_iso(),
                     }));
+                    self.step_guard()
+                        .tools
+                        .push((call_id.clone(), name.clone(), Instant::now()));
                 }
                 self.publish(
                     "tool.start",
@@ -1542,8 +1947,11 @@ impl Session {
                         "toolCallId": value.get("toolCallId"),
                         "toolName": value.get("toolName"),
                         "args": value.get("args"),
+                        "step": self.step_guard().n,
                     }),
                 );
+                self.step_output("tools");
+                self.publish_summary();
             }
             PiRecord::ToolUpdate => {
                 self.publish(
@@ -1560,28 +1968,70 @@ impl Session {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                self.push_assistant_tool_result(
-                    &call_id,
-                    value.get("isError").and_then(Value::as_bool) != Some(true),
-                    value.get("result").cloned().unwrap_or(Value::Null),
-                );
+                let ok = value.get("isError").and_then(Value::as_bool) != Some(true);
+                self.add_to_step_reply(json!({
+                    "type": "toolResult",
+                    "toolCallId": call_id,
+                    "ok": ok,
+                    "result": value.get("result").cloned().unwrap_or(Value::Null),
+                }));
                 self.update_history_tool(
                     &call_id,
-                    if value.get("isError").and_then(Value::as_bool) == Some(true) {
-                        "error"
-                    } else {
-                        "ok"
-                    },
+                    if ok { "ok" } else { "error" },
                     value.get("result").cloned().unwrap_or(Value::Null),
                 );
+                let finished = {
+                    let mut step = self.step_guard();
+                    let at = step.tools.iter().position(|(id, _, _)| *id == call_id);
+                    at.map(|at| step.tools.remove(at))
+                };
+                if let Some((_, name, started)) = finished {
+                    self.log_step(
+                        "tool.end",
+                        json!({ "tool": name, "ok": ok, "elapsedMs": started.elapsed().as_millis() as u64 }),
+                    );
+                }
                 self.publish(
                     "tool.result",
                     json!({
                         "toolCallId": value.get("toolCallId"),
-                        "ok": value.get("isError").and_then(Value::as_bool) != Some(true),
+                        "ok": ok,
                         "result": value.get("result"),
                     }),
                 );
+                self.publish_summary();
+            }
+            PiRecord::RetryStart => {
+                let retry = json!({
+                    "attempt": value.get("attempt"),
+                    "maxAttempts": value.get("maxAttempts"),
+                    "delayMs": value.get("delayMs"),
+                    "error": value.get("errorMessage"),
+                });
+                self.log_step("retry.start", retry.clone());
+                self.step_guard().retry = Some(retry);
+                self.set_step_state("retrying");
+                self.publish_summary();
+            }
+            PiRecord::RetryEnd => {
+                self.log_step(
+                    "retry.end",
+                    json!({ "success": value.get("success"), "attempt": value.get("attempt") }),
+                );
+                self.step_guard().retry = None;
+                self.set_step_state("waiting_model");
+                self.publish_summary();
+            }
+            PiRecord::CompactionStart => {
+                self.log_step("compaction.start", json!({ "reason": value.get("reason") }));
+                self.set_step_state("compacting");
+            }
+            PiRecord::CompactionEnd => {
+                self.log_step(
+                    "compaction.end",
+                    json!({ "reason": value.get("reason"), "aborted": value.get("aborted") }),
+                );
+                self.set_step_state("waiting_model");
             }
             PiRecord::CustomMessage => {
                 let custom_type = value
@@ -1629,57 +2079,9 @@ impl Session {
                     .take();
                 if let Some(message_id) = active {
                     let stop_reason = if aborted { "interrupted" } else { "completed" };
-                    let text = std::mem::take(
-                        &mut *self
-                            .assistant_text
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                    );
-                    let blocks = self.take_assistant_blocks(&text);
-                    let mut row = json!({
-                        "kind": "assistant",
-                        "id": format!("{message_id}:assistant"),
-                        "turnId": message_id.clone(),
-                        "text": text,
-                        "blocks": blocks,
-                        "createdAt": Self::now_iso(),
-                    });
-                    if let Some(message) = value.get("message") {
-                        for field in ["model", "provider", "usage"] {
-                            if let Some(field_value) = message.get(field) {
-                                row[field] = field_value.clone();
-                            }
-                        }
-                    }
-                    if row.get("model").map(Value::is_null).unwrap_or(true) {
-                        if let Some(model) = self
-                            .model
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .clone()
-                        {
-                            row["model"] = model
-                                .get("name")
-                                .or_else(|| model.get("id"))
-                                .cloned()
-                                .unwrap_or(Value::Null);
-                            if let Some(provider) = model.get("provider") {
-                                row["provider"] = provider.clone();
-                            }
-                        }
-                    }
-                    self.push_history(row.clone());
-                    self.publish(
-                        "message.done",
-                        json!({
-                            "messageId": message_id,
-                            "stopReason": stop_reason,
-                            "blocks": row.get("blocks").cloned().unwrap_or_else(|| json!([])),
-                            "model": row.get("model").cloned().unwrap_or(Value::Null),
-                            "provider": row.get("provider").cloned().unwrap_or(Value::Null),
-                            "usage": row.get("usage").cloned().unwrap_or(Value::Null),
-                        }),
-                    );
+                    // Whatever the last step had not finished writing is its reply.
+                    self.finish_step_reply(&message_id, None, aborted);
+                    self.close_unfinished_tools();
                     self.publish(
                         "turn.end",
                         json!({ "turnId": message_id, "status": stop_reason }),
@@ -2441,6 +2843,7 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.reset_step();
         let stored_attachments = self.store_attachments(attachments)?;
         let mut history_row = json!({
             "kind": "user",
@@ -3074,6 +3477,7 @@ impl Session {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone(),
                     "phase": phase,
+                    "step": self.step_view(),
                     "startedAt": self
                         .turn_started_at
                         .lock()
@@ -3219,6 +3623,7 @@ impl Session {
             history_seq: AtomicU64::new(0),
             assistant_text: Mutex::new(String::new()),
             assistant_blocks: Mutex::new(Vec::new()),
+            step: Mutex::new(StepState::new()),
             active_client: Mutex::new(None),
             model: Mutex::new(None),
             pending_model: Mutex::new(None),
@@ -3490,6 +3895,7 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.reset_step();
         self.publish(
             "turn.start",
             json!({ "turnId": turn, "phase": "running" }),
@@ -3597,24 +4003,8 @@ impl Session {
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .take();
                         if let Some(turn) = turn.clone() {
-                            let text = std::mem::take(
-                                &mut *self
-                                    .assistant_text
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                            );
-                            let blocks = self.take_assistant_blocks(&text);
-                            if !text.is_empty() || blocks.as_array().is_some_and(|items| !items.is_empty()) {
-                                self.push_history(json!({
-                                    "kind": "assistant",
-                                    "id": format!("{turn}:assistant"),
-                                    "turnId": turn,
-                                    "text": text,
-                                    "blocks": blocks,
-                                    "createdAt": Self::now_iso(),
-                                    "interrupted": true,
-                                }));
-                            }
+                            self.finish_step_reply(&turn, None, true);
+                            self.close_unfinished_tools();
                         }
                         let client_id = self
                             .active_client_message

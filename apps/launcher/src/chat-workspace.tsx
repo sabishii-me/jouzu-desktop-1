@@ -4,7 +4,7 @@ import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { McpMenu } from "./mcp-menu";
 import { ChatConversation } from "./chat-conversation";
-import { AgentAction } from "./chat-live";
+import { AgentAction, turnLabel } from "./chat-live";
 import { Composer } from "./composer";
 import { changedFiles, snapshotComplete, type WorkspaceSnapshot } from "./workspace-diff";
 import { loadCollapsed, saveCollapsed, toggleCollapsed } from "./sidebar-state";
@@ -61,6 +61,8 @@ export interface ChatWorkspaceProps {
 }
 const lastSegment = (path: string) => path.replaceAll("\\", "/").split("/").filter(Boolean).at(-1) ?? path;
 const workspaceLabel = (path: string) => lastSegment(path) === "default-workspace" ? "Default workspace" : lastSegment(path);
+/** Saved reports first, then ones that arrived live and are not saved yet. */
+const mergeReports = (saved: FlowReportRecord[], live: FlowReportRecord[]) => [...saved, ...live.filter(report => !saved.some(known => known.text === report.text))].slice(-30);
 const isDefaultWorkspace = (path: string) => lastSegment(path) === "default-workspace";
 const normalizedPath = (path: string) => path.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
 /** The UUID at the end of a session file stem; a preview has no live session state. */
@@ -1180,8 +1182,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const booting = !chatUnavailable && !snapshot.connected && !sessionError;
   const conversationProjection = activePreview?.projection ?? snapshot.projection;
   const activeMessage = conversationProjection.activeMessage === null ? undefined : conversationProjection.messages[conversationProjection.activeMessage];
-  // The reasoning being written now: the reply's last block, while the turn runs.
-  const streamingBlock = conversationProjection.running ? activeMessage?.content.at(-1) : undefined;
+  // The host says when the step is reasoning; the words are the step's reasoning block being written.
+  const turnStep = conversationProjection.running ? snapshot.activeTurn?.step : undefined;
+  const streamingBlock = turnStep?.state === "thinking" ? activeMessage?.content.at(-1) : undefined;
   const liveThinking = streamingBlock?.type === "thinking" ? streamingBlock.thinking ?? "" : "";
   const lastMessage = conversationProjection.messages.at(-1);
   const settled = !conversationProjection.running
@@ -1323,7 +1326,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           <div className="hidden min-w-0 items-center gap-1.5 md:flex">
             <SubagentMenu agents={subagents} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} />
             <BackgroundMenu jobs={flow.background} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} />
-            <FlowMenu key={snapshot.sessionId ?? path} flow={flow} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} notice={flowHold?.text} error={flowError} reports={reportsSession && normalizedPath(reportsSession) === activeSession ? diskReports : []} onCommand={command => void runFlowCommand(command)} busy={commandBusy || composerRunning} />
+            <FlowMenu key={snapshot.sessionId ?? path} flow={flow} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} notice={flowHold?.text} error={flowError} reports={reportsSession && normalizedPath(reportsSession) === activeSession ? mergeReports(diskReports, snapshot.projection.flowReports) : []} onCommand={command => void runFlowCommand(command)} busy={commandBusy || composerRunning} />
             <McpMenu onReload={() => void reloadSession()} onAsk={() => updateDraft("Add an MCP server to this workspace. Ask me for the name, transport, target, and any required environment variables.")} />
           </div>
         </div>
@@ -1350,12 +1353,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         </div>
       </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
-          <ChatConversation key={conversationKey} projection={conversationProjection} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onRetrySend={id => void connection.current?.retry(id)?.catch(() => {})} onDiscardSend={id => connection.current?.discard(id)} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={turnChangedFiles} />
+          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onRetrySend={id => void connection.current?.retry(id)?.catch(() => {})} onDiscardSend={id => connection.current?.discard(id)} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={turnChangedFiles} />
         </div>
         <div className="relative">
           <div className="mx-auto w-full max-w-3xl">
             {banners}
-            <AgentAction thinking={liveThinking} label={snapshot.activeTurn?.phase === "starting" ? "Starting session…" : "Working…"} running={conversationProjection.running} elapsed={elapsed} settled={settled} />
+            <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now)} running={conversationProjection.running} elapsed={elapsed} settled={settled} />
           </div>
           {promptNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{promptNode}</div>}
           <Composer connected={snapshot.connected || !!activePreview} pending={snapshot.pending || commandBusy || (opening && !activePreview) || locked } opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />

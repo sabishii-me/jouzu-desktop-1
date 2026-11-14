@@ -50,7 +50,7 @@ function FinalTurnFooter({ messages, index, message, onFork, forkDisabled = fals
  * Consecutive text tools become one row of icons. Rich results (images, Flow,
  * tasks, background work, subagents) keep their own card; nothing is dropped.
  */
-function contentParts(message: ChatMessage, index: number, projection: ChatProjection) {
+function contentParts(message: ChatMessage, index: number, projection: ChatProjection, reasoningLive: boolean) {
   const parts: ReactNode[] = [];
   const activity: ActivityItem[] = [];
   message.content.forEach((block, position) => {
@@ -59,9 +59,9 @@ function contentParts(message: ChatMessage, index: number, projection: ChatProje
       return;
     }
     if (block.type === "thinking") {
-      // Only the reasoning still being written lives in the turn status line; every
-      // finished step keeps its reasoning in place while the turn goes on.
-      const streaming = projection.running && projection.activeMessage === index && position === message.content.length - 1;
+      // Reasoning the status line is showing (the host says the step is reasoning)
+      // is not repeated here; all other reasoning stays in place.
+      const streaming = reasoningLive && projection.running && projection.activeMessage === index && position === message.content.length - 1;
       if (!streaming) {
         activity.push({ kind: "thinking", id: `thinking-${index}-${position}`, text: block.thinking ?? "", streaming: false });
       }
@@ -120,7 +120,7 @@ function OutboxRow({ item, onRetry, onDiscard }: { item: OutboxItem; onRetry?: (
   </article>;
 }
 
-function ChatConversationView({ projection, workspace, busy = false, pendingUser = "", outbox = [], onRetrySend, onDiscardSend, onFork, onOpenArtifacts, changedFiles = [] }: { projection: ChatProjection; workspace?: string; busy?: boolean; pendingUser?: string; outbox?: readonly OutboxItem[]; onRetrySend?: (clientMessageId: string) => void; onDiscardSend?: (clientMessageId: string) => void; onFork?: (prompt: string, index: number) => void; onOpenArtifacts?: () => void; changedFiles?: readonly string[] }) {
+function ChatConversationView({ projection, reasoningLive = false, workspace, busy = false, pendingUser = "", outbox = [], onRetrySend, onDiscardSend, onFork, onOpenArtifacts, changedFiles = [] }: { projection: ChatProjection; reasoningLive?: boolean; workspace?: string; busy?: boolean; pendingUser?: string; outbox?: readonly OutboxItem[]; onRetrySend?: (clientMessageId: string) => void; onDiscardSend?: (clientMessageId: string) => void; onFork?: (prompt: string, index: number) => void; onOpenArtifacts?: () => void; changedFiles?: readonly string[] }) {
   const scroll = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const following = useRef(true);
@@ -206,7 +206,7 @@ function ChatConversationView({ projection, workspace, busy = false, pendingUser
     let last: (typeof shown)[number] | undefined;
     for (const item of group) {
       if (item.message.role === "user") continue;
-      const split = contentParts(item.message, item.index, projection);
+      const split = contentParts(item.message, item.index, projection, reasoningLive);
       parts.push(...split.parts);
       activity.push(...split.activity);
       last = item;
