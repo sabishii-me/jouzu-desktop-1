@@ -271,7 +271,11 @@ export class HostClient {
       const key = (session.sessionPath ?? session.sessionId ?? session.workspacePath)
         .replace(/^\\\\\?\\/u, "")
         .toLowerCase();
-      byPath.set(key, session);
+      // The live record says what the session is doing now; what it does not know
+      // (an empty title, no time yet) never hides what the saved file says.
+      const saved = byPath.get(key);
+      const known = Object.fromEntries(Object.entries(session).filter(([, value]) => value !== null && value !== undefined && value !== ""));
+      byPath.set(key, saved ? { ...saved, ...known } as SessionSummary : session);
     }
     return [...byPath.values()];
   }

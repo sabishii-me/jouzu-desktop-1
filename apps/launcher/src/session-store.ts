@@ -9,7 +9,7 @@
 import { HostChatSession } from "./api/chat-session";
 import { eventRouter } from "./event-router";
 import type { ApiEvent, Attachment, HistoryPage, JouzuApi, Receipt, TimingMark } from "./api/jouzu-api";
-import { emptyProjection, historyRowsProjection, hostBlocks, type ChatBlock, type ChatMessage, type ToolView } from "./chat-projection";
+import { emptyProjection, historyRowsProjection, hostBlocks, hostToolResults, type ChatBlock, type ChatMessage, type ToolView } from "./chat-projection";
 import { describeError } from "./runtime-errors";
 import { classifyNotice, type TextGuardMode } from "./session-notices";
 import {
@@ -27,6 +27,8 @@ import {
 
 export interface SessionPort {
   readonly id: string;
+  /** The saved file the host opened this session on, when it has one. */
+  readonly sessionPath?: string | null;
   history(page?: { limit?: number; before?: number }): Promise<HistoryPage>;
   send(message: { clientMessageId: string; text: string; attachments?: Attachment[] }): Promise<Receipt>;
   interrupt(): Promise<void>;
@@ -169,7 +171,9 @@ export class SessionStore {
     readonly session: SessionPort,
     private readonly onDispose?: () => void,
   ) {
-    this.state = { ...this.state, sessionId: session.id, connected: true };
+    // The file is known from the attach: a send right after opening a saved
+    // session must see it is in that session, not wait for the first event.
+    this.state = { ...this.state, sessionId: session.id, connected: true, ...(session.sessionPath ? { sessionFile: session.sessionPath } : {}) };
   }
 
   static async open(api: JouzuApi, workspacePath: string, sessionPath?: string): Promise<SessionStore> {
@@ -221,6 +225,16 @@ export class SessionStore {
     const view = this.api?.sessions.view;
     if (!view) return;
     void view(this.session.id).then(() => this.refreshHistory(), () => this.refreshHistory());
+  }
+
+  /**
+   * The first thing a reply shows, as the host times it (`message.first_output`):
+   * words, thinking, or a tool at work.
+   */
+  private markFirstOutput(turnId: string): void {
+    if (this.shownOutput === turnId) return;
+    this.shownOutput = turnId;
+    this.markShown("first_output.shown", this.state.activeTurn?.clientMessageId);
   }
 
   /** Record, after the next paint, a moment the user saw (see host.log `timing.ui`). */
@@ -642,6 +656,10 @@ export class SessionStore {
       case "session.updated":
         this.applySummary(data);
         break;
+      case "session.history":
+        // The host replaced this session's history (a saved transcript arrived).
+        void this.refreshHistory();
+        break;
       case "session.attached":
         this.update({ sessionFile: text(data.sessionPath) ?? this.state.sessionFile });
         break;
@@ -680,11 +698,7 @@ export class SessionStore {
           return { ...message, content };
         });
         this.update({ projection: { ...this.state.projection, messages } });
-        const turnId = text(data.turnId) ?? text(data.messageId) ?? "";
-        if (!thinking && this.shownOutput !== turnId) {
-          this.shownOutput = turnId;
-          this.markShown("first_output.shown", this.state.activeTurn?.clientMessageId);
-        }
+        this.markFirstOutput(text(data.turnId) ?? text(data.messageId) ?? "");
         break;
       }
       case "message.done": {
@@ -702,7 +716,9 @@ export class SessionStore {
           }
           : message);
         // The turn may continue (more tools); only `turn.end` / the summary end it.
-        this.update({ projection: { ...this.state.projection, messages, activeMessage: null } });
+        const tools = { ...this.state.projection.tools };
+        for (const [id, tool] of Object.entries(hostToolResults(data.blocks, tools))) if (!tools[id] || tools[id].phase === "running") tools[id] = tool;
+        this.update({ projection: { ...this.state.projection, messages, tools, activeMessage: null } });
         this.active = -1;
         break;
       }
@@ -716,6 +732,7 @@ export class SessionStore {
           ? { ...message, content: [...message.content, { type: "toolCall", id, name: tool.name, arguments: data.args }] }
           : message);
         this.update({ projection: { ...this.state.projection, messages, tools: { ...this.state.projection.tools, [id]: tool } } });
+        this.markFirstOutput(text(data.turnId) ?? this.state.activeTurn?.turnId ?? "");
         break;
       }
       case "tool.update": {

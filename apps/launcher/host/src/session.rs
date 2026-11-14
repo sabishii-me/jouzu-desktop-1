@@ -47,6 +47,25 @@ fn session_header_cwd(session_path: &str) -> Option<String> {
     Path::new(&cwd).is_dir().then_some(cwd)
 }
 
+/// The messages a saved session file holds, in the order they were written.
+fn saved_messages(path: &Path) -> std::io::Result<Vec<Value>> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
+    let mut messages = Vec::new();
+    for line in std::io::BufRead::lines(reader) {
+        let Ok(line) = line else { break };
+        let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("message") {
+            if let Some(message) = value.get_mut("message").map(Value::take) {
+                messages.push(message);
+            }
+        }
+    }
+    Ok(messages)
+}
+
 fn is_scratch_workspace(path: &str) -> bool {
     path.split(|character| character == '\\' || character == '/')
         .any(|part| part.starts_with("jouzu-warm-"))
@@ -763,8 +782,20 @@ impl Session {
         }
         let mark = match event {
             "message.accepted" | "turn.start" | "message.done" | "turn.end" | "session.status" => event,
-            "message.delta" => {
-                let id = data.get("messageId").and_then(Value::as_str).unwrap_or_default();
+            // The first thing the reply shows: words, thinking, or a tool at work.
+            "message.delta" | "tool.start" => {
+                let id = data
+                    .get("messageId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        self.active_message
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone()
+                    })
+                    .unwrap_or_default();
+                let id = id.as_str();
                 let mut last = self
                     .first_output_turn
                     .lock()
@@ -783,7 +814,7 @@ impl Session {
                     first.total_ms += ms;
                     first.last_ms = Some(ms);
                 }
-                "message.first_delta"
+                "message.first_output"
             }
             _ => return,
         };
@@ -1148,12 +1179,13 @@ impl Session {
                 // The host's history is the record. After a runtime restart it
                 // already holds every row (including an interrupted reply the
                 // runtime never saved), so only a fresh attach imports.
-                let keep_host_history = matches!(self.status(), Status::Recovering)
-                    && !self
-                        .history
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .is_empty();
+                // A saved conversation's history was read from its file on open
+                // (`open_saved_history`); the runtime's copy would only renumber it.
+                let keep_host_history = !self
+                    .history
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_empty();
                 if let (false, Some(data)) = (keep_host_history, value.get("data")) {
                     self.import_history(data);
                 }
@@ -1252,6 +1284,33 @@ impl Session {
         self.publish_summary();
     }
 
+    /// Load the transcript of the session's saved file into the host history.
+    pub(crate) fn open_saved_history(&self) {
+        let Some(path) = self.saved_path() else { return };
+        let started = Instant::now();
+        let Ok(messages) = saved_messages(Path::new(&path)) else { return };
+        let count = messages.len();
+        self.import_history(&Value::Array(messages));
+        // Last changed when the file was, as the saved-session list says.
+        if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) {
+            let mut updated = self.updated_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if updated.is_none() {
+                *updated = Some(DateTime::<Utc>::from(modified).to_rfc3339_opts(SecondsFormat::Millis, true));
+            }
+        }
+        log(
+            &self.home,
+            "info",
+            "session.history",
+            json!({
+                "session": self.id,
+                "messages": count,
+                "rows": self.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len(),
+                "elapsedMs": started.elapsed().as_millis() as u64,
+            }),
+        );
+    }
+
     fn import_history(&self, data: &Value) {
         let messages = data
             .as_array()
@@ -1265,6 +1324,30 @@ impl Session {
                 .get("role")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            // A tool's result belongs on the reply that called it, as it does
+            // when the turn streams live (`push_assistant_tool_result`).
+            if role == "toolResult" {
+                let call_id = message.get("toolCallId").and_then(Value::as_str);
+                let reply = rows
+                    .iter_mut()
+                    .rev()
+                    .find(|row: &&mut Value| row.get("kind").and_then(Value::as_str) == Some("assistant"));
+                if let (Some(call_id), Some(blocks)) = (
+                    call_id,
+                    reply.and_then(|row| row.get_mut("blocks")).and_then(Value::as_array_mut),
+                ) {
+                    blocks.push(json!({
+                        "type": "toolResult",
+                        "toolCallId": call_id,
+                        "ok": message.get("isError").and_then(Value::as_bool) != Some(true),
+                        "result": {
+                            "content": message.get("content").cloned().unwrap_or(Value::Null),
+                            "details": message.get("details").cloned().unwrap_or(Value::Null),
+                        },
+                    }));
+                }
+                continue;
+            }
             if role != "user" && role != "assistant" {
                 continue;
             }
@@ -1342,6 +1425,19 @@ impl Session {
         if rows.is_empty() {
             return;
         }
+        // Titled as the session list titles a saved file: by its first message.
+        let first = rows
+            .iter()
+            .find(|row| row.get("kind").and_then(Value::as_str) == Some("user"))
+            .and_then(|row| row.get("text").and_then(Value::as_str))
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "));
+        if let Some(first) = first.filter(|text| !text.is_empty()) {
+            let mut title = self.title.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if title.is_empty() {
+                *title = first.chars().take(80).collect();
+            }
+        }
+        let count = rows.len();
         self.history
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1350,6 +1446,8 @@ impl Session {
         for row in rows {
             self.push_history(row);
         }
+        // A client that read the history before this replaced it reads it again.
+        self.publish("session.history", json!({ "rows": count }));
     }
 
     fn handle_runtime_line(self: &Arc<Self>, value: Value) {
@@ -2379,12 +2477,16 @@ impl Session {
             "message.accepted",
             json!({ "messageId": message_id.clone(), "receipt": "queued" }),
         );
-        let was_pending = matches!(self.status(), Status::Pending);
+        // Running only once the runtime has the session, as the summary says.
+        let starting = matches!(
+            self.status(),
+            Status::Pending | Status::Starting | Status::Recovering
+        );
         self.publish(
             "turn.start",
             json!({
                 "turnId": message_id.clone(),
-                "phase": if was_pending { "starting" } else { "running" },
+                "phase": if starting { "starting" } else { "running" },
             }),
         );
         self.publish_summary();
@@ -3832,21 +3934,8 @@ impl SessionManager {
         limit: Option<usize>,
     ) -> Result<Vec<Value>, ApiError> {
         let path = self.session_file(session_path)?;
-        let file = std::fs::File::open(path)
+        let mut messages = saved_messages(&path)
             .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
-        let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
-        let mut messages = Vec::new();
-        for line in std::io::BufRead::lines(reader) {
-            let Ok(line) = line else { break };
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if value.get("type").and_then(Value::as_str) == Some("message") {
-                if let Some(message) = value.get("message") {
-                    messages.push(message.clone());
-                }
-            }
-        }
         if let Some(limit) = limit {
             if messages.len() > limit {
                 messages.drain(..messages.len() - limit);
@@ -4271,6 +4360,7 @@ impl SessionManager {
                 if is_scratch_workspace(&cwd) {
                     return None;
                 }
+
                 let normalized = cwd
                     .replace('\\', "/")
                     .trim_start_matches("//?/")
@@ -4501,7 +4591,14 @@ impl SessionManager {
         key: Option<String>,
         status: Status,
     ) -> Result<Arc<Session>, ApiError> {
-        let workspace = std::fs::canonicalize(workspace)
+        // A saved conversation belongs to the folder its file names, whatever
+        // folder the client happens to be showing: the runtime works there and
+        // the sidebar must file it there.
+        let workspace = session_path
+            .as_deref()
+            .and_then(session_header_cwd)
+            .unwrap_or_else(|| workspace.to_string());
+        let workspace = std::fs::canonicalize(&workspace)
             .map_err(|_| ApiError::bad_request("workspacePath is unavailable"))?;
         if !workspace.is_dir() {
             return Err(ApiError::bad_request("workspacePath must be a folder"));
@@ -4627,6 +4724,10 @@ impl SessionManager {
             sessions.insert(session.id.clone(), session.clone());
         }
         if matches!(status, Status::Starting) {
+            // A saved conversation is readable the moment it is opened: its
+            // history comes from its file, not from the runtime that attaches
+            // to it seconds (or, on a busy machine, minutes) later.
+            session.open_saved_history();
             let starting = session.clone();
             tokio::spawn(async move { starting.start(false) });
         } else if let Some(pool) = config.warm.get() {

@@ -631,6 +631,8 @@ async fn create_session(
             "sessionId": session.id,
             "status": session.status().as_str(),
             "cursor": session.cursor(),
+            "sessionPath": session.saved_path(),
+            "workspacePath": session.workspace_path,
         })),
     )
         .into_response();
@@ -3260,6 +3262,48 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_saved_session_opens_readable_in_its_own_folder() {
+        // The client is showing another folder; the conversation belongs to the
+        // folder its file names, and its transcript (tool results included) is
+        // there before any runtime answers.
+        let (manager, _home, shown) = manager(50);
+        let own = tempfile::tempdir().unwrap();
+        let file = own.path().join("old.jsonl");
+        let lines = [
+            json!({ "type": "session", "version": 3, "id": "saved", "timestamp": "2026-01-01T00:00:00Z", "cwd": own.path().to_string_lossy() }),
+            json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": "list the files" }] } }),
+            json!({ "type": "message", "message": { "role": "assistant", "content": [{ "type": "toolCall", "id": "call-1", "name": "ls", "arguments": {} }] } }),
+            json!({ "type": "message", "message": { "role": "toolResult", "toolCallId": "call-1", "toolName": "ls", "content": [{ "type": "text", "text": "a.txt" }], "isError": false } }),
+            json!({ "type": "message", "message": { "role": "assistant", "content": [{ "type": "text", "text": "One file." }] } }),
+        ];
+        std::fs::write(&file, lines.iter().map(|line| format!("{line}\n")).collect::<String>()).unwrap();
+        let session = manager
+            .create(
+                shown.path().to_str().unwrap(),
+                Some(file.to_string_lossy().into_owned()),
+                None,
+            )
+            .unwrap();
+        let history = session.history(50, None);
+        let rows = history["messages"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{history}");
+        let texts: Vec<&str> = rows.iter().rev().filter_map(|row| row["text"].as_str()).collect();
+        assert_eq!(texts, vec!["list the files", "", "One file."]);
+        let call = rows.iter().find(|row| row["blocks"][0]["type"] == "toolCall").unwrap();
+        assert_eq!(call["blocks"][1]["type"], "toolResult", "{call}");
+        assert_eq!(call["blocks"][1]["result"]["content"][0]["text"], "a.txt");
+        let info = session.info();
+        assert_eq!(info["title"], "list the files");
+        assert_eq!(
+            std::fs::canonicalize(info["workspacePath"].as_str().unwrap()).unwrap(),
+            std::fs::canonicalize(own.path()).unwrap(),
+        );
+        wait_status(&session, Status::Idle).await;
+        assert_eq!(session.history(50, None)["messages"].as_array().unwrap().len(), 3);
+        manager.stop_all();
+    }
+
+    #[tokio::test]
     async fn a_new_session_in_a_folder_keeps_the_spelling_its_sessions_use() {
         let (manager, _home, workspace) = manager(50);
         let folder = std::fs::canonicalize(workspace.path()).unwrap();
@@ -3763,7 +3807,7 @@ mod session_tests {
             .filter(|line| line["event"] == "timing" && line["fields"]["clientMessageId"] == "timed")
             .map(|line| line["fields"]["mark"].as_str().unwrap_or_default().to_string())
             .collect();
-        for expected in ["message.accepted", "turn.start", "message.first_delta", "turn.end"] {
+        for expected in ["message.accepted", "turn.start", "message.first_output", "turn.end"] {
             assert!(marks.iter().any(|mark| mark == expected), "{expected} missing from {marks:?}");
         }
         assert!(!log.contains("secret words"), "timing must not log content");

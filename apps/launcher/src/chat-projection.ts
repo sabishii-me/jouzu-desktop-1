@@ -58,10 +58,36 @@ export function hostBlocks(blocks: unknown): ChatBlock[] {
       const id = typeof block.toolCallId === "string" ? block.toolCallId : typeof block.id === "string" ? block.id : "";
       return id ? [{ type: "toolCall", id, name: typeof block.name === "string" ? block.name : "tool", arguments: block.input ?? block.arguments }] : [];
     }
-    if (block.type === "toolResult" && typeof block.toolCallId === "string") return [{ type: "toolResult", toolCallId: block.toolCallId, content: [{ type: "text", text: typeof block.result === "string" ? block.result : JSON.stringify(block.result ?? "") }], isError: block.ok === false }];
+    // A tool's result is shown on its call (see `hostToolResults`), not as a block of its own.
+    if (block.type === "toolResult") return [];
     if (block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string") return [{ type: "image", data: block.data, mimeType: block.mimeType }];
     return [];
   });
+}
+
+/** The tool results a host row or `message.done` carries, keyed by tool call. */
+export function hostToolResults(blocks: unknown, known: Record<string, ToolView>): Record<string, ToolView> {
+  if (!Array.isArray(blocks)) return {};
+  const calls = new Map<string, { name: string; args: unknown }>();
+  const results: Record<string, ToolView> = {};
+  for (const block of blocks) {
+    if (!object(block)) continue;
+    const id = typeof block.toolCallId === "string" ? block.toolCallId : typeof block.id === "string" ? block.id : "";
+    if (!id) continue;
+    if (block.type === "toolCall") calls.set(id, { name: typeof block.name === "string" ? block.name : "tool", args: block.input ?? block.arguments });
+    if (block.type === "toolResult") {
+      const call = calls.get(id);
+      results[id] = {
+        id,
+        name: known[id]?.name ?? call?.name ?? "tool",
+        args: known[id]?.args ?? call?.args,
+        phase: block.ok === false ? "error" : "complete",
+        // The same value `tool.result` carried live.
+        result: block.result ?? known[id]?.result,
+      };
+    }
+  }
+  return results;
 }
 
 /** Images the user attached, as stored by the host with the user row. */
@@ -91,6 +117,7 @@ export function historyRowsProjection(rows: unknown): ChatProjection {
         ...(typeof row.provider === "string" ? { provider: row.provider } : {}),
       });
       for (const block of content) if (block.type === "toolCall" && typeof block.id === "string") tools[block.id] = { id: block.id, name: block.name ?? "tool", args: block.arguments, phase: tools[block.id]?.phase ?? "running", result: tools[block.id]?.result };
+      Object.assign(tools, hostToolResults(row.blocks, tools));
       continue;
     }
     if (kind === "tool") {
