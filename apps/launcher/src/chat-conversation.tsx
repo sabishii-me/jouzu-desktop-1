@@ -59,7 +59,10 @@ function contentParts(message: ChatMessage, index: number, projection: ChatProje
       return;
     }
     if (block.type === "thinking") {
-      if (!(projection.running && projection.activeMessage === index)) {
+      // Only the reasoning still being written lives in the turn status line; every
+      // finished step keeps its reasoning in place while the turn goes on.
+      const streaming = projection.running && projection.activeMessage === index && position === message.content.length - 1;
+      if (!streaming) {
         activity.push({ kind: "thinking", id: `thinking-${index}-${position}`, text: block.thinking ?? "", streaming: false });
       }
       return;

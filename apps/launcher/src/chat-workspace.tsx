@@ -1180,10 +1180,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const booting = !chatUnavailable && !snapshot.connected && !sessionError;
   const conversationProjection = activePreview?.projection ?? snapshot.projection;
   const activeMessage = conversationProjection.activeMessage === null ? undefined : conversationProjection.messages[conversationProjection.activeMessage];
-  const hasRunningTool = Object.values(conversationProjection.tools).some(tool => tool.phase === "running");
-  const liveThinking = conversationProjection.running && activeMessage && !hasRunningTool
-    ? activeMessage.content.flatMap(block => block.type === "thinking" ? [block.thinking ?? ""] : []).join("\n")
-    : "";
+  // The reasoning being written now: the reply's last block, while the turn runs.
+  const streamingBlock = conversationProjection.running ? activeMessage?.content.at(-1) : undefined;
+  const liveThinking = streamingBlock?.type === "thinking" ? streamingBlock.thinking ?? "" : "";
   const lastMessage = conversationProjection.messages.at(-1);
   const settled = !conversationProjection.running
     ? lastMessage?.role === "assistant" && lastMessage.stopReason === "error" ? "failed" as const
