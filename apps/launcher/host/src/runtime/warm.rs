@@ -79,6 +79,13 @@ struct Inner {
     /// they are done: on a busy machine a runtime booting beside the one the
     /// user waits for (the entry session at start-up) slows it down.
     attaching: usize,
+    /// A runtime being spawned (its generation and folder): the process start
+    /// runs outside the lock, and until its slot exists the pool must still
+    /// count it as starting, or a second `fill` spawns beside it and the
+    /// loading screen sees "off" and stops waiting.
+    spawning: Option<(u64, Option<PathBuf>)>,
+    /// Stopped for good (the host is shutting down): nothing starts again.
+    stopped: bool,
 }
 
 /// Blank runtimes kept warm. The entry session is the fifth runtime.
@@ -132,7 +139,7 @@ impl Inner {
     fn state(&self) -> WarmState {
         if self.slots.iter().any(|slot| slot.ready_ms.is_some()) {
             WarmState::Ready
-        } else if !self.slots.is_empty() {
+        } else if !self.slots.is_empty() || self.spawning.is_some() {
             WarmState::Starting
         } else if self.error.is_some() {
             WarmState::Failed
@@ -193,6 +200,8 @@ impl WarmPool {
                 taken: 0,
                 recent,
                 attaching: 0,
+                spawning: None,
+                stopped: false,
             }),
             changed: Box::new(changed),
             ready: Notify::new(),
@@ -214,7 +223,7 @@ impl WarmPool {
             "state": inner.state().as_str(),
             "elapsedMs": next.map(|slot| slot.started_at.elapsed().as_millis() as u64),
             "readyMs": next.and_then(|slot| slot.ready_ms),
-            "error": if inner.slots.is_empty() { inner.error.clone() } else { None },
+            "error": if inner.slots.is_empty() && inner.spawning.is_none() { inner.error.clone() } else { None },
             "taken": inner.taken,
             "pid": next.map(|slot| slot.runtime.pid()),
             "warm": inner.slots.len(),
@@ -242,8 +251,8 @@ impl WarmPool {
     pub fn fill(self: &Arc<Self>) {
         let (generation, workspace) = {
             let mut inner = self.lock();
-            let starting = inner.slots.iter().any(|slot| slot.ready_ms.is_none());
-            if starting || inner.attaching > 0 || inner.failures >= MAX_FAILURES {
+            let starting = inner.spawning.is_some() || inner.slots.iter().any(|slot| slot.ready_ms.is_none());
+            if inner.stopped || starting || inner.attaching > 0 || inner.failures >= MAX_FAILURES {
                 return;
             }
             // The first planned place without a runtime: the most recent folder first.
@@ -254,8 +263,10 @@ impl WarmPool {
             };
             inner.generation += 1;
             inner.error = None;
+            inner.spawning = Some((inner.generation, plan[place].clone()));
             (inner.generation, plan[place].clone())
         };
+        self.notify();
         let mut spec = (self.spec)(workspace.as_deref());
         // Below normal until someone waits for it (`hurry`, `take`): the spare
         // stays there, the first one is hurried by the loading screen.
@@ -275,10 +286,14 @@ impl WarmPool {
         let target: Arc<Mutex<Option<mpsc::Sender<RuntimeEvent>>>> = Arc::new(Mutex::new(None));
         {
             let mut inner = self.lock();
+            inner.spawning = None;
             if inner.generation != generation {
-                // Retired while spawning (aimed elsewhere, recycled, stopped).
+                // Retired while spawning (aimed elsewhere, recycled, stopped):
+                // start what the pool wants now instead.
                 drop(inner);
                 runtime.terminate();
+                self.notify();
+                self.fill();
                 return;
             }
             inner.slots.push(Slot {
@@ -380,6 +395,9 @@ impl WarmPool {
     fn failed(self: &Arc<Self>, generation: u64, message: String) {
         let retry = {
             let mut inner = self.lock();
+            if inner.spawning.as_ref().is_some_and(|(spawning, _)| *spawning == generation) {
+                inner.spawning = None;
+            }
             let before = inner.slots.len();
             inner.slots.retain(|slot| slot.generation != generation);
             let removed = inner.slots.len() != before;
@@ -488,8 +506,13 @@ impl WarmPool {
                 }
             }
             inner.slots = keep;
-            if !stale.is_empty() {
-                // Invalidates a spawn in flight that the plan may no longer want.
+            // A runtime still being spawned keeps going if the new plan has an
+            // empty place for its folder; otherwise it is retired once spawned.
+            let (_, covered) = assign(&plan, &inner.slots);
+            let wanted = inner.spawning.as_ref().is_none_or(|(_, folder)| {
+                (0..plan.len()).any(|place| !covered[place] && same_slot(plan[place].as_deref(), folder.as_deref()))
+            });
+            if !wanted {
                 inner.generation += 1;
             }
             stale
@@ -584,6 +607,7 @@ impl WarmPool {
         let slots = {
             let mut inner = self.lock();
             inner.generation += 1;
+            inner.stopped = true;
             std::mem::take(&mut inner.slots)
         };
         for slot in slots {

@@ -485,6 +485,14 @@ pub struct Session {
     queued_turns: Mutex<VecDeque<Queued>>,
     /// Steered messages up to this generation are being taken back (`clear_queue`).
     steer_generation: AtomicU64,
+    /// This run's first model call has started (its first reply began). The
+    /// runtime takes waiting steers once more just before that call, so a
+    /// steer handed over earlier would be merged into the first message.
+    replying: AtomicBool,
+    /// Created as a new conversation, not opened from a saved file. Only a new
+    /// one starts on the default model; a saved one keeps the model it used,
+    /// which the runtime restores when it opens the file.
+    fresh: AtomicBool,
     /// The running turn's own prompt has not come back from the runtime yet;
     /// the first user message of a run is that prompt, not a steered one.
     prompt_echo: AtomicBool,
@@ -727,9 +735,12 @@ impl Session {
     }
 
     /// Hand every waiting message to the running turn. The runtime delivers
-    /// each one at its next step boundary, before the next model call.
+    /// each one at its next step boundary, before the next model call. Not
+    /// before the run's first reply has started: the runtime would put it in
+    /// the first request beside the message that started the run.
     fn steer_queue(&self) {
-        if self.queue_paused.load(Ordering::SeqCst)
+        if !self.replying.load(Ordering::SeqCst)
+            || self.queue_paused.load(Ordering::SeqCst)
             || self.cancelling.load(Ordering::SeqCst)
             || self.active_turn().is_none()
             || !matches!(
@@ -1310,37 +1321,18 @@ impl Session {
         self.tx.subscribe()
     }
 
+    /// Everything a client needs to show the session from scratch: the same
+    /// fields as `session.updated` (queue, failed message, turn, prompts), plus
+    /// where the stream resumes. One builder, so the two cannot drift apart.
     pub fn snapshot_event(&self) -> SessionEvent {
         let cursor = self.cursor();
+        let mut data = self.summary();
+        data["cursor"] = json!(cursor);
+        data["workspacePath"] = json!(canonical_path(&self.workspace_path));
         SessionEvent {
             id: cursor,
             event: "session.snapshot".to_string(),
-            data: json!({
-                "sessionId": self.id,
-                "status": self.status().as_str(),
-                "activeTurn": self.active_turn(),
-                "cursor": cursor,
-                "workspacePath": canonical_path(&self.workspace_path),
-                "sessionPath": self
-                    .session_path
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone(),
-                "pendingApprovals": self.pending_approvals(),
-                "pendingQuestions": self.pending_questions(),
-                "statuses": self.ui_statuses(),
-                "widgets": self.ui_widgets(),
-                "model": self
-                    .model
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone(),
-                "thinkingLevel": self
-                    .thinking_level
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone(),
-            }),
+            data,
         }
     }
 
@@ -2083,8 +2075,9 @@ impl Session {
         match pi::classify(&value) {
             PiRecord::Response => self.handle_response(&value),
             PiRecord::AgentStart => {
+                // Waiting messages go in once the first reply starts.
+                self.replying.store(false, Ordering::SeqCst);
                 self.set_status(Status::Running);
-                self.steer_queue();
             }
             PiRecord::TurnStart => {
                 if self.active_turn_id().is_some() {
@@ -2103,6 +2096,9 @@ impl Session {
                     return;
                 }
                 let assistant = role == Some("assistant");
+                if assistant && !self.replying.swap(true, Ordering::SeqCst) {
+                    self.steer_queue();
+                }
                 if assistant && self.active_turn_id().is_some() {
                     // A second reply in one step is a step the runtime did not mark.
                     let (n, written) = {
@@ -3588,11 +3584,15 @@ impl Session {
         Ok(selected)
     }
 
-    /// A session with no model yet starts from the runtime's default.
+    /// A new conversation with no model yet starts from the default. A saved
+    /// one is left alone: the runtime restores its model and reports it.
     pub fn adopt_default_model(&self, model: Option<Value>) {
         let Some(model) = model else {
             return;
         };
+        if !self.fresh.load(Ordering::SeqCst) {
+            return;
+        }
         let unset = self
             .model
             .lock()
@@ -3913,6 +3913,8 @@ impl Session {
             messages: Mutex::new(HashMap::new()),
             queued_turns: Mutex::new(VecDeque::new()),
             steer_generation: AtomicU64::new(0),
+            replying: AtomicBool::new(false),
+            fresh: AtomicBool::new(false),
             prompt_echo: AtomicBool::new(false),
             queue_paused: AtomicBool::new(false),
             first_output_turn: Mutex::new(None),
@@ -5435,10 +5437,21 @@ impl SessionManager {
             }
         }
         let config = self.config.clone().ok_or_else(|| {
+            // Without a `--runtime`, the host runs the bundled Node and app; say
+            // which one is missing rather than falling back to anything else.
+            let managed = self.runtime_home.parent().unwrap_or(&self.home);
+            let node = managed.join("runtime").join("node").join("node.exe");
+            let message = if !node.is_file() {
+                format!("Jouzu's bundled Node.js is missing ({}). Reinstall Jouzu to restore it.", node.display())
+            } else {
+                "Jouzu's bundled runtime is missing. Reinstall Jouzu to restore it.".to_string()
+            };
             ApiError::new(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "runtime-unavailable",
-                "No runtime is configured for the host",
+                // Not retryable, and not the generic "try again" text: the
+                // message says what is missing.
+                "runtime-missing",
+                message,
                 false,
             )
         })?;
@@ -5446,6 +5459,7 @@ impl SessionManager {
         // A new session gets its identity at creation, not after the runtime
         // handshake. The index and navigation can then show it before the first
         // reply, including when the turn is stopped during starting.
+        let fresh = session_path.is_none();
         let session_path = match session_path {
             Some(path) => Some(path),
             None if matches!(status, Status::Pending) => {
@@ -5479,6 +5493,7 @@ impl SessionManager {
             status,
             &config,
         );
+        session.fresh.store(fresh, Ordering::SeqCst);
         {
             let mut sessions = self
                 .sessions

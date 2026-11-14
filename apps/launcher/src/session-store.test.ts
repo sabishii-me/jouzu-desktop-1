@@ -56,6 +56,20 @@ describe("SessionStore", () => {
     expect(projection.running).toBe(false);
   });
 
+  it("a snapshot restores the waiting queue and the failed message", () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(9, "session.snapshot", {
+      status: "idle",
+      cursor: 9,
+      activeTurn: null,
+      queue: [{ turnId: "m-2", clientMessageId: "c-2", text: "two", images: 0, state: "paused" }],
+      failedTurn: { clientMessageId: "c-3", text: "three" },
+    }));
+    expect(store.snapshot.queue).toMatchObject([{ clientMessageId: "c-2", text: "two", state: "paused" }]);
+    expect(store.snapshot.failedTurn).toEqual({ clientMessageId: "c-3", text: "three" });
+  });
+
   it("shows a send in the outbox until the host confirms it", async () => {
     let release: () => void = () => {};
     const session = fakeSession();

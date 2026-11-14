@@ -25,13 +25,13 @@ export function SessionStatsBar({ stats, timing, firstOutputMs }: { stats?: Sess
   const total = Number.isFinite(tokens.total) ? tokens.total! : (tokens.input ?? 0) + (tokens.output ?? 0) + (tokens.cacheRead ?? 0) + (tokens.cacheWrite ?? 0);
   const prompt = (tokens.input ?? 0) + (tokens.cacheRead ?? 0) + (tokens.cacheWrite ?? 0);
   const cached = prompt > 0 ? Math.round((tokens.cacheRead ?? 0) / prompt * 100) : null;
-  const turns = stats.userMessages ?? timing?.turns ?? 0;
-  const steps = stats.assistantMessages ?? timing?.steps ?? 0;
+  // Turn and step counts are debug data (host.log and the API), not shown here.
+  const modelMs = timing?.modelMs ?? 0;
   const percent = stats.contextUsage?.percent;
   const speed = timing && timing.modelMs > 0 ? timing.outputTokens / (timing.modelMs / 1000) : null;
-  if (!total && !steps && percent == null) return null;
+  if (!total && !modelMs && percent == null) return null;
   return <div aria-label="Session usage" className="mx-auto flex max-w-3xl flex-wrap items-center gap-x-2 gap-y-1 px-2 py-1.5 text-[11px] text-muted-foreground">
-    {steps > 0 && <StatPopover label={<><Gauge className="size-3.5" aria-hidden="true" />{turns} turns · {steps} steps{speed !== null ? ` · ${compact(speed)} tok/s` : ""}</>}>
+    {modelMs > 0 && <StatPopover label={<><Gauge className="size-3.5" aria-hidden="true" />{speed !== null && speed > 0 ? `${compact(speed)} tok/s` : formatDuration(modelMs)}</>}>
       <StatCard title="Session stats">
         <StatRow label="Model time" value={formatDuration(timing?.modelMs ?? 0)} />
         <StatRow label="Tool time" value={formatDuration(timing?.toolMs ?? 0)} />

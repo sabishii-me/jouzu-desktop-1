@@ -1940,7 +1940,7 @@ mod tests {
 
     fn control_manager(home: &Path) -> Arc<control::ControlManager> {
         Arc::new(
-            control::ControlManager::new(home, home, home, &home.join("data"), None)
+            control::ControlManager::new(home, home, None, home, &home.join("data"), None)
                 .expect("control manager"),
         )
     }
@@ -2378,7 +2378,7 @@ mod session_tests {
             started: Instant::now(),
             version: "0.1.0".to_string(),
             sessions: manager,
-            control: Arc::new(control::ControlManager::new(&home, &home, &home, &home.join("data"), None).expect("control manager")),
+            control: Arc::new(control::ControlManager::new(&home, &home, None, &home, &home.join("data"), None).expect("control manager")),
             events: events::EventHub::new(),
             models: Arc::new(models::Models::new(&home)),
         }
@@ -2698,6 +2698,39 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_message_sent_before_the_first_reply_steers_the_next_step() {
+        // The runtime takes waiting steers once more just before its first model
+        // call; a steer handed over then would join the first message. It must
+        // wait for the first reply to start, and land as step 2.
+        let prompts = tempfile::NamedTempFile::new().unwrap();
+        let prompt_log = prompts.path().to_str().unwrap().to_string();
+        let (manager, _home, workspace) = manager_with_env(
+            200,
+            &[
+                ("FAKE_RUNTIME_STEPS", "2"),
+                ("FAKE_RUNTIME_DELAY_MS", "150"),
+                ("FAKE_RUNTIME_PROMPT_LOG", &prompt_log),
+            ],
+        );
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("first", "one").unwrap();
+        wait_until(|| session.status() == Status::Running).await;
+        let receipt = session.send("second", "two").unwrap();
+        assert_eq!(receipt["waiting"], true, "{receipt}");
+        wait_until(|| session.status() == Status::Idle && queue_texts(&session).is_empty()).await;
+        let rows = conversation(&session);
+        let one = rows.iter().position(|row| row == "user:one").unwrap();
+        let two = rows.iter().position(|row| row == "user:two").unwrap();
+        assert!(rows[one + 1].starts_with("assistant:"), "the first message is answered on its own: {rows:?}");
+        assert!(two > one + 1 && !rows[two - 1].starts_with("user:"), "{rows:?}");
+        let sent = std::fs::read_to_string(&prompt_log).unwrap();
+        assert_eq!(sent.lines().collect::<Vec<_>>(), vec!["one"], "it went in as steer: {sent}");
+    }
+
+    #[tokio::test]
     async fn stop_takes_steered_messages_back_and_continue_sends_them_once() {
         let prompts = tempfile::NamedTempFile::new().unwrap();
         let prompt_log = prompts.path().to_str().unwrap().to_string();
@@ -2724,6 +2757,10 @@ mod session_tests {
         let summary = session.summary();
         assert_eq!(queue_texts(&session), vec!["two"], "{summary}");
         assert_eq!(summary["queue"][0]["state"], "paused", "{summary}");
+        // A client that attaches now (a reopened window) sees the same queue.
+        let snapshot = session.snapshot_event().data;
+        assert_eq!(snapshot["queue"], summary["queue"], "{snapshot}");
+        assert!(snapshot.get("failedTurn").is_some() && snapshot.get("firstOutput").is_some(), "{snapshot}");
         assert!(!conversation(&session).contains(&"user:two".to_string()));
         session.continue_queue().unwrap();
         // It runs as its own turn now (this fixture's runs wait on a tool).
@@ -3512,6 +3549,27 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_saved_conversation_keeps_the_model_it_used() {
+        let (manager, _home, workspace) = manager(50);
+        let header = json!({ "type": "session", "version": 3, "id": "saved-model", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let change = json!({ "type": "model_change", "id": "c1", "parentId": null, "timestamp": "2026-01-01T00:00:01Z", "provider": "fixture", "modelId": "own-model" });
+        let file = workspace.path().join("saved.jsonl");
+        std::fs::write(&file, format!("{header}\n{change}\n")).unwrap();
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+        // What opening a session does (create_session): the default is offered.
+        session.adopt_default_model(Some(json!({ "provider": "fixture", "id": "default-x" })));
+        wait_status(&session, Status::Idle).await;
+        let state = session
+            .request(json!({ "type": "get_state" }), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(state["model"]["id"], "own-model", "{state}");
+        assert_eq!(session.info()["model"]["id"], "own-model", "{}", session.info());
+    }
+
+    #[tokio::test]
     async fn a_new_session_takes_the_warm_runtime_and_the_pool_starts_the_next() {
         let (manager, _home, workspace) = manager(50);
         let pool = manager.enable_warm_runtime().expect("warm pool");
@@ -3640,6 +3698,41 @@ mod session_tests {
         // The next warm runtime is for the same folder, and remembered.
         let next = pool.wait_settled(Duration::from_secs(10)).await;
         assert_eq!(next["workspace"], aimed["workspace"]);
+        manager.stop_all();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_requests_start_one_warm_runtime_and_never_read_off() {
+        // The process start runs outside the pool's lock. Until its slot exists
+        // the pool must still say "starting" and must not start a second one.
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_START_DELAY_MS", "400")]);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let folder = std::fs::canonicalize(workspace.path()).unwrap();
+        let mut threads = Vec::new();
+        for n in 0..8 {
+            let pool = pool.clone();
+            let folder = folder.clone();
+            let handle = tokio::runtime::Handle::current();
+            threads.push(std::thread::spawn(move || {
+                let _entered = handle.enter();
+                let mut seen = Vec::new();
+                for _ in 0..20 {
+                    if n % 2 == 0 { pool.aim(&folder) } else { pool.fill() }
+                    seen.push(pool.status());
+                }
+                seen
+            }));
+        }
+        for thread in threads {
+            for status in thread.join().unwrap() {
+                assert_ne!(status["state"], "off", "{status}");
+                let starting = status["slots"].as_array().unwrap().iter().filter(|slot| slot["ready"] == false).count();
+                assert!(starting <= 1, "{status}");
+            }
+        }
+        let status = pool.status();
+        assert_ne!(status["state"], "off", "{status}");
         manager.stop_all();
     }
 

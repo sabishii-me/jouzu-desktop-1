@@ -106,6 +106,7 @@ async fn main() -> ExitCode {
     let control = match jouzu_host::control::ControlManager::new(
         &install,
         &managed,
+        runtime.as_ref().map(|spec| spec.program.clone()),
         &home,
         &runtime_home,
         Some(events.clone()),

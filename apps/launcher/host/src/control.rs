@@ -132,12 +132,14 @@ impl ControlManager {
     pub fn new(
         install: &Path,
         managed: &Path,
+        node: Option<std::path::PathBuf>,
         host_home: &Path,
         runtime_home: &Path,
         events: Option<Arc<crate::events::EventHub>>,
     ) -> Result<Self, String> {
         let app = app::resolve_app(install, managed)?;
-        let node = app::node_executable(managed);
+        // The runtime's own Node when the host was given one, else the bundled one.
+        let node = node.unwrap_or_else(|| app::node_executable(managed));
         let environment = crate::environment::read(host_home)?
             .into_iter()
             .filter(|entry| entry.enabled)

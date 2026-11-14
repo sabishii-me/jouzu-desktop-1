@@ -89,14 +89,11 @@ pub fn resolve_app(install: &Path, managed: &Path) -> Result<PathBuf, String> {
     Ok(app)
 }
 
-/// The provisioned Node, falling back to whatever `node` the environment provides.
+/// The Node that ships with Jouzu. There is no fallback to a `node` on PATH:
+/// another version would run Jouzu's code with different behaviour, and the
+/// difference would only show as strange errors. A missing one is reported.
 pub fn node_executable(managed: &Path) -> PathBuf {
-    let provisioned = managed.join("runtime").join("node").join("node.exe");
-    if provisioned.is_file() {
-        provisioned
-    } else {
-        PathBuf::from("node.exe")
-    }
+    managed.join("runtime").join("node").join("node.exe")
 }
 
 /// Node's entrypoint resolver rejects Windows verbatim paths. Keep canonical paths

@@ -688,22 +688,11 @@ export class SessionStore {
     const data = (event.data ?? {}) as Data;
     switch (event.event) {
       case "session.snapshot": {
+        // The same fields as `session.updated` (queue, failed message, turn,
+        // prompts), sent whole when the stream (re)attaches.
         const empty = this.state.projection.messages.length === 0;
-        this.update({
-          sessionId: text(data.sessionId) ?? this.state.sessionId,
-          sessionFile: text(data.sessionPath) ?? this.state.sessionFile,
-          status: text(data.status) ?? this.state.status,
-          model: text(data.model) ?? this.state.model,
-          thinkingLevel: text(data.thinkingLevel) ?? this.state.thinkingLevel,
-          thinkingLevels: Array.isArray(data.thinkingLevels) ? data.thinkingLevels.filter((level): level is string => typeof level === "string") : this.state.thinkingLevels,
-        });
-        const prompts = promptsOf(data.pendingApprovals, data.pendingQuestions);
-        if (prompts) this.update({ prompts });
-        if ("widgets" in data || "statuses" in data) this.update({ widgets: widgetsOf(data.widgets), statuses: statusesOf(data.statuses) });
-        // The snapshot names the active turn by id only; keep what we know of it.
-        const turnId = text(data.activeTurn);
-        if (turnId) this.applyTurn(this.state.activeTurn?.turnId === turnId ? this.state.activeTurn : { turnId, phase: "running" });
-        else if ("activeTurn" in data) this.applyTurn(null);
+        this.applySummary(data);
+        if (Array.isArray(data.thinkingLevels)) this.update({ thinkingLevels: data.thinkingLevels.filter((level): level is string => typeof level === "string") });
         // The stream can attach after turns already happened: reload the transcript.
         if (empty && typeof data.cursor === "number" && data.cursor > 0) void this.refreshHistory();
         break;

@@ -45,6 +45,12 @@ pub fn spec(context: &ControlContext) -> Result<LaunchSpec, String> {
     if SCRIPT.len() > MAX_SCRIPT_BYTES {
         return Err("Control adapter is too large for the command line".into());
     }
+    if !context.node.is_file() {
+        return Err(format!(
+            "Jouzu's bundled Node.js is missing ({}). Reinstall Jouzu to restore it.",
+            context.node.display()
+        ));
+    }
     // Node rejects verbatim paths, so the managed paths are converted at this boundary.
     let root = super::app::process_path(&context.root);
     let app = super::app::process_path(&context.app);
@@ -120,9 +126,18 @@ pub fn parse_event(line: &str) -> Option<DeviceCode> {
 mod tests {
     use super::*;
 
+    /// A bundled Node that exists (spec refuses a missing one).
+    fn node() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("jouzu-adapter-node-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = dir.join("node.exe");
+        std::fs::write(&node, "").unwrap();
+        node
+    }
+
     fn context() -> ControlContext {
         ControlContext {
-            node: PathBuf::from(r"C:\managed\runtime\node\node.exe"),
+            node: node(),
             root: PathBuf::from(r"C:\managed"),
             app: PathBuf::from(r"C:\managed\app"),
             home: PathBuf::from(r"C:\managed\data"),
@@ -134,6 +149,14 @@ mod tests {
     fn the_script_fits_the_command_line() {
         assert!(SCRIPT.len() <= MAX_SCRIPT_BYTES, "adapter grew to {} bytes", SCRIPT.len());
         assert!(spec(&context()).is_ok());
+    }
+
+    #[test]
+    fn a_missing_bundled_node_is_an_error_not_a_fallback() {
+        let mut context = context();
+        context.node = PathBuf::from(r"C:\nowhere\runtime\node\node.exe");
+        let error = spec(&context).unwrap_err();
+        assert!(error.contains("bundled Node.js is missing"), "{error}");
     }
 
     #[test]

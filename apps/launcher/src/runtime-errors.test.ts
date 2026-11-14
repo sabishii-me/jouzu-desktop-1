@@ -30,3 +30,9 @@ test("errors read as sentences, never as class-prefixed exceptions", async () =>
   expect(describeError(new ApiError("internal", "Host request failed (500)"))).toBe("Host request failed (500)");
   expect(describeError(new Error("Submission retention limit reached"))).toBe(CAPACITY_MESSAGE);
 });
+
+test("a missing bundled runtime says what is missing, not 'try again'", async () => {
+  const { describeError } = await import("./runtime-errors");
+  const { ApiError } = await import("./api/jouzu-api");
+  expect(describeError(new ApiError("runtime-missing", "Jouzu's bundled Node.js is missing (C:\\x\\node.exe). Reinstall Jouzu to restore it."))).toMatch(/bundled Node\.js is missing/);
+});

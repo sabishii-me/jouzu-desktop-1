@@ -1,7 +1,7 @@
 // Fake pi RPC runtime for host tests. It speaks the real wire shapes:
 // {id,type:"response",...}, extension_ui_request, and agent/message events.
 import { spawn } from "node:child_process";
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import readline from "node:readline";
 
 const delay = Number(process.env.FAKE_RUNTIME_DELAY_MS ?? 15);
@@ -328,6 +328,12 @@ lines.on("line", line => {
       response(value.id, "set_thinking_level", { level: String(value.level ?? "off") });
       break;
     case "switch_session":
+      // Like the runtime: a saved conversation resumes on the model it last used.
+      try {
+        const changes = readFileSync(String(value.sessionPath), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.type === "model_change");
+        const last = changes.at(-1);
+        if (last) currentModel = { name: last.modelId, provider: last.provider, id: last.modelId };
+      } catch {}
       response(value.id, "switch_session", { cancelled: false });
       break;
     case "prompt":
