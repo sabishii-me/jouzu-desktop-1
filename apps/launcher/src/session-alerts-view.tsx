@@ -33,8 +33,9 @@ export function SessionAlerts({ alerts }: { alerts: readonly SessionAlert[] }) {
 
 /**
  * Messages sent while a reply runs, in the order the runtime will read them. Each
- * can be taken back to edit or removed until the runtime has used it. After Stop
- * they wait for Continue (or Discard).
+ * can be taken back to edit or removed until the runtime has used it, except one
+ * Flow control holds (it delivers that one itself). After Stop they wait for
+ * Continue (or Discard).
  */
 export function SteerQueue({ items, onEdit, onRemove, onContinue, onDiscard }: { items: readonly QueuedMessage[]; onEdit: (clientMessageId: string) => void; onRemove: (clientMessageId: string) => void; onContinue: () => void; onDiscard: () => void }) {
   if (!items.length) return null;
@@ -50,8 +51,13 @@ export function SteerQueue({ items, onEdit, onRemove, onContinue, onDiscard }: {
     <ol className="mt-1 space-y-0.5">
       {items.map(item => <li key={item.clientMessageId} className="group flex items-center gap-2 rounded px-1 py-0.5 hover:bg-background/60">
         <span className="min-w-0 flex-1 truncate" title={item.text}>{item.text}{item.images > 0 && <span className="ml-1 text-muted-foreground">· {item.images === 1 ? "1 image" : `${item.images} images`}</span>}</span>
-        <Button variant="ghost" className="size-6 p-0" aria-label="Edit queued message" title="Edit" onClick={() => onEdit(item.clientMessageId)}><Pencil className="size-3" /></Button>
-        <Button variant="ghost" className="size-6 p-0" aria-label="Remove queued message" title="Remove" onClick={() => onRemove(item.clientMessageId)}><X className="size-3" /></Button>
+        {item.state === "held"
+          // Flow control took it and releases it when its gate opens; /flow is where it can be changed.
+          ? <span className="shrink-0 text-muted-foreground" title="Flow control is holding this message. Run /flow to see or release it.">Held by Flow</span>
+          : <>
+            <Button variant="ghost" className="size-6 p-0" aria-label="Edit queued message" title="Edit" onClick={() => onEdit(item.clientMessageId)}><Pencil className="size-3" /></Button>
+            <Button variant="ghost" className="size-6 p-0" aria-label="Remove queued message" title="Remove" onClick={() => onRemove(item.clientMessageId)}><X className="size-3" /></Button>
+          </>}
       </li>)}
     </ol>
   </section>;

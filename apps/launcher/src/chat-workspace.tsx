@@ -128,6 +128,20 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const readingRef = useRef(false);
   const [switching, setSwitching] = useState(false);
   const [commandBusy, setCommandBusy] = useState(false);
+  // A setting being applied (model, thinking level, reload, export...). A send made
+  // meanwhile waits for it and then goes out; it is never dropped.
+  const commandIdle = useRef<{ promise: Promise<void>; done: () => void } | null>(null);
+  function beginCommand() {
+    let done = () => {};
+    const promise = new Promise<void>(resolve => { done = resolve; });
+    commandIdle.current = { promise, done };
+    setCommandBusy(true);
+  }
+  function endCommand() {
+    commandIdle.current?.done();
+    commandIdle.current = null;
+    setCommandBusy(false);
+  }
   const [localSubmitted, setLocalSubmitted] = useState("");
   const sendCancelRef = useRef(false);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
@@ -625,6 +639,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (hero) { setComposerFocus(document.activeElement instanceof HTMLTextAreaElement); setHero(false); onStartSession?.(); }
     try {
       if (switchingRef.current) await switchPromise.current;
+      while (commandIdle.current) await commandIdle.current.promise;
       const ready = connection.current?.snapshot.connected ? connection.current : await awaitConnection();
       if (sendCancelRef.current) return;
       if (!ready || !await ensureSelectedSession(ready)) { tell("The session is still opening. Your message was not sent; it is still in the composer."); return; }
@@ -759,27 +774,27 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   async function reloadSession() {
     const client = connection.current;
     if (!client || commandBusy) return;
-    setCommandBusy(true);
+    beginCommand();
     try {
       if (!await ensureSelectedSession(client)) { tell("Could not reload the session: it is not attached.", "error"); return; }
       const active = connection.current;
       if (!active) return;
       await active.reloadSession();
     } catch (error) { report(error, "Could not reload the session."); }
-    finally { setCommandBusy(false); }
+    finally { endCommand(); }
   }
   /** Run an action on the attached session; a failure is reported above the composer. */
   async function withSession(action: (session: ChatConnection) => Promise<void>, failed: string) {
     const client = connection.current;
     if (!client || commandBusy) return;
-    setCommandBusy(true);
+    beginCommand();
     try {
       if (!await ensureSelectedSession(client)) { tell(failed, "error", { details: "The session could not be attached." }); return; }
       const active = connection.current;
       if (active) await action(active);
     }
     catch (error) { report(error, failed); }
-    finally { setCommandBusy(false); }
+    finally { endCommand(); }
   }
   function runFlow(verb: "clear" | "resume" | "off" | "on" | "status") {
     return withSession(async active => {
@@ -797,7 +812,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   async function selectSessionModel(provider: string, id: string) {
     const client = connection.current;
     if (!client || commandBusy) return;
-    setCommandBusy(true);
+    beginCommand();
     try {
       if (!await ensureSelectedSession(client)) { tell("Could not change the model.", "error", { details: "The session could not be attached." }); return; }
       const active = connection.current;
@@ -805,12 +820,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       await active.selectModel(provider, id);
     }
     catch (error) { report(error, "Could not change the model."); }
-    finally { setCommandBusy(false); }
+    finally { endCommand(); }
   }
   async function selectThinkingLevel(level: string) {
     const client = connection.current;
     if (!client || commandBusy) return;
-    setCommandBusy(true);
+    beginCommand();
     try {
       if (!await ensureSelectedSession(client)) { tell("Could not change the thinking level.", "error", { details: "The session could not be attached." }); return; }
       const active = connection.current;
@@ -818,7 +833,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       await active.setThinkingLevel(level);
     }
     catch (error) { report(error, "Could not change the thinking level."); }
-    finally { setCommandBusy(false); }
+    finally { endCommand(); }
   }
   async function recoverSession(sourcePath?: string): Promise<boolean> {
     const client = connection.current;
@@ -1046,7 +1061,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     try { selected = await api.native.saveFile({ title: "Export conversation", defaultPath: `${name}-conversation.html`, filters: [{ name: "HTML", extensions: ["html"] }] }); }
     catch (error) { report(error, "Could not choose where to export."); return; }
     if (typeof selected !== "string" || connection.current !== client) return;
-    setCommandBusy(true);
+    beginCommand();
     try {
       if (!await ensureSelectedSession(client)) { tell("Could not export the conversation.", "error", { details: "The session could not be attached." }); return; }
       const active = connection.current;
@@ -1054,7 +1069,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       await active.exportHtml(selected);
       if (connection.current === active) tell("Conversation exported.", "info", { details: selected, action: { label: "Show file", run: () => void api.native.reveal(selected).catch(() => {}) } });
     } catch (error) { if (connection.current) report(error, "Could not export the conversation."); }
-    finally { setCommandBusy(false); }
+    finally { endCommand(); }
   }
   async function switchWorkspace(next: string) {
     setAppView("chat");
@@ -1408,7 +1423,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           <div className="mb-2 flex flex-wrap items-center gap-2 px-1">{workspacePicker}</div>
           {promptNode && <div className="mb-3">{promptNode}</div>}
           {banners}
-          <Composer hero connected={snapshot.connected} pending={snapshot.pending || commandBusy || locked } opening={switching || opening || booting} starting={composerStarting} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
+          <Composer hero connected={snapshot.connected} pending={snapshot.pending || locked } settling={commandBusy} opening={switching || opening || booting} starting={composerStarting} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
           <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>
       </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
@@ -1421,7 +1436,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
             <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now)} running={conversationProjection.running} elapsed={elapsed} settled={settled} />
           </div>
           {promptNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{promptNode}</div>}
-          <Composer autoFocus={composerFocus} connected={snapshot.connected || !!activePreview} pending={snapshot.pending || commandBusy || (opening && !activePreview) || locked } opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
+          <Composer autoFocus={composerFocus} connected={snapshot.connected || !!activePreview} pending={snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
         </div>
         <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>

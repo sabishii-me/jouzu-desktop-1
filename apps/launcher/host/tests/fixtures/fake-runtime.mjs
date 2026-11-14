@@ -36,6 +36,8 @@ const messages = [];
 // The real runtime delivers them one per step, before the next model call, and
 // keeps going until the queue is empty; abort leaves them queued.
 let steering = [];
+// Steers an extension took and holds (Flow): released into the queue after the run settles.
+let held = [];
 const queueUpdate = () => out({ type: "queue_update", steering: steering.map(item => item.text), followUp: [] });
 const promptLog = text => { if (process.env.FAKE_RUNTIME_PROMPT_LOG) appendFileSync(process.env.FAKE_RUNTIME_PROMPT_LOG, `${text}\n`); };
 function userMessage(text, images) {
@@ -78,6 +80,7 @@ function settled(aborted) {
   current = null;
   pendingUi = null;
   out({ type: "agent_settled", aborted });
+  if (held.length) { steering.push(...held); held = []; queueUpdate(); }
 }
 
 function tick() {
@@ -338,6 +341,11 @@ lines.on("line", line => {
       const text = String(value.message ?? "");
       if (process.env.FAKE_RUNTIME_STEER_LOG) appendFileSync(process.env.FAKE_RUNTIME_STEER_LOG, `${text}\n`);
       if (handledPrompts || text.startsWith("/flow ")) {
+        response(value.id, "steer", { disposition: "handled" });
+        break;
+      }
+      if (text.startsWith("HOLD ")) {
+        held.push({ text, images: value.images });
         response(value.id, "steer", { disposition: "handled" });
         break;
       }

@@ -2803,6 +2803,40 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_message_flow_holds_waits_visibly_and_runs_once_when_released() {
+        let prompts = tempfile::NamedTempFile::new().unwrap();
+        let prompt_log = prompts.path().to_str().unwrap().to_string();
+        let (manager, _home, workspace) = manager_with_env(
+            200,
+            &[
+                ("FAKE_RUNTIME_STEPS", "2"),
+                ("FAKE_RUNTIME_DELAY_MS", "80"),
+                ("FAKE_RUNTIME_PROMPT_LOG", &prompt_log),
+            ],
+        );
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("first", "one").unwrap();
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        session.send("second", "HOLD me").unwrap();
+        // Taken by the extension, not delivered: still waiting, shown as held, not in history.
+        wait_until(|| session.summary()["queue"][0]["state"] == "held").await;
+        assert!(session.cancel_message("second").is_err(), "a held message cannot be removed here");
+        let users = |session: &crate::session::Session| -> Vec<String> {
+            conversation(session).into_iter().filter_map(|row| row.strip_prefix("user:").map(str::to_string)).collect()
+        };
+        assert_eq!(users(&session), vec!["one"]);
+        // Released after the run ended: the host runs it as the next turn, once.
+        wait_until(|| std::fs::read_to_string(&prompt_log).is_ok_and(|text| text.lines().count() == 2)).await;
+        wait_until(|| session.status() == Status::Idle && queue_texts(&session).is_empty()).await;
+        let sent = std::fs::read_to_string(&prompt_log).unwrap();
+        assert_eq!(sent.lines().collect::<Vec<_>>(), vec!["one", "HOLD me"], "{sent}");
+        assert_eq!(users(&session), vec!["one", "HOLD me"]);
+    }
+
+    #[tokio::test]
     async fn a_steered_message_keeps_its_images() {
         let (manager, _home, workspace) =
             manager_with_env(200, &[("FAKE_RUNTIME_STEPS", "3"), ("FAKE_RUNTIME_DELAY_MS", "60")]);

@@ -437,6 +437,10 @@ struct Queued {
     steered: Option<u64>,
     /// The runtime would not take it as steer; it runs as its own turn.
     no_steer: bool,
+    /// An extension (Flow) took the steer and holds it; it releases it into the
+    /// runtime's queue later. Still the user's, still not delivered: never sent
+    /// again by the host while held.
+    held: bool,
 }
 
 impl Queued {
@@ -743,7 +747,7 @@ impl Session {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             queue
                 .iter_mut()
-                .filter(|item| item.steered.is_none() && !item.no_steer)
+                .filter(|item| item.steered.is_none() && !item.no_steer && !item.held)
                 .map(|item| {
                     item.steered = Some(generation);
                     pi::command::with_id(
@@ -783,6 +787,24 @@ impl Session {
         ));
     }
 
+    /// A held message released into the runtime's queue after its run ended
+    /// waits there with nothing to run it: take it back, and it runs as the next turn.
+    fn runtime_queue_changed(self: &Arc<Self>, value: &Value) {
+        let waiting = value
+            .get("steering")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+        let held = self
+            .queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|item| item.held);
+        if waiting && held && self.active_turn().is_none() {
+            self.clear_runtime_queue();
+        }
+    }
+
     /// A user message the runtime put into the running turn.
     fn user_message_started(&self, message: Option<&Value>) {
         let Some(turn) = self.active_turn() else { return };
@@ -801,7 +823,7 @@ impl Session {
             // The runtime delivers what it was given; a slash command arrives expanded.
             let at = queue
                 .iter()
-                .position(|item| item.steered.is_some() && item.text() == text)
+                .position(|item| (item.steered.is_some() || item.held) && item.text() == text)
                 .or_else(|| {
                     queue
                         .iter()
@@ -849,8 +871,21 @@ impl Session {
                 else {
                     return;
                 };
-                if handled {
+                if handled && queue[at].text().starts_with('/') {
+                    // An extension command answered in place: it is done.
                     queue.remove(at)
+                } else if handled {
+                    // Taken but not delivered (Flow holds it until its gate opens). It
+                    // stays the user's waiting message until the runtime starts it.
+                    log(
+                        &self.home,
+                        "info",
+                        "queue.steer_held",
+                        json!({ "session": self.id, "clientMessageId": client }),
+                    );
+                    queue[at].steered = None;
+                    queue[at].held = true;
+                    None
                 } else {
                     // Refused as steer (an extension command): it runs as its own
                     // turn after this one, where the runtime can answer it properly.
@@ -865,7 +900,7 @@ impl Session {
                     None
                 }
             };
-            // Flow kept it: it was the user's message all the same.
+            // A command the runtime ran in place: the user's row all the same.
             if let (Some(item), Some(turn)) = (item, self.active_turn()) {
                 if let Some(row) = item.row {
                     self.deliver_user_row(row, &turn);
@@ -881,7 +916,13 @@ impl Session {
             return;
         };
         // Everything steered up to this take-back that was not delivered before
-        // it (deliveries arrive first) is back in our hands.
+        // it (deliveries arrive first) is back in our hands. So is a held message
+        // its extension had released into the runtime's queue: the answer lists it.
+        let mut released: Vec<String> = value
+            .pointer("/data/steering")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
         for item in self
             .queued_turns
             .lock()
@@ -891,9 +932,17 @@ impl Session {
             if item.steered.is_some_and(|steered| steered <= generation) {
                 item.steered = None;
             }
+            if item.held {
+                if let Some(at) = released.iter().position(|text| *text == item.text()) {
+                    released.remove(at);
+                    item.held = false;
+                }
+            }
         }
         if self.active_turn().is_some() {
             self.steer_queue();
+        } else if self.status() == Status::Idle {
+            self.start_queued_turn();
         }
         self.publish_summary();
     }
@@ -1397,11 +1446,18 @@ impl Session {
             .or_else(|| data.get("messageId"))
             .cloned()
             .unwrap_or(Value::Null);
-        let client_message = self
-            .active_client_message
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        // An event about one message (a waiting one is accepted while another runs) names
+        // that message; otherwise the mark belongs to the running turn's message.
+        let client_message = data
+            .get("clientMessageId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                self.active_client_message
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            });
         log(
             &self.home,
             "info",
@@ -2036,6 +2092,7 @@ impl Session {
                 }
             }
             PiRecord::TurnEnd => {}
+            PiRecord::QueueUpdate => self.runtime_queue_changed(&value),
             PiRecord::MessageStart => {
                 let role = value
                     .get("message")
@@ -3028,7 +3085,7 @@ impl Session {
             self.remember_turn(text);
             self.publish(
                 "message.accepted",
-                json!({ "messageId": message_id.clone(), "receipt": "queued", "waiting": true }),
+                json!({ "messageId": message_id.clone(), "receipt": "queued", "waiting": true, "clientMessageId": client_message_id }),
             );
             let images: Vec<(&str, &str)> = attachments
                 .iter()
@@ -3045,6 +3102,7 @@ impl Session {
                     row: Some(row),
                     steered: None,
                     no_steer: false,
+                    held: false,
                 });
             messages.insert(
                 client_message_id.to_string(),
@@ -3217,10 +3275,19 @@ impl Session {
                 .queued_turns
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            queue
+            let at = queue
                 .iter()
-                .position(|item| item.client_message_id() == Some(client_message_id))
-                .and_then(|at| queue.remove(at))
+                .position(|item| item.client_message_id() == Some(client_message_id));
+            if at.is_some_and(|at| queue[at].held) {
+                // Flow has it and will deliver it; removing it here would not stop that.
+                return Err(ApiError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    "message-held",
+                    "Flow control is holding this message; run /flow to release or cancel it",
+                    false,
+                ));
+            }
+            at.and_then(|at| queue.remove(at))
         };
         if let Some(item) = removed {
             if item.steered.is_some() {
@@ -3289,7 +3356,7 @@ impl Session {
         self.queued_turns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_front(Queued { turn, prompt, row: None, steered: None, no_steer: true });
+            .push_front(Queued { turn, prompt, row: None, steered: None, no_steer: true, held: false });
         self.queue_paused.store(false, Ordering::SeqCst);
         if self.active_turn().is_none() {
             self.start_queued_turn();
@@ -3753,7 +3820,7 @@ impl Session {
                     "clientMessageId": item.client_message_id(),
                     "text": item.text(),
                     "images": item.prompt.get("images").and_then(Value::as_array).map_or(0, Vec::len),
-                    "state": if self.queue_paused.load(Ordering::Relaxed) { "paused" } else { "queued" },
+                    "state": if item.held { "held" } else if self.queue_paused.load(Ordering::Relaxed) { "paused" } else { "queued" },
                 })
             })
             .collect();
@@ -4120,12 +4187,14 @@ impl Session {
         if self.queue_paused.load(Ordering::Relaxed) {
             return false;
         }
-        let Some(item) = self
-            .queued_turns
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pop_front()
-        else {
+        let Some(item) = ({
+            let mut queue = self
+                .queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A held message is its extension's to release; sending it too would send it twice.
+            queue.iter().position(|item| !item.held).and_then(|at| queue.remove(at))
+        }) else {
             return false;
         };
         let Queued { turn, prompt, row, .. } = item;
@@ -4165,7 +4234,7 @@ impl Session {
             self.queued_turns
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push_front(Queued { turn: turn.clone(), prompt, row: None, steered: None, no_steer: true });
+                .push_front(Queued { turn: turn.clone(), prompt, row: None, steered: None, no_steer: true, held: false });
             *self
                 .active_message
                 .lock()
@@ -4309,6 +4378,9 @@ impl Session {
                             .iter_mut()
                         {
                             item.steered = None;
+                            // Whatever an extension held went down with the runtime too;
+                            // the paused queue gives it back to the user.
+                            item.held = false;
                         }
                         if let Some(turn) = turn {
                             self.publish(

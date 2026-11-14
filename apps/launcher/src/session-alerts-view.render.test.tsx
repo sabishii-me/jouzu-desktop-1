@@ -38,6 +38,12 @@ describe("steer queue", () => {
     expect(html).toContain("Continue");
     expect(html).toContain("Discard");
   });
+  it("shows a message Flow holds as held, with nothing that would pretend to remove it", () => {
+    const html = renderToStaticMarkup(<SteerQueue items={[{ clientMessageId: "a", text: "first", state: "held", images: 0 }]} onEdit={noop} onRemove={noop} onContinue={noop} onDiscard={noop} />);
+    expect(html).toContain("Held by Flow");
+    expect(html).not.toContain("Remove queued message");
+    expect(html).not.toContain("Edit queued message");
+  });
 });
 
 describe("the chat has one place for notices", () => {

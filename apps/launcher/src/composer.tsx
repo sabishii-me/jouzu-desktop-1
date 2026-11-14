@@ -138,6 +138,8 @@ export interface ComposerProps {
   textguard?: { mode: TextGuardMode; alert: boolean; disabled: boolean; onMode: (mode: TextGuardMode) => void };
   connected: boolean;
   pending: boolean;
+  /** A setting (such as the model) is being applied: a send waits for it, other actions wait. */
+  settling?: boolean;
   opening?: boolean;
   starting?: boolean;
   unavailable?: boolean;
@@ -189,7 +191,7 @@ function TextGuardControl({ control }: { control: NonNullable<ComposerProps["tex
     </div>}
   </div>;
 }
-export function Composer({ hero = false, autoFocus = false, textguard, connected, pending, opening = false, starting = false, unavailable = false, running, draft, onDraft, onSend, onStop, onCompact, onExport, onReloadMcp, attachments = [], onAddImages, onRemoveImage, readingImages = false, attachmentError, videos = [], onAddVideo, onRemoveVideo, models, model, onSelectModel, onRefreshModels, onRetryModels, thinkingLevel, thinkingLevels, onThinkingLevel }: ComposerProps) {
+export function Composer({ hero = false, autoFocus = false, textguard, connected, pending, settling = false, opening = false, starting = false, unavailable = false, running, draft, onDraft, onSend, onStop, onCompact, onExport, onReloadMcp, attachments = [], onAddImages, onRemoveImage, readingImages = false, attachmentError, videos = [], onAddVideo, onRemoveVideo, models, model, onSelectModel, onRefreshModels, onRetryModels, thinkingLevel, thinkingLevels, onThinkingLevel }: ComposerProps) {
   const active = running || starting;
   const imageInput = useRef<HTMLInputElement>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -197,9 +199,9 @@ export function Composer({ hero = false, autoFocus = false, textguard, connected
   const [videoDraft, setVideoDraft] = useState("");
   const [videoError, setVideoError] = useState<string | null>(null);
   const [modelOpen, setModelOpen] = useState(false);
-  const submit = () => { if ((connected || opening) && !unavailable && !readingImages && !!model && (draft.trim() || videos.length) && (running || starting || !pending)) onSend(); };
-  const compactDisabled = !connected || pending || opening || unavailable || running;
-  const exportDisabled = !connected || pending || opening || unavailable;
+  const submit = () => { if ((connected || opening) && !unavailable && !readingImages && (!!model || settling) && (draft.trim() || videos.length) && (running || starting || !pending)) onSend(); };
+  const compactDisabled = !connected || pending || settling || opening || unavailable || running;
+  const exportDisabled = !connected || pending || settling || opening || unavailable;
   const [commandIndex, setCommandIndex] = useState(0);
   const commands = [
     { id: "compact", label: "Compact", description: "Summarize earlier conversation", disabled: compactDisabled || !onCompact, run: () => onCompact?.() },
@@ -253,7 +255,7 @@ export function Composer({ hero = false, autoFocus = false, textguard, connected
           <span className="hidden text-xs text-muted-foreground lg:inline">{!connected ? "Connecting…" : unavailable ? "Session unavailable" : opening ? "Opening session…" : starting ? "Starting…" : pending ? "Sending…" : running ? "Enter to steer: Jouzu reads it at its next step" : "Enter to send · Shift+Enter for newline"}</span>
           <ModelMenu open={modelOpen} onOpenChange={setModelOpen} models={models} model={model} onSelect={onSelectModel} onOpen={onRefreshModels} onRetry={onRetryModels} thinkingLevel={thinkingLevel} thinkingLevels={thinkingLevels} onThinking={onThinkingLevel} />
           {active && <Button type="button" variant="outline" className="h-8 px-2" onClick={onStop}><Square className="size-3.5" />Stop</Button>}
-          <Button type="submit" className="h-8 px-2" disabled={(!connected && !opening) || (pending && !running && !starting) || unavailable || readingImages || !model || !draft.trim()}><Send className="size-3.5" />{running ? "Steer" : "Send"}</Button>
+          <Button type="submit" className="h-8 px-2" disabled={(!connected && !opening) || (pending && !running && !starting) || unavailable || readingImages || (!model && !settling) || !draft.trim()}><Send className="size-3.5" />{running ? "Steer" : "Send"}</Button>
         </div>
       </div>
     </form>

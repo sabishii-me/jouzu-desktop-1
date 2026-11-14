@@ -26,6 +26,8 @@ pub enum Record {
     CompactionStart,
     CompactionEnd,
     CustomMessage,
+    /// The runtime's own steering/follow-up queue changed.
+    QueueUpdate,
     ExtensionUiRequest,
     ExtensionError,
     Error,
@@ -59,6 +61,7 @@ pub fn classify(value: &Value) -> Record {
         Some("tool_execution_end") => Record::ToolEnd,
         Some("agent_settled") => Record::AgentSettled,
         Some("custom_message") => Record::CustomMessage,
+        Some("queue_update") => Record::QueueUpdate,
         Some("extension_ui_request") => Record::ExtensionUiRequest,
         Some("extension_error") => Record::ExtensionError,
         Some("error") => Record::Error,
