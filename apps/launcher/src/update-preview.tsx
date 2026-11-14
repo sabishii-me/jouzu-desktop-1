@@ -5,6 +5,7 @@ import { Button } from './components/ui/button';
 import { Progress } from './components/ui/progress';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './components/ui/select';
 import type { Locale } from './i18n';
+import { ErrorLine } from "./session-alerts-view";
 
 /** The two update rows: Jouzu first, then the launcher that carries them. */
 const labels: Record<Locale, {
@@ -115,7 +116,7 @@ export function UpdatePreview({ locale, live, focusIndex }: { locale: Locale; li
         {['available', 'complete'].includes(phase) && (live.notes[index]
           ? <div className="max-h-40 overflow-auto rounded-md bg-muted/40 p-2"><p className="text-xs font-medium">{noteText[locale][0]}</p><ul className="mt-1 space-y-1">{noteItems(live.notes[index])}</ul>{live.sources[index] && <p className="mt-1 text-[10px] text-muted-foreground/70">{noteText[locale][1]} {live.sources[index]}</p>}</div>
           : <p className="text-xs text-muted-foreground">{noteText[locale][2]}</p>)}
-        {phase === 'error' && <p role="alert" className="text-sm text-destructive">{live.errors[index] ?? t.checkFailed}</p>}
+        {phase === 'error' && <ErrorLine raw={live.errors[index] ?? ""} failed={t.checkFailed} />}
         {(phase === 'downloading' || phase === 'installing') && <Progress value={phase === 'downloading' ? live.progress : undefined} />}
       </div>
     </section>)}</div>

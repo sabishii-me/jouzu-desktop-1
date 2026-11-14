@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUpCircle, ArrowUpDown, Archive, ArchiveRestore, ChevronDown, ChevronRight, Copy, FolderOpen, FolderPlus, Images, MessageSquare, MoreHorizontal, PanelLeft, Columns2, PanelRight, Pencil, Pin, Plus, RefreshCw, Search, Settings, Sparkles, X } from "lucide-react";
+import { ArrowUpCircle, ArrowUpDown, Archive, ArchiveRestore, Check, ChevronDown, ChevronRight, Copy, FolderOpen, FolderPlus, Images, MessageSquare, MoreHorizontal, PanelLeft, Columns2, PanelRight, Pencil, Pin, Plus, RefreshCw, Search, Settings, Sparkles, X } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { McpMenu } from "./mcp-menu";
@@ -22,7 +22,9 @@ import { fitsSendBudget, readImageAttachment, removeSubmittedImages, validateIma
 import { normalizeVideoUrl, videoMarker } from "./video-url";
 import { emptyProjection, historyProjection, interruptUnfinishedTools, type ChatProjection, type FlowReportRecord } from "./chat-projection";
 import { clearDraft, draftKey, readDraft, writeDraft } from "./drafts";
-import { describeError, isCapacityError, isFlowHistoryError } from "./runtime-errors";
+import { describeError, explainError, isFlowHistoryError, isImageRefused } from "./runtime-errors";
+import { sessionAlerts, type ActionNote, type AlertLevel } from "./session-alerts";
+import { NoticeRow, SessionAlerts, SteerQueue } from "./session-alerts-view";
 import { BackgroundMenu, deriveFlow, deriveSubagents, FlowMenu, latestFlowError, SubagentMenu } from "./tool-renderers";
 import { SessionStatsBar } from "./session-stats-bar";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
@@ -54,6 +56,8 @@ export interface ChatWorkspaceProps {
   onSelect: (path: string) => void;
   onAddFolder: () => void;
   onRemove: (id: string) => void;
+  /** A failed folder action (add, remove, open), shown with the folder list. */
+  folderNotice?: import("react").ReactNode;
   onSettings: () => void;
   onUpdate?: () => void;
   updateAvailable?: boolean;
@@ -94,7 +98,7 @@ async function chooseEntry(api: JouzuApi, workspace: string): Promise<string | n
   return latest?.sessionPath ?? null;
 }
 
-export function ChatWorkspace({ path, revision = 0, newSession = true, locked = false, onStartSession, onRetry, onBusyChange, onBootChange, catalogRefreshing = false, canRefreshModels = false, onModelsMissing, onRetryModels, workspaces, onSelect, onAddFolder, onRemove, onSettings, onUpdate, updateAvailable = false, updateBusy = false }: ChatWorkspaceProps) {
+export function ChatWorkspace({ path, revision = 0, newSession = true, locked = false, onStartSession, onRetry, onBusyChange, onBootChange, catalogRefreshing = false, canRefreshModels = false, onModelsMissing, onRetryModels, workspaces, onSelect, onAddFolder, onRemove, folderNotice, onSettings, onUpdate, updateAvailable = false, updateBusy = false }: ChatWorkspaceProps) {
   const api = useApi();
   // The host starts this workspace's runtime ahead of need; loading waits for it.
   const [warm, retryWarm] = useWarmRuntime(api.runtime, path);
@@ -141,7 +145,21 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [answer, setAnswer] = useState("");
   const [promptBusy, setPromptBusy] = useState(false);
   const [promptError, setPromptError] = useState<string | null>(null);
-  const [notification, setNotification] = useState("");
+  // What the user's own last action needs them to know. It shows with every other
+  // session notice above the composer, never as a floating toast.
+  const [note, setNote] = useState<ActionNote | null>(null);
+  const noteSeq = useRef(0);
+  function tell(text: string, level: AlertLevel = "warning", extra: Partial<Pick<ActionNote, "details" | "action" | "until">> = {}) {
+    setNote({ id: ++noteSeq.current, level, text, ...extra });
+  }
+  function report(error: unknown, failed: string) {
+    setNote({ id: ++noteSeq.current, level: "error", ...explainError(error, failed) });
+  }
+  // Sidebar actions (pin, rename, archive, copy) report in the sidebar.
+  const [sidebarNote, setSidebarNote] = useState<{ text: string; details?: string } | null>(null);
+  const [renaming, setRenaming] = useState<{ path: string; title: string } | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
+  const [dismissed, setDismissed] = useState<{ runtime?: string | null; reply?: number; notice?: number }>({});
   // The provider refused an image already in the history; the session stays usable only
   // after the offending image is removed, so offer that instead of a dead end.
   const [imageRepair, setImageRepair] = useState(false);
@@ -159,10 +177,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [entryAttaching, setEntryAttaching] = useState(false);
   const [entryExisting, setEntryExisting] = useState(false);
   useEffect(() => {
-    if (!notification) return;
-    const timer = setTimeout(() => setNotification(""), 3000);
+    if (!copied) return;
+    const timer = setTimeout(() => { setCopied(null); setSessionMenu(null); }, 1200);
     return () => clearTimeout(timer);
-  }, [notification]);
+  }, [copied]);
   const [dropActive, setDropActive] = useState(false);
   const chatRoot = useRef<HTMLDivElement>(null);
   const [sidebar, setSidebarState] = useState(() => {
@@ -382,10 +400,14 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // Approvals and questions are host state; the first one waiting is shown.
   const prompt: PendingPrompt | null = snapshot.prompts?.[0] ?? null;
   useEffect(() => { setAnswer(""); setPromptError(null); setPromptBusy(false); }, [prompt?.id]);
-  // Runtime command replies and other transient notices become the toast.
-  useEffect(() => { if (snapshot.notice) setNotification(snapshot.notice.text); }, [snapshot.notice?.id]);
-  // Before the first open the loading screen shows a failure; after it, this line does.
-  useEffect(() => { if (warm.state === "failed") setNotification(`The runtime for this folder could not start. ${warm.error ?? ""}`.trim()); }, [warm.state, warm.error]);
+  // A new turn is the user moving on: notes about the last action and command
+  // replies have done their job.
+  useEffect(() => {
+    if (!snapshot.projection.running) return;
+    setNote(current => current && (current.level === "info" || current.until === "turn") ? null : current);
+    if (snapshot.notice) setDismissed(current => ({ ...current, notice: snapshot.notice?.id }));
+  }, [snapshot.projection.running]);
+  useEffect(() => { if (snapshot.modelId) setNote(current => current?.until === "model" ? null : current); }, [snapshot.modelId]);
   useEffect(() => {
     if (!pickerOpen) return;
     const close = (event: MouseEvent) => { if (!picker.current?.contains(event.target as Node)) setPickerOpen(false); };
@@ -430,20 +452,28 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     try {
       await api.sessions.update(sessionPath, change);
       await refreshSessions();
-    } catch (error) { setNotification(describeError(error)); }
+    } catch (error) { setSidebarNote(explainError(error, "Could not update the session.")); }
   }
-  async function renameSession(session: SessionSummary) {
-    const title = window.prompt("Rename session", session.title);
-    if (title !== null) { await updateSession(session.path, { title }); setSessionMenu(null); }
+  function renameSession(session: SessionSummary) {
+    setSessionMenu(null);
+    setRenaming({ path: session.path, title: session.title });
+  }
+  async function finishRename(save: boolean) {
+    const current = renaming;
+    setRenaming(null);
+    if (!save || !current) return;
+    const title = current.title.trim();
+    const before = sessions.find(item => normalizedPath(item.path) === normalizedPath(current.path))?.title;
+    if (title && title !== before) await updateSession(current.path, { title });
   }
   async function copySessionId(session: SessionSummary) {
     const id = session.path.split(/[\\/]/u).at(-1)?.replace(/\.jsonl$/u, "") ?? session.path;
     try {
       if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(id);
       else { const area = document.createElement("textarea"); area.value = id; area.style.position = "fixed"; area.style.opacity = "0"; document.body.appendChild(area); area.select(); document.execCommand("copy"); area.remove(); }
-      setNotification("Session ID copied.");
-      setSessionMenu(null);
-    } catch (error) { setNotification(describeError(error)); }
+      setSidebarNote(null);
+      setCopied(session.path);
+    } catch (error) { setSidebarNote(explainError(error, "Could not copy the session ID.")); setSessionMenu(null); }
   }
   useEffect(() => {
     if (!sessionMenu) return;
@@ -539,13 +569,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         const bytes = new Uint8Array(binary.length);
         for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
         images.push(new File([bytes], data.name, { type: data.mimeType }));
-      } catch (error) { setAttachmentError(describeError(error)); }
+      } catch (error) { setAttachmentError(explainError(error, "Could not read a dropped image.").text); }
     }
     if (images.length) await addImages(images);
     if (files.length) {
+      // The paths appear in the message itself; that is the confirmation.
       const current = draftRef.current;
       updateDraft(`${current}${current.trim() ? "\n\n" : ""}${files.map(path => `File: ${path}`).join("\n")}`);
-      setNotification(`${files.length} file${files.length === 1 ? "" : "s"} added to the message.`);
     }
   }
   useEffect(() => api.native.onFileDrop(event => {
@@ -592,11 +622,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (switchingRef.current) await switchPromise.current;
       const ready = connection.current?.snapshot.connected ? connection.current : await awaitConnection();
       if (sendCancelRef.current) return;
-      if (!ready || !await ensureSelectedSession(ready)) { setNotification("The session is still opening. Your message was not sent."); return; }
+      if (!ready || !await ensureSelectedSession(ready)) { tell("The session is still opening. Your message was not sent; it is still in the composer."); return; }
       const client = connection.current;
       if (!client || sendCancelRef.current) return;
-      if (!client.snapshot.modelId) { setNotification("Choose a model before sending."); return; }
-      if (isFlowHistoryError(client.snapshot.error)) { setNotification("Clear Flow request history before sending again."); return; }
+      if (!client.snapshot.modelId) { tell("Choose a model before sending. Your message is still in the composer.", "warning", { until: "model" }); return; }
+      // The notice above the composer already says Flow history is full, with the way out.
+      if (isFlowHistoryError(client.snapshot.error)) return;
       const receipt = client.send(value, submitted.map(item => item.image));
       // The outbox now shows the message; the composer is free for the next one.
       setLocalSubmitted("");
@@ -609,14 +640,14 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       updateAttachments(removeSubmittedImages(attachmentRef.current, submitted));
       try { await receipt; }
       catch (error) {
-        // The failure is shown on the message itself (not sent, with Retry).
+        // The message is marked "not sent"; the reason, Retry and Discard are above the composer.
         const message = describeError(error);
         if (connection.current === client && /Flow attachment is closed|Flow session metadata is missing/u.test(message)) {
-          try { await recoverSession(); } catch (recoveryError) { setNotification(describeError(recoveryError)); }
+          try { await recoverSession(); } catch (recoveryError) { report(recoveryError, "Could not recover this session."); }
         }
         // A refused image lives in the history, so every later request fails the same
         // way. Offer the repair rather than leaving a session that cannot continue.
-        if (/image[^.]{0,80}(must be larger|too small|minimum|below)|(must be larger|minimum)[^.]{0,40}image/iu.test(message)) setImageRepair(true);
+        if (isImageRefused(message)) setImageRepair(true);
       }
     } finally {
       setLocalSubmitted(current => current === value ? "" : current);
@@ -629,10 +660,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setImageRepair(false);
     try {
       const result = await api.sessions.sanitizeImages(sessionPath);
-      if (!result.removed) { setNotification("No image in this session is below the model's minimum."); return; }
-      setNotification(`Removed ${result.removed} image${result.removed === 1 ? "" : "s"} the model cannot read. The original file is kept as a backup.`);
+      if (!result.removed) { tell("No image in this session is below the model's minimum.", "info"); return; }
+      tell(`Removed ${result.removed} image${result.removed === 1 ? "" : "s"} the model cannot read. The original file is kept as a backup.`, "info");
       await reloadSession();
-    } catch (error) { setNotification(describeError(error)); }
+    } catch (error) { report(error, "Could not remove the image."); }
   }
   const name = workspaceLabel(path);
   function parkPrevious(previous: ChatConnection | null) {
@@ -696,7 +727,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         parkPrevious(previous);
         bindClient(next);
         setDiskReports([]); setReportsSession(""); setTiming(undefined);
-        setNotification("");
+        setNote(null);
         onStartSession?.();
         void refreshSessions();
       } catch (error) {
@@ -706,7 +737,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         setHero(!previousFile);
         setSelectedSession(previousFile);
         setPreview(null);
-        setNotification(describeError(error));
+        report(error, "Could not start a new session.");
       } finally {
         switchingRef.current = false;
         switchingTarget.current = null;
@@ -722,51 +753,50 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (!client || commandBusy) return;
     setCommandBusy(true);
     try {
-      if (!await ensureSelectedSession(client)) { setNotification("Could not attach this session for reloading."); return; }
+      if (!await ensureSelectedSession(client)) { tell("Could not reload the session: it is not attached.", "error"); return; }
       const active = connection.current;
       if (!active) return;
       await active.reloadSession();
-      setNotification("Session reloaded.");
-    } catch (error) { setNotification(describeError(error)); }
+    } catch (error) { report(error, "Could not reload the session."); }
     finally { setCommandBusy(false); }
   }
-  /** Run an action on the attached session; errors become the toast. */
-  async function withSession(action: (session: ChatConnection) => Promise<void>, attachError: string) {
+  /** Run an action on the attached session; a failure is reported above the composer. */
+  async function withSession(action: (session: ChatConnection) => Promise<void>, failed: string) {
     const client = connection.current;
     if (!client || commandBusy) return;
     setCommandBusy(true);
     try {
-      if (!await ensureSelectedSession(client)) { setNotification(attachError); return; }
+      if (!await ensureSelectedSession(client)) { tell(failed, "error", { details: "The session could not be attached." }); return; }
       const active = connection.current;
       if (active) await action(active);
     }
-    catch (error) { setNotification(describeError(error)); }
+    catch (error) { report(error, failed); }
     finally { setCommandBusy(false); }
   }
   function runFlow(verb: "clear" | "resume" | "off" | "on" | "status") {
     return withSession(async active => {
       await active.flow(verb);
       if (verb === "clear") { setSessionError(null); active.clearError(); }
-    }, "Could not attach this session for Flow control.");
+    }, "Flow control did not run.");
   }
   /** The Flow panel sends raw `/flow …` commands (details, retry, cancel, reset). */
   function runFlowCommand(command: string) {
-    return withSession(active => active.runCommand(command), "Could not attach this session for Flow control.");
+    return withSession(active => active.runCommand(command), "Flow control did not run.");
   }
   function setTextGuardMode(mode: TextGuardMode) {
-    return withSession(active => active.setTextGuardMode(mode), "Could not attach this session to change TextGuard.");
+    return withSession(active => active.setTextGuardMode(mode), "Could not change TextGuard.");
   }
   async function selectSessionModel(provider: string, id: string) {
     const client = connection.current;
     if (!client || commandBusy) return;
     setCommandBusy(true);
     try {
-      if (!await ensureSelectedSession(client)) { setNotification("Could not attach this session to change its model."); return; }
+      if (!await ensureSelectedSession(client)) { tell("Could not change the model.", "error", { details: "The session could not be attached." }); return; }
       const active = connection.current;
       if (!active) return;
       await active.selectModel(provider, id);
     }
-    catch (error) { setNotification(describeError(error)); }
+    catch (error) { report(error, "Could not change the model."); }
     finally { setCommandBusy(false); }
   }
   async function selectThinkingLevel(level: string) {
@@ -774,12 +804,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (!client || commandBusy) return;
     setCommandBusy(true);
     try {
-      if (!await ensureSelectedSession(client)) { setNotification("Could not attach this session to change its thinking level."); return; }
+      if (!await ensureSelectedSession(client)) { tell("Could not change the thinking level.", "error", { details: "The session could not be attached." }); return; }
       const active = connection.current;
       if (!active) return;
       await active.setThinkingLevel(level);
     }
-    catch (error) { setNotification(describeError(error)); }
+    catch (error) { report(error, "Could not change the thinking level."); }
     finally { setCommandBusy(false); }
   }
   async function recoverSession(sourcePath?: string): Promise<boolean> {
@@ -794,7 +824,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     await refreshSessions();
     await switchSession(recovered);
     if (normalizedPath(connection.current?.snapshot.sessionFile ?? "") !== normalizedPath(recovered)) return false;
-    setNotification("Recovered the session without the interrupted tool call.");
+    tell("Recovered the session without the interrupted tool call.", "info");
     return true;
   }
   /** The one place that changes which runtime session is loaded. */
@@ -827,7 +857,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (queuedSwitch.current !== "new") setHero(false);
       onStartSession?.();
       setDiskReports([]); setReportsSession(loaded); setTiming(undefined);
-      setNotification("");
+      setNote(null);
       setSessionError(null);
       const session = sessions.find(item => normalizedPath(item.path) === normalizedPath(loaded));
       if (session) localStorage.setItem("jouzu.chat.workspace", session.workspace);
@@ -848,7 +878,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         // The transcript is already on screen. Never replace a readable session with a blank
         // view because its runtime attachment failed.
         setSessionError(message);
-        setNotification("");
+        setNote(null);
         return;
       }
       if (!queuedSwitch.current) {
@@ -858,7 +888,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       }
       previewRequest.current += 1;
       setPreview(null);
-      setNotification(message);
+      report(error, "Could not open this session.");
     } finally {
       switchingRef.current = false;
       switchingTarget.current = null;
@@ -963,25 +993,25 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   async function forkTurn(prompt: string, messageIndex: number) {
     const client = connection.current;
     if (!client || !prompt.trim()) return;
-    if (switchingRef.current || snapshot.pending || !snapshot.connected) { setNotification("Wait for the session to finish loading."); return; }
+    if (switchingRef.current || snapshot.pending || !snapshot.connected) { tell("Wait for the session to finish loading, then branch again.", "info"); return; }
     let branch: string;
     try {
       // Fork copies the session on screen, so that session is attached first, the same way
       // every other command on it does.
-      if (!await ensureSelectedSession(client)) { setNotification("Could not attach this session for forking."); return; }
+      if (!await ensureSelectedSession(client)) { tell("Could not branch the conversation.", "error", { details: "The session could not be attached." }); return; }
       const source = connection.current?.snapshot.sessionFile;
       if (!source) throw new Error("This session has no file to branch yet.");
       // Copy the session through the clicked message (the turn end) into a new saved
       // session. No runtime fork semantics change.
       branch = await api.sessions.branch(source, messageIndex);
-    } catch (error) { setNotification(describeError(error)); return; }
+    } catch (error) { report(error, "Could not branch the conversation."); return; }
     // The branch is an ordinary saved session: open it the way a sidebar click does.
     selectedSessionRef.current = branch;
     setSelectedSession(branch);
     setPreview(null);
     await refreshSessions();
+    // Landing in the new conversation (selected in the sidebar) is the confirmation.
     await switchSession(branch);
-    if (normalizedPath(connection.current?.snapshot.sessionFile ?? "") === normalizedPath(branch)) setNotification("Branched into a new conversation.");
   }
   useEffect(() => {
     if (switching || !snapshot.connected || snapshot.pending || !queuedSwitch.current) return;
@@ -998,24 +1028,24 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   function compactConversation() {
     return withSession(async active => {
       await active.compactSession();
-      if (connection.current === active) setNotification("Earlier conversation compacted.");
-    }, "Could not attach this session to compact it.");
+      if (connection.current === active) tell("Earlier conversation compacted.", "info");
+    }, "Could not compact the conversation.");
   }
   async function exportConversation() {
     const client = connection.current;
     if (!client || !snapshot.connected || commandBusy) return;
     let selected: string | null;
     try { selected = await api.native.saveFile({ title: "Export conversation", defaultPath: `${name}-conversation.html`, filters: [{ name: "HTML", extensions: ["html"] }] }); }
-    catch (error) { setNotification(describeError(error)); return; }
+    catch (error) { report(error, "Could not choose where to export."); return; }
     if (typeof selected !== "string" || connection.current !== client) return;
     setCommandBusy(true);
     try {
-      if (!await ensureSelectedSession(client)) { setNotification("Could not attach this session for export."); return; }
+      if (!await ensureSelectedSession(client)) { tell("Could not export the conversation.", "error", { details: "The session could not be attached." }); return; }
       const active = connection.current;
       if (!active) return;
       await active.exportHtml(selected);
-      if (connection.current === active) setNotification(`Conversation exported to ${selected}`);
-    } catch (error) { if (connection.current) setNotification(describeError(error)); }
+      if (connection.current === active) tell("Conversation exported.", "info", { details: selected, action: { label: "Show file", run: () => void api.native.reveal(selected).catch(() => {}) } });
+    } catch (error) { if (connection.current) report(error, "Could not export the conversation."); }
     finally { setCommandBusy(false); }
   }
   async function switchWorkspace(next: string) {
@@ -1218,10 +1248,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     </div>}
   </div>;
   const workspaceError = showingAttached ? snapshot.error : null;
-  // The runtime's Flow submission budget is per session and never reclaimed; a full
-  // store cannot be retried, so the banner offers the only way out.
-  const capacityError = isCapacityError(sessionError) || isCapacityError(snapshot.error);
-  const flowHistoryError = isFlowHistoryError(sessionError) || isFlowHistoryError(snapshot.error);
   // TextGuard: three modes, and the content it withheld. The runtime confirms the
   // mode; until it has, the default (on) is shown.
   const textguardMode: TextGuardMode = (showingAttached ? snapshot.textguard?.mode : undefined) ?? "on";
@@ -1236,32 +1262,57 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   } : undefined;
   const flowHold = showingAttached ? snapshot.flowHold : null;
   const failedTurn = showingAttached ? snapshot.failedTurn : null;
-  const pausedQueue = showingAttached && snapshot.queue?.some(item => item.state === "paused") ? snapshot.queue : undefined;
-  // Every session-level notice lives in one stack above the composer, in the order
-  // the user needs to act on them. Transient replies use the toast instead.
-  const banners = <div className="space-y-1">
-    {flowHold && <div role="alert" aria-label="Flow control" className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-300">
-      <span className="min-w-0 flex-1">{flowHold.text}</span>
-      {flowHold.paused && <Button variant="outline" className="h-6 px-2 text-[10px]" disabled={commandBusy} onClick={() => void runFlow("resume")}>Resume</Button>}
-      <Button variant="outline" className="h-6 px-2 text-[10px]" disabled={commandBusy} onClick={() => void runFlow("clear")}>Release</Button>
-      <Button variant="outline" className="h-6 px-2 text-[10px]" disabled={commandBusy} title="Turn Flow control off for this session; held messages run normally" onClick={() => void runFlow("off")}>Turn off Flow</Button>
-      <Button variant="ghost" className="size-6 p-0" aria-label="Dismiss" onClick={() => connection.current?.dismissFlowHold()}><X className="size-3" /></Button>
-    </div>}
-    {textguardAlert && <div role="alert" aria-label="TextGuard" className="flex flex-wrap items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px]">
-      <span className="min-w-0 flex-1">{textguardAlert}</span>
-      {textguardMode !== "off" && <Button variant="outline" className="h-6 px-2 text-[10px]" disabled={commandBusy || composerRunning} title="Admit content unscanned for this session, then retry" onClick={() => void setTextGuardMode("off")}>Turn off TextGuard</Button>}
-      <Button variant="ghost" className="size-6 p-0" aria-label="Dismiss" onClick={() => connection.current?.dismissTextGuardAlert()}><X className="size-3" /></Button>
-    </div>}
-    {failedTurn && <div role="alert" className="flex flex-wrap items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px]">
-      <span className="min-w-0 flex-1">This message did not get a reply{failedTurn.text ? `: “${failedTurn.text.length > 80 ? `${failedTurn.text.slice(0, 80)}…` : failedTurn.text}”` : "."}</span>
-      <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void connection.current?.queue("retry")}>Retry</Button>
-    </div>}
-    {pausedQueue && <div role="status" aria-label="Queued messages" className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-[11px]">
-      <span className="min-w-0 flex-1">{pausedQueue.length === 1 ? "1 message is waiting" : `${pausedQueue.length} messages are waiting`} after the stopped turn.</span>
-      <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void connection.current?.queue("continue")}>Continue</Button>
-      <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void connection.current?.queue("discard")}>Discard</Button>
-    </div>}
-  </div>;
+  const queued = showingAttached ? snapshot.queue ?? [] : [];
+  const lastIndex = conversationProjection.messages.length - 1;
+  const replyError = !conversationProjection.running && lastMessage?.role === "assistant" && lastMessage.stopReason === "error" && lastMessage.errorMessage && dismissed.reply !== lastIndex ? lastMessage.errorMessage : null;
+  // Every session-level notice, in one list, in one place: above the composer.
+  const alerts = sessionAlerts({
+    offline: !chatUnavailable && !snapshot.connected && workspaceError ? workspaceError : null,
+    openError: sessionError,
+    runtimeError: snapshot.connected ? workspaceError : null,
+    historyError: showingAttached ? snapshot.historyError : null,
+    imageRefused: imageRepair,
+    replyError,
+    failedSends: showingAttached ? (snapshot.outbox ?? []).filter(item => item.state === "failed") : [],
+    failedTurn,
+    flowHold,
+    textguard: textguardAlert ? { alert: textguardAlert, canTurnOff: textguardMode !== "off" && !composerRunning } : null,
+    attachmentError,
+    note,
+    notice: showingAttached && snapshot.notice && snapshot.notice.id !== dismissed.notice ? snapshot.notice : null,
+    busy: commandBusy,
+  }, {
+    retryOpen: selectedSession ? () => { setSessionError(null); startSwitch(selectedSession); } : undefined,
+    newSession: () => void startNewSession(),
+    clearFlowHistory: () => void runFlow("clear"),
+    removeRefusedImage: () => void repairSessionImages(),
+    retryHistory: () => void connection.current?.retryHistory(),
+    retrySend: id => void connection.current?.retry(id)?.catch(() => {}),
+    discardSend: id => connection.current?.discard(id),
+    retryTurn: () => void connection.current?.queue("retry"),
+    flowResume: () => void runFlow("resume"),
+    flowRelease: () => void runFlow("clear"),
+    flowOff: () => void runFlow("off"),
+    dismissFlowHold: () => connection.current?.dismissFlowHold(),
+    textguardOff: () => void setTextGuardMode("off"),
+    dismissTextGuard: () => connection.current?.dismissTextGuardAlert(),
+    dismissRuntimeError: () => connection.current?.clearError(),
+    dismissReplyError: () => setDismissed(current => ({ ...current, reply: lastIndex })),
+    dismissAttachmentError: () => setAttachmentError(null),
+    dismissNote: () => setNote(null),
+    dismissNotice: () => setDismissed(current => ({ ...current, notice: snapshot.notice?.id })),
+  });
+  async function editQueued(clientMessageId: string) {
+    const taken = await connection.current?.takeQueued(clientMessageId);
+    if (!taken) return;
+    const current = draftRef.current;
+    updateDraft(current.trim() ? `${taken.text}\n\n${current}` : taken.text);
+    if (taken.images.length) updateAttachments([...attachmentRef.current, ...taken.images.map((image, index) => ({ id: `queued-${clientMessageId}-${index}`, name: `image-${index + 1}`, size: Math.ceil(image.data.length * 3 / 4), image }))]);
+  }
+  const banners = <>
+    <SessionAlerts alerts={alerts} />
+    <SteerQueue items={queued} onEdit={id => void editQueued(id)} onRemove={id => void connection.current?.unqueue(id)} onContinue={() => void connection.current?.queue("continue")} onDiscard={() => void connection.current?.queue("discard")} />
+  </>;
   return <div ref={chatRoot} className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
     {dropActive && <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-primary bg-background/85 text-sm font-medium text-primary">Drop images or files</div>}
     {sidebar && <aside aria-label="Workspaces" className="absolute inset-y-0 left-0 z-20 flex w-80 max-w-[85%] flex-col border-r border-border bg-background shadow-xl md:static md:z-auto md:shadow-none">
@@ -1276,6 +1327,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           <Button variant="ghost" className="size-7 p-0" aria-label="Add folder" onClick={onAddFolder}><FolderPlus className="size-3.5" /></Button>
         </div>
       </div>
+      {folderNotice && <div className="px-2 pb-2">{folderNotice}</div>}
+      {sidebarNote && <div className="px-2 pb-2"><NoticeRow alert={{ id: "sidebar", level: "error", text: sidebarNote.text, details: sidebarNote.details, actions: [], dismiss: () => setSidebarNote(null) }} /></div>}
       {searchOpen && <div className="px-2 pb-2"><Input autoFocus aria-label="Search sessions" placeholder="Search sessions" value={search} onChange={event => setSearch(event.target.value)} /></div>}
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 pb-2">
         {[...regularGroups, ...(defaultGroup ? [defaultGroup] : [])].map(group => {
@@ -1289,10 +1342,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
               <Button variant="ghost" className="mr-1 size-6 p-0 opacity-0 group-hover:opacity-100 focus:opacity-100" aria-label={`Remove ${group.path}`} onClick={() => { const workspace = workspaces.find(item => normalizedPath(item.path) === normalizedPath(group.path)); if (workspace) onRemove(workspace.id); }}><X className="size-3" /></Button>
             </div>
             {open && <div className="ml-4 border-l border-border pl-1.5">
+              {warm.state === "failed" && normalizedPath(group.path) === normalizedPath(path) && <div className="py-1"><NoticeRow alert={{ id: "warm", level: "error", text: "The runtime for this folder could not start, so a new session here cannot run yet.", details: warm.error ?? undefined, actions: [{ label: "Retry", run: retryWarm }] }} /></div>}
               {group.sessions.map(session => <div key={session.path} ref={node => { if (selectedKey === normalizedPath(session.path)) selectedRowRef.current = node; }} data-session-selected={selectedKey === normalizedPath(session.path) || undefined} className={`group/session relative flex items-center rounded-md text-sm ${selectedKey === normalizedPath(session.path) ? "bg-accent text-foreground before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded-full before:bg-primary" : "hover:bg-muted/60"} ${session.archived ? "opacity-60" : ""}`}>
-                <button type="button" onClick={() => void openSession(session.path)} title={session.path} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left">
+                {renaming && normalizedPath(renaming.path) === normalizedPath(session.path)
+                  ? <Input autoFocus aria-label="Session name" className="m-0.5 h-7 min-w-0 flex-1 text-sm" value={renaming.title} onChange={event => setRenaming({ path: session.path, title: event.target.value })} onFocus={event => event.target.select()} onKeyDown={event => { if (event.key === "Enter") void finishRename(true); if (event.key === "Escape") void finishRename(false); }} onBlur={() => void finishRename(true)} />
+                  : <button type="button" onClick={() => void openSession(session.path)} title={session.path} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left">
                   {session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label="Pinned" /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span className="min-w-0 flex-1 truncate">{session.title}</span>{chatPool.isRunning(session.path) && <span role="img" aria-label="Running" title="Running" data-session-running className="size-1.5 shrink-0 rounded-full bg-primary" />}<span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={`${artifactCount(session.path)} artifact${artifactCount(session.path) === 1 ? "" : "s"}`}>{artifactCount(session.path)}</span>}
-                </button>
+                </button>}
                 <div className={`relative flex shrink-0 items-center gap-0.5 pr-1 transition-opacity focus-within:opacity-100 group-hover/session:opacity-100 ${sessionMenu === session.path ? "opacity-100" : "opacity-0"}`} data-session-menu>
                   <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={session.pinned ? "Unpin session" : "Pin session"} title={session.pinned ? "Unpin session" : "Pin session"} onClick={() => void updateSession(session.path, { pinned: !session.pinned })}><Pin className={`size-3.5 ${session.pinned ? "text-primary" : "text-muted-foreground"}`} /></button>
                   <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label="Session actions" title="Session actions" aria-haspopup="menu" aria-expanded={sessionMenu === session.path} onClick={() => setSessionMenu(value => value === session.path ? null : session.path)}><MoreHorizontal className="size-4 text-muted-foreground" /></button>
@@ -1300,7 +1356,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
                     <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { pinned: !session.pinned }); setSessionMenu(null); }}><Pin className="size-4 text-muted-foreground" />{session.pinned ? "Unpin session" : "Pin session"}</button>
                     <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void renameSession(session)}><Pencil className="size-4 text-muted-foreground" />Rename</button>
                     <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { archived: !session.archived }); setSessionMenu(null); }}>{session.archived ? <ArchiveRestore className="size-4 text-muted-foreground" /> : <Archive className="size-4 text-muted-foreground" />}{session.archived ? "Restore session" : "Archive session"}</button>
-                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void copySessionId(session)}><Copy className="size-4 text-muted-foreground" />Copy Session ID</button>
+                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void copySessionId(session)}>{copied === session.path ? <><Check className="size-4 text-primary" />Copied</> : <><Copy className="size-4 text-muted-foreground" />Copy Session ID</>}</button>
                   </div>}
                 </div>
               </div>)}
@@ -1322,7 +1378,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         <Button variant="ghost" className="size-8 shrink-0 p-0" aria-label={sidebar ? "Hide workspaces" : "Show workspaces"} title="Workspaces" aria-expanded={sidebar} onClick={() => setSidebar(value => !value)}><PanelLeft className="size-4" /></Button>
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <h2 className="max-w-60 min-w-0 shrink-0 truncate text-sm font-semibold" title={`${name} · ${path}${snapshot.model ? ` · ${snapshot.model}` : ""}`}>{selectedTitle ?? name}</h2>
-          {!chatUnavailable && !snapshot.connected && <span className={`h-7 shrink-0 rounded-md border px-2 text-xs leading-7 ${workspaceError ? "border-destructive/30 text-destructive" : "border-border text-muted-foreground"}`}>{workspaceError ? "Offline" : "Starting…"}</span>}
+          {!chatUnavailable && !snapshot.connected && !workspaceError && <span className="h-7 shrink-0 rounded-md border border-border px-2 text-xs leading-7 text-muted-foreground">Starting…</span>}
           <div className="hidden min-w-0 items-center gap-1.5 md:flex">
             <SubagentMenu agents={subagents} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} />
             <BackgroundMenu jobs={flow.background} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} />
@@ -1334,11 +1390,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           <Button variant="ghost" className="size-7 shrink-0 p-0" aria-label="Toggle artifacts panel" title="Artifacts panel" aria-pressed={panes.length > 0} onClick={toggleSide}><PanelRight className="size-3.5" /></Button>
         </div>
       </div>}
-      {notification && <div role="status" aria-live="polite" className="pointer-events-none fixed left-1/2 top-16 z-50 w-max max-w-[min(40rem,calc(100vw-2rem))] -translate-x-1/2 rounded-lg bg-popover px-4 py-2 text-xs text-foreground shadow-xl">{notification}</div>}
-      {imageRepair && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">This session contains an image the model refuses, so every request fails. Removing it keeps the rest of the transcript.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void repairSessionImages()}>Remove the image</Button></div>}
-      {snapshot.historyError && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">This session is connected, but its transcript could not be loaded. {snapshot.historyError}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void connection.current?.retryHistory()}>Retry</Button></div>}
-      {capacityError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">{sessionError ?? snapshot.error ?? ""}</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void startNewSession()}>New session</Button></div>}
-      {flowHistoryError && !notification && <div role="alert" className="fixed left-1/2 top-16 z-50 flex w-max max-w-[min(44rem,calc(100vw-2rem))] -translate-x-1/2 items-center gap-3 rounded-lg border border-destructive/30 bg-popover px-4 py-2 text-xs text-foreground shadow-xl"><span className="min-w-0 break-words">Flow request history is full. Clear it before sending again.</span><Button variant="outline" className="h-7 shrink-0 px-2" onClick={() => void runFlow("clear")}>Clear Flow history</Button></div>}
       {booting && !hero && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-8 sm:px-8">
         <div className="w-full max-w-3xl">
           <div className="mb-7 flex flex-col items-center gap-3 text-center">
@@ -1348,12 +1399,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           </div>
           <div className="mb-2 flex flex-wrap items-center gap-2 px-1">{workspacePicker}</div>
           {promptNode && <div className="mb-3">{promptNode}</div>}
-          <Composer hero connected={snapshot.connected} pending={snapshot.pending || commandBusy || locked } opening={switching || opening || booting} starting={composerStarting} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
+          {banners}
+          <Composer hero connected={snapshot.connected} pending={snapshot.pending || commandBusy || locked } opening={switching || opening || booting} starting={composerStarting} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
           <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>
       </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
-          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onRetrySend={id => void connection.current?.retry(id)?.catch(() => {})} onDiscardSend={id => connection.current?.discard(id)} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={turnChangedFiles} />
+          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={turnChangedFiles} />
         </div>
         <div className="relative">
           <div className="mx-auto w-full max-w-3xl">
@@ -1361,7 +1413,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
             <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now)} running={conversationProjection.running} elapsed={elapsed} settled={settled} />
           </div>
           {promptNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{promptNode}</div>}
-          <Composer connected={snapshot.connected || !!activePreview} pending={snapshot.pending || commandBusy || (opening && !activePreview) || locked } opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} attachmentError={attachmentError} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
+          <Composer connected={snapshot.connected || !!activePreview} pending={snapshot.pending || commandBusy || (opening && !activePreview) || locked } opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalogModels.length ? catalogModels : snapshot.models ?? []} model={snapshot.model} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onRefreshModels={() => void connection.current?.loadModels()} onRetryModels={canRefreshModels ? onRetryModels : undefined} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
         </div>
         <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>

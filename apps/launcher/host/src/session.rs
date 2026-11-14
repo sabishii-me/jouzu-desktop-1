@@ -422,6 +422,36 @@ struct SentMessage {
     text: String,
 }
 
+/// A message the user sent while a turn ran. The host keeps it until the
+/// runtime has used it: delivered into the running turn (steer), or started as
+/// the next turn. Nothing leaves this queue on a guess, so a message is never
+/// lost or sent twice across reconnects, Stop, or a runtime restart.
+struct Queued {
+    turn: String,
+    prompt: Value,
+    /// The user's row, written to history when the runtime uses the message.
+    /// A retried turn already has its row.
+    row: Option<Value>,
+    /// Handed to the runtime as `steer` (the clear generation it belongs to)
+    /// and not yet delivered.
+    steered: Option<u64>,
+    /// The runtime would not take it as steer; it runs as its own turn.
+    no_steer: bool,
+}
+
+impl Queued {
+    fn client_message_id(&self) -> Option<&str> {
+        self.prompt.get("id").and_then(Value::as_str)
+    }
+
+    fn text(&self) -> &str {
+        self.prompt.get("message").and_then(Value::as_str).unwrap_or("")
+    }
+}
+
+const STEER_ID_PREFIX: &str = "steer:";
+const CLEAR_QUEUE_ID_PREFIX: &str = "clear-queue:";
+
 struct PendingApproval {
     pi_id: String,
     data: Value,
@@ -448,7 +478,12 @@ pub struct Session {
     config: SessionConfig,
     lease_path: PathBuf,
     messages: Mutex<HashMap<String, SentMessage>>,
-    queued_turns: Mutex<VecDeque<(String, Value)>>,
+    queued_turns: Mutex<VecDeque<Queued>>,
+    /// Steered messages up to this generation are being taken back (`clear_queue`).
+    steer_generation: AtomicU64,
+    /// The running turn's own prompt has not come back from the runtime yet;
+    /// the first user message of a run is that prompt, not a steered one.
+    prompt_echo: AtomicBool,
     first_output_turn: Mutex<Option<String>>,
     first_output: Mutex<FirstOutput>,
     /// Held while this session attaches to a runtime from the warm pool.
@@ -652,12 +687,7 @@ impl Session {
                         .cloned()
                         .unwrap_or(Value::Null);
                 }
-                // Follow-ups queued behind this turn are newer than its reply.
-                let at = page
-                    .iter()
-                    .take_while(|row| row.get("queued").and_then(Value::as_bool) == Some(true))
-                    .count();
-                page.insert(at, row);
+                page.insert(0, row);
             }
         }
         json!({ "messages": page, "nextBefore": next_before })
@@ -674,28 +704,198 @@ impl Session {
             .push(row);
     }
 
-    /// A queued follow-up is recorded when it is accepted, while the previous
-    /// turn is still running. When it starts, move its user row after that turn's
-    /// reply so history reads in the order the conversation happened.
-    fn place_started_row(&self, turn: &str) {
-        let id = format!("{turn}:user");
-        let mut history = self
+    /// A queued message the runtime has used: its row joins history now, where
+    /// it happened in the conversation, and every client is told.
+    fn deliver_user_row(&self, mut row: Value, turn: &str) {
+        if let Some(object) = row.as_object_mut() {
+            object.insert("turnId".to_string(), json!(turn));
+            object.insert("createdAt".to_string(), json!(Self::now_iso()));
+        }
+        self.push_history(row.clone());
+        let row = self
             .history
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(at) = history
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last()
+            .cloned()
+            .unwrap_or(row);
+        self.publish("message.user", row);
+    }
+
+    /// Hand every waiting message to the running turn. The runtime delivers
+    /// each one at its next step boundary, before the next model call.
+    fn steer_queue(&self) {
+        if self.queue_paused.load(Ordering::SeqCst)
+            || self.cancelling.load(Ordering::SeqCst)
+            || self.active_turn().is_none()
+            || !matches!(
+                self.status(),
+                Status::Running | Status::WaitingApproval | Status::WaitingQuestion
+            )
+        {
+            return;
+        }
+        let generation = self.steer_generation.load(Ordering::SeqCst);
+        let commands: Vec<Value> = {
+            let mut queue = self
+                .queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue
+                .iter_mut()
+                .filter(|item| item.steered.is_none() && !item.no_steer)
+                .map(|item| {
+                    item.steered = Some(generation);
+                    pi::command::with_id(
+                        pi::command::as_steer(&item.prompt),
+                        &format!("{STEER_ID_PREFIX}{}", item.client_message_id().unwrap_or_default()),
+                    )
+                })
+                .collect()
+        };
+        for command in commands {
+            if self.write_command(command).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Take back steered messages the runtime has not delivered (a turn ended,
+    /// Stop, or one was removed). They stay queued here; the runtime's answer
+    /// says the take-back is done.
+    fn reclaim_steered(&self) {
+        let any = self
+            .queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .position(|row| row.get("id").and_then(Value::as_str) == Some(id.as_str()))
+            .any(|item| item.steered.is_some());
+        if any {
+            self.clear_runtime_queue();
+        }
+    }
+
+    fn clear_runtime_queue(&self) {
+        let generation = self.steer_generation.fetch_add(1, Ordering::SeqCst);
+        let _ = self.write_command(pi::command::with_id(
+            pi::command::clear_queue(),
+            &format!("{CLEAR_QUEUE_ID_PREFIX}{generation}"),
+        ));
+    }
+
+    /// A user message the runtime put into the running turn.
+    fn user_message_started(&self, message: Option<&Value>) {
+        let Some(turn) = self.active_turn() else { return };
+        if self.prompt_echo.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let text = message
+            .and_then(|message| message.get("content"))
+            .map(pi::content_text)
+            .unwrap_or_default();
+        let delivered = {
+            let mut queue = self
+                .queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The runtime delivers what it was given; a slash command arrives expanded.
+            let at = queue
+                .iter()
+                .position(|item| item.steered.is_some() && item.text() == text)
+                .or_else(|| {
+                    queue
+                        .iter()
+                        .position(|item| item.steered.is_some() && item.text().starts_with('/'))
+                });
+            at.and_then(|at| queue.remove(at))
+        };
+        let row = match delivered {
+            Some(item) => item.row,
+            None if text.is_empty() => None,
+            // Not one of ours (taken back too late, or added by an extension):
+            // the transcript has it, so history shows it.
+            None => {
+                let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
+                Some(json!({
+                    "kind": "user",
+                    "id": format!("m-{counter}:user"),
+                    "text": text,
+                    "blocks": [{ "type": "text", "text": text }],
+                }))
+            }
+        };
+        if let Some(row) = row {
+            self.deliver_user_row(row, &turn);
+        }
+        self.publish_summary();
+    }
+
+    /// The runtime answered a steer or a take-back.
+    fn queue_response(self: &Arc<Self>, id: &str, value: &Value) {
+        if let Some(client) = id.strip_prefix(STEER_ID_PREFIX) {
+            let success = value.get("success").and_then(Value::as_bool) == Some(true);
+            let handled = value.pointer("/data/disposition").and_then(Value::as_str) == Some("handled");
+            if success && !handled {
+                return;
+            }
+            let item = {
+                let mut queue = self
+                    .queued_turns
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(at) = queue
+                    .iter()
+                    .position(|item| item.client_message_id() == Some(client))
+                else {
+                    return;
+                };
+                if handled {
+                    queue.remove(at)
+                } else {
+                    // Refused as steer (an extension command): it runs as its own
+                    // turn after this one, where the runtime can answer it properly.
+                    log(
+                        &self.home,
+                        "info",
+                        "queue.steer_refused",
+                        json!({ "session": self.id, "error": value.get("error") }),
+                    );
+                    queue[at].steered = None;
+                    queue[at].no_steer = true;
+                    None
+                }
+            };
+            // Flow kept it: it was the user's message all the same.
+            if let (Some(item), Some(turn)) = (item, self.active_turn()) {
+                if let Some(row) = item.row {
+                    self.deliver_user_row(row, &turn);
+                }
+            }
+            self.publish_summary();
+            return;
+        }
+        let Some(generation) = id
+            .strip_prefix(CLEAR_QUEUE_ID_PREFIX)
+            .and_then(|generation| generation.parse::<u64>().ok())
         else {
             return;
         };
-        let mut row = history.remove(at);
-        let cursor = self.history_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some(object) = row.as_object_mut() {
-            object.remove("queued");
-            object.insert("cursor".to_string(), json!(cursor));
+        // Everything steered up to this take-back that was not delivered before
+        // it (deliveries arrive first) is back in our hands.
+        for item in self
+            .queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter_mut()
+        {
+            if item.steered.is_some_and(|steered| steered <= generation) {
+                item.steered = None;
+            }
         }
-        history.push(row);
+        if self.active_turn().is_some() {
+            self.steer_queue();
+        }
+        self.publish_summary();
     }
 
     fn now_iso() -> String {
@@ -1401,6 +1601,10 @@ impl Session {
             }
             return;
         }
+        if response_id.starts_with(STEER_ID_PREFIX) || response_id.starts_with(CLEAR_QUEUE_ID_PREFIX) {
+            self.queue_response(response_id, value);
+            return;
+        }
         let reply = pi::reply_to(value);
         if reply == pi::Reply::Prompt
             && value.get("success").and_then(Value::as_bool) == Some(true)
@@ -1652,6 +1856,8 @@ impl Session {
             }
             self.publish("turn.end", data);
         }
+        self.prompt_echo.store(false, Ordering::SeqCst);
+        self.reclaim_steered();
         if !self.start_queued_turn() {
             self.set_status(Status::Idle);
         }
@@ -1822,6 +2028,7 @@ impl Session {
             PiRecord::Response => self.handle_response(&value),
             PiRecord::AgentStart => {
                 self.set_status(Status::Running);
+                self.steer_queue();
             }
             PiRecord::TurnStart => {
                 if self.active_turn_id().is_some() {
@@ -1830,11 +2037,15 @@ impl Session {
             }
             PiRecord::TurnEnd => {}
             PiRecord::MessageStart => {
-                let assistant = value
+                let role = value
                     .get("message")
                     .and_then(|message| message.get("role"))
-                    .and_then(Value::as_str)
-                    == Some("assistant");
+                    .and_then(Value::as_str);
+                if role == Some("user") {
+                    self.user_message_started(value.get("message"));
+                    return;
+                }
+                let assistant = role == Some("assistant");
                 if assistant && self.active_turn_id().is_some() {
                     // A second reply in one step is a step the runtime did not mark.
                     let (n, written) = {
@@ -2102,6 +2313,10 @@ impl Session {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                 self.cancelling.store(false, Ordering::SeqCst);
                 self.turn_running.store(false, Ordering::SeqCst);
+                self.prompt_echo.store(false, Ordering::SeqCst);
+                // Steered messages the run did not reach are taken back before
+                // anything else is sent, so the runtime cannot use them twice.
+                self.reclaim_steered();
                 if !self.start_queued_turn() {
                     self.set_status(Status::Idle);
                 }
@@ -2775,9 +2990,16 @@ impl Session {
                     false,
                 ));
             }
+            let waiting = self
+                .queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|item| item.client_message_id() == Some(client_message_id));
             return Ok(json!({
                 "messageId": existing.message_id.clone(),
                 "receipt": "queued",
+                "waiting": waiting,
             }));
         }
         if self.active_turn().is_some() {
@@ -2785,32 +3007,45 @@ impl Session {
                 .failed_turn
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            // A turn is already starting/running. The host owns the follow-up
-            // prompt, not the composer: queue it, show it in history, and deliver
-            // it when the current turn ends.
+            // A turn is already starting/running. The host owns the message, not
+            // the composer: it waits in the queue (shown above the composer) and
+            // is handed to the running turn as steer. It joins the transcript when
+            // the runtime uses it, or starts the next turn if this one ends first.
             let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
             let message_id = format!("m-{counter}");
-            let history_row = json!({
+            let stored_attachments = self.store_attachments(attachments)?;
+            let mut row = json!({
                 "kind": "user",
                 "id": format!("{message_id}:user"),
                 "turnId": message_id,
+                "clientMessageId": client_message_id,
                 "text": text,
                 "blocks": [{ "type": "text", "text": text }],
-                "createdAt": Self::now_iso(),
-                "queued": true,
             });
-            self.push_history(history_row);
+            if !stored_attachments.is_empty() {
+                row["attachments"] = json!(stored_attachments);
+            }
             self.remember_turn(text);
             self.publish(
                 "message.accepted",
-                json!({ "messageId": message_id.clone(), "receipt": "queued" }),
+                json!({ "messageId": message_id.clone(), "receipt": "queued", "waiting": true }),
             );
+            let images: Vec<(&str, &str)> = attachments
+                .iter()
+                .map(|attachment| (attachment.mime_type.as_str(), attachment.data.as_str()))
+                .collect();
             let prompt =
-                pi::command::with_id(pi::command::prompt(text, &[]), client_message_id);
+                pi::command::with_id(pi::command::prompt(text, &images), client_message_id);
             self.queued_turns
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push_back((message_id.clone(), prompt));
+                .push_back(Queued {
+                    turn: message_id.clone(),
+                    prompt,
+                    row: Some(row),
+                    steered: None,
+                    no_steer: false,
+                });
             messages.insert(
                 client_message_id.to_string(),
                 SentMessage {
@@ -2818,8 +3053,11 @@ impl Session {
                     text: text.to_string(),
                 },
             );
+            drop(messages);
+            self.steer_queue();
             self.publish_summary();
-            return Ok(json!({ "messageId": message_id, "receipt": "queued" }));        }
+            return Ok(json!({ "messageId": message_id, "receipt": "queued", "waiting": true }));
+        }
         let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
         let message_id = format!("m-{counter}");
         *self
@@ -2851,6 +3089,7 @@ impl Session {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         self.reset_step();
+        self.prompt_echo.store(true, Ordering::SeqCst);
         let stored_attachments = self.store_attachments(attachments)?;
         let mut history_row = json!({
             "kind": "user",
@@ -2978,13 +3217,17 @@ impl Session {
                 .queued_turns
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let before = queue.len();
-            queue.retain(|(_, prompt)| {
-                prompt.get("id").and_then(Value::as_str) != Some(client_message_id)
-            });
-            before != queue.len()
+            queue
+                .iter()
+                .position(|item| item.client_message_id() == Some(client_message_id))
+                .and_then(|at| queue.remove(at))
         };
-        if removed {
+        if let Some(item) = removed {
+            if item.steered.is_some() {
+                // The runtime holds the removed message too: take its queue
+                // back; the rest are handed over again once it has answered.
+                self.clear_runtime_queue();
+            }
             self.publish_summary();
             return Ok(json!({ "status": "cancelled" }));
         }
@@ -3009,6 +3252,7 @@ impl Session {
         let started = if self.status() == Status::Idle && self.active_turn().is_none() {
             self.start_queued_turn()
         } else {
+            self.steer_queue();
             false
         };
         self.publish_summary();
@@ -3045,7 +3289,7 @@ impl Session {
         self.queued_turns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_front((turn, prompt));
+            .push_front(Queued { turn, prompt, row: None, steered: None, no_steer: true });
         self.queue_paused.store(false, Ordering::SeqCst);
         if self.active_turn().is_none() {
             self.start_queued_turn();
@@ -3055,6 +3299,7 @@ impl Session {
     }
 
     pub fn discard_queue(&self) -> Result<Value, ApiError> {
+        self.reclaim_steered();
         self.queued_turns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3502,11 +3747,12 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .map(|(turn_id, prompt)| {
+            .map(|item| {
                 json!({
-                    "turnId": turn_id,
-                    "clientMessageId": prompt.get("id").and_then(Value::as_str),
-                    "text": prompt.get("message").and_then(Value::as_str),
+                    "turnId": item.turn,
+                    "clientMessageId": item.client_message_id(),
+                    "text": item.text(),
+                    "images": item.prompt.get("images").and_then(Value::as_array).map_or(0, Vec::len),
                     "state": if self.queue_paused.load(Ordering::Relaxed) { "paused" } else { "queued" },
                 })
             })
@@ -3599,6 +3845,8 @@ impl Session {
             lease_path,
             messages: Mutex::new(HashMap::new()),
             queued_turns: Mutex::new(VecDeque::new()),
+            steer_generation: AtomicU64::new(0),
+            prompt_echo: AtomicBool::new(false),
             queue_paused: AtomicBool::new(false),
             first_output_turn: Mutex::new(None),
             pending_prompts: Mutex::new(Vec::new()),
@@ -3872,7 +4120,7 @@ impl Session {
         if self.queue_paused.load(Ordering::Relaxed) {
             return false;
         }
-        let Some((turn, prompt)) = self
+        let Some(item) = self
             .queued_turns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3880,7 +4128,10 @@ impl Session {
         else {
             return false;
         };
-        self.place_started_row(&turn);
+        let Queued { turn, prompt, row, .. } = item;
+        if let Some(row) = row.clone() {
+            self.deliver_user_row(row, &turn);
+        }
         *self
             .active_message
             .lock()
@@ -3903,6 +4154,7 @@ impl Session {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         self.reset_step();
+        self.prompt_echo.store(true, Ordering::SeqCst);
         self.publish(
             "turn.start",
             json!({ "turnId": turn, "phase": "running" }),
@@ -3913,7 +4165,7 @@ impl Session {
             self.queued_turns
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push_front((turn.clone(), prompt));
+                .push_front(Queued { turn: turn.clone(), prompt, row: None, steered: None, no_steer: true });
             *self
                 .active_message
                 .lock()
@@ -4048,6 +4300,16 @@ impl Session {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                         self.queue_paused.store(true, Ordering::SeqCst);
+                        self.prompt_echo.store(false, Ordering::SeqCst);
+                        // The runtime's own queue went with it.
+                        for item in self
+                            .queued_turns
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .iter_mut()
+                        {
+                            item.steered = None;
+                        }
                         if let Some(turn) = turn {
                             self.publish(
                                 "turn.end",

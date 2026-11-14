@@ -248,10 +248,10 @@ export function Composer({ hero = false, textguard, connected, pending, opening 
           {readingImages && <span role="status" className="text-xs text-muted-foreground">Reading images…</span>}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <span className="hidden text-xs text-muted-foreground lg:inline">{!connected ? "Connecting…" : unavailable ? "Session unavailable" : opening ? "Opening session…" : starting ? "Starting…" : pending ? "Sending…" : running ? "Enter to queue after this reply" : "Enter to send · Shift+Enter for newline"}</span>
+          <span className="hidden text-xs text-muted-foreground lg:inline">{!connected ? "Connecting…" : unavailable ? "Session unavailable" : opening ? "Opening session…" : starting ? "Starting…" : pending ? "Sending…" : running ? "Enter to steer: Jouzu reads it at its next step" : "Enter to send · Shift+Enter for newline"}</span>
           <ModelMenu open={modelOpen} onOpenChange={setModelOpen} models={models} model={model} onSelect={onSelectModel} onOpen={onRefreshModels} onRetry={onRetryModels} thinkingLevel={thinkingLevel} thinkingLevels={thinkingLevels} onThinking={onThinkingLevel} />
           {active && <Button type="button" variant="outline" className="h-8 px-2" onClick={onStop}><Square className="size-3.5" />Stop</Button>}
-          <Button type="submit" className="h-8 px-2" disabled={(!connected && !opening) || (pending && !running && !starting) || unavailable || readingImages || !model || !draft.trim()}><Send className="size-3.5" />{running ? "Queue" : "Send"}</Button>
+          <Button type="submit" className="h-8 px-2" disabled={(!connected && !opening) || (pending && !running && !starting) || unavailable || readingImages || !model || !draft.trim()}><Send className="size-3.5" />{running ? "Steer" : "Send"}</Button>
         </div>
       </div>
     </form>

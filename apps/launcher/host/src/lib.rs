@@ -2588,7 +2588,7 @@ mod session_tests {
             .unwrap();
         wait_status(&session, Status::Idle).await;
         session.send("first", "one").unwrap();
-        wait_status(&session, Status::Running).await;
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
         session.send("second", "two").unwrap();
         wait_until(|| {
             session.status() == Status::Idle
@@ -2632,7 +2632,214 @@ mod session_tests {
             .map(|row| format!("{}{}", row["kind"].as_str().unwrap_or(""), if row["partial"] == true { "*" } else { "" }))
             .collect();
         rows.reverse();
-        assert_eq!(rows, vec!["user", "assistant*", "user"], "{history}");
+        // A waiting message is in the queue, not yet in the conversation.
+        assert_eq!(rows, vec!["user", "assistant*"], "{history}");
+        let queue = session.summary()["queue"].clone();
+        assert_eq!(queue.as_array().map(Vec::len), Some(1), "{queue}");
+        assert_eq!(queue[0]["text"], "two");
+    }
+
+    fn conversation(session: &crate::session::Session) -> Vec<String> {
+        let mut rows: Vec<String> = session.history(200, None)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| format!("{}:{}", row["kind"].as_str().unwrap_or(""), row["text"].as_str().unwrap_or("")))
+            .collect();
+        rows.reverse();
+        rows
+    }
+
+    fn queue_texts(session: &crate::session::Session) -> Vec<String> {
+        session.summary()["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["text"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_message_sent_during_a_run_steers_it_once_in_order() {
+        let prompts = tempfile::NamedTempFile::new().unwrap();
+        let prompt_log = prompts.path().to_str().unwrap().to_string();
+        let (manager, _home, workspace) = manager_with_env(
+            200,
+            &[
+                ("FAKE_RUNTIME_STEPS", "3"),
+                ("FAKE_RUNTIME_DELAY_MS", "60"),
+                ("FAKE_RUNTIME_PROMPT_LOG", &prompt_log),
+            ],
+        );
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("first", "one").unwrap();
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        let receipt = session.send("second", "two").unwrap();
+        assert_eq!(receipt["waiting"], true, "{receipt}");
+        session.send("third", "three").unwrap();
+        assert_eq!(queue_texts(&session), vec!["two", "three"]);
+        // Sending the same message again (a reconnecting client) changes nothing.
+        session.send("second", "two").unwrap();
+        wait_until(|| session.status() == Status::Idle && queue_texts(&session).is_empty()).await;
+        let rows = conversation(&session);
+        let users: Vec<&String> = rows.iter().filter(|row| row.starts_with("user:")).collect();
+        assert_eq!(users, vec!["user:one", "user:two", "user:three"], "{rows:?}");
+        // Each steered message sits between replies of the same run, in order.
+        let two = rows.iter().position(|row| row == "user:two").unwrap();
+        let three = rows.iter().position(|row| row == "user:three").unwrap();
+        assert!(!rows[two - 1].starts_with("user:") && !rows[three - 1].starts_with("user:"), "{rows:?}");
+        assert!(rows.last().unwrap().starts_with("assistant:"), "{rows:?}");
+        // They went in as steer, not as new prompts.
+        let sent = std::fs::read_to_string(&prompt_log).unwrap();
+        assert_eq!(sent.lines().collect::<Vec<_>>(), vec!["one"], "{sent}");
+    }
+
+    #[tokio::test]
+    async fn stop_takes_steered_messages_back_and_continue_sends_them_once() {
+        let prompts = tempfile::NamedTempFile::new().unwrap();
+        let prompt_log = prompts.path().to_str().unwrap().to_string();
+        let (manager, _home, workspace) = manager_with_env(
+            200,
+            &[
+                ("FAKE_RUNTIME_STEPS", "2"),
+                ("FAKE_RUNTIME_HANG_TOOL", "1"),
+                ("FAKE_RUNTIME_PROMPT_LOG", &prompt_log),
+            ],
+        );
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("first", "one").unwrap();
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        session.send("second", "two").unwrap();
+        // The tool never finishes, so the run never reaches a step boundary.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        session.interrupt().unwrap();
+        wait_until(|| session.status() == Status::Idle).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let summary = session.summary();
+        assert_eq!(queue_texts(&session), vec!["two"], "{summary}");
+        assert_eq!(summary["queue"][0]["state"], "paused", "{summary}");
+        assert!(!conversation(&session).contains(&"user:two".to_string()));
+        session.continue_queue().unwrap();
+        // It runs as its own turn now (this fixture's runs wait on a tool).
+        wait_until(|| queue_texts(&session).is_empty() && std::fs::read_to_string(&prompt_log).is_ok_and(|text| text.lines().count() == 2)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rows = conversation(&session);
+        assert_eq!(rows.iter().filter(|row| *row == "user:two").count(), 1, "{rows:?}");
+        let sent = std::fs::read_to_string(&prompt_log).unwrap();
+        assert_eq!(sent.lines().collect::<Vec<_>>(), vec!["one", "two"], "{sent}");
+    }
+
+    #[tokio::test]
+    async fn a_removed_message_never_reaches_the_runtime() {
+        let prompts = tempfile::NamedTempFile::new().unwrap();
+        let prompt_log = prompts.path().to_str().unwrap().to_string();
+        let (manager, _home, workspace) = manager_with_env(
+            200,
+            &[
+                ("FAKE_RUNTIME_STEPS", "2"),
+                ("FAKE_RUNTIME_HANG_TOOL", "1"),
+                ("FAKE_RUNTIME_PROMPT_LOG", &prompt_log),
+            ],
+        );
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("first", "one").unwrap();
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        session.send("second", "two").unwrap();
+        session.send("third", "three").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(session.cancel_message("second").unwrap()["status"], "cancelled");
+        assert_eq!(queue_texts(&session), vec!["three"]);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        session.interrupt().unwrap();
+        wait_until(|| session.status() == Status::Idle).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        session.continue_queue().unwrap();
+        wait_until(|| queue_texts(&session).is_empty() && std::fs::read_to_string(&prompt_log).is_ok_and(|text| text.lines().count() == 2)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rows = conversation(&session);
+        assert!(!rows.contains(&"user:two".to_string()), "{rows:?}");
+        assert_eq!(rows.iter().filter(|row| *row == "user:three").count(), 1, "{rows:?}");
+        let sent = std::fs::read_to_string(&prompt_log).unwrap();
+        assert_eq!(sent.lines().collect::<Vec<_>>(), vec!["one", "three"], "{sent}");
+    }
+
+    #[tokio::test]
+    async fn a_message_the_runtime_will_not_steer_runs_as_the_next_turn() {
+        let prompts = tempfile::NamedTempFile::new().unwrap();
+        let prompt_log = prompts.path().to_str().unwrap().to_string();
+        let (manager, _home, workspace) = manager_with_env(
+            200,
+            &[
+                ("FAKE_RUNTIME_STEPS", "2"),
+                ("FAKE_RUNTIME_DELAY_MS", "60"),
+                ("FAKE_RUNTIME_PROMPT_LOG", &prompt_log),
+            ],
+        );
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let mut rx = session.subscribe();
+        session.send("first", "one").unwrap();
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        session.send("second", "/ext run").unwrap();
+        wait_until(|| std::fs::read_to_string(&prompt_log).is_ok_and(|text| text.lines().count() == 2)).await;
+        wait_until(|| session.status() == Status::Idle && queue_texts(&session).is_empty()).await;
+        let sent = std::fs::read_to_string(&prompt_log).unwrap();
+        assert_eq!(sent.lines().collect::<Vec<_>>(), vec!["one", "/ext run"], "{sent}");
+        // The refusal is the host's to handle; nobody sees a runtime error for it.
+        while let Ok(event) = rx.try_recv() {
+            assert_ne!(event.event, "error", "{:?}", event.data);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_steered_message_keeps_its_images() {
+        let (manager, _home, workspace) =
+            manager_with_env(200, &[("FAKE_RUNTIME_STEPS", "3"), ("FAKE_RUNTIME_DELAY_MS", "60")]);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("first", "one").unwrap();
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        session
+            .send_with_client(
+                "second",
+                "look",
+                None,
+                &[Attachment { name: "pixel.png".into(), mime_type: "image/png".into(), data: "AAEC".into() }],
+            )
+            .unwrap();
+        assert_eq!(session.summary()["queue"][0]["images"], 1);
+        wait_until(|| session.status() == Status::Idle && queue_texts(&session).is_empty()).await;
+        let history = session.history(50, None);
+        let user = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "user" && row["text"] == "look")
+            .cloned()
+            .unwrap();
+        assert_eq!(user["attachments"][0]["mimeType"], "image/png", "{user}");
+        let messages = session.request(json!({ "type": "get_messages" }), Duration::from_secs(2)).await.unwrap();
+        let delivered = messages.get("data").unwrap_or(&messages)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "user" && message["content"][0]["text"] == "look")
+            .cloned()
+            .unwrap();
+        assert_eq!(delivered["content"][1]["mimeType"], "image/png", "{delivered}");
     }
 
     #[tokio::test]

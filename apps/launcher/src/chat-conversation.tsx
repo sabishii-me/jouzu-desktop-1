@@ -105,22 +105,21 @@ function UserContent({ message }: { message: ChatMessage }) {
   })}</>;
 }
 
-/** A message the host has not confirmed: shown at once, marked "not sent" on failure. */
-function OutboxRow({ item, onRetry, onDiscard }: { item: OutboxItem; onRetry?: (id: string) => void; onDiscard?: (id: string) => void }) {
+/**
+ * A message the host has not confirmed: shown at once, marked "not sent" on
+ * failure. Why, and Retry/Discard, are with the other notices above the composer.
+ */
+function OutboxRow({ item }: { item: OutboxItem }) {
   const failed = item.state === "failed";
   return <article aria-label="user message" data-outbox={item.state} className={`ml-6 rounded-xl border px-4 py-2 text-left ${failed ? "border-destructive/40 bg-destructive/5" : "border-border bg-muted/50 opacity-70"}`}>
     <div className="mb-2 text-xs font-medium text-muted-foreground">You</div>
     {item.text && <ChatMarkdown text={item.text} />}
     {item.images.map((image, index) => <MessageImage key={index} kind="block" source={`data:${image.mimeType};base64,${image.data}`} alt="Conversation attachment" />)}
-    {failed ? <div role="alert" className="mt-2 flex flex-wrap items-center gap-2 text-xs text-destructive">
-      <span className="min-w-0 flex-1">Not sent{item.error ? `: ${item.error}` : "."}</span>
-      {onRetry && <Button variant="outline" className="h-6 px-2 text-[10px]" onClick={() => onRetry(item.clientMessageId)}>Retry</Button>}
-      {onDiscard && <Button variant="ghost" className="h-6 px-2 text-[10px]" onClick={() => onDiscard(item.clientMessageId)}>Discard</Button>}
-    </div> : <p className="mt-1 text-[11px] text-muted-foreground">Sending…</p>}
+    <p className={`mt-1 text-[11px] ${failed ? "text-destructive" : "text-muted-foreground"}`}>{failed ? "Not sent" : "Sending…"}</p>
   </article>;
 }
 
-function ChatConversationView({ projection, reasoningLive = false, workspace, busy = false, pendingUser = "", outbox = [], onRetrySend, onDiscardSend, onFork, onOpenArtifacts, changedFiles = [] }: { projection: ChatProjection; reasoningLive?: boolean; workspace?: string; busy?: boolean; pendingUser?: string; outbox?: readonly OutboxItem[]; onRetrySend?: (clientMessageId: string) => void; onDiscardSend?: (clientMessageId: string) => void; onFork?: (prompt: string, index: number) => void; onOpenArtifacts?: () => void; changedFiles?: readonly string[] }) {
+function ChatConversationView({ projection, reasoningLive = false, workspace, busy = false, pendingUser = "", outbox = [], onFork, onOpenArtifacts, changedFiles = [] }: { projection: ChatProjection; reasoningLive?: boolean; workspace?: string; busy?: boolean; pendingUser?: string; outbox?: readonly OutboxItem[]; onFork?: (prompt: string, index: number) => void; onOpenArtifacts?: () => void; changedFiles?: readonly string[] }) {
   const scroll = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const following = useRef(true);
@@ -215,7 +214,10 @@ function ChatConversationView({ projection, reasoningLive = false, workspace, bu
     if (last) {
       const nextMessage = projection.messages[last.index + 1];
       const turnEnd = !nextMessage || nextMessage.role === "user";
-      if (last.message.errorMessage) rows.push(<p key={`error-${last.index}`} role="alert" className="select-text text-sm text-destructive">{last.message.errorMessage}</p>);
+      // A marker only: what went wrong is explained above the composer (for the
+      // latest reply); the model's own words stay behind Details.
+      // Stop is the user's own choice, not an error; the status line says "Interrupted".
+      if (last.message.errorMessage && last.message.stopReason !== "aborted") rows.push(<details key={`error-${last.index}`} className="text-xs text-destructive"><summary className="cursor-pointer select-none">This reply stopped with an error</summary><pre className="mt-1 select-text whitespace-pre-wrap break-words font-mono text-[10px] text-muted-foreground">{last.message.errorMessage}</pre></details>);
       if (turnEnd && !projection.running && !busy && !last.message.content.some(block => block.type === "toolCall") && last.message.stopReason !== "toolUse") {
         rows.push(<div key={`footer-${last.index}`}><TurnSummary data={summarizeTurn(projection.messages, projection.tools, last.index, changedFiles)} workspace={workspace} onOpenArtifacts={onOpenArtifacts} /><FinalTurnFooter messages={projection.messages} index={last.index} message={last.message} onFork={onFork} forkDisabled={busy} /></div>);
       }
@@ -227,7 +229,7 @@ function ChatConversationView({ projection, reasoningLive = false, workspace, bu
       {!visible.length && <div className="mx-auto max-w-xl py-16 text-center"><h2 className="text-xl font-semibold">What would you like to work on?</h2><p className="mt-3 text-sm text-muted-foreground">Ask Jouzu to explore your workspace, explain code, or make a change.</p></div>}
       {visible.length > shown.length && <div className="mx-auto mb-4 flex max-w-3xl justify-center"><Button variant="outline" className="h-7 px-3 text-xs" onClick={() => setLimit(value => value + 50)}>Show {visible.length - shown.length} earlier message{visible.length - shown.length === 1 ? "" : "s"}</Button></div>}
       <div ref={content} className="mx-auto max-w-3xl space-y-3">{rows}
-        {outbox.map(item => <OutboxRow key={item.clientMessageId} item={item} onRetry={onRetrySend} onDiscard={onDiscardSend} />)}
+        {outbox.map(item => <OutboxRow key={item.clientMessageId} item={item} />)}
         {pendingUser && <article aria-label="user message" className="ml-6 rounded-xl border border-border bg-muted/50 px-4 py-2 text-left opacity-70">
           <div className="mb-2 text-xs font-medium text-muted-foreground">You</div>
           <ChatMarkdown text={pendingUser} />

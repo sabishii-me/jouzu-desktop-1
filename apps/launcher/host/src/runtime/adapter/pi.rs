@@ -79,6 +79,20 @@ pub fn delta_kind(value: &Value) -> DeltaKind {
     }
 }
 
+/// The text of a message's content (a string, or text blocks joined).
+pub fn content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
 pub fn delta_text(value: &Value) -> &str {
     value
         .get("assistantMessageEvent")
@@ -137,6 +151,19 @@ pub mod command {
 
     pub fn abort() -> Value {
         json!({ "type": "abort" })
+    }
+
+    /// The same user message, for the running turn: the runtime delivers it at
+    /// the next step boundary, before the next model call.
+    pub fn as_steer(prompt: &Value) -> Value {
+        let mut steer = prompt.clone();
+        steer["type"] = Value::String("steer".to_string());
+        steer
+    }
+
+    /// Take back every steered message the runtime has not delivered yet.
+    pub fn clear_queue() -> Value {
+        json!({ "type": "clear_queue" })
     }
 
     pub fn set_model(provider: &str, model: &str) -> Value {

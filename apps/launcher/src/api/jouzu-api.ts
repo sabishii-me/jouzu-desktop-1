@@ -89,6 +89,8 @@ export interface OutgoingMessage {
 export interface Receipt {
   messageId: string;
   receipt: string;
+  /** The session was busy: the message waits in its queue until the runtime uses it. */
+  waiting?: boolean;
 }
 
 export interface HistoryRow {

@@ -255,6 +255,42 @@ describe("SessionStore", () => {
     expect(messages[1].content).toEqual([{ type: "text", text: "hi!" }]);
   });
 
+  it("keeps a message sent during a run out of the conversation until the runtime uses it", async () => {
+    const session = fakeSession();
+    session.send = async message => { session.sent.push(message); return { messageId: "m-2", receipt: "queued", waiting: true }; };
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "message.start", { messageId: "m-1", turnId: "m-1", role: "assistant" }));
+    session.emit(event(2, "message.done", { messageId: "m-1", blocks: [{ type: "text", text: "step 1" }], stopReason: "toolUse" }));
+    const image = { type: "image" as const, data: "AAEC", mimeType: "image/png" as const };
+    await store.send("also check the tests", [image], "c-2");
+    session.emit(event(3, "session.updated", { queue: [{ clientMessageId: "c-2", text: "also check the tests", state: "queued", images: 1, turnId: "m-2" }] }));
+    expect(store.snapshot.outbox).toEqual([]);
+    expect(store.snapshot.projection.messages.map(message => message.role)).toEqual(["assistant"]);
+    expect(store.snapshot.queue).toEqual([{ clientMessageId: "c-2", text: "also check the tests", state: "queued", images: 1 }]);
+    // Delivered between steps: one row, where it happened, with its image.
+    session.emit(event(4, "message.user", { kind: "user", id: "m-2:user", turnId: "m-1", clientMessageId: "c-2", text: "also check the tests", blocks: [{ type: "text", text: "also check the tests" }] }));
+    session.emit(event(5, "session.updated", { queue: [] }));
+    session.emit(event(6, "message.start", { messageId: "m-1", turnId: "m-1", role: "assistant" }));
+    session.emit(event(7, "message.delta", { messageId: "m-1", turnId: "m-1", text: "ok" }));
+    const messages = store.snapshot.projection.messages;
+    expect(messages.map(message => message.role)).toEqual(["assistant", "user", "assistant"]);
+    expect(messages[1].content).toEqual([{ type: "text", text: "also check the tests" }, image]);
+    expect(store.snapshot.queue).toEqual([]);
+  });
+
+  it("gives a waiting message back for editing and removes it from the queue", async () => {
+    const session = fakeSession();
+    const cancelled: string[] = [];
+    session.cancel = async id => { cancelled.push(id); };
+    session.send = async message => { session.sent.push(message); return { messageId: "m-2", receipt: "queued", waiting: true }; };
+    const store = SessionStore.attach(session);
+    const image = { type: "image" as const, data: "AAEC", mimeType: "image/png" as const };
+    await store.send("draft", [image], "c-2");
+    session.emit(event(1, "session.updated", { queue: [{ clientMessageId: "c-2", text: "draft", state: "queued", images: 1 }] }));
+    expect(await store.takeQueued("c-2")).toEqual({ text: "draft", images: [image] });
+    expect(cancelled).toEqual(["c-2"]);
+  });
+
   it("disposes exactly once", () => {
     const onDispose = vi.fn();
     const store = SessionStore.attach(fakeSession(), onDispose);

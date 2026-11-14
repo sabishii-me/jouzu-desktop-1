@@ -57,7 +57,8 @@ export interface ActiveTurn {
   startedAt?: number;
   step?: TurnStep;
 }
-export interface QueuedMessage { clientMessageId: string; text: string; state: string }
+/** A message waiting for the running turn (steer) or, after Stop, for Continue. */
+export interface QueuedMessage { clientMessageId: string; text: string; state: string; images: number }
 /** An approval or question the host is waiting on; rendered from host data only. */
 export interface PendingPrompt {
   kind: "approval" | "question";

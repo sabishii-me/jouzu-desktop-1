@@ -126,7 +126,7 @@ function queueOf(value: unknown): QueuedMessage[] {
   return value.flatMap(item => {
     const row = record(item);
     const clientMessageId = text(row?.clientMessageId);
-    return row && clientMessageId ? [{ clientMessageId, text: text(row.text) ?? "", state: text(row.state) ?? "queued" }] : [];
+    return row && clientMessageId ? [{ clientMessageId, text: text(row.text) ?? "", state: text(row.state) ?? "queued", images: typeof row.images === "number" ? row.images : 0 }] : [];
   });
 }
 
@@ -189,6 +189,8 @@ export class SessionStore {
   private state: ChatSnapshot = emptySnapshot();
   private readonly listeners = new Set<(state: ChatSnapshot) => void>();
   private active = -1;
+  /** Images of messages waiting in the host queue, so Edit can give them back. */
+  private waitingImages = new Map<string, ChatImage[]>();
   private following = false;
   private routerUnsubscribe?: () => void;
   private disposed = false;
@@ -332,7 +334,8 @@ export class SessionStore {
   }
 
   /**
-   * Send (while a turn runs, the host queues it for after the reply). The message is in
+   * Send. While a turn runs the host queues the message and hands it to that
+   * turn (steer); it joins the transcript when the runtime uses it. The message is in
    * the outbox, and on screen, before the request leaves; the host's receipt
    * turns it into a transcript row. A failure keeps it as "not sent".
    */
@@ -374,6 +377,12 @@ export class SessionStore {
   private confirm(item: OutboxItem, receipt: Receipt): void {
     const outbox = (this.state.outbox ?? []).filter(entry => entry.clientMessageId !== item.clientMessageId);
     if (receipt.receipt === "cancelled") { this.setOutbox(outbox); return; }
+    // Waiting in the session's queue (shown above the composer), not yet in the conversation.
+    if (receipt.waiting) {
+      if (item.images.length) this.waitingImages.set(item.clientMessageId, item.images);
+      this.update({ outbox, pending: outbox.some(entry => entry.state === "sending"), flowHold: null });
+      return;
+    }
     const turnId = typeof receipt.messageId === "string" ? receipt.messageId : undefined;
     const current = this.state.projection.messages;
     // A fast reply can start streaming before the POST returns. The user row
@@ -490,6 +499,22 @@ export class SessionStore {
       if (turn && this.state.activeTurn?.turnId === turn.turnId && this.state.activeTurn.phase === "cancelling") this.update({ activeTurn: turn });
       this.update({ error: describeError(error) });
     }
+  }
+
+  /** Remove a waiting message; it never reaches the runtime. */
+  async unqueue(clientMessageId: string): Promise<void> {
+    this.waitingImages.delete(clientMessageId);
+    try { await this.session.cancel(clientMessageId); }
+    catch (error) { this.update({ error: describeError(error) }); }
+  }
+
+  /** Take a waiting message back to edit it: its text and images, removed from the queue. */
+  async takeQueued(clientMessageId: string): Promise<{ text: string; images: ChatImage[] } | null> {
+    const item = this.state.queue?.find(entry => entry.clientMessageId === clientMessageId);
+    if (!item) return null;
+    const images = this.waitingImages.get(clientMessageId) ?? [];
+    await this.unqueue(clientMessageId);
+    return { text: item.text, images };
   }
 
   async queue(action: "continue" | "discard" | "retry"): Promise<void> {
@@ -706,6 +731,23 @@ export class SessionStore {
       case "turn.end":
         if (!this.state.activeTurn || this.state.activeTurn.turnId === text(data.turnId)) this.applyTurn(null);
         break;
+      case "message.user": {
+        // A waiting message the runtime used: it joins the conversation where it happened.
+        const message = historyRowsProjection([data]).messages[0];
+        if (!message) break;
+        const id = text(data.clientMessageId);
+        const images = id ? this.waitingImages.get(id) : undefined;
+        if (id) this.waitingImages.delete(id);
+        const content = images?.length && !message.content.some(block => block.type === "image")
+          ? [...message.content, ...images.map(image => ({ type: "image", data: image.data, mimeType: image.mimeType }))]
+          : message.content;
+        const current = this.state.projection.messages;
+        const at = this.active >= 0 && this.active === current.length - 1 ? this.active : current.length;
+        if (at === this.active) this.active += 1;
+        const messages = [...current.slice(0, at), { ...message, content }, ...current.slice(at)];
+        this.update({ projection: { ...this.state.projection, messages, activeMessage: this.active >= 0 ? this.active : this.state.projection.activeMessage } });
+        break;
+      }
       case "message.start":
         this.active = -1;
         this.ensureAssistant(text(data.turnId));

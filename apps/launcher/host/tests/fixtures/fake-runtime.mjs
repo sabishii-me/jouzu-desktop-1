@@ -32,6 +32,26 @@ let timer = null;
 let current = null;
 let pendingUi = null;
 const messages = [];
+// Messages the user sent while a run was going (the runtime's steering queue).
+// The real runtime delivers them one per step, before the next model call, and
+// keeps going until the queue is empty; abort leaves them queued.
+let steering = [];
+const queueUpdate = () => out({ type: "queue_update", steering: steering.map(item => item.text), followUp: [] });
+const promptLog = text => { if (process.env.FAKE_RUNTIME_PROMPT_LOG) appendFileSync(process.env.FAKE_RUNTIME_PROMPT_LOG, `${text}\n`); };
+function userMessage(text, images) {
+  const content = [{ type: "text", text }, ...(images ?? [])];
+  out({ type: "message_start", message: { role: "user", content } });
+  out({ type: "message_end", message: { role: "user", content } });
+  messages.push({ role: "user", content });
+}
+// Deliver the next steered message, as the runtime does at a step boundary.
+function deliverSteer() {
+  const next = steering.shift();
+  if (!next) return null;
+  queueUpdate();
+  userMessage(next.text, next.images);
+  return next;
+}
 
 if (startDelay > 0) {
   await new Promise(resolve => setTimeout(resolve, startDelay));
@@ -91,11 +111,20 @@ function tick() {
     model: "fixture-model",
     provider: "fixture",
   });
+  if (steering.length > 0) {
+    out({ type: "turn_end" });
+    out({ type: "turn_start" });
+    const next = deliverSteer();
+    out({ type: "message_start", message: { role: "assistant", content: [] } });
+    current = { parts: Array.from(next.text), index: 0 };
+    timer = setTimeout(tick, delay);
+    return;
+  }
   settled(false);
 }
 
-function runSteps() {
-  const script = [{ type: "agent_start" }];
+function runSteps(text, images) {
+  const script = [{ type: "agent_start" }, { type: "echo", text, images }];
   for (let n = 1; n <= steps; n += 1) {
     const last = n === steps;
     if (stepRetry && n === 2) {
@@ -103,6 +132,7 @@ function runSteps() {
       script.push({ type: "auto_retry_end", success: true, attempt: 1 });
     }
     script.push({ type: "turn_start" });
+    if (n > 1) script.push({ type: "steer-point" });
     script.push({ type: "message_start", message: { role: "assistant", content: [] } });
     script.push({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: `think ${n}` } });
     script.push({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: `say ${n}` } });
@@ -121,6 +151,7 @@ function runSteps() {
     }
     script.push({ type: "turn_end" });
   }
+  script.push({ type: "last-steer-point" });
   script.push({ type: "agent_end" });
   const next = () => {
     if (!busy) return;
@@ -128,6 +159,31 @@ function runSteps() {
     const event = script.shift();
     if (!event) { settled(false); return; }
     if (event.type === "hang") return;
+    if (event.type === "echo") {
+      // The prompt, then anything steered before the run began.
+      userMessage(event.text, event.images);
+      deliverSteer();
+      timer = setTimeout(next, delay);
+      return;
+    }
+    if (event.type === "steer-point") { deliverSteer(); timer = setTimeout(next, delay); return; }
+    if (event.type === "last-steer-point") {
+      // The run would end, but steered messages remain: one more step answers them.
+      if (steering.length > 0) {
+        const answer = { role: "assistant", content: [{ type: "text", text: "ack" }], model: "fixture-model", provider: "fixture", usage: { input: 1, output: 1 }, stopReason: "stop" };
+        script.unshift(
+          { type: "turn_start" },
+          { type: "steer-point" },
+          { type: "message_start", message: { role: "assistant", content: [] } },
+          { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "ack" } },
+          { type: "message_end", message: answer, record: answer },
+          { type: "turn_end" },
+          { type: "last-steer-point" },
+        );
+      }
+      timer = setTimeout(next, delay);
+      return;
+    }
     const { record, ...wire } = event;
     if (record) messages.push(record);
     out(wire);
@@ -166,24 +222,23 @@ function requestUi(text) {
   out(request);
 }
 
-function prompt(id, text) {
+function prompt(id, text, images) {
   if (handledPrompts || String(text).startsWith("/flow ")) {
-    if (process.env.FAKE_RUNTIME_PROMPT_LOG) appendFileSync(process.env.FAKE_RUNTIME_PROMPT_LOG, `${text}\n`);
+    promptLog(text);
     response(id, "prompt", { disposition: "handled" });
     return;
   }
-  if (process.env.FAKE_RUNTIME_PROMPT_LOG) appendFileSync(process.env.FAKE_RUNTIME_PROMPT_LOG, `${text}\n`);
+  promptLog(text);
   // "EXTERR <text>" first reports an extension failure, like a real extension would.
   if (String(text).startsWith("EXTERR ")) out({ type: "extension_error", extensionPath: "fake", event: "turn_start", error: String(text).slice(7) });
   busy = true;
   interrupted = false;
-  messages.push({ role: "user", content: [{ type: "text", text: String(text) }] });
   response(id, "prompt", { disposition: "started" });
   if (crashOnPrompt) {
     setTimeout(() => process.exit(8), 10);
   }
   if (steps > 0) {
-    runSteps();
+    runSteps(String(text), images);
     return;
   }
   if (tool) {
@@ -193,6 +248,7 @@ function prompt(id, text) {
   }
   out({ type: "agent_start" });
   out({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+  userMessage(String(text), images);
   out({ type: "message_start", message: { role: "assistant", content: [] } });
   out({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_start", contentIndex: 0 } });
   if (uiMethod === "noise") {
@@ -276,8 +332,31 @@ lines.on("line", line => {
         failure(value.id, "prompt", "prompt while busy");
         break;
       }
-      prompt(value.id, String(value.message ?? ""));
+      prompt(value.id, String(value.message ?? ""), value.images);
       break;
+    case "steer": {
+      const text = String(value.message ?? "");
+      if (process.env.FAKE_RUNTIME_STEER_LOG) appendFileSync(process.env.FAKE_RUNTIME_STEER_LOG, `${text}\n`);
+      if (handledPrompts || text.startsWith("/flow ")) {
+        response(value.id, "steer", { disposition: "handled" });
+        break;
+      }
+      if (text.startsWith("/ext ")) {
+        failure(value.id, "steer", `Extension command "${text}" cannot be queued`);
+        break;
+      }
+      steering.push({ text, images: value.images });
+      queueUpdate();
+      response(value.id, "steer", { disposition: "queued" });
+      break;
+    }
+    case "clear_queue": {
+      const cleared = steering.map(item => item.text);
+      steering = [];
+      queueUpdate();
+      response(value.id, "clear_queue", { steering: cleared, followUp: [] });
+      break;
+    }
     case "abort":
       response(value.id, "abort", {});
       if (busy) {
