@@ -249,8 +249,18 @@ impl WarmPool {
 
     /// Start a warm runtime when there is room and none is starting.
     pub fn fill(self: &Arc<Self>) {
+        self.fill_replacing(None);
+    }
+
+    /// `replacing`: the generation of a spawn that was retired once spawned.
+    /// Its reservation is released and the next one taken under one lock, so
+    /// the pool never reads "off" in between.
+    fn fill_replacing(self: &Arc<Self>, replacing: Option<u64>) {
         let (generation, workspace) = {
             let mut inner = self.lock();
+            if replacing.is_some() && inner.spawning.as_ref().map(|(spawning, _)| *spawning) == replacing {
+                inner.spawning = None;
+            }
             let starting = inner.spawning.is_some() || inner.slots.iter().any(|slot| slot.ready_ms.is_none());
             if inner.stopped || starting || inner.attaching > 0 || inner.failures >= MAX_FAILURES {
                 return;
@@ -286,16 +296,16 @@ impl WarmPool {
         let target: Arc<Mutex<Option<mpsc::Sender<RuntimeEvent>>>> = Arc::new(Mutex::new(None));
         {
             let mut inner = self.lock();
-            inner.spawning = None;
             if inner.generation != generation {
                 // Retired while spawning (aimed elsewhere, recycled, stopped):
                 // start what the pool wants now instead.
                 drop(inner);
                 runtime.terminate();
+                self.fill_replacing(Some(generation));
                 self.notify();
-                self.fill();
                 return;
             }
+            inner.spawning = None;
             inner.slots.push(Slot {
                 generation,
                 workspace,
@@ -395,16 +405,20 @@ impl WarmPool {
     fn failed(self: &Arc<Self>, generation: u64, message: String) {
         let retry = {
             let mut inner = self.lock();
-            if inner.spawning.as_ref().is_some_and(|(spawning, _)| *spawning == generation) {
-                inner.spawning = None;
-            }
             let before = inner.slots.len();
             inner.slots.retain(|slot| slot.generation != generation);
             let removed = inner.slots.len() != before;
             // A spawn that failed before it had a slot is only news if it is the
-            // latest one; anything older was retired on purpose.
+            // latest one; anything older was retired on purpose, and the pool
+            // starts what it wants now in its place.
             if !removed && inner.generation != generation {
+                drop(inner);
+                self.fill_replacing(Some(generation));
+                self.notify();
                 return;
+            }
+            if inner.spawning.as_ref().is_some_and(|(spawning, _)| *spawning == generation) {
+                inner.spawning = None;
             }
             inner.error = Some(message);
             inner.failures += 1;

@@ -6,7 +6,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -520,6 +520,12 @@ pub struct Session {
     /// runtime takes waiting steers once more just before that call, so a
     /// steer handed over earlier would be merged into the first message.
     replying: AtomicBool,
+    /// Steers written to the runtime and not answered yet. The runtime queues
+    /// a steer only after its extensions' input handlers ran, handling other
+    /// commands meanwhile: until it answers, a take-back would miss it.
+    steers_in_flight: AtomicUsize,
+    /// A take-back is due once every steer in flight has been answered.
+    reclaim_waiting: AtomicBool,
     /// Created as a new conversation, not opened from a saved file. Only a new
     /// one starts on the default model; a saved one keeps the model it used,
     /// which the runtime restores when it opens the file.
@@ -800,7 +806,15 @@ impl Session {
                 .collect()
         };
         for command in commands {
+            log(
+                &self.home,
+                "info",
+                "queue.steer_sent",
+                json!({ "session": self.id, "clientMessageId": command.get("id").and_then(Value::as_str).and_then(|id| id.strip_prefix(STEER_ID_PREFIX)) }),
+            );
+            self.steers_in_flight.fetch_add(1, Ordering::SeqCst);
             if self.write_command(command).is_err() {
+                self.steers_in_flight.fetch_sub(1, Ordering::SeqCst);
                 break;
             }
         }
@@ -809,20 +823,41 @@ impl Session {
     /// Take back steered messages the runtime has not delivered (a turn ended,
     /// Stop, or one was removed). They stay queued here; the runtime's answer
     /// says the take-back is done.
-    fn reclaim_steered(&self) {
+    ///
+    /// Returns whether a take-back is under way: the next queued turn then
+    /// starts from its answer, never beside it, or the runtime could use a
+    /// message both as that turn's prompt and as a steer it still holds.
+    fn reclaim_steered(&self) -> bool {
         let any = self
             .queued_turns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .any(|item| item.steered.is_some());
-        if any {
+        if !any {
+            return false;
+        }
+        if self.steers_in_flight.load(Ordering::SeqCst) > 0 {
+            // A steer still on its way would land after an empty take-back.
+            // Take back once the runtime has answered them all.
+            self.reclaim_waiting.store(true, Ordering::SeqCst);
+        } else {
             self.clear_runtime_queue();
+        }
+        true
+    }
+
+    /// A run ended: take back what it did not use, then start the next
+    /// waiting message (at once, or from the take-back's answer).
+    fn run_finished(self: &Arc<Self>) {
+        if self.reclaim_steered() || !self.start_queued_turn() {
+            self.set_status(Status::Idle);
         }
     }
 
     fn clear_runtime_queue(&self) {
         let generation = self.steer_generation.fetch_add(1, Ordering::SeqCst);
+        log(&self.home, "info", "queue.take_back", json!({ "session": self.id, "generation": generation }));
         let _ = self.write_command(pi::command::with_id(
             pi::command::clear_queue(),
             &format!("{CLEAR_QUEUE_ID_PREFIX}{generation}"),
@@ -897,6 +932,13 @@ impl Session {
     /// The runtime answered a steer or a take-back.
     fn queue_response(self: &Arc<Self>, id: &str, value: &Value) {
         if let Some(client) = id.strip_prefix(STEER_ID_PREFIX) {
+            let _ = self.steers_in_flight.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+            if self.steers_in_flight.load(Ordering::SeqCst) == 0
+                && self.reclaim_waiting.swap(false, Ordering::SeqCst)
+            {
+                // Its run ended while it was on its way: now the take-back sees it.
+                self.clear_runtime_queue();
+            }
             let success = value.get("success").and_then(Value::as_bool) == Some(true);
             let handled = value.pointer("/data/disposition").and_then(Value::as_str) == Some("handled");
             if success && !handled {
@@ -1936,10 +1978,7 @@ impl Session {
             self.publish("turn.end", data);
         }
         self.prompt_echo.store(false, Ordering::SeqCst);
-        self.reclaim_steered();
-        if !self.start_queued_turn() {
-            self.set_status(Status::Idle);
-        }
+        self.run_finished();
         self.publish_summary();
     }
 
@@ -2400,10 +2439,7 @@ impl Session {
                 self.prompt_echo.store(false, Ordering::SeqCst);
                 // Steered messages the run did not reach are taken back before
                 // anything else is sent, so the runtime cannot use them twice.
-                self.reclaim_steered();
-                if !self.start_queued_turn() {
-                    self.set_status(Status::Idle);
-                }
+                self.run_finished();
                 self.publish_summary();
             }
             PiRecord::ExtensionUiRequest => self.handle_extension_ui_request(&value),
@@ -3957,6 +3993,8 @@ impl Session {
             queued_turns: Mutex::new(VecDeque::new()),
             steer_generation: AtomicU64::new(0),
             replying: AtomicBool::new(false),
+            steers_in_flight: AtomicUsize::new(0),
+            reclaim_waiting: AtomicBool::new(false),
             fresh: AtomicBool::new(false),
             prompt_echo: AtomicBool::new(false),
             queue_paused: AtomicBool::new(false),
@@ -4415,6 +4453,8 @@ impl Session {
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                         self.queue_paused.store(true, Ordering::SeqCst);
                         self.prompt_echo.store(false, Ordering::SeqCst);
+                        self.steers_in_flight.store(0, Ordering::SeqCst);
+                        self.reclaim_waiting.store(false, Ordering::SeqCst);
                         // The runtime's own queue went with it.
                         for item in self
                             .queued_turns

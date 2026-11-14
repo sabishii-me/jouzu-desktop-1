@@ -2726,6 +2726,40 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_steer_still_on_its_way_when_the_run_ends_is_used_once() {
+        // The runtime queues a steer only after its input handlers ran, and it
+        // handles other commands meanwhile. A run that ends while a steer is on
+        // its way must not take back an empty queue and start the message as a
+        // new turn too: the steer lands later and the message would run twice.
+        let prompts = tempfile::NamedTempFile::new().unwrap();
+        let prompt_log = prompts.path().to_str().unwrap().to_string();
+        let (manager, _home, workspace) = manager_with_env(
+            200,
+            &[
+                ("FAKE_RUNTIME_STEPS", "1"),
+                ("FAKE_RUNTIME_DELAY_MS", "40"),
+                ("FAKE_RUNTIME_STEER_DELAY_MS", "400"),
+                ("FAKE_RUNTIME_PROMPT_LOG", &prompt_log),
+            ],
+        );
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("first", "one").unwrap();
+        wait_until(|| session.status() == Status::Running).await;
+        session.send("second", "two").unwrap();
+        wait_until(|| session.status() == Status::Idle && queue_texts(&session).is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        wait_until(|| session.status() == Status::Idle).await;
+        let rows = conversation(&session);
+        assert_eq!(rows.iter().filter(|row| *row == "user:two").count(), 1, "{rows:?}");
+        let sent = std::fs::read_to_string(&prompt_log).unwrap();
+        let runs = sent.lines().count();
+        assert!(runs <= 2, "{sent}");
+    }
+
+    #[tokio::test]
     async fn stop_takes_steered_messages_back_and_continue_sends_them_once() {
         let prompts = tempfile::NamedTempFile::new().unwrap();
         let prompt_log = prompts.path().to_str().unwrap().to_string();

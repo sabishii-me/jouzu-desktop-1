@@ -359,9 +359,16 @@ lines.on("line", line => {
         failure(value.id, "steer", `Extension command "${text}" cannot be queued`);
         break;
       }
-      steering.push({ text, images: value.images });
-      queueUpdate();
-      response(value.id, "steer", { disposition: "queued" });
+      // Like the runtime: a steer passes the extensions' input handlers (async)
+      // before it is queued, while later commands are already being handled.
+      const enqueue = () => {
+        steering.push({ text, images: value.images });
+        queueUpdate();
+        response(value.id, "steer", { disposition: "queued" });
+      };
+      const steerDelay = Number(process.env.FAKE_RUNTIME_STEER_DELAY_MS ?? 0);
+      if (steerDelay > 0) setTimeout(enqueue, steerDelay);
+      else enqueue();
       break;
     }
     case "clear_queue": {
