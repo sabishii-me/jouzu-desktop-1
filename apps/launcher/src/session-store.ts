@@ -30,6 +30,8 @@ export interface SessionPort {
   readonly id: string;
   /** The saved file the host opened this session on, when it has one. */
   readonly sessionPath?: string | null;
+  /** The host's view of the session when it was attached (same fields as `session.updated`). */
+  readonly initial?: Record<string, unknown>;
   history(page?: { limit?: number; before?: number }): Promise<HistoryPage>;
   send(message: { clientMessageId: string; text: string; attachments?: Attachment[] }): Promise<Receipt>;
   interrupt(): Promise<void>;
@@ -206,6 +208,9 @@ export class SessionStore {
     // The file is known from the attach: a send right after opening a saved
     // session must see it is in that session, not wait for the first event.
     this.state = { ...this.state, sessionId: session.id, connected: true, ...(session.sessionPath ? { sessionFile: session.sessionPath } : {}) };
+    // Start from the host's state at attach: what it published before this
+    // store subscribed (the model it set at creation) never arrives as an event.
+    if (session.initial) this.applySummary(session.initial as Data);
   }
 
   static async open(api: JouzuApi, workspacePath: string, sessionPath?: string): Promise<SessionStore> {

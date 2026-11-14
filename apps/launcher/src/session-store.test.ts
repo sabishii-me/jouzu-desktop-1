@@ -56,6 +56,13 @@ describe("SessionStore", () => {
     expect(projection.running).toBe(false);
   });
 
+  it("starts from the state the host reported at attach", () => {
+    const session = { ...fakeSession(), initial: { sessionId: "s-test", status: "idle", model: { provider: "p", id: "saved", name: "Saved model" } } };
+    const store = SessionStore.attach(session);
+    expect(store.snapshot.model).toBe("Saved model");
+    expect(store.snapshot.modelId).toBe("saved");
+  });
+
   it("a snapshot restores the waiting queue and the failed message", () => {
     const session = fakeSession();
     const store = SessionStore.attach(session);

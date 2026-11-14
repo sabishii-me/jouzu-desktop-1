@@ -39,6 +39,11 @@ export class HostChatSession {
     return this.handle.sessionPath ?? null;
   }
 
+  /** The session's state when it was attached; events after `cursor` follow it. */
+  get initial(): Record<string, unknown> {
+    return this.handle;
+  }
+
   history(page: { limit?: number; before?: number } = {}): Promise<HistoryPage> {
     return this.api.sessions.history(this.id, page);
   }

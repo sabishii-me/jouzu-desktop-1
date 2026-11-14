@@ -47,6 +47,37 @@ fn session_header_cwd(session_path: &str) -> Option<String> {
     Path::new(&cwd).is_dir().then_some(cwd)
 }
 
+/// The model a saved session last used, the way the runtime restores it: the
+/// latest model change or assistant reply. (The runtime follows the current
+/// branch; file order is the same for a conversation without branches, and
+/// the runtime's own report replaces this once it is attached.)
+fn saved_model(path: &Path) -> Option<Value> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
+    let mut found = None;
+    for line in std::io::BufRead::lines(reader) {
+        let Ok(line) = line else { break };
+        let change = line.contains("\"model_change\"");
+        if !change && !line.contains("\"assistant\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let pair = if value["type"] == "model_change" {
+            (value["provider"].as_str(), value["modelId"].as_str())
+        } else if value["type"] == "message" && value["message"]["role"] == "assistant" {
+            (value["message"]["provider"].as_str(), value["message"]["model"].as_str())
+        } else {
+            continue;
+        };
+        if let (Some(provider), Some(id)) = pair {
+            found = Some(json!({ "provider": provider, "id": id, "name": id }));
+        }
+    }
+    found
+}
+
 /// The messages a saved session file holds, in the order they were written.
 fn saved_messages(path: &Path) -> std::io::Result<Vec<Value>> {
     let file = std::fs::File::open(path)?;
@@ -3590,7 +3621,19 @@ impl Session {
         let Some(model) = model else {
             return;
         };
+        let unset = self
+            .model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none();
         if !self.fresh.load(Ordering::SeqCst) {
+            // Shown until the runtime reports its own: the model the file
+            // last used, as the runtime restores it, else the default it
+            // falls back to. Display only; nothing is applied to the runtime.
+            if unset {
+                let saved = self.saved_path().and_then(|path| saved_model(Path::new(&path)));
+                self.set_model(Some(saved.unwrap_or(model)));
+            }
             return;
         }
         let unset = self

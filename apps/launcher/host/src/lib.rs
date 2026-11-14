@@ -630,17 +630,12 @@ async fn create_session(
     {
         state.sessions.hold(client_id, &session.id);
     }
-    let mut response = (
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "sessionId": session.id,
-            "status": session.status().as_str(),
-            "cursor": session.cursor(),
-            "sessionPath": session.saved_path(),
-            "workspacePath": session.workspace_path,
-        })),
-    )
-        .into_response();
+    // The session as it stands (model, queue, turn, prompts): the client starts
+    // from this and follows events after `cursor`, so nothing published before
+    // it subscribed (the model chosen at creation) is missed.
+    let mut body = session.snapshot_event().data;
+    body["workspacePath"] = json!(session.workspace_path);
+    let mut response = (StatusCode::ACCEPTED, Json(body)).into_response();
     response.headers_mut().insert(
         header::LOCATION,
         HeaderValue::from_str(&format!("/v1/sessions/{}", session.id))
@@ -3560,6 +3555,8 @@ mod session_tests {
             .unwrap();
         // What opening a session does (create_session): the default is offered.
         session.adopt_default_model(Some(json!({ "provider": "fixture", "id": "default-x" })));
+        // Before the runtime answers, the saved model is what is shown.
+        assert_eq!(session.info()["model"]["id"], "own-model", "{}", session.info());
         wait_status(&session, Status::Idle).await;
         let state = session
             .request(json!({ "type": "get_state" }), Duration::from_secs(5))

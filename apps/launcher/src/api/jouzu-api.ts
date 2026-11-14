@@ -69,6 +69,8 @@ export interface SessionHandle {
   sessionPath: string | null;
   status: string;
   cursor: number;
+  /** The rest of the session's state at attach (model, queue, turn...), as `session.updated` carries it. */
+  [field: string]: unknown;
 }
 
 export interface Attachment {
