@@ -216,7 +216,7 @@ export interface WarmRuntime {
   workspace?: string | null;
 }
 
-export type TimingMark = "loading.ready" | "message.shown" | "first_output.shown" | "stop.shown";
+export type TimingMark = "ui.boot" | "loading.ready" | "message.shown" | "first_output.shown" | "stop.shown";
 
 export interface RuntimeApi {
   status(): Promise<RuntimeStatus>;

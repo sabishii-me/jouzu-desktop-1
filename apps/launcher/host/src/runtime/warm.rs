@@ -75,6 +75,10 @@ struct Inner {
     /// Folders to warm for, most recent first, at most `CAPACITY`. Empty warms
     /// in a scratch folder, which still saves the Node start.
     recent: Vec<PathBuf>,
+    /// Sessions still attaching to a runtime they took. Nothing new starts until
+    /// they are done: on a busy machine a runtime booting beside the one the
+    /// user waits for (the entry session at start-up) slows it down.
+    attaching: usize,
 }
 
 /// Blank runtimes kept warm. The entry session is the fifth runtime.
@@ -188,6 +192,7 @@ impl WarmPool {
                 failures: 0,
                 taken: 0,
                 recent,
+                attaching: 0,
             }),
             changed: Box::new(changed),
             ready: Notify::new(),
@@ -218,9 +223,11 @@ impl WarmPool {
                 .or(inner.recent.first())
                 .map(|path| path.to_string_lossy().into_owned()),
             "ready": inner.slots.iter().filter(|slot| slot.ready_ms.is_some()).count(),
+            "attaching": inner.attaching,
             "slots": inner.slots.iter().map(|slot| json!({
                 "workspace": slot.workspace.as_ref().map(|path| path.to_string_lossy().into_owned()),
                 "ready": slot.ready_ms.is_some(),
+                "pid": slot.runtime.pid(),
             })).collect::<Vec<_>>(),
             "folders": inner.recent.iter().map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         })
@@ -236,7 +243,7 @@ impl WarmPool {
         let (generation, workspace) = {
             let mut inner = self.lock();
             let starting = inner.slots.iter().any(|slot| slot.ready_ms.is_none());
-            if starting || inner.failures >= MAX_FAILURES {
+            if starting || inner.attaching > 0 || inner.failures >= MAX_FAILURES {
                 return;
             }
             // The first planned place without a runtime: the most recent folder first.
@@ -408,7 +415,7 @@ impl WarmPool {
         self: &Arc<Self>,
         events: mpsc::Sender<RuntimeEvent>,
         workspace: &Path,
-    ) -> Option<(Arc<RuntimeSupervisor>, bool)> {
+    ) -> Option<(Arc<RuntimeSupervisor>, bool, Attaching)> {
         let slot = {
             let mut inner = self.lock();
             let matches = |slot: &Slot| {
@@ -426,6 +433,7 @@ impl WarmPool {
                 .or_else(|| inner.next())?;
             let slot = inner.slots.remove(index);
             inner.taken += 1;
+            inner.attaching += 1;
             // A session asking is a fresh reason to try again after failures.
             inner.failures = 0;
             slot
@@ -441,7 +449,7 @@ impl WarmPool {
             .workspace
             .as_deref()
             .is_some_and(|warm| same_folder(warm, workspace));
-        Some((slot.runtime, matched))
+        Some((slot.runtime, matched, Attaching(Some(self.clone()))))
     }
 
     /// `workspace` is where the user works now: it becomes the most recent
@@ -508,6 +516,15 @@ impl WarmPool {
         if let Some(pid) = pid {
             process::set_low_priority(pid, false);
         }
+    }
+
+    fn attached(self: &Arc<Self>) {
+        {
+            let mut inner = self.lock();
+            inner.attaching = inner.attaching.saturating_sub(1);
+        }
+        self.notify();
+        self.fill();
     }
 
     /// The folder the pool warms most for: the most recent one.
@@ -577,6 +594,18 @@ impl WarmPool {
     /// The folder warm runtimes start in when no workspace is known yet.
     pub fn scratch(home: &std::path::Path) -> PathBuf {
         home.join("warm")
+    }
+}
+
+/// A session attaching to a runtime it took from the pool. While any is held the
+/// pool starts nothing; dropping it (attached, failed or stopped) lets it fill.
+pub struct Attaching(Option<Arc<WarmPool>>);
+
+impl Drop for Attaching {
+    fn drop(&mut self) {
+        if let Some(pool) = self.0.take() {
+            pool.attached();
+        }
     }
 }
 

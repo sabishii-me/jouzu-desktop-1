@@ -1282,7 +1282,7 @@ struct UiTiming {
     client_message_id: Option<String>,
 }
 
-const UI_TIMING_MARKS: &[&str] = &["loading.ready", "message.shown", "first_output.shown", "stop.shown"];
+const UI_TIMING_MARKS: &[&str] = &["ui.boot", "loading.ready", "message.shown", "first_output.shown", "stop.shown"];
 
 async fn record_ui_timing(
     State(state): State<AppState>,

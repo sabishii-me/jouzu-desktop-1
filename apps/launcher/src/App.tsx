@@ -363,6 +363,8 @@ export function App() {
     });
     return () => { pending.then(unlisten => unlisten()).catch(() => {}); };
   }, []);
+  // When the window's code first runs: the gap from host start to here is the webview's.
+  useEffect(() => { api.runtime.mark?.("ui.boot"); }, []);
   const initialWorkspaceChosen = useRef(false);
   useEffect(() => {
     if (initialWorkspaceChosen.current || activePath || !state) return;

@@ -321,6 +321,8 @@ pub struct Session {
     queued_turns: Mutex<VecDeque<(String, Value)>>,
     first_output_turn: Mutex<Option<String>>,
     first_output: Mutex<FirstOutput>,
+    /// Held while this session attaches to a runtime from the warm pool.
+    warm_attach: Mutex<Option<(crate::runtime::warm::Attaching, Instant)>>,
     queue_paused: AtomicBool,
     pending_prompts: Mutex<Vec<Value>>,
     next_message: AtomicU64,
@@ -846,6 +848,22 @@ impl Session {
                 true
             }
         };
+        if changed && !matches!(status, Status::Pending | Status::Starting | Status::Recovering) {
+            // Attached (or given up): the pool may start the next runtime.
+            let attach = self
+                .warm_attach
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some((_attaching, since)) = attach {
+                log(
+                    &self.home,
+                    "info",
+                    "runtime.warm_attached",
+                    json!({ "session": self.id, "status": status.as_str(), "elapsedMs": since.elapsed().as_millis() as u64 }),
+                );
+            }
+        }
         if changed {
             if matches!(status, Status::Running) {
                 self.turn_running.store(true, Ordering::SeqCst);
@@ -925,6 +943,17 @@ impl Session {
             .clone();
         match existing {
             Some(path) => {
+                // How much history the runtime loads: a long session takes long to attach.
+                log(
+                    &self.home,
+                    "info",
+                    "session.attach",
+                    json!({
+                        "session": self.id,
+                        "bytes": std::fs::metadata(&path).map(|meta| meta.len()).ok(),
+                        "status": self.status().as_str(),
+                    }),
+                );
                 let id = self.request_id();
                 let result =
                     self.write_command(pi::command::with_id(pi::command::switch_session(&path), &id));
@@ -3089,6 +3118,7 @@ impl Session {
             pending_model_request: Mutex::new(None),
             pending_thinking: Mutex::new(None),
             first_output: Mutex::new(FirstOutput::default()),
+            warm_attach: Mutex::new(None),
             thinking_level: Mutex::new(None),
             subscribers: AtomicU64::new(0),
             next_client: AtomicU64::new(0),
@@ -3149,9 +3179,13 @@ impl Session {
             .is_some();
         if let (true, Some(pool)) = (has_file, self.config.warm.get()) {
             let before = pool.status();
-            if let Some((runtime, matched)) =
+            if let Some((runtime, matched, attaching)) =
                 pool.take(event_tx.clone(), Path::new(&self.runtime_cwd()))
             {
+                *self
+                    .warm_attach
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((attaching, Instant::now()));
                 log(
                     &self.home,
                     "info",
@@ -4632,6 +4666,7 @@ impl SessionManager {
             )
         });
         pool.fill();
+        log(&config.home, "info", "runtime.warm_start", pool.status());
         // The app is starting and its loading screen waits for this runtime.
         pool.hurry();
         Some(pool.clone())
