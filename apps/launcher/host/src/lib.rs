@@ -4170,6 +4170,10 @@ mod session_tests {
         let info = session_info(&app, &session.id).await;
         assert_eq!(info["pendingApprovalCount"], 1);
         assert_eq!(info["status"], "waiting_approval");
+        // The detail shows the turn in progress exactly as the session list does.
+        assert_eq!(info["activeTurn"]["turnId"], "m-1");
+        assert_eq!(info["activeTurn"]["phase"], "running");
+        assert_eq!(info["activeTurn"], session.summary()["activeTurn"]);
 
         let unauthenticated = call(
             app.clone(),

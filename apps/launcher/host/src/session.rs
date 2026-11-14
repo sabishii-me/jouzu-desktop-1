@@ -3034,6 +3034,7 @@ impl Session {
                 .clone(),
             "status": self.status().as_str(),
             "running": self.status() == Status::Running,
+            "activeTurn": self.active_turn_view(self.status()),
             "runtimePid": self.runtime_pid(),
             "model": self
                 .model
@@ -3049,10 +3050,9 @@ impl Session {
         })
     }
 
-    pub fn summary(&self) -> Value {
-        let status = self.status();
-        let active_turn = self
-            .active_message
+    /// The turn in progress, as the session list and the session detail both show it.
+    fn active_turn_view(&self, status: Status) -> Option<Value> {
+        self.active_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
@@ -3061,7 +3061,7 @@ impl Session {
                     "cancelling"
                 } else {
                     match status {
-                        Status::Starting | Status::Recovering => "starting",
+                        Status::Pending | Status::Starting | Status::Recovering => "starting",
                         Status::Running | Status::WaitingApproval | Status::WaitingQuestion => "running",
                         _ => "accepted",
                     }
@@ -3080,7 +3080,12 @@ impl Session {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone(),
                 })
-            });
+            })
+    }
+
+    pub fn summary(&self) -> Value {
+        let status = self.status();
+        let active_turn = self.active_turn_view(status);
         let queue: Vec<Value> = self
             .queued_turns
             .lock()
