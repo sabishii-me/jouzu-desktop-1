@@ -2192,6 +2192,14 @@ impl Session {
                 // Waiting messages go in once the first reply starts.
                 self.replying.store(false, Ordering::SeqCst);
                 self.set_status(Status::Running);
+                // The runtime runs its input handlers before the agent run exists,
+                // and an abort that lands then finds nothing to stop. The host
+                // already answered that Stop with "cancelling", so it stops this run.
+                if self.cancelling.load(Ordering::SeqCst) {
+                    let id = self.request_id();
+                    // A failed write means the runtime is gone; its exit ends the turn.
+                    let _ = self.write_command(pi::command::with_id(pi::command::abort(), &id));
+                }
             }
             PiRecord::TurnStart => {
                 if self.active_turn_id().is_some() {
