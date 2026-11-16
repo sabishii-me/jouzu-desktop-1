@@ -59,6 +59,12 @@ When more than one notice is due, only the highest is shown:
 Blocked > Not sent > Reply failed > Action failed > Needs a choice > Connection >
 Runtime notice > Information.
 
+Errors piling up is a defect, not a display problem: it means one failure caused
+others. Showing one notice does not hide that. A second error raised while one is
+already due is written to `host.log` as `notice.cascade` (both codes), and each
+cascade is fixed at its source: after a failure the session is in one known
+state, and actions that cannot work in that state are not attempted.
+
 The others are not lost: when the shown notice clears, the next one is shown if it
 still applies. Notices that no longer apply are dropped, not replayed.
 
