@@ -4,6 +4,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, 
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { writeLongSession } from './long-session.mjs';
+import { hostTiming, hostGateProblem } from '../e2e/host-timing.mjs';
 
 // The stable release exam (#86): the full user playbook, with a real model, against the
 // stable build, on throwaway data folders. Every scenario and every gate must pass;
@@ -106,6 +107,15 @@ try {
   const playbook = await run('playbook', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9224', PLAYBOOK_IMAGE_PROVIDER: process.env.PLAYBOOK_OPENROUTER_API_KEY ? 'OpenRouter' : '' , PLAYBOOK_SHISA_API_KEY: '' });
   // The Shisa key scenario runs on its own home below, so it is expected to skip here.
   judge(playbook, { allowSkipped: ['Shisa key saved in Settings works without restart', ...imageProviderOptional] });
+  // The host's part of a first reply, from this home's host.log over the playbook's run (#117, #129).
+  {
+    const log = join(main, 'logs', 'host.log');
+    const timing = existsSync(log) && playbook.result
+      ? hostTiming(readFileSync(log, 'utf8'), { from: Date.parse(playbook.result.startedAt), to: Date.parse(playbook.result.finishedAt ?? new Date().toISOString()) })
+      : null;
+    const problem = existsSync(log) ? hostGateProblem(timing) : `gate sendToModelRequest: no host.log at ${log}`;
+    report.runs.push({ name: 'host-timing', problems: problem ? [problem] : [], result: timing });
+  }
   await browser.close();
   const restart = await run('entry-restart', 'e2e-runtime/entry-restart.mjs', { JOUZU_E2E_HOST_HOME: main });
   judge({ ...restart, result: restart.result ?? (restart.code === 0 ? { scenarios: [{ name: 'entry restart', ok: true }] } : null) });

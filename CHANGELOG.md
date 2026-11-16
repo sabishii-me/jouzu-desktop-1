@@ -14,6 +14,10 @@
   working by the median of five new sessions, and the host's part of a reply from host.log.
   The answer's own time (provider and model) is recorded, not gated (#97).
 
+- The stable release exam now enforces the host's part of a first reply (message accepted to
+  the model request, from host.log; median 200 ms, slowest 400 ms) instead of only showing
+  it in the report (#129).
+
 ## 1.1.3-rc.1 - 2026-11-15
 
 First release candidate for 1.1.3, on the QA channel.

@@ -1,5 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { basename } from "node:path";
+import { hostTiming, hostGateProblem, HOST_GATE_LIMIT_MS } from "./host-timing.mjs";
 
 /**
  * Build one report for two consumers:
@@ -56,36 +57,11 @@ const labels = {
   savedSessionSwitch: ["Saved-session switch", 2000],
   newRowCount: ["New session rows visible", null],
 };
-/**
- * Host part of a reply, from host.log (PLAYBOOK_HOST_LOG): from `message.accepted`
- * to the runtime asking the model (`step.start`, step 1) for each turn the run
- * sent. This is the app's own work before the provider is involved; the playbook
- * itself stays black-box, the report reads the log afterwards.
- * Limit 200 ms (median of first turns in new sessions; slowest <= 400 ms): a later
- * turn in the same session does the same work in about 40 ms on Windows, so a first
- * turn has no reason to be slower once the runtime is attached before the send.
- */
-async function hostTiming(run) {
+/** Host part of a reply (#117), read from PLAYBOOK_HOST_LOG after the run; see host-timing.mjs. */
+async function readHostTiming(run) {
   const path = process.env.PLAYBOOK_HOST_LOG;
   if (!path) return null;
-  const from = Date.parse(run.startedAt ?? 0), to = Date.parse(run.finishedAt ?? new Date().toISOString());
-  const turns = new Map();
-  const seenSessions = new Set();
-  for (const line of (await readFile(path, "utf8")).split(/\r?\n/)) {
-    let entry; try { entry = JSON.parse(line); } catch { continue; }
-    if (entry.event !== "timing") continue;
-    const at = Date.parse(entry.ts), f = entry.fields ?? {};
-    if (!(at >= from && at <= to) || !f.clientMessageId) continue;
-    if (f.mark === "turn.start" && !turns.has(f.clientMessageId)) {
-      turns.set(f.clientMessageId, { session: f.session, accepted: at, first: !seenSessions.has(f.session) });
-      seenSessions.add(f.session);
-    }
-    const turn = turns.get(f.clientMessageId);
-    if (f.mark === "step.start" && turn && turn.modelAsked == null) turn.modelAsked = at - turn.accepted;
-  }
-  const pick = first => [...turns.values()].filter(t => t.first === first && t.modelAsked != null).map(t => t.modelAsked).sort((a, b) => a - b);
-  const stat = list => list.length ? { median: list[Math.floor((list.length - 1) / 2)], slowest: list[list.length - 1], samples: list } : null;
-  return { first: stat(pick(true)), later: stat(pick(false)) };
+  return hostTiming(await readFile(path, "utf8"), { from: Date.parse(run.startedAt ?? 0), to: Date.parse(run.finishedAt ?? new Date().toISOString()) });
 }
 
 const fmt = value => value == null ? "not measured" : `${Math.round(value)} ms`;
@@ -99,10 +75,10 @@ const allMetrics = Object.entries(run.metrics ?? {}).map(([id, value]) => {
   const status = gate ? (gate.ok ? "pass" : "fail") : limit == null ? "record" : value <= limit ? "pass" : "fail";
   return { id, label, valueMs: value, limitMs: limit, status };
 });
-const host = await hostTiming(run);
+const host = await readHostTiming(run);
 if (host?.first) {
-  const limit = 200;
-  const ok = host.first.median <= limit && host.first.slowest <= limit * 2;
+  const limit = HOST_GATE_LIMIT_MS;
+  const ok = hostGateProblem(host, limit) === null;
   allMetrics.push({ id: "sendToModelRequest", label: "Send to model request, first turn (host.log, median)", valueMs: host.first.median, limitMs: limit, status: ok ? "pass" : "fail", slowestMs: host.first.slowest, samples: host.first.samples });
 }
 if (host?.later) allMetrics.push({ id: "sendToModelRequestLater", label: "Send to model request, later turns (host.log, median)", valueMs: host.later.median, limitMs: null, status: "record" });
