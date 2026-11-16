@@ -41,7 +41,6 @@ The composer shows what can be done now; it does not explain what cannot.
 | New session, model still getting ready | Shows that it is loading | Unavailable | Typing works |
 | No model available | Becomes the way to set one up (opens Settings → Model providers) | Unavailable | Typing works |
 | A reply is running | Normal | Adds the message to the queue above the composer (each item can be edited or removed) | Stop is next to it |
-| Near the length limit | — | Unavailable past the limit | A character count appears |
 | The model has no image input | — | — | The attach-image button is not shown |
 | Commands that cannot run during a reply (compact, export) | — | — | Not offered while it runs |
 

@@ -29,7 +29,7 @@ were checked against the published jouzu 0.2.6 package.
 | Choosing a model | RPC `set_model` changes only that session (recorded in the session file); making it the global default is the caller's choice | When the person picks a model in a session, the host also writes it as the runtime's default model, so new sessions use the last selected model |
 | Model catalog | Control `available-models` returns the list and the default model; the catalog has a revision, and Shisa provider ids carry it; a runtime reads the catalog only at start | The host records which revision each runtime loaded and recycles runtimes when the revision changes |
 | Configuration channel | One configuration operation at a time | The host queues operations |
-| Input length | External input limit of 32 KiB | The host's precondition check uses the same value; it does not invent its own limit |
+| Input length | No length cap on user prompts; a 32 KiB cap applies only to external and Flow-composed input; fitting the model's context window is checked by the runtime | The host adds no length limit of its own |
 | Notifications | Extensions send text through `notify` (for example MCP "needs sign-in, Run /mcp"), once per runtime start | The host deduplicates per session and routes it to the feature it belongs to |
 | Errors | Provider errors, refused images and quota are text only, with no structured code | The host can only classify by text for now (see the request below) |
 

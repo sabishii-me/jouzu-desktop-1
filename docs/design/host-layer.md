@@ -108,7 +108,7 @@ not recorded; the client handles reconnecting.
 ### 6.3 Codes
 
 - **Precondition**: the command cannot work in the current state. `no-model`,
-  `model-unavailable`, `session-stopped`, `session-busy`, `text-too-long`, image
+  `model-unavailable`, `session-stopped`, `session-busy`, image
   count and size limits. A client should not offer these paths; when one arrives
   without a race, the host logs `ui.illegal_path`.
 - **Runtime**: a real failure. Tool failure, provider stopped / timed out / out
@@ -124,7 +124,7 @@ succeed, the response says so. Examples:
 
 | API | Retry can succeed | Retry cannot succeed |
 |---|---|---|
-| Send message | Provider timeout, network | Precondition codes, `text-too-long` |
+| Send message | Provider timeout, network | Precondition codes |
 | Change model | Runtime temporarily busy | `model-unavailable` |
 | Save key | Network | Invalid key |
 | Recover session | Runtime failed to start (limited attempts) | Refused image in history (remove it first) |
