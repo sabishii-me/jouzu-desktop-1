@@ -342,6 +342,41 @@ describe("SessionStore", () => {
     expect(cancelled).toEqual(["c-2"]);
   });
 
+  it("keeps the remembered model when the model list could not be loaded (#99)", async () => {
+    const stored = new Map<string, string>([["jouzu.chat.model", JSON.stringify({ provider: "p", id: "remembered" })]]);
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => stored.get(key) ?? null,
+      setItem: (key: string, value: string) => { stored.set(key, value); },
+      removeItem: (key: string) => { stored.delete(key); },
+    });
+    try {
+      const selected: string[] = [];
+      let listed: Array<{ provider: string; id: string; name: string }> | null = null;
+      const api = {
+        models: {
+          list: async () => { if (!listed) throw new Error("models-unavailable"); return listed; },
+          select: async (_session: string, provider: string, id: string) => { selected.push(`${provider}/${id}`); },
+        },
+      };
+      const store = SessionStore.attach(fakeSession(), undefined, api as never);
+      const load = (store as unknown as { load: () => Promise<void> }).load.bind(store);
+      // The host could not list the models yet: nothing says the choice is gone.
+      await load();
+      expect(stored.get("jouzu.chat.model")).toContain("remembered");
+      expect(selected).toEqual([]);
+      // The next session, with the list, applies it.
+      listed = [{ provider: "p", id: "remembered", name: "Remembered" }];
+      const next = SessionStore.attach(fakeSession(), undefined, api as never);
+      await (next as unknown as { load: () => Promise<void> }).load.call(next);
+      expect(selected).toEqual(["p/remembered"]);
+      expect(next.snapshot.modelId).toBe("remembered");
+      store.dispose();
+      next.dispose();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("disposes exactly once", () => {
     const onDispose = vi.fn();
     const store = SessionStore.attach(fakeSession(), onDispose);

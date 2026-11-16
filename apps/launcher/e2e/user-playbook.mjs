@@ -274,7 +274,37 @@ async function shisaKeyWithoutRestart() {
   await page.screenshot({ path: process.env.TEMP + "\\playbook-03-shisa-key.png" });
 }
 
+/**
+ * The first new session after the app starts (#99). It was created before the
+ * model list was known and showed "Select model", and Send did nothing without
+ * a reason. Runs before the reload below, so the host is as freshly started as
+ * the user's. Pass: the session shows a model; with no model at all, Send says
+ * why above the composer instead of doing nothing.
+ */
+async function firstSessionHasModel() {
+  const name = "First new session after start has a model, or Send says why (#99)";
+  await newSession().waitFor({ timeout: 30_000 });
+  await newSession().click();
+  await composer().waitFor({ timeout: 10_000 });
+  const modelButton = page.getByRole("button", { name: "Model", exact: true }).first();
+  const shown = async () => !/^\s*select model\s*$/i.test(await modelButton.innerText().catch(() => ""));
+  const end = now() + 15_000;
+  while (now() < end && !await shown()) await page.waitForTimeout(100);
+  if (await shown()) {
+    scenario(name, true, `model shown: ${(await modelButton.innerText()).trim()}`);
+    return;
+  }
+  // Nothing to send with: the press must be answered with the reason.
+  await composer().fill("model check");
+  await send().click();
+  const reason = page.getByText(/Choose a model before sending|No model is available/).first();
+  const explained = await reason.waitFor({ timeout: 20_000 }).then(() => true, () => false);
+  scenario(name, explained, explained ? "no model configured; Send explained why" : "no model shown and Send gave no reason");
+  await composer().fill("");
+}
+
 try {
+  await firstSessionHasModel();
   let start = now();
   await page.reload({ waitUntil: "domcontentloaded" });
   await newSession().waitFor({ timeout: 30_000 });

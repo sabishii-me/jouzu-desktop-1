@@ -609,7 +609,10 @@ export class SessionStore {
     const preferred = this.preferred;
     if (!preferred) return;
     if (this.state.modelProvider === preferred.provider && this.state.modelId === preferred.id) return;
-    if (!this.state.models?.some(model => model.provider === preferred.provider && model.id === preferred.id)) {
+    // No list (still loading, or the host could not list them) says nothing
+    // about the choice: keep it for the next session instead of forgetting it.
+    if (!this.state.models?.length) return;
+    if (!this.state.models.some(model => model.provider === preferred.provider && model.id === preferred.id)) {
       this.preferred = undefined;
       writeModelPreference(undefined);
       return;

@@ -648,6 +648,22 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     return connection.current?.snapshot.connected ? connection.current : null;
   }
   /**
+   * A new session gets its default model from the host once the model list is
+   * known (#99). A send pressed before then waits for the list instead of being
+   * refused, and for the host's report of the model that follows it.
+   */
+  async function awaitModel(client: ChatConnection, limitMs = 15000): Promise<void> {
+    const end = Date.now() + limitMs;
+    let listedAt: number | undefined;
+    while (!client.snapshot.modelId && Date.now() < end && !sendCancelRef.current) {
+      if (client.snapshot.modelsLoaded) {
+        listedAt ??= Date.now();
+        if (Date.now() - listedAt > 1000) return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
+  /**
    * Hand the message to the session's outbox. Until a session exists (a new
    * session still attaching) the message is shown locally; once the store has
    * it, the outbox owns it: "sending", then a transcript row, or "not sent"
@@ -673,7 +689,14 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!ready || !await ensureSelectedSession(ready)) { tell("The session is still opening. Your message was not sent; it is still in the composer."); return; }
       const client = connection.current;
       if (!client || sendCancelRef.current) return;
-      if (!client.snapshot.modelId) { tell("Choose a model before sending. Your message is still in the composer.", "warning", { until: "model" }); return; }
+      await awaitModel(client);
+      if (sendCancelRef.current) return;
+      if (!client.snapshot.modelId) {
+        const listed = (catalogModels.length ? catalogModels : client.snapshot.models ?? []).some(model => model.available !== false);
+        if (listed) tell("Choose a model before sending. Your message is still in the composer.", "warning", { until: "model" });
+        else tell("No model is available to send this message. Set up a provider or API key in Settings. Your message is still in the composer.", "warning", { until: "model", action: { label: "Settings", run: onSettings } });
+        return;
+      }
       // The notice above the composer already says Flow history is full, with the way out.
       if (isFlowHistoryError(client.snapshot.error)) return;
       const receipt = client.send(value, submitted.map(item => item.image));
