@@ -1,6 +1,14 @@
 # Changelog
 
-## 1.1.3-rc.2 - unreleased
+## 1.1.3-rc.3 - unreleased
+
+- The stable release exam now enforces the host's part of a first reply (message accepted to
+  the model request, from host.log; median 200 ms, slowest 400 ms) instead of only showing
+  it in the report (#129).
+
+## 1.1.3-rc.2 - 2026-11-16
+
+Second release candidate for 1.1.3, on the QA channel.
 
 - Sessions from earlier Desktop versions are back. 1.1.3-rc.1 looked for Jouzu's data in a
   different folder, so everything created before it was missing from the list. Desktop uses
@@ -14,9 +22,31 @@
   working by the median of five new sessions, and the host's part of a reply from host.log.
   The answer's own time (provider and model) is recorded, not gated (#97).
 
-- The stable release exam now enforces the host's part of a first reply (message accepted to
-  the model request, from host.log; median 200 ms, slowest 400 ms) instead of only showing
-  it in the report (#129).
+- After the computer wakes from sleep the chat no longer stays on "Starting session…". Idle
+  time no longer counts time asleep, the session in the window is kept while the window
+  reconnects, and a session that was stopped is reopened automatically (#111).
+- Images in a message stay visible after switching sessions, reloading, or opening the
+  session in a browser. The host serves each image by id and no longer puts local file paths
+  in history (#119).
+- A session that fails no longer leaves its turn waiting with a running timer. It shows one
+  alert above the composer with the reason and a "Restart session" action, and a session
+  file the runtime refuses is not retried in a loop (#95).
+- Fewer background runtimes. A session no window shows gives its runtime back after about a
+  minute; two runtimes no longer start side by side for the same settings; a folder written
+  two ways counts as one; stopped or failed sessions no longer leave a runtime running; an
+  empty new session no longer leaves its file behind (#92, #93, #94, #98).
+- When the model refuses an image, the error above the composer offers "Remove images" and
+  "New session" for any image refusal, not only some wordings. "Remove images" replaces the
+  images in the session with a short note (a backup of the file is kept), so the session can
+  continue (#17).
+- A long session can be read back to its first message: scrolling up loads earlier pages,
+  for open and saved sessions. Branching from an earlier message copies the conversation up
+  to the end of that turn (#20).
+- Stop pressed right after Send now stops the reply. A Stop that reached the runtime before
+  the run had started was lost, so the reply streamed to the end (#61).
+- The first new session after start gets the default model. When a message cannot be sent,
+  the composer says why: choose a model, or no model is available, with a link to
+  Settings (#99).
 
 ## 1.1.3-rc.1 - 2026-11-15
 

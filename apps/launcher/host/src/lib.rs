@@ -3412,6 +3412,31 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_stop_before_the_run_starts_still_stops_that_run() {
+        // The runtime awaits its input handlers before the agent run exists; an
+        // abort in that window is a no-op there, so the host repeats it.
+        let (manager, _home, workspace) = manager_with_env(
+            50,
+            &[("FAKE_RUNTIME_INPUT_DELAY_MS", "300"), ("FAKE_RUNTIME_DELAY_MS", "200")],
+        );
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let (_, before) = session.events_after(0);
+        session.send("early", "hello").unwrap();
+        wait_until(|| session.status() == Status::Running).await;
+        assert_eq!(session.cancel_message("early").unwrap()["status"], "cancelling");
+        wait_until(|| session.status() == Status::Idle).await;
+        let events = session.events_after(before).0;
+        let end = events.iter().find(|event| event.event == "turn.end").expect("turn.end");
+        assert_eq!(end.data["status"], "interrupted", "{:?}", end.data);
+        let rows = conversation(&session);
+        // At most what was already on its way when the repeated abort arrived.
+        assert!(!rows.contains(&"assistant:hello".to_string()), "{rows:?}");
+    }
+
+    #[tokio::test]
     async fn stop_takes_steered_messages_back_and_continue_sends_them_once() {
         let prompts = tempfile::NamedTempFile::new().unwrap();
         let prompt_log = prompts.path().to_str().unwrap().to_string();
