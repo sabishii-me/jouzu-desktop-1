@@ -5962,6 +5962,30 @@ impl SessionManager {
             .collect()
     }
 
+    /// The model list just became known (issue #99). A new conversation created
+    /// before it was known got no default model; it has not started its runtime,
+    /// so nothing would ever report one and the user could not send. Give each
+    /// such session the default now, the same way creation would have.
+    pub fn adopt_default_model_where_missing(&self, model: Option<Value>) {
+        let Some(model) = model else {
+            return;
+        };
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for session in sessions {
+            if matches!(session.status(), Status::Pending)
+                && session.fresh.load(Ordering::SeqCst)
+            {
+                session.adopt_default_model(Some(model.clone()));
+            }
+        }
+    }
+
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
         self.sessions
             .lock()

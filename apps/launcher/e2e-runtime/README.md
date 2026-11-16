@@ -88,6 +88,18 @@ Needs a model-ready throwaway home. Lists the models, adds a provider and its ke
 control API, lists again (the provider must be there), removes the key and lists again (it must
 be gone), with no restart (#84). Results are written to `model-list-fresh-result.json`.
 
+## First new session after start has a model
+
+```powershell
+$env:JOUZU_E2E_HOST_HOME = '<home of a host JUST started on a throwaway data folder>'
+$env:JOUZU_E2E_WORKSPACE = '<workspace folder>'
+node e2e-runtime/first-session-model.mjs
+```
+
+Needs a model-ready throwaway home and a host that no client has asked for models yet. Creates a
+new session first, the order of the first app start, then lists the models: the session must
+show the default model without anything sent (#99). Results are written to
+`first-session-model-result.json`.
 ## A refused image does not trap the session
 
 ```powershell

@@ -199,7 +199,9 @@ export function Composer({ hero = false, autoFocus = false, textguard, connected
   const [videoDraft, setVideoDraft] = useState("");
   const [videoError, setVideoError] = useState<string | null>(null);
   const [modelOpen, setModelOpen] = useState(false);
-  const submit = () => { if ((connected || opening) && !unavailable && !readingImages && (!!model || settling) && (draft.trim() || videos.length) && (running || starting || !pending)) onSend(); };
+  // No model is not a reason to swallow the press: the send says why above the
+  // composer (#99). A disabled button with no reason looked broken.
+  const submit = () => { if ((connected || opening) && !unavailable && !readingImages && (draft.trim() || videos.length) && (running || starting || !pending)) onSend(); };
   const compactDisabled = !connected || pending || settling || opening || unavailable || running;
   const exportDisabled = !connected || pending || settling || opening || unavailable;
   const [commandIndex, setCommandIndex] = useState(0);
@@ -255,7 +257,7 @@ export function Composer({ hero = false, autoFocus = false, textguard, connected
           <span className="hidden text-xs text-muted-foreground lg:inline">{!connected ? "Connecting…" : unavailable ? "Session unavailable" : opening ? "Opening session…" : starting ? "Starting…" : pending ? "Sending…" : running ? "Enter to steer: Jouzu reads it at its next step" : "Enter to send · Shift+Enter for newline"}</span>
           <ModelMenu open={modelOpen} onOpenChange={setModelOpen} models={models} model={model} onSelect={onSelectModel} onOpen={onRefreshModels} onRetry={onRetryModels} thinkingLevel={thinkingLevel} thinkingLevels={thinkingLevels} onThinking={onThinkingLevel} />
           {active && <Button type="button" variant="outline" className="h-8 px-2" onClick={onStop}><Square className="size-3.5" />Stop</Button>}
-          <Button type="submit" className="h-8 px-2" disabled={(!connected && !opening) || (pending && !running && !starting) || unavailable || readingImages || (!model && !settling) || !draft.trim()}><Send className="size-3.5" />{running ? "Steer" : "Send"}</Button>
+          <Button type="submit" className="h-8 px-2" disabled={(!connected && !opening) || (pending && !running && !starting) || unavailable || readingImages || !draft.trim()}><Send className="size-3.5" />{running ? "Steer" : "Send"}</Button>
         </div>
       </div>
     </form>

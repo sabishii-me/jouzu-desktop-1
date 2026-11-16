@@ -1420,13 +1420,24 @@ async fn save_environment(
 }
 
 async fn models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    state.models.get(&state.control).await.map(Json)
+    let snapshot = state.models.get(&state.control).await?;
+    adopt_listed_default(&state);
+    Ok(Json(snapshot))
+}
+
+/// A session created before the list was known has no model yet (#99).
+fn adopt_listed_default(state: &AppState) {
+    state
+        .sessions
+        .adopt_default_model_where_missing(state.models.default_model());
 }
 
 /// Jouzu refreshes its catalog, then the host re-reads the snapshot. A failure keeps
 /// the previous snapshot and marks it stale.
 async fn refresh_models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    state.models.refresh(&state.control).await.map(Json)
+    let snapshot = state.models.refresh(&state.control).await?;
+    adopt_listed_default(&state);
+    Ok(Json(snapshot))
 }
 
 async fn tools_snapshot(State(state): State<AppState>) -> Json<Value> {
@@ -4336,6 +4347,36 @@ mod session_tests {
             .await
             .unwrap();
         assert_eq!(state["model"]["id"], "default-x", "{state}");
+    }
+
+    #[tokio::test]
+    async fn a_new_session_created_before_the_model_list_takes_the_default_once_listed() {
+        // Issue #99: at startup the first new session is created before the model
+        // list is known, so create_session has no default to give it. It has not
+        // started its runtime, so nothing else would ever report a model.
+        let (manager, _home, workspace) = manager(50);
+        let folder = workspace.path().to_str().unwrap();
+        let session = manager.create_pending(folder, None, None).unwrap();
+        session.adopt_default_model(None);
+        assert!(session.info()["model"].is_null(), "{}", session.info());
+        // A session the user already gave a model keeps it.
+        let chosen = manager.create_pending(folder, None, None).unwrap();
+        chosen.select_model("fixture", "picked").await.unwrap();
+        // The list arrives.
+        manager.adopt_default_model_where_missing(Some(
+            json!({ "provider": "fixture", "id": "default-x", "name": "Default X" }),
+        ));
+        assert_eq!(session.info()["model"]["id"], "default-x", "{}", session.info());
+        assert_eq!(chosen.info()["model"]["id"], "picked", "{}", chosen.info());
+        // The shown model is the one the runtime uses.
+        session.send("first", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        let state = session
+            .request(json!({ "type": "get_state" }), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(state["model"]["id"], "default-x", "{state}");
+        manager.stop_all();
     }
 
     #[tokio::test]
