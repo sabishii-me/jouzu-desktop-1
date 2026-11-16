@@ -23,7 +23,14 @@ Status: draft v2 (2026-11-16), replaces the 2026-11-14 design implemented in
    why it did not. Text the user typed is never lost.
 8. **No notice for what the UI already shows** (an attachment in the composer, a
    new session opening). Stop is not an error.
-9. **Every on-screen sentence and action label is localized** (en, ja, zh-Hans,
+9. **A notice never changes the layout.** The notice area has a fixed height
+   (one line of text plus its actions). The sentence is cut with an ellipsis, long
+   tokens (paths, model ids, URLs) wrap or are cut and never widen the window, and
+   Details open in a bounded, scrollable panel over the conversation, not inside
+   the flow. Showing, changing or clearing a notice moves nothing else: not the
+   composer, not the transcript, not the sidebar. The same holds for App notices
+   inside their card or panel.
+10. **Every on-screen sentence and action label is localized** (en, ja, zh-Hans,
    zh-Hant) through the launcher's i18n catalog. No user-facing string is
    hard-coded in a component.
 
@@ -85,6 +92,9 @@ runtime confirms it used it; Stop takes unused ones back with Continue / Discard
   appears only if it still applies.
 - Trigger one error through two paths (failed model change with a session error):
   it is shown once.
+- Trigger the longest notice (image refused) and a notice with a long unbroken
+  token, with Details open and closed, at the smallest window size: the composer,
+  transcript and sidebar keep their size and position.
 - Switch the interface language to each locale: every notice and action is
   translated; Details stay original.
 - No toast component exists; no user action ends with no visible outcome.
@@ -100,4 +110,6 @@ runtime confirms it used it; Stop takes unused ones back with Continue / Discard
   with raw text, not in the card that failed.
 - Runtime notices (MCP status) are passed through verbatim, including terminal
   advice, and repeat on every runtime start.
+- Notices grow with their text: long sentences, long tokens and opened Details
+  push the composer up and can widen the layout.
 - A message sent right after creating a session can disappear with no notice.
