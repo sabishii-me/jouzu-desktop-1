@@ -1,137 +1,103 @@
 # Errors and notices
 
-Status: approved 2026-11-14, implemented in `9c2fd48`. Open decision at the end.
-
-This document is the rule set for how Jouzu Desktop shows errors, warnings and
-information. Every new error path, and every fix that touches one, must follow it.
+Status: draft v2 (2026-11-16), replaces the 2026-11-14 design implemented in
+`9c2fd48`. Every new error path, and every fix that touches one, must follow it.
 
 ## Rules
 
-1. **Session errors and notices appear only above the composer**, in the session
-   notice area, in one form.
-2. **App errors appear where they happen**: settings errors in Settings, update
-   errors in the update panel, startup errors on the start page, a folder's errors
-   on that folder's row in the sidebar.
-3. **No floating toasts.** A toast leaves its context, disappears, and does not say
-   which session it belongs to.
-4. **No raw technical errors on screen.** The user sees one plain sentence and the
-   actions they can take. The original text goes into an expandable **Details**
-   section and into `host.log`.
-5. **No notice for a result the UI already shows** (for example, an attachment
-   that already appears in the composer).
+1. **One type, one form.** Every message the app shows belongs to exactly one type
+   (below). A type has one place, one look and one set of actions. The same
+   underlying error never appears in two forms or two places.
+2. **No stacking.** The notice area above the composer shows **one** notice at a
+   time. A notice is not a queue and not a log.
+3. **One error, one report.** An error is identified by its source and code. When
+   several paths report the same error (for example a failed model change and the
+   session error it caused), the user sees it once.
+4. **Session messages appear only above the composer.** App messages appear where
+   they happen (Settings card, update panel, start page, sidebar row).
+5. **No floating toasts, no unexplained pop-ups.**
+6. **Plain words on screen, original text in Details.** Details are collapsed,
+   copyable, never translated, and the same text is written to `host.log` with its
+   code.
+7. **Never silent.** An action the user started either succeeds visibly or shows
+   why it did not. Text the user typed is never lost.
+8. **No notice for what the UI already shows** (an attachment in the composer, a
+   new session opening). Stop is not an error.
+9. **Every on-screen sentence and action label is localized** (en, ja, zh-Hans,
+   zh-Hant) through the launcher's i18n catalog. No user-facing string is
+   hard-coded in a component.
 
-## The one form
+## Types
 
-Every notice above the composer has the same parts:
+| Type | What it means | Where | Look | Actions | Clears when |
+|---|---|---|---|---|---|
+| **Blocked** | The session cannot continue until something is done | Notice area | Error | The one action that unblocks (Restart session, New session, Remove images, Clear Flow history, Open Settings) | The cause is gone; cannot be dismissed |
+| **Action failed** | Something the user just did did not work | Notice area | Error | Retry | Retry succeeds, the next action, or Dismiss |
+| **Reply failed** | The model or provider ended a reply with an error | Notice area for the latest reply; earlier replies only marked "failed" in the transcript | Error | Retry | Next turn starts, or Dismiss |
+| **Not sent** | A message did not reach the runtime | The message stays in the composer (or is marked "not sent" in the transcript); reason in the notice area | Warning | Retry, Discard | Sent or discarded |
+| **Needs a choice** | The runtime waits for the user (Flow hold, TextGuard review, approval) | Notice area, as the existing card for that feature | Warning | The feature's own choices | The choice is made |
+| **Connection** | The window lost its link to the session | Notice area | Warning | Retry | Reconnected |
+| **Information** | A result the UI cannot show by itself (export path, command reply) | Notice area | Info | Open folder / Dismiss | Next turn starts, or Dismiss |
+| **Runtime notice** | Text the runtime or an extension sends (MCP status, extension errors) | Notice area | Warning or info | Dismiss | Dismiss; the same notice is not shown again for this session |
+| **App** | Settings, provider, update, startup, folder runtime, panels | The card, panel or row where it happened | Error | Retry where it helps | The cause is gone |
 
-- one sentence that says what happened, in plain words;
-- the actions that help (Retry, New session, Restart session, Remove images, ...);
-- **Details**, collapsed by default, with the original error text (copyable);
-- Dismiss, unless dismissing would leave the session silently unusable.
+Successes have no type of their own: the UI change is the confirmation (copy button
+shows a check mark, a divider says "Earlier conversation compacted", the forked
+session opens). Confirmations before destructive actions are not errors.
 
-Implementation: `apps/launcher/src/session-alerts.ts` (what is shown) and
-`apps/launcher/src/session-alerts-view.tsx` (how it is shown).
+## One notice at a time
 
-## Order
+When more than one notice is due, only the highest is shown:
 
-Notices are ordered by what the user must deal with first:
+Blocked > Not sent > Reply failed > Action failed > Needs a choice > Connection >
+Runtime notice > Information.
 
-1. Failures that block every message (session cannot open, session stopped,
-   too many open sessions, Flow history full, model rejects an image).
-2. Things that need a choice (Flow holds a message, TextGuard review, approvals,
-   unsent messages).
-3. Information (command results, export done).
+The others are not lost: when the shown notice clears, the next one is shown if it
+still applies. Notices that no longer apply are dropped, not replayed.
 
-## Where each notice goes
+## Sentences and i18n
 
-### Inside a session (above the composer)
-
-| Situation | Sentence (shape) | Actions |
-|---|---|---|
-| Runtime or extension error | "Extension X failed; this reply may be incomplete." | Details, Dismiss |
-| Session cannot open | "This session could not be opened: reason." | Retry, New session |
-| Session stopped | "This session stopped and needs a restart." | Restart session |
-| Too many open sessions | "Too many sessions are open at once." | New session |
-| Flow request history full | "Flow request history is full. Clear it before sending again." | Clear Flow history |
-| Model rejects an image | "The model rejected a request because of an image in this conversation ..." | Remove images |
-| Reply failed | "The last reply stopped because the model returned an error." | Retry |
-| Message not sent | The message is only marked "not sent"; reason and actions are here | Retry, Discard |
-| No model selected | "Choose a model before sending." Model picker highlighted | Choose model |
-| Changing model / thinking level failed | "The model was not changed: reason." Picker returns to the old value | Retry |
-| Compact, fork, export, reload, recover failed | "Compacting did not finish: reason." (etc.) | Retry |
-| Attachment / video link error | Plain sentence | Dismiss |
-| Runtime command reply (e.g. TextGuard) | Info line; clears when the next turn starts | Dismiss |
-| Connection lost | "Lost the connection to this session." | Retry |
-| Approval error | Stays in the approval card, which is itself in this area | - |
-
-### Successes
-
-Successes get no separate notice when the UI already shows them:
-
-| Result | How the user sees it |
-|---|---|
-| Session ID copied | The copy button shows a check mark for 2 s |
-| Files added | They appear in the composer |
-| Compacted | A divider in the conversation: "Earlier conversation compacted" |
-| Forked | The new session opens |
-| Reloaded | Nothing |
-| Exported | Info line "Exported to ..." with "Open folder" |
-| Session recovered | A divider in the conversation |
-
-### App level
-
-| Source | Where |
-|---|---|
-| Settings, provider connection, startup | In the card where it failed |
-| Window minimise/close failed | Log only (the user cannot act on it) |
-| A folder's runtime cannot start | Under that folder in the sidebar, with Retry |
-| Rename session | Inline on the sidebar row; failure shown on that row |
-| Update check / install | In the update panel, plain sentence + Details |
-| Files, tools, artifacts, MCP, components, reports panels | In the panel, plain sentence + Details |
-
-Confirmations (delete, stop and switch) keep the system confirm dialog; they are
-not errors.
-
-## Plain sentence and Details
-
-- Every error the host returns has a `code`. The UI maps the code to a sentence,
-  for example `capacity` -> "Too many sessions are open at once."
-- An unknown code: say which step did not succeed ("The model was not changed"),
-  and put the original text in Details.
-- Details are collapsed by default and copyable, for bug reports. `host.log` holds
-  the same text.
+- Each type and code maps to one catalog key, for example
+  `notice.blocked.sessionStopped`, `notice.actionFailed.changeModel`,
+  `notice.notSent.noModel`. Placeholders carry names, never raw error text.
+- Host errors carry a `code`; the UI maps the code to a key. An unknown code uses
+  the type's generic sentence ("The model was not changed.") and puts the original
+  text in Details.
+- Runtime and extension text cannot be translated by the launcher: the sentence is
+  a localized summary ("An extension needs attention: slack (sign-in)"), the
+  runtime's text goes to Details. Advice that only works in the terminal (for
+  example "Run /mcp") is not shown as the sentence.
+- A test fails the build when a notice, action label or composer hint is not in all
+  four catalogs.
 
 ## Steer queue
 
-- Messages sent while a reply is running are listed above the composer as an
-  ordered queue. Each can be removed or edited until the runtime uses it.
-- The host owns the queue. It hands a message to the runtime as `steer`; the
-  runtime inserts it at the next safe point (after the current step's tools,
-  before the next model request). A message leaves the queue only after the
-  runtime confirms it used it, so reconnecting or switching sessions neither
-  loses nor duplicates it.
-- Stop takes unused messages back from the runtime. They stay in the queue with
-  Continue or Discard.
+Messages sent while a reply runs are not notices. They are listed above the
+composer as the user's own pending messages, each removable or editable until the
+runtime uses it. The host owns the queue and removes a message only after the
+runtime confirms it used it; Stop takes unused ones back with Continue / Discard.
 
 ## Acceptance
 
-- Trigger each error once: it appears only where this document says, no raw
-  technical text is on screen, and Details holds the original.
-- The UI has no toast component.
-- Steer: send 3 messages during a long reply; the queue shows them in order and
-  each is inserted once, in order. Reconnecting, or switching away and back, loses
-  or duplicates nothing. After Stop the rest can be continued or discarded.
+- Trigger each type once: it appears only in its place, in its form, with no raw
+  technical text on screen and the original in Details.
+- Trigger two errors at once: one notice is shown; after it clears the other
+  appears only if it still applies.
+- Trigger one error through two paths (failed model change with a session error):
+  it is shown once.
+- Switch the interface language to each locale: every notice and action is
+  translated; Details stay original.
+- No toast component exists; no user action ends with no visible outcome.
 
-## Open decision (2026-11-16)
+## Known gaps in the current build (1.1.3-rc.2)
 
-Observed on 1.1.3-rc.1/rc.2: several notices stack above the composer at once,
-and one failure can be reported twice from two paths (for example a session
-error and "Could not change the model" with the same Details). The current
-implementation renders every source as its own row, with no de-duplication and no
-limit, and recent fixes added more notice kinds.
-
-Proposed rule, pending approval:
-
-- Show **one** notice at a time: the most important one by the order above. Others
-  wait and appear when it is resolved or dismissed.
-- **One underlying error is reported once**, whichever path reported it.
+- Notices are rendered as a list, every source its own row: they stack and one
+  error can be shown twice.
+- All session notices, composer hints and `runtime-errors.ts` sentences are
+  hard-coded English; only `App.tsx` and the web-access section use the i18n
+  catalog.
+- Settings shows a generic "Something went wrong" bar at the top of the window
+  with raw text, not in the card that failed.
+- Runtime notices (MCP status) are passed through verbatim, including terminal
+  advice, and repeat on every runtime start.
+- A message sent right after creating a session can disappear with no notice.
