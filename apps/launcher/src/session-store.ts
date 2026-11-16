@@ -9,7 +9,7 @@
 import { HostChatSession } from "./api/chat-session";
 import { eventRouter } from "./event-router";
 import type { ApiEvent, Attachment, HistoryPage, JouzuApi, Receipt, TimingMark } from "./api/jouzu-api";
-import { emptyProjection, historyRowsProjection, hostBlocks, hostToolResults, type ChatBlock, type ChatMessage, type FlowReportRecord, type ToolView } from "./chat-projection";
+import { emptyProjection, historyRowsProjection, hostBlocks, prependHistory, hostToolResults, type ChatBlock, type ChatMessage, type FlowReportRecord, type ToolView } from "./chat-projection";
 import { describeError } from "./runtime-errors";
 import { classifyNotice, type SessionNotice, type TextGuardMode } from "./session-notices";
 import {
@@ -42,6 +42,9 @@ export interface SessionPort {
   detach(): void;
   follow(onEvent: (event: ApiEvent) => void, onError: (error: unknown) => void): void;
 }
+
+/** History rows read per request: the newest page first, earlier pages on demand. */
+const HISTORY_PAGE = 200;
 
 const emptySnapshot = (): ChatSnapshot => ({
   projection: emptyProjection(),
@@ -206,6 +209,12 @@ export class SessionStore {
   private state: ChatSnapshot = emptySnapshot();
   private readonly listeners = new Set<(state: ChatSnapshot) => void>();
   private active = -1;
+  /** The host cursor of the page before the loaded history; null once the first message is loaded. */
+  private earlier: number | null = null;
+  /** History rows loaded, so a reload keeps the earlier pages the user opened. */
+  private loadedRows = 0;
+  /** Bumped by every full reload: an earlier page read before it is stale. */
+  private historyGeneration = 0;
   /** Images of messages waiting in the host queue, so Edit can give them back. */
   private waitingImages = new Map<string, ChatImage[]>();
   private following = false;
@@ -333,11 +342,26 @@ export class SessionStore {
   async loadHistory(): Promise<void> { await this.refreshHistory(); }
 
   async refreshHistory(): Promise<void> {
+    const generation = ++this.historyGeneration;
     try {
-      const page = await this.session.history({ limit: 200 });
+      // The newest page, and as many earlier ones as were loaded before, so a
+      // reload does not take away what the user scrolled back to (#20).
+      const want = Math.max(HISTORY_PAGE, this.loadedRows);
+      const newestFirst: Data[] = [];
+      let before: number | undefined;
+      let earlier: number | null = null;
+      do {
+        const page = await this.session.history({ limit: HISTORY_PAGE, ...(before === undefined ? {} : { before }) });
+        if (generation !== this.historyGeneration) return;
+        newestFirst.push(...(page.messages as unknown as Data[]));
+        earlier = page.nextBefore;
+        before = earlier ?? undefined;
+      } while (earlier !== null && newestFirst.length < want);
       // The host pages newest first (its in-flight partial row leads the page).
       // The transcript reads oldest first, so the partial reply ends up last.
-      const rows = [...(page.messages as unknown as Data[])].reverse();
+      const rows = newestFirst.reverse();
+      this.earlier = earlier;
+      this.loadedRows = rows.length;
       let active = -1;
       let messageIndex = -1;
       for (const row of rows) {
@@ -345,13 +369,39 @@ export class SessionStore {
         if (row.partial === true) active = messageIndex;
       }
       this.active = active;
-      const projection = historyRowsProjection(rows);
+      const projection = historyRowsProjection(rows, this.session.id);
       this.update({
         projection: { ...projection, running: this.running, turnStartedAt: this.state.activeTurn?.startedAt ?? this.state.projection.turnStartedAt, activeMessage: active >= 0 ? active : null },
         historyError: undefined,
+        hasEarlier: earlier !== null,
+        loadingEarlier: false,
       });
     } catch (error) {
-      this.update({ historyError: describeError(error) });
+      if (generation === this.historyGeneration) this.update({ historyError: describeError(error), loadingEarlier: false });
+    }
+  }
+
+  /**
+   * Put the page before the loaded history in front of it (#20). The host
+   * keeps the whole conversation; the transcript starts with its newest page
+   * and reads back one page per request until the first message.
+   */
+  async loadEarlier(): Promise<void> {
+    const before = this.earlier;
+    if (before === null || this.state.loadingEarlier) return;
+    const generation = this.historyGeneration;
+    this.update({ loadingEarlier: true });
+    try {
+      const page = await this.session.history({ limit: HISTORY_PAGE, before });
+      if (generation !== this.historyGeneration || this.disposed) return;
+      const rows = [...(page.messages as unknown as Data[])].reverse().filter(row => row.partial !== true);
+      const earlier = historyRowsProjection(rows, this.session.id);
+      if (this.active >= 0) this.active += earlier.messages.length;
+      this.earlier = page.nextBefore;
+      this.loadedRows += rows.length;
+      this.update({ projection: prependHistory(this.state.projection, earlier), hasEarlier: page.nextBefore !== null, loadingEarlier: false });
+    } catch (error) {
+      if (generation === this.historyGeneration) this.update({ loadingEarlier: false, historyError: describeError(error) });
     }
   }
 
@@ -766,13 +816,15 @@ export class SessionStore {
         break;
       case "message.user": {
         // A waiting message the runtime used: it joins the conversation where it happened.
-        const message = historyRowsProjection([data]).messages[0];
+        const message = historyRowsProjection([data], this.session.id).messages[0];
         if (!message) break;
         const id = text(data.clientMessageId);
         const images = id ? this.waitingImages.get(id) : undefined;
         if (id) this.waitingImages.delete(id);
-        const content = images?.length && !message.content.some(block => block.type === "image")
-          ? [...message.content, ...images.map(image => ({ type: "image", data: image.data, mimeType: image.mimeType }))]
+        // The images this client sent are already here; the host's references to
+        // the same images are fetched only by clients that do not have them.
+        const content = images?.length
+          ? [...message.content.filter(block => block.type !== "image" || !block.attachment), ...images.map(image => ({ type: "image", data: image.data, mimeType: image.mimeType }))]
           : message.content;
         const current = this.state.projection.messages;
         const at = this.active >= 0 && this.active === current.length - 1 ? this.active : current.length;

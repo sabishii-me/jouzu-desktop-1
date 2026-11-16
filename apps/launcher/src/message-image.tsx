@@ -6,6 +6,9 @@ import { Button } from "./components/ui/button";
 import { JouzuLoader } from "./components/ui/jouzu-loader";
 import { useWorkspaceRoot } from "./workspace-context";
 import { copyText } from "./secure-context";
+import { useOptionalApi } from "./api/context";
+import type { JouzuApi } from "./api/jouzu-api";
+import type { HostAttachmentRef } from "./chat-projection";
 
 /** The native reader's cap for a workspace file. */
 export const MAX_LOCAL_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -394,6 +397,70 @@ function LocalImage({ workspace, path, name, alt, caption }: { workspace: string
     const reason = imageCardReason(error.reason);
     return <ImageFallbackCard reason={reason} name={name} path={path} bytes={error.bytes} detail={reason === "not-an-image" ? error.message : undefined} />;
   }
+  return <div role="status" className="my-2 flex items-center gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
+    <JouzuLoader className="jouzu-loader-sm" />Loading image…
+  </div>;
+}
+
+const hostCache = new Map<string, { mimeType: string; data: string }>();
+const hostInflight = new Map<string, Promise<{ mimeType: string; data: string }>>();
+
+/** One deduplicated host read per session+image, kept for the last few shown. */
+export function requestHostAttachment(api: JouzuApi, ref: HostAttachmentRef): Promise<{ mimeType: string; data: string }> {
+  const key = `${ref.sessionId}\u0000${ref.id}`;
+  const cached = hostCache.get(key);
+  if (cached) return Promise.resolve(cached);
+  const pending = hostInflight.get(key);
+  if (pending) return pending;
+  const load = api.sessions.attachment;
+  if (!load) return Promise.reject(new Error("This client cannot read message images."));
+  const request = load(ref.sessionId, ref.id).then(payload => {
+    hostInflight.delete(key);
+    hostCache.delete(key);
+    hostCache.set(key, payload);
+    while (hostCache.size > CACHE_LIMIT) {
+      const oldest = hostCache.keys().next().value;
+      if (oldest === undefined) break;
+      hostCache.delete(oldest);
+    }
+    return payload;
+  }, error => {
+    hostInflight.delete(key);
+    throw error;
+  });
+  hostInflight.set(key, request);
+  return request;
+}
+
+type HostState = { status: "loading" } | { status: "ready"; src: string } | { status: "failed" };
+
+/**
+ * An image of a user message that the host keeps (a history row names it by id).
+ * It is read from the host when shown, so every client (desktop or web) sees
+ * the same transcript after switching sessions or restarting (#119).
+ */
+export function HostAttachmentImage({ attachment, alt = "" }: { attachment: HostAttachmentRef; alt?: string }) {
+  const api = useOptionalApi();
+  const key = `${attachment.sessionId}\u0000${attachment.id}`;
+  const [state, setState] = useState<HostState>(() => {
+    const cached = hostCache.get(key);
+    return cached ? { status: "ready", src: `data:${cached.mimeType};base64,${cached.data}` } : { status: "loading" };
+  });
+  useEffect(() => {
+    let cancelled = false;
+    if (!api) {
+      setState({ status: "failed" });
+      return () => { cancelled = true; };
+    }
+    void requestHostAttachment(api, attachment).then(payload => {
+      if (!cancelled) setState({ status: "ready", src: `data:${payload.mimeType};base64,${payload.data}` });
+    }, () => {
+      if (!cancelled) setState({ status: "failed" });
+    });
+    return () => { cancelled = true; };
+  }, [api, key]);
+  if (state.status === "ready") return <MessageImage kind="block" source={state.src} alt={alt} />;
+  if (state.status === "failed") return <ImageFallbackCard reason="unreadable" name={alt || "Image"} />;
   return <div role="status" className="my-2 flex items-center gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
     <JouzuLoader className="jouzu-loader-sm" />Loading image…
   </div>;

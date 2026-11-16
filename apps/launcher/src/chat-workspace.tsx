@@ -3,7 +3,7 @@ import { ArrowUpCircle, ArrowUpDown, Archive, ArchiveRestore, Check, ChevronDown
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { McpMenu } from "./mcp-menu";
-import { ChatConversation } from "./chat-conversation";
+import { ChatConversation, type EarlierHistory } from "./chat-conversation";
 import { AgentAction, turnLabel } from "./chat-live";
 import { Composer } from "./composer";
 import { changedFiles, snapshotComplete, type WorkspaceSnapshot } from "./workspace-diff";
@@ -20,7 +20,7 @@ import type { ChatModel, ChatSnapshot, PendingPrompt, SessionTiming } from "./ch
 import { eventRouter } from "./event-router";
 import { fitsSendBudget, readImageAttachment, removeSubmittedImages, validateImageSelection, type ImageAttachment } from "./chat-attachments";
 import { normalizeVideoUrl, videoMarker } from "./video-url";
-import { emptyProjection, historyProjection, interruptUnfinishedTools, type ChatProjection, type FlowReportRecord } from "./chat-projection";
+import { emptyProjection, prependHistory, savedPageProjection, type ChatProjection, type FlowReportRecord } from "./chat-projection";
 import { clearDraft, draftKey, readDraft, writeDraft } from "./drafts";
 import { describeError, explainError, isFlowHistoryError, isImageRefused } from "./runtime-errors";
 import { sessionAlerts, type ActionNote, type AlertLevel } from "./session-alerts";
@@ -40,6 +40,18 @@ function defaultPaneWidth() {
 
 interface WorkspaceItem { id: string; path: string }
 interface SessionSummary { path: string; title: string; workspace: string; updated: number; pinned: boolean; archived: boolean; running: boolean; status: string }
+
+/** A saved session shown from its file before (or without) attaching it. */
+type SessionPreview = {
+  path: string;
+  projection: ChatProjection;
+  /** Where the page before it starts in the file; null at the first message; absent when unknown. */
+  before?: number | null;
+  loading?: boolean;
+};
+/** Saved messages read per preview page (#20). */
+const PREVIEW_PAGE = 200;
+
 export interface ChatWorkspaceProps {
   path: string;
   revision?: number;
@@ -150,10 +162,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const switchingRef = useRef(false);
   const switchingTarget = useRef<string | "new" | null>(null);
   const switchPromise = useRef<Promise<void> | null>(null);
-  const [preview, setPreview] = useState<{ path: string; projection: ChatProjection } | null>(null);
-  const previewRef = useRef<{ path: string; projection: ChatProjection } | null>(null);
+  const [preview, setPreview] = useState<SessionPreview | null>(null);
+  const previewRef = useRef<SessionPreview | null>(null);
   previewRef.current = preview;
   const previewRequest = useRef(0);
+  // The last transcript of sessions the user left, to show at once when they come back.
+  // Only a whole transcript is kept: a partial one could not read back its earlier pages.
   const projectionCache = useRef(new Map<string, ChatProjection>());
   const selectedSessionRef = useRef<string | null>(null);
   selectedSessionRef.current = selectedSession;
@@ -429,9 +443,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   useEffect(() => {
     const key = normalizedPath(snapshot.sessionFile ?? "");
     if (!key) return;
-    projectionCache.current.set(key, snapshot.projection);
+    if (snapshot.hasEarlier) projectionCache.current.delete(key);
+    else projectionCache.current.set(key, snapshot.projection);
     while (projectionCache.current.size > 8) projectionCache.current.delete(projectionCache.current.keys().next().value as string);
-  }, [snapshot.sessionFile, snapshot.projection]);
+  }, [snapshot.sessionFile, snapshot.projection, snapshot.hasEarlier]);
   useEffect(() => {
     const current = previewRef.current;
     if (!current || normalizedPath(current.path) !== normalizedPath(snapshot.sessionFile ?? "")) return;
@@ -642,6 +657,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     while (Date.now() < end && !sendCancelRef.current) {
       const current = connection.current;
       if (current?.snapshot.connected) return current;
+      if (current && current.snapshot.status === "stopped" && !switchingRef.current) {
+        if (!await reopenBoundSession()) return null;
+        continue;
+      }
       if (current?.snapshot.error && !current.snapshot.connected && !switchingRef.current) return null;
       await new Promise(resolve => setTimeout(resolve, 25));
     }
@@ -727,17 +746,25 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       setLocalSubmitted(current => current === value ? "" : current);
     }
   }
-  /** Remove the images the provider refuses, keeping the original session file. */
+  /**
+   * Take every image out of this session's history (the host keeps the original
+   * file as a backup), then reload it. Which image a provider refused cannot be
+   * told from its error, and any image left in the history is sent again with the
+   * next message, so all of them go; the text of the conversation stays.
+   */
   async function repairSessionImages() {
     const sessionPath = connection.current?.snapshot.sessionFile ?? snapshot.sessionFile;
     if (!sessionPath) return;
-    setImageRepair(false);
     try {
       const result = await api.sessions.sanitizeImages(sessionPath);
-      if (!result.removed) { tell("No image in this session is below the model's minimum.", "info"); return; }
-      tell(`Removed ${result.removed} image${result.removed === 1 ? "" : "s"} the model cannot read. The original file is kept as a backup.`, "info");
+      setImageRepair(false);
+      if (!result.removed) { tell("This conversation has no images in its history, so nothing was removed.", "info"); return; }
+      // The failed reply stays in the transcript; its error no longer applies.
+      setDismissed(current => ({ ...current, reply: lastIndex }));
+      connection.current?.clearError();
+      tell(`Removed ${result.removed} image${result.removed === 1 ? "" : "s"} from this conversation. The original file is kept as a backup.`, "info");
       await reloadSession();
-    } catch (error) { report(error, "Could not remove the image."); }
+    } catch (error) { report(error, "Could not remove the images."); }
   }
   const name = workspaceLabel(path);
   function parkPrevious(previous: ChatConnection | null) {
@@ -980,21 +1007,96 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       }
     }
   }
+  /**
+   * The host stopped the session this window is bound to (issue #111: the idle
+   * reaper after the machine slept). Open the same conversation again: a saved
+   * one is re-created from its file (the host replaces a stopped session at the
+   * same path), a blank one gets a new session. Selection and preview are left as
+   * the user set them; this only replaces the dead connection under them.
+   * The same path is the "Restart session" of a session the host gave up on
+   * (#95: status "error"); that one runs only when the user asks.
+   */
+  async function reopenBoundSession(): Promise<boolean> {
+    const stale = connection.current;
+    // A failed session (#95) still counts as connected, but its host session runs nothing.
+    if (!stale || (stale.snapshot.connected && stale.snapshot.status !== "error") || switchingRef.current) return false;
+    const sessionFile = stale.snapshot.sessionFile;
+    const saved = !!sessionFile && stale.snapshot.projection.messages.length > 0;
+    switchingRef.current = true;
+    switchingTarget.current = saved ? sessionFile : "new";
+    setSwitching(true);
+    const promise = (async () => {
+      try {
+        // `enter` drops the stale pooled store for this path and opens a fresh one.
+        const next = saved ? await chatPool.enter(path, sessionFile) : await chatPool.lease(path);
+        if (connection.current !== stale) { if (!saved) void next.close().catch(() => {}); return false; }
+        bindClient(next);
+        // Dispose, not close: the host may give the reopened session the same id,
+        // and closing would stop it.
+        stale.dispose();
+        setSessionError(null);
+        void refreshSessions();
+        return true;
+      } catch (error) {
+        if (connection.current === stale) report(error, "Could not reopen this session.");
+        return false;
+      } finally {
+        switchingRef.current = false;
+        switchingTarget.current = null;
+        setSwitching(false);
+      }
+    })();
+    switchPromise.current = promise.then(() => undefined);
+    const current = switchPromise.current;
+    try { return await promise; }
+    finally { if (switchPromise.current === current) switchPromise.current = null; }
+  }
+  // Reopen automatically once per stopped connection. A failure is reported and
+  // left to the user's next send, so a runtime that cannot start is not retried
+  // in a loop.
+  const reopenTried = useRef<ChatConnection | null>(null);
+  useEffect(() => {
+    const stale = connection.current;
+    if (!stale || snapshot.connected || snapshot.status !== "stopped" || switching) return;
+    if (reopenTried.current === stale) return;
+    reopenTried.current = stale;
+    void reopenBoundSession();
+  }, [snapshot.connected, snapshot.status, switching]);
   function loadPreview(sessionPath: string) {
     const request = ++previewRequest.current;
     const cached = projectionCache.current.get(normalizedPath(sessionPath));
     if (cached) {
-      setPreview({ path: sessionPath, projection: cached });
+      // Cached only when whole (see projectionCache): nothing earlier to read.
+      setPreview({ path: sessionPath, projection: cached, before: null });
       return;
     }
-    const previewMessages = api.sessions.messages(sessionPath, 200);
-    void previewMessages.then(messages => {
+    const previewMessages = api.sessions.messages(sessionPath, { limit: PREVIEW_PAGE });
+    void previewMessages.then(page => {
       if (previewRequest.current !== request) return;
       if (normalizedPath(selectedSessionRef.current ?? "") !== normalizedPath(sessionPath)) return;
-      try { setPreview({ path: sessionPath, projection: interruptUnfinishedTools(historyProjection(messages)) }); }
+      try { setPreview({ path: sessionPath, projection: savedPageProjection(page.messages, page.turn), before: page.nextBefore }); }
       catch (error) { setSessionError(describeError(error)); }
     }).catch(error => {
       if (previewRequest.current === request) setSessionError(describeError(error));
+    });
+  }
+  /** The page before what the preview shows, read from the session's file (#20). */
+  function loadEarlierPreview() {
+    const current = previewRef.current;
+    if (!current || current.before === undefined || current.before === null || current.loading) return;
+    const { path, before } = current;
+    const request = previewRequest.current;
+    setPreview({ ...current, loading: true });
+    const same = (value: SessionPreview | null) => previewRequest.current === request && !!value && normalizedPath(value.path) === normalizedPath(path) && value.before === before;
+    void api.sessions.messages(path, { limit: PREVIEW_PAGE, before }).then(page => {
+      const latest = previewRef.current;
+      if (!same(latest) || !latest) return;
+      setPreview({ ...latest, projection: prependHistory(latest.projection, savedPageProjection(page.messages, page.turn)), before: page.nextBefore, loading: false });
+    }).catch(error => {
+      const latest = previewRef.current;
+      if (!same(latest) || !latest) return;
+      setPreview({ ...latest, loading: false });
+      setSessionError(describeError(error));
     });
   }
   /** Start the runtime switch and expose the one promise a send can wait for. */
@@ -1064,7 +1166,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     }
     loadPreview(sessionPath);
   }
-  async function forkTurn(prompt: string, messageIndex: number) {
+  async function forkTurn(prompt: string, turn: number) {
     const client = connection.current;
     if (!client || !prompt.trim()) return;
     if (switchingRef.current || snapshot.pending || !snapshot.connected) { tell("Wait for the session to finish loading, then branch again.", "info"); return; }
@@ -1075,9 +1177,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!await ensureSelectedSession(client)) { tell("Could not branch the conversation.", "error", { details: "The session could not be attached." }); return; }
       const source = connection.current?.snapshot.sessionFile;
       if (!source) throw new Error("This session has no file to branch yet.");
-      // Copy the session through the clicked message (the turn end) into a new saved
-      // session. No runtime fork semantics change.
-      branch = await api.sessions.branch(source, messageIndex);
+      // Copy the session through the clicked turn (its user message, replies and tool
+      // results) into a new saved session. No runtime fork semantics change.
+      branch = await api.sessions.branch(source, turn);
     } catch (error) { report(error, "Could not branch the conversation."); return; }
     // The branch is an ordinary saved session: open it the way a sidebar click does.
     selectedSessionRef.current = branch;
@@ -1285,6 +1387,16 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // never sees a second, still-blocked "Connecting…" state.
   const booting = !chatUnavailable && !snapshot.connected && !sessionError;
   const conversationProjection = activePreview?.projection ?? snapshot.projection;
+  // Earlier pages come from where the transcript on screen came from: the saved file for a
+  // preview, the host session once it shows the attached session (#20).
+  const showsStore = activePreview
+    ? activePreview.before === undefined && normalizedPath(activePreview.path) === normalizedPath(snapshot.sessionFile ?? "")
+    : selectedKey === activeSession;
+  const earlierHistory: EarlierHistory | undefined = showsStore
+    ? { more: !!snapshot.hasEarlier, loading: !!snapshot.loadingEarlier, load: () => void connection.current?.loadEarlier() }
+    : activePreview && activePreview.before !== undefined
+      ? { more: activePreview.before !== null, loading: !!activePreview.loading, load: loadEarlierPreview }
+      : undefined;
   const activeMessage = conversationProjection.activeMessage === null ? undefined : conversationProjection.messages[conversationProjection.activeMessage];
   // The host says when the step is reasoning; the words are the step's reasoning block being written.
   const turnStep = conversationProjection.running ? snapshot.activeTurn?.step : undefined;
@@ -1344,6 +1456,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     offline: !chatUnavailable && !snapshot.connected && workspaceError ? workspaceError : null,
     openError: sessionError,
     runtimeError: snapshot.connected ? workspaceError : null,
+    sessionFailed: showingAttached && snapshot.status === "error",
     historyError: showingAttached ? snapshot.historyError : null,
     imageRefused: imageRepair,
     replyError,
@@ -1356,6 +1469,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     notice: showingAttached && snapshot.notice && snapshot.notice.id !== dismissed.notice ? snapshot.notice : null,
     busy: commandBusy,
   }, {
+    restartSession: () => void reopenBoundSession(),
     retryOpen: selectedSession ? () => { setSessionError(null); startSwitch(selectedSession); } : undefined,
     newSession: () => void startNewSession(),
     clearFlowHistory: () => void runFlow("clear"),
@@ -1479,7 +1593,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         </div>
       </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
-          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={showingAttached && turnChanged && normalizedPath(turnChanged.session) === normalizedPath(snapshot.sessionFile ?? "") ? turnChanged.files : []} />
+          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onFork={(prompt, turn) => void forkTurn(prompt, turn)} history={earlierHistory} onOpenArtifacts={openArtifactsPanel} changedFiles={showingAttached && turnChanged && normalizedPath(turnChanged.session) === normalizedPath(snapshot.sessionFile ?? "") ? turnChanged.files : []} />
         </div>
         <div className="relative">
           <div className="mx-auto w-full max-w-3xl">

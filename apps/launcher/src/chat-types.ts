@@ -94,6 +94,10 @@ export interface ChatSnapshot {
   error: string | null;
   /** The session is open but its transcript could not be read. */
   historyError?: string;
+  /** Earlier messages exist before the loaded history (#20). */
+  hasEarlier?: boolean;
+  /** An earlier page is being read. */
+  loadingEarlier?: boolean;
   sessionId?: string;
   sessionFile?: string;
   /** Host status: pending, starting, idle, running, waiting_approval, waiting_question, recovering, stopped, error. */

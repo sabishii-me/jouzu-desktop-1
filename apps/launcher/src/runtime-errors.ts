@@ -48,9 +48,16 @@ export function describeError(error: unknown): string {
 /** What a person reads, and the raw text kept behind "Details". */
 export interface Explained { text: string; details?: string }
 
-/** A model or provider refused an image that is part of the session. */
+/**
+ * A failed request whose reason names an image. Providers word image refusals in
+ * many ways (size, format, content, "does not support images"), so this does not
+ * try to tell them apart: any failure that blames an image counts. Whatever the
+ * exact reason, the image stays in the session history and is sent again with
+ * every later request (jouzu runtime, shisa-ai/jouzu#54), so the session cannot
+ * continue until the images are taken out of its history.
+ */
 export function isImageRefused(message: string | null | undefined): boolean {
-  return !!message && /image[^.]{0,80}(must be larger|too small|minimum|below)|(must be larger|minimum)[^.]{0,40}image/iu.test(message);
+  return !!message && /\bimage/iu.test(message);
 }
 
 function rawText(error: unknown): string {
@@ -78,6 +85,6 @@ export function explainError(error: unknown, failed: string): Explained {
   if (error instanceof TypeError && /fetch|network/iu.test(error.message)) return { text: "Cannot reach Jouzu. Check that the app is still running.", details };
   if (isCapacityError(raw)) return { text: CAPACITY_MESSAGE, details };
   if (isFlowHistoryError(raw)) return { text: "Flow request history is full. Clear it before sending again.", details };
-  if (isImageRefused(raw)) return { text: "The model refuses an image in this session, so every request fails.", details };
+  if (isImageRefused(raw)) return { text: "The model rejected a request because of an image in this conversation.", details };
   return { text: sentence(failed), details };
 }

@@ -117,6 +117,16 @@ export interface HistoryPage {
   nextBefore: number | null;
 }
 
+/** A page of a saved session's messages, read from its file (#20). */
+export interface SavedMessagesPage {
+  /** Runtime messages, oldest first. */
+  messages: unknown[];
+  /** Read the page before this one with `before: nextBefore`; null at the first message. */
+  nextBefore: number | null;
+  /** User messages before this page: the user turn it starts in. */
+  turn: number;
+}
+
 export interface SessionTiming {
   modelMs: number;
   toolMs: number;
@@ -191,17 +201,20 @@ export interface SessionApi {
   /** This client shows the session now; the host streams its content here again. */
   view?(sessionId: string): Promise<void>;
   history(sessionId: string, page?: { limit?: number; before?: number }): Promise<HistoryPage>;
-  messages(sessionPath: string, limit?: number): Promise<unknown[]>;
+  messages(sessionPath: string, page?: { limit?: number; before?: number }): Promise<SavedMessagesPage>;
   send(sessionId: string, message: OutgoingMessage): Promise<Receipt>;
   interrupt(sessionId: string): Promise<void>;
   cancel(sessionId: string, clientMessageId: string): Promise<void>;
   queue(sessionId: string, action: "continue" | "discard" | "retry"): Promise<void>;
   stop(sessionId: string): Promise<void>;
   update(sessionPath: string, change: { pinned?: boolean; archived?: boolean; title?: string }): Promise<SessionSummary | unknown>;
-  branch(sessionPath: string, messageIndex: number): Promise<string>;
+  /** Copy a saved session through user turn `turn` (1 = the first user message) into a new one. */
+  branch(sessionPath: string, turn: number): Promise<string>;
   recover(sessionPath: string): Promise<string | null>;
   /** Replace images the provider refuses with placeholders; the original is kept. */
   sanitizeImages(sessionPath: string): Promise<{ removed: number; backup: string }>;
+  /** An image of a user message in the session's history, by the id its history row gives it. */
+  attachment?(sessionId: string, attachmentId: string): Promise<{ mimeType: string; data: string }>;
   timing(sessionPath: string): Promise<SessionTiming>;
   flowReports(sessionPath: string): Promise<Array<{ kind: string; text: string }>>;
 }

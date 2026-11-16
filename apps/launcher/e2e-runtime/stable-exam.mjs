@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { writeLongSession } from './long-session.mjs';
 
 // The stable release exam (#86): the full user playbook, with a real model, against the
 // stable build, on throwaway data folders. Every scenario and every gate must pass;
@@ -115,6 +116,15 @@ try {
   browser = await openBrowser(freshHost, 9225);
   const key = await run('shisa-key', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9225', PLAYBOOK_SCENARIO: 'shisa-key', PLAYBOOK_SHISA_API_KEY: shisaKey });
   judge(key);
+  await browser.close();
+
+  // 3. A long saved session reads back to its first message and branches from an
+  //    early turn (#20). It needs a home that holds that session.
+  const long = home('long');
+  writeLongSession(join(long, 'data'), join(long, 'long-workspace'));
+  const longHost = await startHost(long, { SHISA_API_KEY: shisaKey });
+  browser = await openBrowser(longHost, 9226);
+  judge(await run('long-session', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9226', PLAYBOOK_SCENARIO: 'long-session', PLAYBOOK_SHISA_API_KEY: '' }));
   await browser.close();
 } catch (error) {
   report.runs.push({ name: 'exam', problems: [String(error?.message ?? error)] });

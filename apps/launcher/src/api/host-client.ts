@@ -13,6 +13,7 @@ import {
   type EnvironmentEntry,
   type FileEntry,
   type HistoryPage,
+  type SavedMessagesPage,
   type Model,
   type Receipt,
   type RuntimeStatus,
@@ -330,11 +331,18 @@ export class HostClient {
     );
   }
 
-  messages(sessionPath: string, limit?: number): Promise<unknown[]> {
+  attachment(sessionId: string, attachmentId: string): Promise<{ mimeType: string; data: string }> {
+    return this.request<{ mimeType: string; data: string }>(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(attachmentId)}`,
+    );
+  }
+
+  messages(sessionPath: string, page: { limit?: number; before?: number } = {}): Promise<SavedMessagesPage> {
     const query = new URLSearchParams({ sessionPath });
-    if (limit) query.set("limit", String(limit));
-    return this.request<{ messages: unknown[] }>(`/v1/sessions/history?${query}`)
-      .then(body => body.messages);
+    if (page.limit) query.set("limit", String(page.limit));
+    if (page.before !== undefined) query.set("before", String(page.before));
+    return this.request<Partial<SavedMessagesPage>>(`/v1/sessions/history?${query}`)
+      .then(body => ({ messages: body.messages ?? [], nextBefore: body.nextBefore ?? null, turn: body.turn ?? 0 }));
   }
 
   models(): Promise<{ models: Model[] }> {
@@ -433,10 +441,10 @@ export class HostClient {
     });
   }
 
-  branch(sessionPath: string, messageIndex: number): Promise<string> {
+  branch(sessionPath: string, turn: number): Promise<string> {
     return this.request<{ sessionPath: string }>("/v1/sessions/branch", {
       method: "POST",
-      body: JSON.stringify({ sessionPath, messageIndex }),
+      body: JSON.stringify({ sessionPath, turn }),
     }).then(body => body.sessionPath);
   }
 

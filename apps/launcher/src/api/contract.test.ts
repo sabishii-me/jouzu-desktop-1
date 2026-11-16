@@ -48,7 +48,7 @@ function client() {
     sessions: vi.fn(async () => [session]),
     attach: vi.fn(async () => handle),
     history: vi.fn(async () => ({ messages: [], nextBefore: null })),
-    messages: vi.fn(async () => []),
+    messages: vi.fn(async () => ({ messages: [], nextBefore: null, turn: 0 })),
     send: vi.fn(async () => ({ messageId: "m-1", receipt: "queued" })),
     interrupt: vi.fn(async () => undefined),
     stop: vi.fn(async () => undefined),

@@ -2,9 +2,9 @@ import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowDown } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { ChatMarkdown } from "./chat-markdown";
-import { MessageImage } from "./message-image";
+import { HostAttachmentImage, MessageImage } from "./message-image";
 import { WorkspaceContext } from "./workspace-context";
-import type { ChatMessage, ChatProjection } from "./chat-projection";
+import { turnAt, type ChatMessage, type ChatProjection } from "./chat-projection";
 import type { OutboxItem } from "./chat-types";
 import { ToolRenderer } from "./tool-renderers";
 import { ActivityStrip, isRichTool, type ActivityItem } from "./tool-renderers/tool-chip";
@@ -41,9 +41,11 @@ function turnUsageAt(messages: ChatMessage[], end: number) {
   }
   return { usage, startedAt: messages[start]?.timestamp };
 }
-function FinalTurnFooter({ messages, index, message, onFork, forkDisabled = false }: { messages: ChatMessage[]; index: number; message: ChatMessage; onFork?: (prompt: string, index: number) => void; forkDisabled?: boolean }) {
+function FinalTurnFooter({ messages, index, message, complete, onFork, forkDisabled = false }: { messages: ChatMessage[]; index: number; message: ChatMessage; complete: boolean; onFork?: (prompt: string, turn: number) => void; forkDisabled?: boolean }) {
   const metrics = turnUsageAt(messages, index);
-  return <TurnFooter message={message} usage={metrics.usage} startedAt={metrics.startedAt} onFork={onFork ? () => onFork(turnPrompt(messages, index), index) : undefined} forkDisabled={forkDisabled} />;
+  // A branch names the user turn, which stays right whatever part of the history is loaded (#20).
+  const turn = turnAt(messages, index, complete);
+  return <TurnFooter message={message} usage={metrics.usage} startedAt={metrics.startedAt} onFork={onFork && turn !== undefined ? () => onFork(turnPrompt(messages, index), turn) : undefined} forkDisabled={forkDisabled} />;
 }
 
 /**
@@ -65,6 +67,10 @@ function contentParts(message: ChatMessage, index: number, projection: ChatProje
       if (!streaming) {
         activity.push({ kind: "thinking", id: `thinking-${index}-${position}`, text: block.thinking ?? "", streaming: false });
       }
+      return;
+    }
+    if (block.type === "image" && block.attachment) {
+      parts.push(<HostAttachmentImage key={position} attachment={block.attachment} alt="Conversation attachment" />);
       return;
     }
     if (block.type === "image" && typeof block.data === "string" && ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(block.mimeType ?? "")) {
@@ -98,6 +104,7 @@ function contentParts(message: ChatMessage, index: number, projection: ChatProje
 function UserContent({ message }: { message: ChatMessage }) {
   return <>{message.content.map((block, position) => {
     if (block.type === "text") return <ChatMarkdown key={position} text={block.text ?? ""} />;
+    if (block.type === "image" && block.attachment) return <HostAttachmentImage key={position} attachment={block.attachment} alt="Conversation attachment" />;
     if (block.type === "image" && typeof block.data === "string" && ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(block.mimeType ?? "")) {
       return <MessageImage key={position} kind="block" source={`data:${block.mimeType};base64,${block.data}`} alt="Conversation attachment" />;
     }
@@ -119,7 +126,10 @@ function OutboxRow({ item }: { item: OutboxItem }) {
   </article>;
 }
 
-function ChatConversationView({ projection, reasoningLive = false, workspace, busy = false, pendingUser = "", outbox = [], onFork, onOpenArtifacts, changedFiles = [] }: { projection: ChatProjection; reasoningLive?: boolean; workspace?: string; busy?: boolean; pendingUser?: string; outbox?: readonly OutboxItem[]; onFork?: (prompt: string, index: number) => void; onOpenArtifacts?: () => void; changedFiles?: readonly string[] }) {
+/** The session's history beyond what is loaded: earlier pages read on request (#20). */
+export interface EarlierHistory { more: boolean; loading: boolean; load: () => void }
+
+function ChatConversationView({ projection, reasoningLive = false, workspace, busy = false, pendingUser = "", outbox = [], onFork, history, onOpenArtifacts, changedFiles = [] }: { projection: ChatProjection; reasoningLive?: boolean; workspace?: string; busy?: boolean; pendingUser?: string; outbox?: readonly OutboxItem[]; onFork?: (prompt: string, turn: number) => void; history?: EarlierHistory; onOpenArtifacts?: () => void; changedFiles?: readonly string[] }) {
   const scroll = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const following = useRef(true);
@@ -141,6 +151,9 @@ function ChatConversationView({ projection, reasoningLive = false, workspace, bu
   useEffect(() => { pinToBottom(); }, [projection]);
   const visible = projection.messages.flatMap((message, index) => message.role === "user" || message.role === "assistant" ? [{ message, index }] : []);
   const shown = visible.slice(-limit);
+  // Keys stay with their message when earlier pages are put in front.
+  const key = (index: number) => (projection.firstIndex ?? 0) + index;
+  const complete = history ? !history.more : false;
   const turnMarkers = visible.flatMap((item, position) => {
     if (item.message.role !== "user") return [];
     const nextUser = visible.findIndex((candidate, candidatePosition) => candidatePosition > position && candidate.message.role === "user");
@@ -195,7 +208,7 @@ function ChatConversationView({ projection, reasoningLive = false, workspace, bu
     }
     const user = group.find(item => item.message.role === "user");
     if (user) {
-      rows.push(<article key={user.index} ref={node => { if (node) articleRefs.current.set(user.index, node); else articleRefs.current.delete(user.index); }} aria-label="user message" className="ml-6 rounded-xl border border-border bg-muted/50 px-4 py-2 text-left [content-visibility:auto] [contain-intrinsic-size:auto_160px]">
+      rows.push(<article key={key(user.index)} ref={node => { if (node) articleRefs.current.set(user.index, node); else articleRefs.current.delete(user.index); }} aria-label="user message" className="ml-6 rounded-xl border border-border bg-muted/50 px-4 py-2 text-left [content-visibility:auto] [contain-intrinsic-size:auto_160px]">
         <div className="mb-2 text-xs font-medium text-muted-foreground">You</div>
         <UserContent message={user.message} />
       </article>);
@@ -210,18 +223,18 @@ function ChatConversationView({ projection, reasoningLive = false, workspace, bu
       activity.push(...split.activity);
       last = item;
     }
-    if (parts.length || activity.length) rows.push(<article key={`turn-${group[0].index}`} aria-label="assistant message" ref={node => { if (node) articleRefs.current.set(group[0].index, node); else articleRefs.current.delete(group[0].index); }} className="space-y-2">{parts}{activity.length > 0 && <ActivityStrip items={activity} />}</article>);
+    if (parts.length || activity.length) rows.push(<article key={`turn-${key(group[0].index)}`} aria-label="assistant message" ref={node => { if (node) articleRefs.current.set(group[0].index, node); else articleRefs.current.delete(group[0].index); }} className="space-y-2">{parts}{activity.length > 0 && <ActivityStrip items={activity} />}</article>);
     if (last) {
       const nextMessage = projection.messages[last.index + 1];
       const turnEnd = !nextMessage || nextMessage.role === "user";
       // A marker only: what went wrong is explained above the composer (for the
       // latest reply); the model's own words stay behind Details.
       // Stop is the user's own choice, not an error; the status line says "Interrupted".
-      if (last.message.errorMessage && last.message.stopReason !== "aborted") rows.push(<details key={`error-${last.index}`} className="text-xs text-destructive"><summary className="cursor-pointer select-none">This reply stopped with an error</summary><pre className="mt-1 select-text whitespace-pre-wrap break-words font-mono text-[10px] text-muted-foreground">{last.message.errorMessage}</pre></details>);
+      if (last.message.errorMessage && last.message.stopReason !== "aborted") rows.push(<details key={`error-${key(last.index)}`} className="text-xs text-destructive"><summary className="cursor-pointer select-none">This reply stopped with an error</summary><pre className="mt-1 select-text whitespace-pre-wrap break-words font-mono text-[10px] text-muted-foreground">{last.message.errorMessage}</pre></details>);
       if (turnEnd && !projection.running && !busy && !last.message.content.some(block => block.type === "toolCall") && last.message.stopReason !== "toolUse") {
         // The workspace diff belongs to the latest turn only (#79); earlier turns list
         // what their own tool calls show.
-        rows.push(<div key={`footer-${last.index}`}><TurnSummary data={summarizeTurn(projection.messages, projection.tools, last.index, nextMessage ? [] : changedFiles)} workspace={workspace} onOpenArtifacts={onOpenArtifacts} /><FinalTurnFooter messages={projection.messages} index={last.index} message={last.message} onFork={onFork} forkDisabled={busy} /></div>);
+        rows.push(<div key={`footer-${key(last.index)}`}><TurnSummary data={summarizeTurn(projection.messages, projection.tools, last.index, nextMessage ? [] : changedFiles)} workspace={workspace} onOpenArtifacts={onOpenArtifacts} /><FinalTurnFooter messages={projection.messages} index={last.index} message={last.message} complete={complete} onFork={onFork} forkDisabled={busy} /></div>);
       }
     }
   }
@@ -229,7 +242,9 @@ function ChatConversationView({ projection, reasoningLive = false, workspace, bu
     <section aria-label="Conversation" className="relative flex min-h-0 min-w-0 flex-1 flex-col">
     <div ref={scroll} className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-5 sm:px-8" onScroll={event => { const view = event.currentTarget; following.current = view.scrollHeight - view.scrollTop - view.clientHeight < 80; setShowLatest(!following.current); if (turnMarkers.length) { const max = view.scrollHeight - view.clientHeight; const ratio = max > 0 ? Math.min(1, Math.max(0, view.scrollTop / max)) : 0; setActiveTurn(Math.min(turnMarkers.length - 1, Math.round(ratio * (turnMarkers.length - 1)))); } }}>
       {!visible.length && <div className="mx-auto max-w-xl py-16 text-center"><h2 className="text-xl font-semibold">What would you like to work on?</h2><p className="mt-3 text-sm text-muted-foreground">Ask Jouzu to explore your workspace, explain code, or make a change.</p></div>}
-      {visible.length > shown.length && <div className="mx-auto mb-4 flex max-w-3xl justify-center"><Button variant="outline" className="h-7 px-3 text-xs" onClick={() => setLimit(value => value + 50)}>Show {visible.length - shown.length} earlier message{visible.length - shown.length === 1 ? "" : "s"}</Button></div>}
+      {visible.length > shown.length
+        ? <div className="mx-auto mb-4 flex max-w-3xl justify-center"><Button variant="outline" className="h-7 px-3 text-xs" onClick={() => setLimit(value => value + 50)}>Show {visible.length - shown.length} earlier message{visible.length - shown.length === 1 ? "" : "s"}</Button></div>
+        : history?.more && <div className="mx-auto mb-4 flex max-w-3xl justify-center"><Button variant="outline" className="h-7 px-3 text-xs" disabled={history.loading} onClick={() => { setLimit(value => Math.max(value, visible.length) + 50); history.load(); }}>{history.loading ? "Loading earlier messages…" : "Load earlier messages"}</Button></div>}
       <div ref={content} className="mx-auto max-w-3xl space-y-3">{rows}
         {outbox.map(item => <OutboxRow key={item.clientMessageId} item={item} />)}
         {pendingUser && <article aria-label="user message" className="ml-6 rounded-xl border border-border bg-muted/50 px-4 py-2 text-left opacity-70">

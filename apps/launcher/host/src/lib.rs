@@ -13,6 +13,7 @@ use std::{
 };
 
 mod artifacts;
+pub mod awake;
 pub mod control;
 mod environment;
 pub mod events;
@@ -324,6 +325,10 @@ pub fn router(state: AppState) -> Router {
             "/sessions/{id}/queue",
             axum::routing::post(queue_session),
         )
+        .route(
+            "/sessions/{id}/attachments/{attachment}",
+            get(session_attachment),
+        )
         .route("/sessions/{id}/stop", axum::routing::post(stop_session))
         .route("/sessions/{id}/view", axum::routing::post(view_session))
         .route("/sessions/{id}/stats", get(session_stats))
@@ -570,25 +575,27 @@ struct MessagesQuery {
     #[serde(rename = "sessionPath")]
     session_path: String,
     limit: Option<usize>,
+    /// Read the messages before this position (the `nextBefore` of the later page).
+    before: Option<usize>,
 }
 
 async fn history_preview(
     State(state): State<AppState>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!({
-        "messages": state
+    Ok(Json(
+        state
             .sessions
-            .messages(&query.session_path, query.limit)?,
-    })))
+            .messages(&query.session_path, query.limit, query.before)?,
+    ))
 }
 
 #[derive(Deserialize)]
 struct BranchRequest {
     #[serde(rename = "sessionPath")]
     session_path: String,
-    #[serde(rename = "messageIndex")]
-    message_index: usize,
+    /// The user turn to branch through (1 = the first user message).
+    turn: usize,
 }
 
 async fn branch_session(
@@ -598,7 +605,7 @@ async fn branch_session(
     Ok(Json(json!({
         "sessionPath": state
             .sessions
-            .branch_session(&request.session_path, request.message_index)?,
+            .branch_session(&request.session_path, request.turn)?,
     })))
 }
 
@@ -1714,6 +1721,18 @@ async fn history(
 ) -> Result<Json<Value>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
     Ok(Json(session.history(query.limit.unwrap_or(200), query.before)))
+}
+
+/// An image of a user message in the session's history, by the id the history
+/// row gives it. History rows carry no image data, so every client (desktop
+/// window or web) shows a message's images through this one route (#119).
+async fn session_attachment(
+    State(state): State<AppState>,
+    AxumPath((id, attachment)): AxumPath<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    let (mime_type, data) = session.attachment(&attachment)?;
+    Ok(Json(json!({ "id": attachment, "mimeType": mime_type, "data": data })))
 }
 
 /// A request the host could not serve leaves a line in host.log with what the
@@ -2852,7 +2871,7 @@ mod tests {
 #[cfg(test)]
 mod session_tests {
     use super::*;
-    use crate::session::{Attachment, RuntimeSpec, SessionManager, Status};
+    use crate::session::{Attachment, IdleLimits, RuntimeSpec, SessionManager, Status};
     use axum::http::{Method, Request};
     use http_body_util::BodyExt;
     use std::{
@@ -3606,6 +3625,84 @@ mod session_tests {
             .unwrap();
         wait_until(|| session.status() == Status::Error).await;
         assert_eq!(session.status(), Status::Error);
+    }
+
+    /// A saved conversation and a message sent to it before its runtime started.
+    async fn failing_session(env: &[(&str, &str)]) -> (Arc<crate::session::Session>, Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir, String) {
+        let (manager, home, workspace) = manager_with_env(50, env);
+        let header = json!({ "type": "session", "version": 3, "id": "fails", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let file = workspace.path().join("fails.jsonl");
+        std::fs::write(&file, format!("{header}\n")).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), Some(path.clone()), None)
+            .unwrap();
+        session.send("waiting", "hello").unwrap();
+        (session, manager, home, workspace, path)
+    }
+
+    /// What a client is left with once the session has failed: no turn to
+    /// wait for, no runtime to stop, and the reason.
+    fn assert_failed_and_settled(session: &crate::session::Session, code: &str) {
+        let summary = session.summary();
+        assert_eq!(summary["status"], "error", "{summary}");
+        assert!(summary["activeTurn"].is_null(), "a failed session keeps no turn waiting: {summary}");
+        assert_eq!(session.runtime_pid(), None, "a failed session keeps no runtime");
+        let (events, _) = session.events_after(1);
+        let ended = events
+            .iter()
+            .find(|event| event.event == "turn.end")
+            .unwrap_or_else(|| panic!("the waiting turn ended: {:?}", events.iter().map(|event| &event.event).collect::<Vec<_>>()));
+        assert_eq!(ended.data["status"], "failed", "{}", ended.data);
+        assert_eq!(ended.data["reason"], code, "{}", ended.data);
+        let error = events.iter().rev().find(|event| event.event == "error").expect("an error event");
+        assert_eq!(error.data["code"], code, "{}", error.data);
+        // Stop has nothing left to wait for (it used to answer "cancelling" or
+        // leave "Stopping…" up forever).
+        let stop = session.cancel_message("waiting").unwrap();
+        assert_ne!(stop["status"], "cancelling", "{stop}");
+    }
+
+    #[tokio::test]
+    async fn a_session_the_runtime_refuses_to_open_fails_at_once_and_ends_the_waiting_turn() {
+        let starts = tempfile::NamedTempFile::new().unwrap();
+        let starts_path = starts.path().to_string_lossy().into_owned();
+        let (session, manager, _home, _workspace, path) = failing_session(&[
+            ("FAKE_RUNTIME_SWITCH_ERROR", "Flow session metadata is missing or inconsistent."),
+            ("FAKE_RUNTIME_START_LOG", &starts_path),
+        ])
+        .await;
+        wait_until(|| session.status() == Status::Error).await;
+        assert_failed_and_settled(&session, "session-attach-failed");
+        let (events, _) = session.events_after(1);
+        let error = events.iter().rev().find(|event| event.event == "error").unwrap();
+        let message = error.data["message"].as_str().unwrap();
+        assert!(message.contains("Flow session metadata is missing or inconsistent."), "{message}");
+        // The refusal is about the file, not the runtime: no restart may follow.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let started = std::fs::read_to_string(starts.path()).unwrap().lines().count();
+        assert_eq!(started, 1, "a refused session is not retried on new runtimes");
+        assert_eq!(session.status(), Status::Error);
+        // Opening it again is a new attempt with a new session.
+        let again = manager
+            .create(_workspace.path().to_str().unwrap(), Some(path), None)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&again, &session));
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_keeps_dying_while_a_message_waits_ends_that_turn() {
+        let (session, manager, _home, _workspace, _path) =
+            failing_session(&[("FAKE_RUNTIME_IGNORE_STDIN", "1"), ("FAKE_RUNTIME_EXIT_ON_START_MS", "5")]).await;
+        for _ in 0..200 {
+            if session.status() == Status::Error {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_failed_and_settled(&session, "runtime-crashed");
+        manager.stop_all();
     }
 
     #[tokio::test]
@@ -4383,7 +4480,7 @@ mod session_tests {
         let _stream = manager.connect_client("window");
         manager.hold("window", &left.id);
         // Shown by a client: kept.
-        manager.reap_idle(Duration::from_secs(3600));
+        manager.reap_idle(IdleLimits::all(Duration::from_secs(3600)));
         assert!(manager.get(&left.id).is_some());
         // Used: kept until the usual idle time.
         let used = manager.create_pending(folder, None, None).unwrap();
@@ -4391,10 +4488,125 @@ mod session_tests {
         wait_status(&used, Status::Idle).await;
         // The client moves on: the untouched one is released at once, the used one is not.
         manager.hold("window", &used.id);
-        manager.reap_idle(Duration::from_secs(3600));
+        let left_file = left.session_path.lock().unwrap().clone().expect("a new session has a file");
+        let used_file = used.session_path.lock().unwrap().clone().expect("a new session has a file");
+        manager.reap_idle(IdleLimits::all(Duration::from_secs(3600)));
         assert!(manager.get(&left.id).is_none());
         assert_eq!(left.status(), Status::Stopped);
         assert!(manager.get(&used.id).is_some());
+        // #92: the never-used one leaves no file; the used one keeps its own.
+        wait_until(|| !std::path::Path::new(&left_file).exists()).await;
+        assert!(std::path::Path::new(&used_file).exists());
+        manager.stop_all();
+    }
+
+    /// #93: visiting many sessions does not keep a runtime for each. Once the
+    /// window moves on and the idle limit passes, only the session it shows
+    /// keeps one (besides the warm pool).
+    #[tokio::test]
+    async fn sessions_the_window_left_give_their_runtimes_back() {
+        let (manager, _home, workspace) = manager(50);
+        let folder = workspace.path().to_str().unwrap();
+        let _stream = manager.connect_client("window");
+        let mut visited = Vec::new();
+        for n in 0..5 {
+            let path = workspace.path().join(format!("s{n}.jsonl"));
+            let session = manager.create(folder, Some(path.to_string_lossy().into_owned()), None).unwrap();
+            manager.hold("window", &session.id);
+            wait_status(&session, Status::Idle).await;
+            session.send(&format!("m{n}"), "hello").unwrap();
+            wait_status(&session, Status::Idle).await;
+            visited.push(session);
+        }
+        let limits = IdleLimits { idle: Duration::ZERO, pending: Duration::from_secs(3600), released_hold: Duration::from_secs(3600) };
+        manager.reap_idle(limits);
+        let live: Vec<_> = visited.iter().filter(|session| session.runtime_pid().is_some() && session.status() == Status::Idle).collect();
+        assert_eq!(live.len(), 1, "only the shown session keeps its runtime");
+        assert_eq!(live[0].id, visited[4].id);
+        for session in &visited[..4] {
+            assert_eq!(session.status(), Status::Stopped);
+            assert!(manager.get(&session.id).is_none());
+        }
+        manager.stop_all();
+    }
+
+    /// #92: a new session left before anything was sent, with no runtime
+    /// (nothing was warm), leaves no file once it is reaped or the host exits.
+    #[tokio::test]
+    async fn a_new_session_never_used_leaves_no_file() {
+        let (manager, _home, workspace) = manager(50);
+        let folder = workspace.path().to_str().unwrap();
+        let left = manager.create_pending(folder, None, None).unwrap();
+        let left_file = left.session_path.lock().unwrap().clone().expect("a new session has a file");
+        let kept = manager.create_pending(folder, None, None).unwrap();
+        let kept_file = kept.session_path.lock().unwrap().clone().expect("a new session has a file");
+        assert!(std::path::Path::new(&left_file).exists());
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &kept.id);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
+        assert!(std::path::Path::new(&kept_file).exists(), "shown by a client: kept");
+        assert_eq!(left.status(), Status::Cancelled);
+        assert!(!std::path::Path::new(&left_file).exists());
+        // A file that holds a conversation is never removed, whatever the host thinks.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&kept_file)
+            .and_then(|mut file| {
+                std::io::Write::write_all(
+                    &mut file,
+                    b"{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+                )
+            })
+            .unwrap();
+        manager.shutdown();
+        assert!(std::path::Path::new(&kept_file).exists());
+    }
+
+    /// #93: a saved conversation stopped before its start ran (the start is
+    /// spawned) must not start a runtime that nobody owns.
+    #[tokio::test]
+    async fn a_session_stopped_before_its_start_runs_starts_no_runtime() {
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().join("old.jsonl");
+        let session = manager
+            .create(
+                workspace.path().to_str().unwrap(),
+                Some(path.to_string_lossy().into_owned()),
+                None,
+            )
+            .unwrap();
+        session.stop();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(session.status(), Status::Stopped);
+        assert_eq!(session.runtime_pid(), None);
+    }
+
+    /// #94: until one runtime has answered, a runtime may still have to apply
+    /// its profile under a lock it does not wait for. A session that finds
+    /// nothing to take while another runtime boots waits for it instead of
+    /// starting a second one beside it.
+    #[tokio::test]
+    async fn before_any_runtime_answered_runtimes_start_one_at_a_time() {
+        let (manager, _home, workspace) = slow_manager(50);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let folder = workspace.path().to_str().unwrap();
+        wait_until(|| pool.status()["warm"] == 1).await;
+        let first = manager
+            .create(folder, Some(workspace.path().join("a.jsonl").to_string_lossy().into_owned()), None)
+            .unwrap();
+        wait_until(|| first.runtime_pid().is_some()).await;
+        // The warm runtime, still booting, went to the first session.
+        let second = manager
+            .create(folder, Some(workspace.path().join("b.jsonl").to_string_lossy().into_owned()), None)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(second.runtime_pid(), None, "no second runtime while the first boots");
+        assert!(pool.must_wait(), "{}", pool.status());
+        wait_status(&first, Status::Idle).await;
+        // Once one answered, the second starts.
+        wait_status(&second, Status::Idle).await;
+        assert!(second.runtime_pid().is_some());
+        assert_ne!(second.runtime_pid(), first.runtime_pid());
         manager.stop_all();
     }
 
@@ -4744,6 +4956,130 @@ mod session_tests {
         assert_eq!(result["interrupted"], true);
         assert_eq!(result["ok"], false);
         assert_eq!(reply["stopReason"], "toolUse");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_long_saved_session_pages_back_to_its_first_turn_and_branches_by_turn() {
+        // #20: a long conversation (130 turns, each with a tool call) is read page
+        // by page, newest first, until the first turn, with no gap or repeat. Each
+        // row names its user turn, and branching through a turn copies that turn
+        // whole (tool result and final reply included) and nothing after it.
+        let (manager, _home, workspace) = manager(50);
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("long.jsonl");
+        let turns = 130usize;
+        let mut lines = vec![json!({ "type": "session", "version": 3, "id": "long", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() })];
+        for turn in 1..=turns {
+            let call = format!("call-{turn}");
+            lines.push(json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": format!("question {turn}") }] } }));
+            lines.push(json!({ "type": "message", "message": { "role": "assistant", "content": [{ "type": "toolCall", "id": call, "name": "ls", "arguments": {} }], "stopReason": "toolUse" } }));
+            lines.push(json!({ "type": "message", "message": { "role": "toolResult", "toolCallId": call, "toolName": "ls", "content": [{ "type": "text", "text": "a.txt" }], "isError": false } }));
+            lines.push(json!({ "type": "message", "message": { "role": "assistant", "content": [{ "type": "text", "text": format!("answer {turn}") }], "stopReason": "stop" } }));
+        }
+        std::fs::write(&file, lines.iter().map(|line| format!("{line}\n")).collect::<String>()).unwrap();
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+
+        let mut rows: Vec<Value> = Vec::new();
+        let mut before = None;
+        let mut pages = 0;
+        loop {
+            let page = session.history(200, before);
+            pages += 1;
+            let messages = page["messages"].as_array().unwrap();
+            // Pages arrive newest first; the transcript reads oldest first.
+            rows.splice(0..0, messages.iter().rev().cloned());
+            match page["nextBefore"].as_u64() {
+                Some(next) => before = Some(next),
+                None => break,
+            }
+            assert!(pages < 10, "paging did not end");
+        }
+        assert_eq!(rows.len(), turns * 3, "every saved row is reachable");
+        let cursors: Vec<u64> = rows.iter().map(|row| row["cursor"].as_u64().unwrap()).collect();
+        assert_eq!(cursors, (1..=(turns as u64 * 3)).collect::<Vec<_>>(), "no gap or repeat at page boundaries");
+        for (at, row) in rows.iter().enumerate() {
+            assert_eq!(row["turn"].as_u64(), Some((at / 3 + 1) as u64), "{row}");
+        }
+        assert_eq!(rows[0]["text"], "question 1");
+        assert_eq!(rows.last().unwrap()["text"], format!("answer {turns}"));
+
+        let branch = manager.branch_session(file.to_str().unwrap(), 1).unwrap();
+        let copied: Vec<Value> = std::fs::read_to_string(&branch)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let roles: Vec<&str> = copied.iter().filter_map(|entry| entry["message"]["role"].as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "toolResult", "assistant"]);
+        assert_eq!(copied[3]["message"]["content"][0]["text"], "answer 1");
+        let last = manager.branch_session(file.to_str().unwrap(), turns).unwrap();
+        assert_eq!(std::fs::read_to_string(&last).unwrap().lines().count(), lines.len());
+        assert!(manager.branch_session(file.to_str().unwrap(), 0).is_err());
+        assert!(manager.branch_session(file.to_str().unwrap(), turns + 1).is_err());
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_saved_session_preview_pages_back_with_turn_numbers() {
+        // #20: an idle saved session is shown from its file. Its pages go back to
+        // the first message with no gap or repeat, and each page says which user
+        // turn it starts in.
+        let (manager, _home, workspace) = manager(50);
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("preview-long.jsonl");
+        let mut lines = vec![json!({ "type": "session", "version": 3, "id": "p", "cwd": workspace.path().to_string_lossy() }).to_string()];
+        for turn in 1..=130 {
+            lines.push(json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": format!("q{turn}") }] } }).to_string());
+            lines.push(json!({ "type": "message", "message": { "role": "assistant", "content": [{ "type": "toolCall", "id": format!("c{turn}"), "name": "ls", "arguments": {} }] } }).to_string());
+            lines.push(json!({ "type": "message", "message": { "role": "toolResult", "toolCallId": format!("c{turn}"), "content": [{ "type": "text", "text": "x" }] } }).to_string());
+            lines.push(json!({ "type": "message", "message": { "role": "assistant", "content": [{ "type": "text", "text": format!("a{turn}") }] } }).to_string());
+        }
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let mut all: Vec<Value> = Vec::new();
+        let mut before = None;
+        let mut turns = Vec::new();
+        loop {
+            let page = manager.messages(&path, Some(200), before).unwrap();
+            let messages = page["messages"].as_array().unwrap().clone();
+            turns.push(page["turn"].as_u64().unwrap());
+            all.splice(0..0, messages);
+            match page["nextBefore"].as_u64() {
+                Some(next) => before = Some(next as usize),
+                None => break,
+            }
+        }
+        assert_eq!(all.len(), 520);
+        assert_eq!(turns, vec![80, 30, 0], "the newest page starts in turn 81, the next in turn 31");
+        assert_eq!(all[0]["content"][0]["text"], "q1");
+        assert_eq!(all[519]["content"][0]["text"], "a130");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_saved_session_larger_than_32_mib_shows_its_newest_messages() {
+        // #20: the newest messages of a long session are at the end of its file.
+        let (manager, _home, workspace) = manager(50);
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("big.jsonl");
+        let big = "x".repeat(33 * 1024 * 1024);
+        let lines = [
+            json!({ "type": "session", "version": 3, "id": "big", "cwd": workspace.path().to_string_lossy() }).to_string(),
+            json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": big }] } }).to_string(),
+            json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": "newest" }] } }).to_string(),
+        ];
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+        let page = manager.messages(&file.to_string_lossy(), Some(1), None).unwrap();
+        assert_eq!(page["messages"][0]["content"][0]["text"], "newest");
+        assert_eq!(page["turn"], 1);
+        assert_eq!(page["nextBefore"], 1);
         manager.stop_all();
     }
 
@@ -5661,7 +5997,7 @@ mod session_tests {
         let stream = manager.connect_client("desktop");
         manager.hold("desktop", &first.id);
         manager.hold("desktop", &second.id);
-        manager.reap_idle(Duration::ZERO);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
         assert!(
             manager.get(&first.id).is_none(),
             "a session the client left is reaped"
@@ -5673,15 +6009,82 @@ mod session_tests {
 
         drop(stream);
         let reconnected = manager.connect_client("desktop");
-        manager.reap_idle(Duration::ZERO);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
         assert!(
             manager.get(&second.id).is_some(),
             "a reconnected stream keeps its hold"
         );
 
         drop(reconnected);
-        manager.reap_idle(Duration::ZERO);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
         assert!(manager.get(&second.id).is_none(), "a closed stream holds nothing");
+    }
+
+    #[tokio::test]
+    async fn the_session_a_client_shows_survives_its_stream_dropping_for_the_idle_timeout() {
+        // Issue #111: a sleeping machine drops the window's event stream. At resume
+        // the reaper runs before the stream reconnects; the session in view must
+        // still be there when it does.
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().to_str().unwrap();
+        let shown = manager.create(path, None, Some("shown".into())).unwrap();
+        let left = manager.create(path, None, Some("left".into())).unwrap();
+        wait_status(&shown, Status::Idle).await;
+        wait_status(&left, Status::Idle).await;
+        let stream = manager.connect_client("desktop");
+        manager.hold("desktop", &shown.id);
+        drop(stream);
+
+        let limits = IdleLimits {
+            idle: Duration::ZERO,
+            pending: Duration::ZERO,
+            released_hold: Duration::from_secs(3600),
+        };
+        manager.reap_idle(limits);
+        assert!(manager.get(&shown.id).is_some(), "the shown session is kept while its client reconnects");
+        assert!(manager.get(&left.id).is_none(), "other idle sessions are still reaped");
+
+        // The reconnected client keeps it as before.
+        let _reconnected = manager.connect_client("desktop");
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
+        assert!(manager.get(&shown.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_comes_back_releases_its_session_after_the_hold() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let stream = manager.connect_client("desktop");
+        manager.hold("desktop", &session.id);
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        manager.reap_idle(IdleLimits {
+            idle: Duration::ZERO,
+            pending: Duration::ZERO,
+            released_hold: Duration::from_millis(50),
+        });
+        assert!(manager.get(&session.id).is_none());
+        assert_eq!(session.status(), Status::Stopped);
+    }
+
+    #[tokio::test]
+    async fn an_untouched_new_session_in_view_survives_a_dropped_stream() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        let stream = manager.connect_client("desktop");
+        manager.hold("desktop", &session.id);
+        drop(stream);
+        manager.reap_idle(IdleLimits {
+            idle: Duration::ZERO,
+            pending: Duration::ZERO,
+            released_hold: Duration::from_secs(3600),
+        });
+        assert!(manager.get(&session.id).is_some());
     }
 
     #[tokio::test]
@@ -5692,7 +6095,7 @@ mod session_tests {
             .unwrap();
         let _stream = manager.connect_client("desktop");
         manager.hold("desktop", &session.id);
-        manager.reap_idle(Duration::ZERO);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
         assert!(manager.get(&session.id).is_some());
     }
 
@@ -5704,7 +6107,7 @@ mod session_tests {
             .unwrap();
         wait_status(&session, Status::Idle).await;
         manager.hold("desktop", &session.id);
-        manager.reap_idle(Duration::ZERO);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
         assert!(manager.get(&session.id).is_none());
     }
 
@@ -6090,8 +6493,95 @@ mod session_tests {
         let attachment = &user["attachments"][0];
         assert!(attachment.get("data").is_none());
         assert_eq!(attachment["mimeType"], "image/png");
-        assert!(attachment["path"].as_str().unwrap().ends_with(".png"));
-        assert!(std::path::Path::new(attachment["path"].as_str().unwrap()).is_file());
+        // Where the host keeps the file is not part of history (web clients read it).
+        assert!(attachment.get("path").is_none(), "{attachment}");
+        assert!(!history.to_string().contains("attachments\\att-") && !history.to_string().contains("attachments/att-"), "{history}");
+        let id = attachment["id"].as_str().unwrap();
+        assert_eq!(session.attachment(id).unwrap(), ("image/png".to_string(), "AAEC".to_string()));
+    }
+
+    /// Issue #119: a message's images stay in the transcript a client rebuilds
+    /// from host history, for a live session and for one read from its saved file.
+    #[tokio::test]
+    async fn history_images_are_served_by_id_live_and_from_the_saved_file() {
+        let (manager, _home, workspace) = manager(50);
+        let header = json!({ "type": "session", "version": 3, "id": "saved-images", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let with_text = json!({ "type": "message", "id": "m1", "parentId": null, "timestamp": "2026-01-01T00:00:01Z", "message": { "role": "user", "content": [
+            { "type": "text", "text": "what is in this picture?" },
+            { "type": "image", "mimeType": "image/webp", "data": "UklGRg==" },
+        ] } });
+        let reply = json!({ "type": "message", "id": "m2", "parentId": "m1", "timestamp": "2026-01-01T00:00:02Z", "message": { "role": "assistant", "content": [{ "type": "text", "text": "A cat." }] } });
+        let image_only = json!({ "type": "message", "id": "m3", "parentId": "m2", "timestamp": "2026-01-01T00:00:03Z", "message": { "role": "user", "content": [
+            { "type": "image", "mimeType": "image/png", "data": "AAEC" },
+        ] } });
+        let file = workspace.path().join("saved.jsonl");
+        std::fs::write(&file, format!("{header}\n{with_text}\n{reply}\n{image_only}\n")).unwrap();
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+
+        let users = |history: &Value| -> Vec<Value> {
+            let mut rows: Vec<Value> = history["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["kind"] == "user")
+                .cloned()
+                .collect();
+            rows.reverse();
+            rows
+        };
+        let history = session.history(50, None);
+        let saved = users(&history);
+        assert_eq!(saved.len(), 2, "the image-only message is kept: {history}");
+        assert_eq!(saved[0]["text"], "what is in this picture?");
+        assert_eq!(saved[0]["attachments"][0]["mimeType"], "image/webp");
+        assert_eq!(saved[0]["attachments"][0]["bytes"], 4);
+        assert_eq!(saved[1]["text"], "");
+        assert_eq!(saved[1]["attachments"][0]["mimeType"], "image/png");
+        assert!(!history.to_string().contains("UklGRg=="), "history carries no image data: {history}");
+
+        // A message sent now, with an image, next to those from the file.
+        session
+            .send_with_client(
+                "live-image",
+                "and this one?",
+                None,
+                &[Attachment { name: "pixel.gif".into(), mime_type: "image/gif".into(), data: "R0lG".into() }],
+            )
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let live = users(&session.history(50, None));
+        assert_eq!(live.len(), 3, "{live:?}");
+
+        let app = app(manager.clone());
+        let fetch = |id: &str| {
+            let app = app.clone();
+            let path = format!("/v1/sessions/{}/attachments/{}", session.id, id);
+            async move { call(app, request(Method::GET, &path).body(Body::empty()).unwrap()).await }
+        };
+        for (row, mime_type, data) in [
+            (&saved[0], "image/webp", "UklGRg=="),
+            (&saved[1], "image/png", "AAEC"),
+            (&live[2], "image/gif", "R0lG"),
+        ] {
+            let id = row["attachments"][0]["id"].as_str().unwrap();
+            let (status, _, body) = fetch(id).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["mimeType"], mime_type);
+            assert_eq!(body["data"], data);
+        }
+        let (status, _, body) = fetch("att-unknown").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        // The file read again (as on reload): same ids, still served.
+        session.open_saved_history();
+        let again = users(&session.history(50, None));
+        assert_eq!(again[0]["attachments"][0]["id"], saved[0]["attachments"][0]["id"]);
+        let (status, _, _) = fetch(saved[1]["attachments"][0]["id"].as_str().unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

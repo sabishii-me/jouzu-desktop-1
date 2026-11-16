@@ -153,9 +153,19 @@ async fn main() -> ExitCode {
     {
         let sessions = sessions.clone();
         tokio::spawn(async move {
+            // A session nobody shows gives its runtime back within about a
+            // minute: reopening it takes a warm runtime for its folder (a switch
+            // of about a second), while every runtime kept costs ~150 MB (#93).
+            // A new session never started holds no runtime and waits longer; a
+            // window whose stream dropped (sleep) keeps its session (#111).
+            let limits = jouzu_host::session::IdleLimits {
+                idle: std::time::Duration::from_secs(60),
+                pending: std::time::Duration::from_secs(15 * 60),
+                released_hold: std::time::Duration::from_secs(15 * 60),
+            };
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                sessions.reap_idle(std::time::Duration::from_secs(15 * 60));
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                sessions.reap_idle(limits);
             }
         });
     }
@@ -223,7 +233,7 @@ async fn main() -> ExitCode {
         })
         .await;
 
-    sessions.stop_all();
+    sessions.shutdown();
     remove_host_file(&home, &token);
     log(
         &home,

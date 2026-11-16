@@ -79,3 +79,23 @@ describe("files a turn changed", () => {
     expect(html.slice(0, latest)).not.toContain("notes.db-shm");
   });
 });
+
+describe("earlier messages of a long session (#20)", () => {
+  const page: ChatProjection = {
+    ...emptyProjection(),
+    messages: [
+      { role: "user", content: [{ type: "text", text: "question 131" }], turn: 131 },
+      { role: "assistant", content: [{ type: "text", text: "answer 131" }], turn: 131, stopReason: "stop" },
+    ],
+  };
+
+  it("offers to load earlier messages while the host has more", () => {
+    const html = renderToStaticMarkup(<ChatConversation projection={page} history={{ more: true, loading: false, load: () => {} }} />);
+    expect(html).toContain("Load earlier messages");
+    expect(renderToStaticMarkup(<ChatConversation projection={page} history={{ more: false, loading: false, load: () => {} }} />)).not.toContain("Load earlier messages");
+  });
+
+  it("shows that an earlier page is loading", () => {
+    expect(renderToStaticMarkup(<ChatConversation projection={page} history={{ more: true, loading: true, load: () => {} }} />)).toContain("Loading earlier messages…");
+  });
+});

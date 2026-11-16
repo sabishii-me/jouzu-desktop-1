@@ -36,6 +36,8 @@ export interface SessionAlertInputs {
   openError?: string | null;
   /** An error the runtime or host reported for this session. */
   runtimeError?: string | null;
+  /** The host gave up on this session (status "error"): it runs nothing until restarted. */
+  sessionFailed?: boolean;
   historyError?: string | null;
   imageRefused?: boolean;
   /** The last reply ended with a model error (only while nothing runs). */
@@ -53,6 +55,8 @@ export interface SessionAlertInputs {
 
 export interface SessionAlertHandlers {
   retryOpen?: () => void;
+  /** Open the session again on a new runtime. */
+  restartSession?: () => void;
   newSession: () => void;
   clearFlowHistory: () => void;
   removeRefusedImage: () => void;
@@ -97,9 +101,9 @@ export function sessionAlerts(input: SessionAlertInputs, on: SessionAlertHandler
     alerts.push({
       id: "image",
       level: "error",
-      text: "This session contains an image the model refuses, so every request fails. Removing it keeps the rest of the conversation.",
+      text: "The model rejected a request because of an image in this conversation. Images stay in the history and are sent again with every message, so the next message fails the same way. Remove the images to continue; the text of the conversation is kept.",
       details: errors.find(isImageRefused),
-      actions: [{ label: "Remove the image", run: on.removeRefusedImage, disabled: busy }],
+      actions: [{ label: "Remove images", run: on.removeRefusedImage, disabled: busy }, { label: "New session", run: on.newSession }],
     });
   }
   if (input.historyError) {
@@ -126,7 +130,12 @@ export function sessionAlerts(input: SessionAlertInputs, on: SessionAlertHandler
   if (input.replyError && !special(input.replyError)) {
     alerts.push({ id: "reply", level: "error", text: "The last reply stopped because the model returned an error.", details: input.replyError, actions: [], dismiss: on.dismissReplyError });
   }
-  if (input.runtimeError && !special(input.runtimeError) && input.runtimeError !== input.replyError) {
+  if (input.sessionFailed) {
+    // Nothing runs in it any more, so the reason comes with the way back, and
+    // it cannot be dismissed into a session that silently refuses every message.
+    const { details } = explainError(input.runtimeError ?? "", "This session stopped.");
+    alerts.push({ id: "runtime", level: "error", text: "This session stopped and needs a restart.", details, actions: on.restartSession ? [{ label: "Restart session", run: on.restartSession, disabled: busy }] : [] });
+  } else if (input.runtimeError && !special(input.runtimeError) && input.runtimeError !== input.replyError) {
     const { text, details } = explainError(input.runtimeError, "Something in this session failed.");
     alerts.push({ id: "runtime", level: "error", text, details, actions: [], dismiss: on.dismissRuntimeError });
   }

@@ -86,6 +86,12 @@ struct Inner {
     spawning: Option<(u64, Option<PathBuf>)>,
     /// Stopped for good (the host is shutting down): nothing starts again.
     stopped: bool,
+    /// A runtime has answered since the host started (or since settings that
+    /// runtimes apply at start changed). Until then the runtime may still have
+    /// to apply its profile, which it does under a lock it does not wait for: a
+    /// second runtime starting beside the first exits with code 1 (#94). So
+    /// until one has answered, only one runtime starts at a time.
+    converged: bool,
 }
 
 /// Blank runtimes kept warm. The entry session is the fifth runtime.
@@ -163,6 +169,8 @@ pub struct WarmPool {
     inner: Mutex<Inner>,
     changed: Box<dyn Fn(Value) + Send + Sync>,
     ready: Notify,
+    /// Told on every change of the pool, for sessions waiting their turn to start.
+    moved: Notify,
 }
 
 impl WarmPool {
@@ -176,19 +184,24 @@ impl WarmPool {
         memory: Option<PathBuf>,
         changed: impl Fn(Value) + Send + Sync + 'static,
     ) -> Arc<Self> {
-        let recent: Vec<PathBuf> = memory
+        let mut recent: Vec<PathBuf> = Vec::new();
+        let remembered = memory
             .as_ref()
             .and_then(|file| std::fs::read_to_string(file).ok())
-            .map(|text| {
-                text.lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(PathBuf::from)
-                    .filter(|path| path.is_dir())
-                    .take(CAPACITY)
-                    .collect()
-            })
             .unwrap_or_default();
+        for path in remembered
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+        {
+            // One place per folder, whatever its spelling (#98): an older list
+            // may hold `\\?\C:\x` and `C:\x` both. The first (most recent) wins.
+            if recent.len() < CAPACITY && !recent.iter().any(|known| same_place(known, &path)) {
+                recent.push(path);
+            }
+        }
         Arc::new(Self {
             spec: Box::new(spec),
             memory,
@@ -202,9 +215,11 @@ impl WarmPool {
                 attaching: 0,
                 spawning: None,
                 stopped: false,
+                converged: false,
             }),
             changed: Box::new(changed),
             ready: Notify::new(),
+            moved: Notify::new(),
         })
     }
 
@@ -244,6 +259,7 @@ impl WarmPool {
 
     fn notify(&self) {
         let status = self.status();
+        self.moved.notify_waiters();
         (self.changed)(status);
     }
 
@@ -385,6 +401,7 @@ impl WarmPool {
                         // then dies would otherwise be restarted forever. A session
                         // taking one, or a client asking again, resets them.
                         slot.ready_ms = Some(slot.started_at.elapsed().as_millis() as u64);
+                        inner.converged = true;
                     }
                     pool.ready.notify_waiters();
                     pool.notify();
@@ -502,7 +519,11 @@ impl WarmPool {
                 .first()
                 .is_some_and(|first| same_folder(first, workspace));
             if !already_first {
-                inner.recent.retain(|folder| !same_folder(folder, workspace));
+                // One place per folder (#98). `\\?\C:\x` and `C:\x` are one folder
+                // to the user; the runtime still loads its extensions again across
+                // the two spellings, so the place takes the spelling of the latest
+                // use and runtimes warmed in the other one are retired below.
+                inner.recent.retain(|folder| !same_place(folder, workspace));
                 inner.recent.insert(0, workspace.to_path_buf());
                 inner.recent.truncate(CAPACITY);
                 if let Some(file) = &self.memory {
@@ -558,6 +579,50 @@ impl WarmPool {
         };
         if let Some(pid) = pid {
             process::set_low_priority(pid, false);
+        }
+    }
+
+    /// A runtime the pool did not start (a session's own) begins to boot: the
+    /// pool starts nothing beside it until the session has attached, as when a
+    /// session takes a warm runtime.
+    pub fn booting(self: &Arc<Self>) -> Attaching {
+        self.lock().attaching += 1;
+        self.notify();
+        Attaching(Some(self.clone()))
+    }
+
+    /// A session's runtime answered: the runtime's start-up work (its profile)
+    /// is done, so runtimes may start side by side from now on.
+    pub fn converged(&self) {
+        let changed = {
+            let mut inner = self.lock();
+            !std::mem::replace(&mut inner.converged, true)
+        };
+        if changed {
+            self.notify();
+        }
+    }
+
+    /// Whether a session that found no runtime to take must wait before it
+    /// starts its own: no runtime has answered yet and another one is booting
+    /// (the pool's, still being spawned, or one a session is attaching to).
+    pub fn must_wait(&self) -> bool {
+        let inner = self.lock();
+        !inner.converged && !inner.stopped && (inner.spawning.is_some() || inner.attaching > 0)
+    }
+
+    /// Wait until `must_wait` is false, up to `timeout`.
+    pub async fn wait_turn(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let moved = self.moved.notified();
+            if !self.must_wait() {
+                return;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || tokio::time::timeout(left, moved).await.is_err() {
+                return;
+            }
         }
     }
 
@@ -626,6 +691,9 @@ impl WarmPool {
             inner.failures = 0;
             inner.generation += 1;
             inner.error = None;
+            // What changed (a profile, a sign-in) is applied by the next runtime
+            // that starts; let it start alone again.
+            inner.converged = false;
             std::mem::take(&mut inner.slots)
         };
         for slot in slots {
@@ -711,5 +779,28 @@ mod tests {
         );
         let many: Vec<PathBuf> = (0..6).map(|n| PathBuf::from(format!("/f{n}"))).collect();
         assert_eq!(plan(&many).len(), 4);
+    }
+
+    /// #98: one folder written two ways (`\\?\` prefix, other case on
+    /// Windows) is one place in the pool; the latest spelling is kept.
+    #[tokio::test]
+    async fn one_folder_in_two_spellings_is_one_place() {
+        let home = tempfile::tempdir().unwrap();
+        let memory = home.path().join("warm-workspace.txt");
+        let pool = WarmPool::new(|_| Err("no runtime in this test".to_string()), Some(memory.clone()), |_| {});
+        let plain = home.path().to_path_buf();
+        let prefixed = PathBuf::from(format!("\\\\?\\{}", plain.display()));
+        assert!(same_place(&plain, &prefixed));
+        pool.aim(&plain);
+        pool.aim(&prefixed);
+        assert_eq!(pool.folders(), vec![prefixed.clone()]);
+        pool.aim(&plain);
+        assert_eq!(pool.folders(), vec![plain.clone()]);
+        pool.stop();
+        // An older list holding both spellings is read as one place.
+        std::fs::write(&memory, format!("{}\n{}\n", plain.display(), prefixed.display())).unwrap();
+        let pool = WarmPool::new(|_| Err("no runtime in this test".to_string()), Some(memory), |_| {});
+        assert_eq!(pool.folders().len(), 1);
+        pool.stop();
     }
 }

@@ -25,6 +25,15 @@ const uiTimeout = Number(process.env.FAKE_RUNTIME_UI_TIMEOUT_MS ?? 0);
 const steps = Number(process.env.FAKE_RUNTIME_STEPS ?? 0);
 const stepRetry = process.env.FAKE_RUNTIME_STEP_RETRY === "1";
 const hangTool = process.env.FAKE_RUNTIME_HANG_TOOL === "1";
+// Like Flow refusing a session file it cannot own: every switch_session fails.
+// The same, decided when the switch arrives: while this file exists, its text is the refusal.
+const switchErrorFile = process.env.FAKE_RUNTIME_SWITCH_ERROR_FILE ?? "";
+const switchRefusal = () => {
+  if (process.env.FAKE_RUNTIME_SWITCH_ERROR) return process.env.FAKE_RUNTIME_SWITCH_ERROR;
+  try { return switchErrorFile ? readFileSync(switchErrorFile, "utf8").trim() : ""; } catch { return ""; }
+};
+// One line per runtime started, to count restarts.
+if (process.env.FAKE_RUNTIME_START_LOG) appendFileSync(process.env.FAKE_RUNTIME_START_LOG, `${process.pid}\n`);
 const out = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 const response = (id, command, data) =>
   out({ id, type: "response", command, success: true, data });
@@ -334,6 +343,11 @@ lines.on("line", line => {
       response(value.id, "set_thinking_level", { level: String(value.level ?? "off") });
       break;
     case "switch_session":
+      const refusal = switchRefusal();
+      if (refusal) {
+        failure(value.id, "switch_session", refusal);
+        break;
+      }
       // Like the runtime: a saved conversation resumes on the model it last used.
       try {
         const changes = readFileSync(String(value.sessionPath), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.type === "model_change");

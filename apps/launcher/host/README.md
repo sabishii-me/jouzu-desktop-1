@@ -93,7 +93,8 @@ POST /sessions                       { workspacePath, sessionPath? }  -> 202
 GET  /sessions/persisted             saved sessions per workspace
 GET  /sessions/{id}                  status, pending approvals and questions
 GET  /sessions/{id}/messages         history, paged
-POST /sessions/{id}/messages         { clientMessageId, text }  -> 202 with a receipt
+POST /sessions/{id}/messages         { clientMessageId, text, attachments? }  -> 202 with a receipt
+GET  /sessions/{id}/attachments/{attachmentId}  an image of a user message in history: { id, mimeType, data }
 POST /sessions/{id}/interrupt | /cancel | /stop | /queue
 POST /sessions/{id}/model | /thinking | /compact | /export | /reload
 POST /approvals/{id}/decision        { clientId, decision }

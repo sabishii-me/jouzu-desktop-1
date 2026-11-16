@@ -79,9 +79,11 @@ fn saved_model(path: &Path) -> Option<Value> {
 }
 
 /// The messages a saved session file holds, in the order they were written.
+/// Every message of a saved session file, oldest first. The whole file is read:
+/// a long session's newest messages are at its end (#20).
 fn saved_messages(path: &Path) -> std::io::Result<Vec<Value>> {
     let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
+    let reader = std::io::BufReader::new(file);
     let mut messages = Vec::new();
     for line in std::io::BufRead::lines(reader) {
         let Ok(line) = line else { break };
@@ -105,6 +107,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
+use crate::awake::AwakeInstant;
 use crate::log;
 use crate::runtime::adapter::pi::{self, DeltaKind, Record as PiRecord};
 use crate::runtime::{same_place, RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec, WarmPool};
@@ -123,6 +126,7 @@ use sha2::{Digest, Sha256};
 
 pub const DEFAULT_REPLAY_LIMIT: usize = 5_000;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
+const RUNTIME_GAVE_UP: &str = "The runtime could not recover; restart it to continue.";
 
 #[derive(Clone)]
 pub struct RuntimeSpec {
@@ -395,6 +399,40 @@ fn reply_blocks(message: &Value) -> Vec<Value> {
     blocks
 }
 
+/// Where a history image's bytes are: a file the host stored when the message
+/// was sent, or the image block of the saved session file it was read from.
+#[derive(Clone)]
+enum AttachmentSource {
+    File { path: PathBuf, mime_type: String },
+    Saved { mime_type: String, data: Arc<str> },
+}
+
+/// The images of a saved user message, with the ids its history row gives them.
+/// The id is the message's place in the file, so it is the same on every import.
+fn saved_images(message: &Value, index: usize) -> Vec<(String, String, String)> {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|block| {
+            let mime_type = block.get("mimeType").and_then(Value::as_str)?;
+            let data = block.get("data").and_then(Value::as_str)?;
+            (mime_type.starts_with("image/") && !data.is_empty())
+                .then(|| (mime_type.to_string(), data.to_string()))
+        })
+        .enumerate()
+        .map(|(number, (mime_type, data))| (format!("saved-{index}-{number}"), mime_type, data))
+        .collect()
+}
+
+/// Decoded size of base64 data.
+fn base64_len(data: &str) -> usize {
+    let padding = data.bytes().rev().take_while(|byte| *byte == b'=').count().min(2);
+    (data.len() / 4 * 3).saturating_sub(padding)
+}
+
 /// What a tool that never finished shows: it was cut off, not still running.
 fn interrupted_result() -> Value {
     json!({ "content": [{ "type": "text", "text": "Interrupted" }] })
@@ -601,6 +639,9 @@ pub struct Session {
     runtime_home: PathBuf,
     history: Mutex<Vec<Value>>,
     history_seq: AtomicU64,
+    /// Where the images of the user's messages in `history` are: a history row
+    /// names an image by id only, and clients fetch it by that id (#119).
+    attachments: Mutex<HashMap<String, AttachmentSource>>,
     assistant_text: Mutex<String>,
     assistant_blocks: Mutex<Vec<Value>>,
     step: Mutex<StepState>,
@@ -615,7 +656,8 @@ pub struct Session {
     thinking_level: Mutex<Option<String>>,
     subscribers: AtomicU64,
     next_client: AtomicU64,
-    last_activity: Mutex<Instant>,
+    /// Awake time, so a machine that slept does not count as idle (issue #111).
+    last_activity: Mutex<AwakeInstant>,
 }
 
 impl Session {
@@ -658,14 +700,14 @@ impl Session {
         *self
             .last_activity
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = AwakeInstant::now();
     }
 
     pub fn subscriber_count(&self) -> u64 {
         self.subscribers.load(Ordering::Relaxed)
     }
 
-    pub fn last_activity(&self) -> Instant {
+    pub fn last_activity(&self) -> AwakeInstant {
         *self
             .last_activity
             .lock()
@@ -725,12 +767,16 @@ impl Session {
         let mut page = page;
         // A resync while a step is streaming must include what it has already
         // said. This row is synthetic: the step's reply is appended to history
-        // when the runtime finishes writing it.
-        let active = self
-            .active_message
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        // when the runtime finishes writing it. It is the newest row, so only
+        // the newest page carries it, never an earlier one.
+        let active = if before.is_some() {
+            None
+        } else {
+            self.active_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        };
         if let Some(turn) = active {
             let text = self
                 .assistant_text
@@ -775,13 +821,24 @@ impl Session {
 
     fn push_history(&self, mut row: Value) {
         let cursor = self.history_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Which user turn of the conversation a row belongs to (1 = the first
+        // user message). The saved file counts user messages the same way, so a
+        // client that loaded only some pages can still name a turn to branch at.
+        let previous = history
+            .last()
+            .and_then(|row| row.get("turn"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let user = row.get("kind").and_then(Value::as_str) == Some("user");
         if let Some(object) = row.as_object_mut() {
             object.insert("cursor".to_string(), json!(cursor));
+            object.insert("turn".to_string(), json!(previous + u64::from(user)));
         }
-        self.history
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(row);
+        history.push(row);
     }
 
     /// A queued message the runtime has used: its row joins history now, where
@@ -1686,22 +1743,14 @@ impl Session {
     fn request_messages(&self) {
         let id = self.request_id();
         if let Err(error) = self.write_command(pi::command::with_id(pi::command::get_messages(), &id)) {
-            self.publish(
-                "error",
-                json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-            );
-            self.set_status(Status::Error);
+            self.fail(error.code, &error.message, error.retryable);
         }
     }
 
     fn request_state(&self) {
         let id = self.request_id();
         if let Err(error) = self.write_command(pi::command::with_id(pi::command::get_state(), &id)) {
-            self.publish(
-                "error",
-                json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-            );
-            self.set_status(Status::Error);
+            self.fail(error.code, &error.message, error.retryable);
         }
     }
 
@@ -1728,11 +1777,7 @@ impl Session {
                 let result =
                     self.write_command(pi::command::with_id(pi::command::switch_session(&path), &id));
                 if let Err(error) = result {
-                    self.publish(
-                        "error",
-                        json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-                    );
-                    self.set_status(Status::Error);
+                    self.fail(error.code, &error.message, error.retryable);
                     return;
                 }
                 *self
@@ -1886,6 +1931,18 @@ impl Session {
                 "runtime.response_failed",
                 json!({ "command": command, "message": message }),
             );
+            // A live runtime that refuses to open the session file (Flow
+            // storage, ownership, a damaged file) answers the same way to any
+            // runtime started after it: restarting cannot help, so the session
+            // fails at once with the runtime's reason.
+            if reply.is_handshake() && matches!(self.status(), Status::Starting | Status::Recovering) {
+                self.fail(
+                    "session-attach-failed",
+                    &format!("This session could not be opened: {message}"),
+                    true,
+                );
+                return;
+            }
             self.publish(
                 "error",
                 json!({ "code": "runtime-error", "message": message, "retryable": false }),
@@ -1910,9 +1967,7 @@ impl Session {
             if reply == pi::Reply::SetThinkingLevel {
                 self.request_state();
             }
-            if reply.is_handshake() && matches!(self.status(), Status::Starting | Status::Recovering) {
-                self.recovery_failed(message.to_string());
-            } else if reply == pi::Reply::Prompt {
+            if reply == pi::Reply::Prompt {
                 self.end_turn(
                     response_id,
                     json!({ "aborted": true, "reason": "runtime-error", "message": message }),
@@ -1928,15 +1983,13 @@ impl Session {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 if cancelled {
-                    self.publish(
-                        "error",
-                        json!({ "code": "session-switch-cancelled", "message": "The runtime cancelled the session switch", "retryable": false }),
+                    // An extension refused the switch: the same refusal awaits
+                    // any restarted runtime.
+                    self.fail(
+                        "session-switch-cancelled",
+                        "The runtime cancelled the session switch",
+                        true,
                     );
-                    if matches!(self.status(), Status::Starting | Status::Recovering) {
-                        self.recovery_failed("session switch cancelled".to_string());
-                    } else {
-                        self.set_status(Status::Error);
-                    }
                     return;
                 }
                 *self
@@ -1990,6 +2043,8 @@ impl Session {
         // Start the next warm runtime only now: on a busy machine a second
         // runtime booting beside this one would slow down the one the user waits for.
         if let Some(pool) = self.config.warm.get() {
+            // This runtime answered, so its start-up work is done (#94).
+            pool.converged();
             let pool = pool.clone();
             let workspace = PathBuf::from(self.runtime_cwd());
             tokio::spawn(async move { pool.aim(&workspace) });
@@ -2088,6 +2143,8 @@ impl Session {
             return;
         };
         let mut rows = Vec::new();
+        let mut saved_attachments = Vec::new();
+        let mut attachment_refs = Vec::new();
         for (index, message) in messages.iter().enumerate() {
             let role = message
                 .get("role")
@@ -2121,6 +2178,7 @@ impl Session {
                 continue;
             }
             let blocks = reply_blocks(message);
+            let images = if role == "user" { saved_images(message, index) } else { Vec::new() };
             let text = blocks
                 .iter()
                 .filter_map(|block| {
@@ -2132,7 +2190,8 @@ impl Session {
                 })
                 .collect::<Vec<_>>()
                 .join("");
-            if text.is_empty() && blocks.is_empty() {
+            // A message of only an image is still a message (#119).
+            if text.is_empty() && blocks.is_empty() && images.is_empty() {
                 continue;
             }
             let blocks = if blocks.is_empty() {
@@ -2140,6 +2199,25 @@ impl Session {
             } else {
                 Value::Array(blocks)
             };
+            if !images.is_empty() {
+                // Same shape as a row the host wrote when the message was sent.
+                let refs: Vec<Value> = images
+                    .iter()
+                    .enumerate()
+                    .map(|(number, (id, mime_type, data))| {
+                        json!({
+                            "id": id,
+                            "name": format!("image-{}", number + 1),
+                            "mimeType": mime_type,
+                            "bytes": base64_len(data),
+                        })
+                    })
+                    .collect();
+                saved_attachments.extend(images.into_iter().map(|(id, mime_type, data)| {
+                    (id, AttachmentSource::Saved { mime_type, data: Arc::from(data) })
+                }));
+                attachment_refs.push((rows.len(), refs));
+            }
             rows.push(json!({
                 "kind": role,
                 "id": message
@@ -2167,6 +2245,16 @@ impl Session {
         }
         if rows.is_empty() {
             return;
+        }
+        for (row, refs) in attachment_refs {
+            rows[row]["attachments"] = json!(refs);
+        }
+        {
+            // The saved file's images replace those of an earlier import; images
+            // sent in this run stay, as their rows may still be on screen.
+            let mut attachments = self.attachments.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            attachments.retain(|_, source| matches!(source, AttachmentSource::File { .. }));
+            attachments.extend(saved_attachments);
         }
         // A saved conversation is at rest: a tool call with no result was cut off
         // (the app closed, the runtime stopped). While a turn runs, its own calls
@@ -2536,11 +2624,7 @@ impl Session {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("runtime error");
-                self.publish(
-                    "error",
-                    json!({ "code": "runtime-error", "message": message, "retryable": false }),
-                );
-                self.set_status(Status::Error);
+                self.fail("runtime-error", message, false);
             }
             _ => {}
         }
@@ -3103,15 +3187,42 @@ impl Session {
             let path = directory.join(format!("{id}.{extension}"));
             std::fs::write(&path, &bytes)
                 .map_err(|error| ApiError::internal(format!("Could not store attachment: {error}")))?;
+            // The row names the image by id; where it is stored stays in the host.
             stored.push(json!({
                 "id": id,
                 "name": attachment.name,
                 "mimeType": attachment.mime_type,
                 "bytes": bytes.len(),
-                "path": path.to_string_lossy(),
             }));
+            self.attachments
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id, AttachmentSource::File { path, mime_type: attachment.mime_type.clone() });
         }
         Ok(stored)
+    }
+
+    /// An image of a user message in this session's history, by the id its
+    /// history row gives it: its type and base64 data.
+    pub fn attachment(&self, id: &str) -> Result<(String, String), ApiError> {
+        let source = self
+            .attachments
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::new(axum::http::StatusCode::NOT_FOUND, "attachment-not-found", "No such attachment", false)
+            })?;
+        match source {
+            AttachmentSource::File { path, mime_type } => {
+                let bytes = std::fs::read(&path).map_err(|error| {
+                    ApiError::internal(format!("Could not read attachment: {error}"))
+                })?;
+                Ok((mime_type, STANDARD.encode(bytes)))
+            }
+            AttachmentSource::Saved { mime_type, data } => Ok((mime_type, data.to_string())),
+        }
     }
 
     pub fn send(self: &Arc<Self>, client_message_id: &str, text: &str) -> Result<Value, ApiError> {
@@ -3341,10 +3452,7 @@ impl Session {
             self.set_status(Status::Starting);
             self.start(true);
             if matches!(self.status(), Status::Cancelled | Status::Error) {
-                self.publish(
-                    "turn.end",
-                    json!({ "turnId": message_id, "aborted": true, "reason": "runtime-unavailable" }),
-                );
+                self.end_active_turn(json!({ "aborted": true, "reason": "runtime-unavailable" }));
                 messages.remove(client_message_id);
                 return Err(ApiError::new(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -3363,11 +3471,7 @@ impl Session {
             self.set_status(Status::Running);
             let result = self.write_command(prompt);
             if let Err(error) = result {
-                self.publish(
-                    "error",
-                    json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-                );
-                self.set_status(Status::Error);
+                self.fail(error.code, &error.message, error.retryable);
                 messages.remove(client_message_id);
                 return Err(error);
             }
@@ -3886,6 +3990,52 @@ impl Session {
         let _ = std::fs::remove_file(&self.lease_path);
     }
 
+    /// The host is done with this session for good: it was reaped, or the host
+    /// is shutting down. A new conversation nobody ever wrote in also leaves no
+    /// file behind (#92): the host wrote its header at creation, so the host
+    /// removes it, unless the file holds a conversation after all.
+    pub fn discard(&self) {
+        let unused = self.untouched();
+        self.stop();
+        if !unused {
+            return;
+        }
+        let Some(path) = self
+            .session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        if !session_file_unused(&path) {
+            return;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            log(&self.home, "info", "session.discarded", json!({ "session": self.id }));
+            return;
+        }
+        // The runtime was just terminated; on Windows its handle can outlive
+        // the call for a moment.
+        let home = self.home.clone();
+        let id = self.id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                for _ in 0..10 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    if !session_file_unused(&path) {
+                        return;
+                    }
+                    if std::fs::remove_file(&path).is_ok() {
+                        log(&home, "info", "session.discarded", json!({ "session": id }));
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
     pub fn info(&self) -> Value {
         json!({
             "sessionId": self.id,
@@ -4099,6 +4249,7 @@ impl Session {
             runtime_home: config.runtime_home.clone(),
             history: Mutex::new(Vec::new()),
             history_seq: AtomicU64::new(0),
+            attachments: Mutex::new(HashMap::new()),
             assistant_text: Mutex::new(String::new()),
             assistant_blocks: Mutex::new(Vec::new()),
             step: Mutex::new(StepState::new()),
@@ -4112,7 +4263,7 @@ impl Session {
             thinking_level: Mutex::new(None),
             subscribers: AtomicU64::new(0),
             next_client: AtomicU64::new(0),
-            last_activity: Mutex::new(Instant::now()),
+            last_activity: Mutex::new(AwakeInstant::now()),
         })
     }
 
@@ -4162,15 +4313,7 @@ impl Session {
             .write(true)
             .open(&self.lease_path)
         {
-            self.set_status(Status::Error);
-            self.publish(
-                "error",
-                json!({
-                    "code": "internal",
-                    "message": format!("Could not create the runtime lease: {error}"),
-                    "retryable": false,
-                }),
-            );
+            self.fail("internal", &format!("Could not create the runtime lease: {error}"), false);
             return;
         }
         self.spawn_runtime(true, from_pending);
@@ -4198,6 +4341,11 @@ impl Session {
     }
 
     fn spawn_runtime(self: &Arc<Self>, initial: bool, from_pending: bool) -> bool {
+        // Stopped before its start ran (the start is spawned): a runtime started
+        // now would belong to nobody and live until the host exits (#93).
+        if matches!(self.status(), Status::Stopped | Status::Cancelled) {
+            return false;
+        }
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
         // A warm runtime is switched to this session's file by the handshake, so
         // only a session with a file can take one.
@@ -4230,36 +4378,64 @@ impl Session {
                 return true;
             }
             pool.reset_failures();
+        }
+        let mut booting = None;
+        if let Some(pool) = self.config.warm.get() {
+            // Nothing to take, but the pool is spawning one or another session's
+            // runtime is booting, and none has answered yet: this runtime may
+            // have to apply its profile, which fails at once when another
+            // runtime holds the lock (#94). Wait for that one, then try again.
+            if pool.must_wait() {
+                log(
+                    &self.home,
+                    "info",
+                    "runtime.start_deferred",
+                    json!({ "session": self.id, "warm": pool.status() }),
+                );
+                let session = self.clone();
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    pool.wait_turn(Duration::from_secs(300)).await;
+                    if matches!(session.status(), Status::Starting | Status::Recovering) {
+                        session.spawn_runtime(initial, from_pending);
+                    }
+                });
+                return true;
+            }
             log(
                 &self.home,
                 "info",
                 "runtime.cold_start",
-                json!({ "session": self.id, "warm": before }),
+                json!({ "session": self.id, "warm": pool.status() }),
             );
+            // The pool starts nothing beside this runtime until it has attached.
+            booting = Some(pool.booting());
         }
         match self
             .spawn_spec()
             .and_then(|spec| RuntimeSupervisor::start(spec, event_tx))
         {
             Ok(runtime) => {
+                if let Some(booting) = booting {
+                    *self
+                        .warm_attach
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((booting, Instant::now()));
+                }
                 self.install_runtime(runtime, event_rx);
                 true
             }
             Err(error) => {
-                if initial {
-                    self.set_status(if from_pending {
-                        Status::Cancelled
-                    } else {
-                        Status::Error
-                    });
+                let message = format!("Could not start the runtime: {error}");
+                if initial && !from_pending {
+                    self.fail("runtime-unavailable", &message, true);
+                } else if initial {
+                    // The first send started it; that send answers for its turn.
+                    self.set_status(Status::Cancelled);
                     let _ = std::fs::remove_file(&self.lease_path);
                     self.publish(
                         "error",
-                        json!({
-                            "code": "runtime-unavailable",
-                            "message": format!("Could not start the runtime: {error}"),
-                            "retryable": true,
-                        }),
+                        json!({ "code": "runtime-unavailable", "message": message, "retryable": true }),
                     );
                 } else {
                     self.recovery_failed(format!("Could not restart the runtime: {error}"));
@@ -4278,7 +4454,19 @@ impl Session {
         *self
             .runtime
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime.clone());
+        // `stop` sets the status before it reads the runtime; this reads the
+        // status after setting it. A stop in between is seen by one of the two,
+        // so the runtime never outlives its session (#93).
+        if matches!(self.status(), Status::Stopped | Status::Cancelled) {
+            runtime.terminate();
+            // Its hold on the pool goes with it.
+            self.warm_attach
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            return;
+        }
         self.restarts.settle();
         let session = self.clone();
         tokio::spawn(async move {
@@ -4303,15 +4491,7 @@ impl Session {
             Decision::GiveUp => 0,
         };
         if count == 0 {
-            self.set_status(Status::Error);
-            self.publish(
-                "error",
-                json!({
-                    "code": "runtime-crashed",
-                    "message": "The runtime could not recover; restart it to continue.",
-                    "retryable": true,
-                }),
-            );
+            self.fail("runtime-crashed", RUNTIME_GAVE_UP, true);
             return;
         }
         log(
@@ -4357,15 +4537,7 @@ impl Session {
             json!({ "reason": reason, "attempts": count }),
         );
         if self.restarts.exhausted() {
-            self.set_status(Status::Error);
-            self.publish(
-                "error",
-                json!({
-                    "code": "runtime-crashed",
-                    "message": "The runtime could not recover; restart it to continue.",
-                    "retryable": true,
-                }),
-            );
+            self.fail("runtime-crashed", RUNTIME_GAVE_UP, true);
             return;
         }
         let session = self.clone();
@@ -4373,6 +4545,96 @@ impl Session {
             tokio::time::sleep(Duration::from_millis(200)).await;
             session.schedule_recovery(reason);
         });
+    }
+
+    /// The session cannot run any more: the one way into `Error`. Nothing may
+    /// be left waiting on a runtime that will not answer, so the turn in
+    /// progress ends as failed, prompts parked for the handshake are dropped,
+    /// open approvals and questions expire, and the runtime is let go (a Stop
+    /// has nothing left to reach). Reopening the session starts a new one.
+    fn fail(&self, code: &str, message: &str, retryable: bool) {
+        if matches!(self.status(), Status::Error | Status::Stopped | Status::Cancelled) {
+            return;
+        }
+        log(
+            &self.home,
+            "warn",
+            "session.failed",
+            json!({ "session": self.id, "code": code, "message": message }),
+        );
+        self.set_status(Status::Error);
+        self.publish(
+            "error",
+            json!({ "code": code, "message": message, "retryable": retryable }),
+        );
+        self.pending_prompts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.queue_paused.store(true, Ordering::SeqCst);
+        self.steers_in_flight.store(0, Ordering::SeqCst);
+        for item in self
+            .queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter_mut()
+        {
+            item.steered = None;
+            item.held = false;
+        }
+        self.end_active_turn(json!({ "status": "failed", "reason": code }));
+        self.cancel_pending(code);
+        self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        // Events of the released runtime (its exit) must not reach a failed session.
+        self.runtime_generation.fetch_add(1, Ordering::SeqCst);
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(runtime) = runtime {
+            runtime.cancel_pending(code);
+            runtime.terminate();
+        }
+        let _ = std::fs::remove_file(&self.lease_path);
+        self.restarts.settle();
+        self.publish_summary();
+    }
+
+    /// End the turn in progress, whatever stage it reached, without a run
+    /// ending it. A reply cut off mid-stream keeps what arrived.
+    fn end_active_turn(&self, outcome: Value) {
+        let turn = self
+            .active_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(turn) = turn.as_deref() {
+            self.finish_step_reply(turn, None, true);
+            self.close_unfinished_tools();
+        }
+        *self
+            .active_client_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .turn_started_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .active_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.cancelling.store(false, Ordering::SeqCst);
+        self.turn_running.store(false, Ordering::SeqCst);
+        self.prompt_echo.store(false, Ordering::SeqCst);
+        if let Some(turn) = turn {
+            let mut data = json!({ "turnId": turn });
+            if let (Some(data), Some(outcome)) = (data.as_object_mut(), outcome.as_object()) {
+                data.extend(outcome.clone());
+            }
+            self.publish("turn.end", data);
+        }
     }
 
     fn recovery_succeeded(&self) {
@@ -4437,11 +4699,7 @@ impl Session {
                 .active_message
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            self.publish(
-                "error",
-                json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-            );
-            self.set_status(Status::Error);
+            self.fail(error.code, &error.message, error.retryable);
         }
         true
     }
@@ -4459,11 +4717,7 @@ impl Session {
         self.set_status(Status::Running);
         for prompt in prompts {
             if let Err(error) = self.write_command(prompt) {
-                self.publish(
-                    "error",
-                    json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-                );
-                self.set_status(Status::Error);
+                self.fail(error.code, &error.message, error.retryable);
                 return;
             }
         }
@@ -4606,6 +4860,23 @@ impl Session {
     }
 }
 
+/// A session file with nothing said in it: a header and setup entries (model,
+/// thinking level, extension state), no message of any kind.
+fn session_file_unused(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines().filter(|line| !line.trim().is_empty()).all(|line| {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        !matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("message" | "custom_message" | "compaction" | "branch_summary" | "session_info")
+        )
+    })
+}
+
 fn same_session_file(left: &str, right: &str) -> bool {
     if left == right {
         return true;
@@ -4632,7 +4903,8 @@ pub struct SessionManager {
     clients: Mutex<HashMap<String, Vec<String>>>,
     /// What each client connected to the global event stream has open. A
     /// client opens one session at a time; that session is never reaped while
-    /// the client's stream is connected. Other idle sessions are, so a window
+    /// the client's stream is connected, nor for the idle timeout after it
+    /// closes (a sleeping machine drops it). Other idle sessions are, so a window
     /// left open does not keep a runtime alive for every session it visited.
     holders: Mutex<HashMap<String, Holder>>,
     persisted_cache: Mutex<Option<Vec<Value>>>,
@@ -4645,10 +4917,47 @@ struct ManagedRuntime {
     events: Option<Arc<crate::events::EventHub>>,
 }
 
+/// How long, in awake time, the idle reaper waits before it stops a session.
+#[derive(Clone, Copy, Debug)]
+pub struct IdleLimits {
+    /// An idle session nobody shows or follows.
+    pub idle: Duration,
+    /// A session created but never started.
+    pub pending: Duration,
+    /// How long a client whose event stream closed still holds the session it shows.
+    pub released_hold: Duration,
+}
+
+impl IdleLimits {
+    /// The same limit for everything.
+    pub fn all(ttl: Duration) -> Self {
+        Self { idle: ttl, pending: ttl, released_hold: ttl }
+    }
+}
+
 #[derive(Default)]
 struct Holder {
     streams: usize,
     session: Option<String>,
+    /// When the client's last stream closed (awake time). A stream drops when the
+    /// machine sleeps or the window reloads; the client keeps its hold for the
+    /// idle timeout after that, so it finds the session it shows still running
+    /// when it reconnects (issue #111).
+    released: Option<AwakeInstant>,
+}
+
+impl Holder {
+    /// The session this client still holds: its stream is connected, or closed
+    /// less than `ttl` of awake time ago.
+    fn holds(&self, ttl: Duration) -> Option<&String> {
+        let connected = self.streams > 0;
+        let recent = self.released.is_some_and(|at| at.elapsed() < ttl);
+        if connected || recent {
+            self.session.as_ref()
+        } else {
+            None
+        }
+    }
 }
 
 /// One connected global stream. Dropping it releases the client's hold once
@@ -4666,9 +4975,12 @@ impl Drop for ClientStream {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Keep what the client had open: a stream that reconnects picks its
-        // hold up again. With no stream connected it protects nothing.
+        // hold up again. With no stream connected the hold lasts one idle timeout.
         if let Some(holder) = holders.get_mut(&self.client_id) {
             holder.streams = holder.streams.saturating_sub(1);
+            if holder.streams == 0 {
+                holder.released = Some(AwakeInstant::now());
+            }
         }
     }
 }
@@ -4878,7 +5190,13 @@ impl SessionManager {
         Ok(Some(canonical_path(&destination.to_string_lossy())))
     }
 
-    pub fn branch_session(&self, session_path: &str, message_index: usize) -> Result<String, ApiError> {
+    /// Copy a saved conversation through the end of its user turn `turn` (1 = the
+    /// first user message) into a new saved session. A turn ends where the next
+    /// user message starts, so its replies and tool results come along. Clients
+    /// name the turn from the `turn` of a history row, which counts user
+    /// messages the same way, so it is right whatever part of the history they
+    /// loaded.
+    pub fn branch_session(&self, session_path: &str, turn: usize) -> Result<String, ApiError> {
         let source = self.session_file(session_path)?;
         let text = std::fs::read_to_string(&source)
             .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
@@ -4893,23 +5211,27 @@ impl SessionManager {
             .and_then(Value::as_str)
             .ok_or_else(|| ApiError::bad_request("Session has no workspace"))?;
         let mut kept = Vec::new();
-        let mut seen = 0usize;
-        let mut found = false;
+        let mut users = 0usize;
         for line in lines {
             let Ok(entry) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
-            kept.push(line);
-            if entry.get("type").and_then(Value::as_str) == Some("message") {
-                if seen == message_index {
-                    found = true;
+            let user = entry.get("type").and_then(Value::as_str) == Some("message")
+                && entry
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+                    == Some("user");
+            if user {
+                if users == turn {
                     break;
                 }
-                seen += 1;
+                users += 1;
             }
+            kept.push(line);
         }
-        if !found {
-            return Err(ApiError::bad_request("Message not found in session"));
+        if turn == 0 || users < turn {
+            return Err(ApiError::bad_request("Turn not found in session"));
         }
         let directory = source
             .parent()
@@ -4942,20 +5264,33 @@ impl SessionManager {
         Ok(canonical_path(&target.to_string_lossy()))
     }
 
+    /// A page of a saved session's messages, read from its file: the `limit`
+    /// messages before position `before` (the newest when absent). `nextBefore`
+    /// reads the page before this one, null at the first message; `turn` is the
+    /// user turn the page starts in (user messages before it), so a client can
+    /// number turns without the earlier pages (#20).
     pub fn messages(
         &self,
         session_path: &str,
         limit: Option<usize>,
-    ) -> Result<Vec<Value>, ApiError> {
+        before: Option<usize>,
+    ) -> Result<Value, ApiError> {
         let path = self.session_file(session_path)?;
         let mut messages = saved_messages(&path)
             .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
-        if let Some(limit) = limit {
-            if messages.len() > limit {
-                messages.drain(..messages.len() - limit);
-            }
-        }
-        Ok(messages)
+        let end = before.unwrap_or(messages.len()).min(messages.len());
+        let start = limit.map_or(0, |limit| end.saturating_sub(limit.max(1)));
+        let turn = messages[..start]
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .count();
+        messages.truncate(end);
+        let page = messages.split_off(start);
+        Ok(json!({
+            "messages": page,
+            "nextBefore": if start > 0 { json!(start) } else { Value::Null },
+            "turn": turn,
+        }))
     }
 
     pub fn timing(&self, session_path: &str) -> Result<Value, ApiError> {
@@ -5295,14 +5630,13 @@ impl SessionManager {
     /// Session files live in the runtime home owned by the host. This index is
     /// metadata-only: it never starts a runtime and never returns transcript
     /// bodies.
-    pub fn reap_idle(&self, ttl: Duration) {
+    pub fn reap_idle(&self, limits: IdleLimits) {
         let held: Vec<String> = self
             .holders
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
-            .filter(|holder| holder.streams > 0)
-            .filter_map(|holder| holder.session.clone())
+            .filter_map(|holder| holder.holds(limits.released_hold).cloned())
             .collect();
         let mut sessions = self
             .sessions
@@ -5316,21 +5650,24 @@ impl SessionManager {
                 let untouched = session.status() == Status::Idle
                     && !held.contains(id)
                     && session.untouched();
+                // A session in error that nobody shows can still own a live
+                // runtime; it is released like an idle one (#93). Opening it
+                // again starts it afresh.
                 let idle = untouched
-                    || session.status() == Status::Idle
+                    || matches!(session.status(), Status::Idle | Status::Error)
                         && session.subscriber_count() == 0
                         && !held.contains(id)
-                        && session.last_activity().elapsed() >= ttl;
+                        && session.last_activity().elapsed() >= limits.idle;
                 let pending = session.status() == Status::Pending
                     && !held.contains(id)
-                    && session.last_activity().elapsed() >= ttl;
+                    && session.last_activity().elapsed() >= limits.pending;
                 idle || pending
             })
             .map(|(id, _)| id.clone())
             .collect();
         for id in stale {
             if let Some(session) = sessions.remove(&id) {
-                session.stop();
+                session.discard();
             }
         }
     }
@@ -5525,6 +5862,7 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(client_id.to_string())
+            .and_modify(|holder| holder.released = None)
             .or_default()
             .streams += 1;
         ClientStream {
@@ -5759,6 +6097,9 @@ impl SessionManager {
                 ) {
                     return Ok(existing);
                 }
+                // A session in error can still own a live runtime; one that
+                // leaves the table without a stop keeps it until the host exits.
+                existing.stop();
                 sessions.remove(&existing.id);
             }
         }
@@ -5929,6 +6270,24 @@ impl SessionManager {
             .collect();
         for session in sessions {
             session.stop();
+        }
+    }
+
+    /// The host is exiting: stop everything, and leave no file for a new
+    /// conversation nobody wrote in (#92).
+    pub fn shutdown(&self) {
+        if let Some(pool) = self.warm_runtime() {
+            pool.stop();
+        }
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, session)| session)
+            .collect();
+        for session in sessions {
+            session.discard();
         }
     }
 }

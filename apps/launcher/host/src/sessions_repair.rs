@@ -1,17 +1,23 @@
 use std::path::{Path, PathBuf};
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::{json, Value};
 
-const MIN_IMAGE_SIDE: u32 = 16;
+/// What replaces an image taken out of the history, so the model still sees that
+/// one was there.
+const PLACEHOLDER: &str = "[image removed: the model rejected a request that contained images]";
 
-/// Repair a session whose history holds an image the provider refuses.
+/// Take the images out of a session whose requests the model rejects because of
+/// an image.
 ///
+/// The runtime keeps every image in the history and sends it again with each
+/// request, so one refused image fails every later turn. A provider's error does
+/// not reliably say which image it refused, or why, so every image block becomes
+/// a short text placeholder and the text of the conversation stays as it was.
 /// The host owns the session files, so the repair lives here. The original is kept
 /// as `.jsonl.bak` and the rewrite is atomic: a failed repair changes nothing.
 pub fn sanitize_images(session_path: &str) -> Result<Value, String> {
     let path = session_file(session_path)?;
-    let (removed, backup) = sanitize(&path, MIN_IMAGE_SIDE)?;
+    let (removed, backup) = sanitize(&path)?;
     Ok(json!({ "removed": removed, "backup": backup.to_string_lossy() }))
 }
 
@@ -25,50 +31,8 @@ fn session_file(session_path: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Pixel size from the container header, or None when this format's header does not
-/// carry it. Guessing here would delete images that are fine.
-fn image_size(mime: Option<&str>, data: &str) -> Option<(u32, u32)> {
-    let bytes = BASE64.decode(data).ok()?;
-    match mime.unwrap_or("") {
-        "image/png" if bytes.len() >= 24 && &bytes[12..16] == b"IHDR" => Some((
-            u32::from_be_bytes(bytes[16..20].try_into().ok()?),
-            u32::from_be_bytes(bytes[20..24].try_into().ok()?),
-        )),
-        "image/gif" if bytes.len() >= 10 => Some((
-            u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32,
-            u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32,
-        )),
-        "image/jpeg" => {
-            let mut offset = 2;
-            while offset + 9 < bytes.len() {
-                if bytes[offset] != 0xFF {
-                    offset += 1;
-                    continue;
-                }
-                let marker = bytes[offset + 1];
-                let frame = matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
-                if frame {
-                    let height =
-                        u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().ok()?) as u32;
-                    let width =
-                        u16::from_be_bytes(bytes[offset + 7..offset + 9].try_into().ok()?) as u32;
-                    return Some((width, height));
-                }
-                let length =
-                    u16::from_be_bytes(bytes[offset + 2..offset + 4].try_into().ok()?) as usize;
-                if length < 2 {
-                    return None;
-                }
-                offset += 2 + length;
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-/// Replace images the provider would refuse with a text placeholder.
-fn sanitize(path: &Path, min_side: u32) -> Result<(usize, PathBuf), String> {
+/// Replace every image block in the session's messages with a text placeholder.
+fn sanitize(path: &Path) -> Result<(usize, PathBuf), String> {
     let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
     let mut removed = 0usize;
     let mut output = String::with_capacity(text.len());
@@ -78,6 +42,7 @@ fn sanitize(path: &Path, min_side: u32) -> Result<(usize, PathBuf), String> {
             output.push('\n');
             continue;
         };
+        let mut changed = false;
         if value.get("type").and_then(Value::as_str) == Some("message") {
             if let Some(content) = value
                 .get_mut("message")
@@ -85,29 +50,20 @@ fn sanitize(path: &Path, min_side: u32) -> Result<(usize, PathBuf), String> {
                 .and_then(Value::as_array_mut)
             {
                 for block in content.iter_mut() {
-                    if block.get("type").and_then(Value::as_str) != Some("image") {
-                        continue;
+                    if block.get("type").and_then(Value::as_str) == Some("image") {
+                        *block = json!({ "type": "text", "text": PLACEHOLDER });
+                        removed += 1;
+                        changed = true;
                     }
-                    let mime = block.get("mimeType").and_then(Value::as_str);
-                    let Some((width, height)) = block
-                        .get("data")
-                        .and_then(Value::as_str)
-                        .and_then(|data| image_size(mime, data))
-                    else {
-                        continue;
-                    };
-                    if width.min(height) >= min_side {
-                        continue;
-                    }
-                    *block = json!({
-                        "type": "text",
-                        "text": format!("[image removed: {width}\u{00d7}{height}px is below the model's minimum of {min_side}px]")
-                    });
-                    removed += 1;
                 }
             }
         }
-        output.push_str(&serde_json::to_string(&value).map_err(|error| error.to_string())?);
+        // Lines without images are written back exactly as read.
+        if changed {
+            output.push_str(&serde_json::to_string(&value).map_err(|error| error.to_string())?);
+        } else {
+            output.push_str(line);
+        }
         output.push('\n');
     }
     if removed == 0 {
@@ -125,52 +81,65 @@ fn sanitize(path: &Path, min_side: u32) -> Result<(usize, PathBuf), String> {
 mod tests {
     use super::*;
 
-    fn tiny_png() -> String {
-        // 8x8 PNG header: below the 16px minimum.
+    fn image(width: u32, height: u32) -> Value {
         let mut bytes = vec![0u8; 33];
         bytes[12..16].copy_from_slice(b"IHDR");
-        bytes[16..20].copy_from_slice(&8u32.to_be_bytes());
-        bytes[20..24].copy_from_slice(&8u32.to_be_bytes());
-        BASE64.encode(bytes)
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        json!({ "type": "image", "mimeType": "image/png", "data": BASE64.encode(bytes) })
     }
 
     #[test]
-    fn a_small_image_becomes_a_placeholder_and_keeps_a_backup() {
+    fn every_image_becomes_a_placeholder_and_keeps_a_backup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
-        let line = json!({
+        // The #17 case: a 256x1 image the provider refuses ("must be larger than 10"),
+        // read by a tool, next to an ordinary image the user attached.
+        let user = json!({
             "type": "message",
             "message": { "role": "user", "content": [
-                { "type": "image", "mimeType": "image/png", "data": tiny_png() }
+                { "type": "text", "text": "look" }, image(640, 480)
             ]}
         });
-        std::fs::write(&path, format!("{line}\n")).unwrap();
+        let tool = json!({
+            "type": "message",
+            "message": { "role": "toolResult", "content": [image(256, 1)] }
+        });
+        let original = format!("{user}\n{tool}\n");
+        std::fs::write(&path, &original).unwrap();
 
-        let (removed, backup) = sanitize(&path, MIN_IMAGE_SIDE).unwrap();
+        let (removed, backup) = sanitize(&path).unwrap();
 
-        assert_eq!(removed, 1);
-        assert!(backup.is_file());
+        assert_eq!(removed, 2);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("[image removed: 8"));
         assert!(!text.contains("\"type\":\"image\""));
+        assert_eq!(text.matches(PLACEHOLDER).count(), 2);
+        assert!(text.contains("\"text\":\"look\""));
     }
 
     #[test]
-    fn a_large_image_is_left_alone() {
+    fn a_session_without_images_is_not_touched() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
-        let mut bytes = vec![0u8; 33];
-        bytes[12..16].copy_from_slice(b"IHDR");
-        bytes[16..20].copy_from_slice(&64u32.to_be_bytes());
-        bytes[20..24].copy_from_slice(&64u32.to_be_bytes());
-        let line = json!({
-            "type": "message",
-            "message": { "role": "user", "content": [
-                { "type": "image", "mimeType": "image/png", "data": BASE64.encode(bytes) }
-            ]}
-        });
-        std::fs::write(&path, format!("{line}\n")).unwrap();
+        let original = "{\"type\":\"session\",\"id\":\"x\"}\nnot json\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        std::fs::write(&path, original).unwrap();
 
-        assert_eq!(sanitize(&path, MIN_IMAGE_SIDE).unwrap().0, 0);
+        assert_eq!(sanitize(&path).unwrap().0, 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.with_extension("jsonl.bak").exists());
+    }
+
+    #[test]
+    fn lines_without_images_are_kept_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let plain = "{\"type\":\"message\",  \"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}";
+        let with_image = json!({ "type": "message", "message": { "role": "user", "content": [image(8, 8)] } });
+        std::fs::write(&path, format!("{plain}\n{with_image}\n")).unwrap();
+
+        assert_eq!(sanitize(&path).unwrap().0, 1);
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with(&format!("{plain}\n")));
     }
 }
