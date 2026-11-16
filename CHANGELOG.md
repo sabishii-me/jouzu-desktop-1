@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.3-rc.3 - unreleased
+
+- The stable release exam now enforces the host's part of a first reply (message accepted to
+  the model request, from host.log; median 200 ms, slowest 400 ms) instead of only showing
+  it in the report (#129).
+
 ## 1.1.3-rc.2 - 2026-11-16
 
 Second release candidate for 1.1.3, on the QA channel.
