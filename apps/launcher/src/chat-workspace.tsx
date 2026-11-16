@@ -82,6 +82,10 @@ const workspaceLabel = (path: string) => lastSegment(path) === "default-workspac
 const mergeReports = (saved: FlowReportRecord[], live: FlowReportRecord[]) => [...saved, ...live.filter(report => !saved.some(known => known.text === report.text))].slice(-30);
 const isDefaultWorkspace = (path: string) => lastSegment(path) === "default-workspace";
 const normalizedPath = (path: string) => path.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
+/** The height the workspace menu may take below its button and still fit inside the window (shisa-ai/jouzu-desktop#114). */
+function pickerSpaceOf(bounds: DOMRect): number {
+  return Math.max(0, window.innerHeight - bounds.bottom - 16);
+}
 /** The UUID at the end of a session file stem; a preview has no live session state. */
 const sessionIdFromFile = (path?: string): string | undefined => {
   const name = path?.replaceAll("\\", "/").split("/").filter(Boolean).at(-1)?.replace(/\.jsonl$/u, "") ?? "";
@@ -256,6 +260,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [sessionMenu, setSessionMenu] = useState<string | null>(null);
   const [sort, setSort] = useState<"recent" | "name">("recent");
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerSpace, setPickerSpace] = useState<number | null>(null);
   const picker = useRef<HTMLDivElement>(null);
   const connection = useRef<ChatConnection | null>(null);
   const unsubscribeRef = useRef<null | (() => void)>(null);
@@ -471,11 +476,17 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   useEffect(() => { if (snapshot.modelId) setNote(current => current?.until === "model" ? null : current); }, [snapshot.modelId]);
   useEffect(() => {
     if (!pickerOpen) return;
+    const fit = () => {
+      const bounds = picker.current?.getBoundingClientRect();
+      if (bounds) setPickerSpace(pickerSpaceOf(bounds));
+    };
     const close = (event: MouseEvent) => { if (!picker.current?.contains(event.target as Node)) setPickerOpen(false); };
     const escape = (event: KeyboardEvent) => { if (event.key === "Escape") setPickerOpen(false); };
+    fit();
+    window.addEventListener("resize", fit);
     document.addEventListener("mousedown", close);
     document.addEventListener("keydown", escape);
-    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", escape); };
+    return () => { window.removeEventListener("resize", fit); document.removeEventListener("mousedown", close); document.removeEventListener("keydown", escape); };
   }, [pickerOpen]);
   function fromApiSession(value: ApiSessionSummary): SessionSummary | null {
     if (!value.sessionPath) return null;
@@ -1421,16 +1432,18 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const subagents = useMemo(() => showingAttached ? deriveSubagents(snapshot.projection.tools) : [], [showingAttached, snapshot.projection.tools]);
   const flowError = useMemo(() => showingAttached ? latestFlowError(snapshot.projection.messages) : undefined, [showingAttached, snapshot.projection.messages]);
   const workspacePicker = <div ref={picker} className="relative">
-    <Button type="button" variant="outline" className="h-8 max-w-64 gap-2 px-2 text-xs" aria-label="Choose workspace" aria-expanded={pickerOpen} onClick={() => setPickerOpen(value => !value)}>
+    <Button type="button" variant="outline" className="h-8 max-w-64 gap-2 px-2 text-xs" aria-label="Choose workspace" aria-expanded={pickerOpen} onClick={() => { if (!pickerOpen) { const bounds = picker.current?.getBoundingClientRect(); if (bounds) setPickerSpace(pickerSpaceOf(bounds)); } setPickerOpen(value => !value); }}>
       <FolderOpen className="size-4 shrink-0" aria-hidden="true" /><span className="truncate">{name}</span><ChevronDown className="size-3 shrink-0" aria-hidden="true" />
     </Button>
-    {pickerOpen && <div role="menu" aria-label="Choose workspace" className="absolute left-0 top-full z-30 mt-1 w-80 max-w-[calc(100vw-2rem)] rounded-xl border border-border bg-popover p-2 shadow-xl">
+    {pickerOpen && <div role="menu" aria-label="Choose workspace" style={{ maxHeight: pickerSpace ?? undefined }} className="absolute left-0 top-full z-30 mt-1 flex w-80 max-w-[calc(100vw-2rem)] flex-col rounded-xl border border-border bg-popover p-2 shadow-xl">
+      <div data-workspace-list className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
       {[...workspaces].sort((left, right) => Number(isDefaultWorkspace(left.path)) - Number(isDefaultWorkspace(right.path))).map(workspace => <button key={workspace.id} type="button" role="menuitemradio" aria-checked={workspace.path === path} onClick={() => void switchWorkspace(workspace.path)} className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent">
         <span className="min-w-0"><span className="block truncate">{workspaceLabel(workspace.path)}</span><span className="block truncate text-xs text-muted-foreground">{workspace.path}</span></span>
         {workspace.path === path && <span className="text-xs text-primary">Current</span>}
       </button>)}
       {!workspaces.length && <p className="px-2 py-2 text-sm text-muted-foreground">No workspaces yet.</p>}
-      <div className="mt-1 border-t border-border pt-1"><Button type="button" variant="ghost" className="w-full justify-start" onClick={() => { setPickerOpen(false); onAddFolder(); }}><Plus className="size-4" />Add folder</Button></div>
+      </div>
+      <div className="mt-1 shrink-0 border-t border-border pt-1"><Button type="button" variant="ghost" className="w-full justify-start" onClick={() => { setPickerOpen(false); onAddFolder(); }}><Plus className="size-4" />Add folder</Button></div>
     </div>}
   </div>;
   const workspaceError = showingAttached ? snapshot.error : null;
@@ -1578,8 +1591,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           <Button variant="ghost" className="size-7 shrink-0 p-0" aria-label="Toggle artifacts panel" title="Artifacts panel" aria-pressed={panes.length > 0} onClick={toggleSide}><PanelRight className="size-3.5" /></Button>
         </div>
       </div>}
-      {booting && !hero && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-8 sm:px-8">
-        <div className="w-full max-w-3xl">
+      {booting && !hero && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 justify-center overflow-y-auto px-4 py-8 sm:px-8">
+        <div className="my-auto w-full max-w-3xl">
           <div className="mb-7 flex flex-col items-center gap-3 text-center">
             <span className="flex size-12 items-center justify-center rounded-2xl border border-border bg-card"><Sparkles className="size-6 text-primary" aria-hidden="true" /></span>
             <h1 className="text-2xl font-semibold tracking-tight">What would you like to build?</h1>
