@@ -1,18 +1,14 @@
-# Errors and notices
+# UI error presentation
 
-Status: draft v3 (2026-11-16), for discussion. Replaces v2 (one notice at a time
-above the composer) and the 2026-11-14 design implemented in `9c2fd48`.
+Status: draft (2026-11-16), for discussion. Together with
+[host-error-model.md](host-error-model.md) it replaces `errors-and-notices.md`.
 
-This document has two parts with different readers. **Part 1** is for the person
-using the app: what they see and can do when something goes wrong, screen by
-screen. **Part 2** is for the host/API: how errors are owned, classified and
-exposed. The UI is designed from Part 1; it does not mirror Part 2.
+This document is for the desktop UI. It describes, screen by screen, what the
+person sees and can do when something goes wrong. The UI reads the host's
+snapshots, but it is designed from the person's view, not from the host's slots:
+one host field is not one piece of screen.
 
----
-
-## Part 1 — What the person sees
-
-### Goals
+## Goals
 
 - Something that cannot work is not offered. The person should rarely meet an
   error they could have been kept from.
@@ -23,7 +19,7 @@ exposed. The UI is designed from Part 1; it does not mirror Part 2.
 - Nothing moves when an error appears or clears. Nothing the person typed is lost.
   No toasts, no pop-ups they did not ask for.
 
-### The conversation
+## The conversation
 
 - **A tool call fails.** Its card shows the failed state (icon and colour) and,
   when opened, its output. Tool calls running beside it carry on, and so does the
@@ -34,7 +30,7 @@ exposed. The UI is designed from Part 1; it does not mirror Part 2.
 - **A message could not be sent.** The message stays in the conversation, dimmed,
   with Retry and Discard. Its text is never lost.
 
-### The composer
+## The composer
 
 The composer shows what can be done now; it does not explain what cannot.
 
@@ -56,7 +52,7 @@ The composer shows what can be done now; it does not explain what cannot.
   that ever appears in the composer's place, and only one at a time, because an
   ended session cannot end again.
 
-### Controls in the session
+## Controls in the session
 
 - **Changing the model fails**: the model button stays on the previous model and
   shows a small failed mark; its tooltip says why. The session is otherwise
@@ -64,32 +60,32 @@ The composer shows what can be done now; it does not explain what cannot.
 - **Stop, compact, export, a command fails**: the result shows at that control (the
   button's state, the command's own output line), not as a session message.
 
-### Session header and sidebar
+## Session header and sidebar
 
 - **The window loses its connection to the host**: the header shows
   "Reconnecting…" and the composer is dimmed. The session keeps running in the
   host and the window catches up on reconnect. This is not a session error.
 - The sidebar row shows whether a session is running or has ended; nothing else.
 
-### Settings
+## Settings
 
 - **A settings action fails** (key rejected, sign-in failed): that card shows a
   short reason under the action that failed. Other cards keep working.
 - **Several actions in a row**: each button shows its own progress while it waits
   its turn; nothing fails because another action is running.
 
-### Start page
+## Start page
 
 - **The app cannot work** (host unreachable, runtime not installed): the start page
   says so in one line with the one action that fixes it.
 
-### Extensions and MCP
+## Extensions and MCP
 
 - **An MCP server needs attention** (for example sign-in): its entry in the MCP
   menu shows the state and the action. It is not shown in the conversation and is
   not repeated each time a runtime starts.
 
-### Words on screen
+## Words on screen
 
 - One short line at most. If a state needs more than a line to explain, the
   layout is changed instead.
@@ -101,71 +97,17 @@ The composer shows what can be done now; it does not explain what cannot.
   conversation or the sidebar, and long tokens (paths, model ids) never widen the
   window.
 
----
-
-## Part 2 — Host / API
-
-### Ownership
-
-Runtime events and runtime text reach the host only. The host classifies them,
-removes duplicates and exposes each error in the slot of its snapshot that matches
-what it interrupted. Clients (the desktop UI, nsh, scripts) render the snapshot;
-they do not parse runtime text.
-
-| What failed | Slot | Clears |
-|---|---|---|
-| A tool call | `tool.result` with `ok: false` and reason | Never; history |
-| A message not delivered | `queue[].error` | Sent or discarded |
-| A reply | `lastRun.error` and the reply's record | Next run starts |
-| A command in a session | the command's response code | — |
-| The session ended | `failure`, `lifecycle = failed` (only via `Session::fail`) | Recovery action |
-| A settings operation | `AppView.config.lastResult` | Next operation of that kind |
-| App startup | `AppView.startup` | Cause gone |
-| Extension / MCP status | the feature's own state, deduplicated per session | Resolved |
-
-### Rules
-
-1. **An error changes only what it interrupted.** It escalates only when the level
-   above is really broken (for example the runtime exited and recovery failed),
-   decided in one place. Lower-level errors caused by an escalation are not
-   reported again; the host writes `notice.cascade` to `host.log` with both codes,
-   and the cascade is fixed at its source.
-2. **Operations in different scopes never block or fail each other.** Work that
-   must be serial (the configuration channel) is queued by the host, not refused
-   with `409`.
-3. **Never trust the caller.** Every command checks its preconditions and refuses
-   with a typed code. Codes are of two kinds:
-   - *precondition* — the command cannot work in the current state (`no-model`,
-     `session-stopped`, `text-too-long`, image limits, `session-busy`,
-     `model-unavailable`). A client should not offer these paths; when one arrives
-     without a race, the host logs `ui.illegal_path`.
-   - *runtime* — a real failure (tool, provider, runtime exit, network, invalid
-     key, model removed from the catalog at the moment of sending).
-4. **Retry is decided per API and per error**, not by a blanket flag. Where a retry
-   can succeed, the response says so.
-5. **Text**: every error carries a code and parameters for the client to localize,
-   and the original text for Details; the same is written to `host.log`.
-
-### Steer queue
-
-The host owns the queue of messages sent while a reply runs and removes a message
-only after the runtime confirms it used it; Stop returns unused ones to the queue.
-
----
-
 ## Acceptance
 
 - Two tool calls run in parallel and one fails: only its card shows it; the other
   completes; the reply continues; the composer is unchanged.
 - Changing the model fails: the model button stays on the previous model with its
-  failed mark; nothing else on screen changes; nothing is reported twice.
+  failed mark; nothing else on screen changes; nothing is shown twice.
 - A reply fails: the reply is marked; the next message sends normally.
-- The session ends (runtime killed, recovery refused): the composer is replaced by
-  the reason and one action; no other error appears for that session; `host.log`
-  has the cascade entries.
-- A settings save fails while a catalog refresh runs: only that card shows it; the
-  refresh completes.
-- With no model, Send cannot be pressed; a direct API send gets `no-model`.
+- The session ends: the composer is replaced by the reason and one action; no
+  other error appears for that session.
+- A settings save fails while a catalog refresh runs: only that card shows it.
+- With no model, Send cannot be pressed.
 - Longest text and a long unbroken token at the smallest window: nothing moves or
   widens.
 - All four locales complete; no toast component exists; no action ends with no
