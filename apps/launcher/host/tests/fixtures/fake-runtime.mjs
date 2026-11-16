@@ -239,6 +239,7 @@ function requestUi(text) {
   out(request);
 }
 
+let inputPhase = false;
 function prompt(id, text, images) {
   if (handledPrompts || String(text).startsWith("/flow ")) {
     promptLog(text);
@@ -252,6 +253,18 @@ function prompt(id, text, images) {
   busy = true;
   interrupted = false;
   response(id, "prompt", { disposition: "started" });
+  // Like the runtime: prompt() awaits the extensions' input handlers before the
+  // agent run exists, and an abort that lands in that window finds no run.
+  const inputDelay = Number(process.env.FAKE_RUNTIME_INPUT_DELAY_MS ?? 0);
+  if (inputDelay > 0) {
+    inputPhase = true;
+    setTimeout(() => { inputPhase = false; run(String(text), images); }, inputDelay);
+    return;
+  }
+  run(String(text), images);
+}
+
+function run(text, images) {
   if (crashOnPrompt) {
     setTimeout(() => process.exit(8), 10);
   }
@@ -400,7 +413,7 @@ lines.on("line", line => {
     }
     case "abort":
       response(value.id, "abort", {});
-      if (busy) {
+      if (busy && !inputPhase) {
         interrupted = true;
         if (current) clearTimeout(timer);
         settled(true);
