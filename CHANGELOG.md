@@ -36,6 +36,8 @@ Second release candidate for 1.1.3, on the QA channel.
 - A long session can be read back to its first message: scrolling up loads earlier pages,
   for open and saved sessions. Branching from an earlier message copies the conversation up
   to the end of that turn (#20).
+- Stop pressed right after Send now stops the reply. A Stop that reached the runtime before
+  the run had started was lost, so the reply streamed to the end (#61).
 - The first new session after start gets the default model. When a message cannot be sent,
   the composer says why: choose a model, or no model is available, with a link to
   Settings (#99).
