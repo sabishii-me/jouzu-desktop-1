@@ -27,8 +27,8 @@ function modelDetails(model: ChatModel) {
 }
 
 /**
- * The model button next to Send carries the session's model state itself:
- * loading while it is not known yet, the way to set up a provider when there is
+ * The model button next to Send carries the session's model: its name, "Select
+ * model" when there is none, the way to set up a provider when the catalog has
  * no model at all, and the menu of the host's catalog otherwise.
  */
 function ModelMenu({ open, onOpenChange, models, catalogState, catalogError, model, state, onSelect, onSetup, thinkingLevel, thinkingLevels, onThinking, onRetry }: {
@@ -60,10 +60,10 @@ function ModelMenu({ open, onOpenChange, models, catalogState, catalogError, mod
   const providers = [...new Set(visible.map(item => item.provider))];
   // Nothing to choose from: the button is the way to set a provider up.
   const setup = state !== "ready" && catalogState === "ready" && !models.length && !!onSetup;
-  const label = state === "resolving" ? model ?? "Model" : setup ? "Set up a model" : model ?? "Select model";
+  const label = setup ? "Set up a model" : state === "ready" && model ? model : "Select model";
   return <div ref={root} className="relative">
-    <Button type="button" variant="ghost" className={`h-8 gap-1 px-2 text-xs ${state === "unavailable" ? "text-amber-600" : ""}`} aria-label="Model" aria-busy={state === "resolving"} aria-expanded={setup ? undefined : open} title={state === "unavailable" && model ? "Not available" : undefined} onClick={() => { if (setup) { onSetup?.(); return; } const next = !open; onOpenChange(next); if (next) setQuery(""); }}>
-      {state === "resolving" ? <LoaderCircle className="size-4 shrink-0 animate-spin" aria-hidden="true" /> : <Cpu className="size-4 shrink-0" aria-hidden="true" />}
+    <Button type="button" variant="ghost" className="h-8 gap-1 px-2 text-xs" aria-label="Model" aria-expanded={setup ? undefined : open} onClick={() => { if (setup) { onSetup?.(); return; } const next = !open; onOpenChange(next); if (next) setQuery(""); }}>
+      <Cpu className="size-4 shrink-0" aria-hidden="true" />
       <span className="max-w-40 truncate">{label}</span>
       {!setup && <ChevronDown className="size-3 shrink-0" aria-hidden="true" />}
     </Button>
@@ -219,7 +219,7 @@ export function Composer({ hero = false, autoFocus = false, textguard, connected
   // Send is offered only with a model the host says is ready; the model button
   // next to it shows why not (loading, or the way to set one up). A command
   // (`/flow`, `/textguard`) is the runtime's to handle and needs no model.
-  const modelReady = modelState === "ready" || draft.trimStart().startsWith("/");
+  const modelReady = modelState === "ready";
   const submit = () => { if ((connected || opening) && modelReady && !unavailable && !readingImages && (draft.trim() || videos.length) && (running || starting || !pending)) onSend(); };
   const compactDisabled = !connected || pending || settling || opening || unavailable || running;
   const exportDisabled = !connected || pending || settling || opening || unavailable;

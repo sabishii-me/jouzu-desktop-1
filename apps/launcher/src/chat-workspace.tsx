@@ -18,6 +18,7 @@ import { ToolReviewDialog } from "./tool-review-dialog";
 import { SessionStore as ChatConnection, chatPool } from "./session-store";
 import type { ChatSnapshot, ModelState, PendingPrompt, SessionTiming } from "./chat-types";
 import { modelCatalog, useModelCatalog } from "./model-catalog";
+import { lastModel, rememberModel } from "./last-model";
 import { eventRouter } from "./event-router";
 import { fitsSendBudget, readImageAttachment, removeSubmittedImages, validateImageSelection, type ImageAttachment } from "./chat-attachments";
 import { normalizeVideoUrl, videoMarker } from "./video-url";
@@ -239,6 +240,24 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   useEffect(() => { if (hero) setComposerFocus(false); }, [hero]);
   // The host's one model catalog; the session's own model comes from its snapshot.
   const catalog = useModelCatalog();
+  // A new session (the hero) starts with no model. This window picks the one the
+  // person last picked, if the catalog still lists it; otherwise nothing is
+  // picked. An opened conversation keeps its own model, or has none.
+  const lastPick = useRef<{ session: ChatConnection; done: Promise<void> } | null>(null);
+  function takeLastModel(client: ChatConnection): Promise<void> {
+    if (lastPick.current?.session === client) return lastPick.current.done;
+    const current = client.snapshot;
+    const last = lastModel(modelCatalog.snapshot.models);
+    if (!current.sessionId || current.modelState === "ready" || !last) return Promise.resolve();
+    // A refused pick leaves the session without a model; Send stays unavailable.
+    const done = client.selectModel(last.provider, last.id).catch(() => {});
+    lastPick.current = { session: client, done };
+    return done;
+  }
+  useEffect(() => {
+    const client = connection.current;
+    if (hero && client && snapshot.sessionId && snapshot.modelState === "none") void takeLastModel(client);
+  }, [hero, snapshot.sessionId, snapshot.modelState, catalog.revision]);
   // The pool owns every live session, including the ones that are not on screen;
   // the list re-renders when one of them starts or stops a turn.
   const [, setPoolStatusVersion] = useState(0);
@@ -662,6 +681,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const submitDraftKey = draftKeyRef.current;
     sendCancelRef.current = false;
     setLocalSubmitted(value);
+    const fromHero = hero;
     // Sending from the hero swaps it for the session's composer. Typing continues there
     // (the next message is often a steer), so the focus moves with it.
     if (hero) { setComposerFocus(document.activeElement instanceof HTMLTextAreaElement); setHero(false); onStartSession?.(); }
@@ -673,6 +693,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!ready || !await ensureSelectedSession(ready)) { tell("The session is still opening. Your message was not sent; it is still in the composer."); return; }
       const client = connection.current;
       if (!client || sendCancelRef.current) return;
+      // A hero send binds the new session just now: it takes the last picked model first.
+      if (fromHero) await takeLastModel(client);
+      if (sendCancelRef.current || connection.current !== client) return;
       // Send is offered only while the session's model is ready; the host checks
       // it again and a refusal leaves the message "not sent" with Retry.
       // The notice above the composer already says Flow history is full, with the way out.
@@ -849,6 +872,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       const active = connection.current;
       if (!active) return;
       await active.selectModel(provider, id);
+      rememberModel({ provider, id });
     }
     catch (error) { report(error, "Could not change the model."); }
     finally { endCommand(); }
@@ -1222,12 +1246,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // sessionFile: a new pending session has no file yet, which hid Stop during
   // the first turn.
   const composerRunning = snapshot.projection.running;
-  // The session's model as the host reports it. Before a session is bound (the
-  // hero while it attaches) a new session will start on the catalog's default,
-  // or, with none saved, on the one its runtime picks.
+  // The session's model as the host reports it. Before a new session is bound
+  // (the hero while it attaches) it is the model this window will pick for it.
+  const heroModel = snapshot.sessionId ? null : lastModel(catalog.models);
   const composerModel: { name?: string; state: ModelState } = snapshot.sessionId
-    ? { name: snapshot.model, state: snapshot.modelState ?? "resolving" }
-    : { name: catalog.default?.name, state: catalog.default ? "ready" : catalog.state === "loading" || (catalog.state === "ready" && catalog.models.length) ? "resolving" : "unavailable" };
+    ? { name: snapshot.model, state: snapshot.modelState ?? "none" }
+    : { name: heroModel?.name, state: heroModel ? "ready" : "none" };
   // A listing that failed is retried by the host; otherwise a signed-in account
   // can ask its published catalogs again.
   const retryModels = catalog.state === "failed" || catalog.stale ? () => void modelCatalog.refresh() : canRefreshModels ? onRetryModels : undefined;

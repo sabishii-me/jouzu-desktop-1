@@ -1,10 +1,10 @@
 /**
  * The host's model catalog, as this page shows it.
  *
- * The host owns the one list of chat models and the default model. The page reads
- * it once and then follows `models.changed`; it never lists models per session,
- * keeps no copy of its own, and remembers no model choice (the host makes the
- * last selected model the default for new sessions).
+ * The host relays the runtime's one list of models and its saved default, as
+ * the runtime gives them. The page reads it once and then follows
+ * `models.changed`; it never lists models per session and keeps no copy of its
+ * own. The last picked model is this window's memory (last-model.ts).
  */
 import { useSyncExternalStore } from "react";
 import type { ChatModel } from "./chat-types";

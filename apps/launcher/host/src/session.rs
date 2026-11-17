@@ -2064,6 +2064,8 @@ impl Session {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Handshake::Messages;
                 self.request_messages();
+                // The model (and level) the runtime opened this session on.
+                self.request_state();
             }
             pi::Reply::GetMessages => {
                 // The host's history is the record. After a runtime restart it
@@ -3722,12 +3724,8 @@ impl Session {
                 "waiting": waiting,
             }));
         }
-        // Only a new message is checked: a retried one already has its answer
-        // above. A slash command (`/flow`, `/textguard`) is the runtime's to
-        // handle and needs no model.
-        if !text.starts_with('/') {
-            self.check_model()?;
-        }
+        // Only a new message is checked: a retried one already has its answer above.
+        self.check_model()?;
         let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
         let message_id = format!("m-{counter}");
         let images: Vec<(&str, &str)> = attachments
@@ -4217,52 +4215,19 @@ impl Session {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// A session without a model starts on the catalog's default, applied when
-    /// its runtime starts (or now, when it runs): a new conversation, or a saved
-    /// one whose file names no model, which the runtime would open on its
-    /// default anyway. Called at creation and whenever the catalog changes; a
-    /// session that has a model keeps it.
-    fn take_default_model(self: &Arc<Self>) {
-        if self.run_id().is_some() {
-            return;
-        }
-        let Some(default) = self.config.catalog.default_model() else {
-            return;
-        };
-        let live = {
-            let mut slot = self.model_slot();
-            if slot.current.is_some() {
-                return;
-            }
-            slot.current = Some(default);
-            slot.unapplied = true;
-            !matches!(
-                self.status(),
-                Status::Pending | Status::Starting | Status::Recovering
-            )
-        };
-        if live {
-            self.apply_model();
-        }
-    }
-
-    /// A new conversation with no model while the runtime has no saved default:
-    /// the runtime picks the model it starts on by its own rules (the model
-    /// last used, the catalog's recommended one), which the host cannot
-    /// repeat. Its runtime is started to report it.
-    fn runtime_picks_model(&self) -> bool {
-        self.fresh.load(Ordering::SeqCst)
-            && self.model_slot().current.is_none()
-            && self.config.catalog.has_models()
-            && self.config.catalog.default_model().is_none()
-    }
-
-    /// What the runtime says it uses. A model chosen and not applied yet stays
-    /// the session's model until the runtime answers its `set_model`.
+    /// What the runtime says it uses. The session's model is the one the
+    /// person picked or its file records; the model a runtime opens on when it
+    /// has none, or in place of one it can no longer use, is its own fallback
+    /// and not taken. Only a change made inside the runtime to a session that
+    /// has a usable model (a model command) is followed. A model chosen and
+    /// not applied yet stays until the runtime answers its `set_model`.
     fn runtime_reported_model(&self, reported: &Value) {
         let Some(reported) = ModelRef::from_value(reported) else {
             return;
         };
+        if self.usable_model().is_none() {
+            return;
+        }
         {
             let mut slot = self.model_slot();
             if slot.unapplied || slot.applying.is_some() || slot.current.as_ref() == Some(&reported) {
@@ -4294,26 +4259,19 @@ impl Session {
     }
 
     /// The session's model as clients show it: which one, and whether a message
-    /// can be sent with it (`resolving`, `ready`, `unavailable`).
+    /// can be sent with it (`ready`, or `none` until the person picks one).
     fn model_view(&self) -> Value {
-        let current = self.model_slot().current.clone();
-        let catalog = &self.config.catalog;
-        let revision = catalog.revision();
-        let Some(model) = current else {
-            let state = if self.awaits_model() { "resolving" } else { "unavailable" };
+        let revision = self.config.catalog.revision();
+        let Some((model, row)) = self.usable_model() else {
+            // No model this session can send with: none chosen, or one the
+            // runtime no longer offers. That is not an error; the person picks one.
             return json!({
                 "provider": null,
                 "id": null,
                 "name": null,
-                "state": state,
+                "state": "none",
                 "catalogRevision": revision,
             });
-        };
-        let (state, row) = match catalog.lookup(&model) {
-            Lookup::Listed(row) => ("ready", Some(row)),
-            // Not listed yet: the runtime judges when the message is sent.
-            Lookup::Unknown => ("ready", None),
-            Lookup::Missing => ("unavailable", None),
         };
         let field = |name: &str| {
             row.as_ref()
@@ -4325,68 +4283,46 @@ impl Session {
             "provider": model.provider,
             "id": model.id,
             "name": field("name").unwrap_or_else(|| json!(model.id)),
-            "state": state,
+            "state": "ready",
             "catalogRevision": revision,
             "thinkingLevels": field("thinkingLevels").unwrap_or_else(|| json!([])),
         })
     }
 
-    fn model_name(&self) -> Option<String> {
-        self.model_view()
-            .get("name")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-    }
-
-    /// No model yet, and one is on its way: a new conversation waits for the
-    /// catalog (its default), a saved one for its runtime to report the model
-    /// it restores.
-    fn awaits_model(&self) -> bool {
-        if self.fresh.load(Ordering::SeqCst) {
-            // While the first listing runs (a failed one is not on its way), or
-            // while the runtime that picks the model starts.
-            self.config.catalog.loading()
-                || (self.runtime_picks_model()
-                    && matches!(
-                        self.status(),
-                        Status::Pending | Status::Starting | Status::Recovering
-                    ))
-        } else {
-            matches!(
-                self.status(),
-                Status::Pending | Status::Starting | Status::Recovering
-            )
+    /// The session's model when the runtime offers it (or the list is not
+    /// known yet), with its catalog row.
+    fn usable_model(&self) -> Option<(ModelRef, Option<Value>)> {
+        let model = self.model_slot().current.clone()?;
+        match self.config.catalog.lookup(&model) {
+            Lookup::Listed(row) => Some((model, Some(row))),
+            Lookup::Unknown => Some((model, None)),
+            Lookup::Missing => None,
         }
     }
 
-    /// A message needs a model the catalog offers. A client shows Send as
-    /// unavailable until then, so a refusal here is a race or a client bug.
+    /// The model this session last used, for its history rows, listed or not.
+    fn model_name(&self) -> Option<String> {
+        let model = self.model_slot().current.clone()?;
+        Some(match self.config.catalog.lookup(&model) {
+            Lookup::Listed(row) => row.get("name").and_then(Value::as_str).map(ToString::to_string).unwrap_or(model.id),
+            _ => model.id,
+        })
+    }
+
+
+    /// A message needs a model this session can send with; without one it
+    /// would only fail. A client shows Send as unavailable then, so a refusal
+    /// here is a race or a client bug.
     fn check_model(&self) -> Result<(), ApiError> {
-        let current = self.model_slot().current.clone();
-        let refusal = match current {
-            None => {
-                let waiting = self.awaits_model();
-                ApiError::new(
-                    axum::http::StatusCode::CONFLICT,
-                    "no-model",
-                    if waiting {
-                        "This session's model is not known yet"
-                    } else {
-                        "This session has no model; choose one first"
-                    },
-                    waiting,
-                )
-            }
-            Some(model) => match self.config.catalog.lookup(&model) {
-                Lookup::Missing => ApiError::new(
-                    axum::http::StatusCode::CONFLICT,
-                    "model-unavailable",
-                    format!("{}/{} is not available; choose another model", model.provider, model.id),
-                    false,
-                ),
-                Lookup::Listed(_) | Lookup::Unknown => return Ok(()),
-            },
-        };
+        if self.usable_model().is_some() {
+            return Ok(());
+        }
+        let refusal = ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "no-model",
+            "This session has no model; choose one first",
+            false,
+        );
         log(
             &self.home,
             "warn",
@@ -4787,9 +4723,7 @@ impl Session {
             .warm
             .get()
             .is_some_and(|pool| pool.ready_for(Path::new(&self.runtime_cwd())));
-        // Without a warm runtime, start one anyway when only a runtime can say
-        // which model this conversation starts on.
-        if !ready && !self.runtime_picks_model() {
+        if !ready {
             return;
         }
         log(&self.home, "info", "session.attach_early", json!({ "session": self.id }));
@@ -6443,10 +6377,8 @@ impl SessionManager {
         self.catalog.clone()
     }
 
-    /// The catalog changed. A new conversation still without a model takes the
-    /// default now (#99: one created before the first listing had none, and
-    /// nothing else would give it one); every session's model state follows the
-    /// catalog, so each is published again.
+    /// The catalog changed: every session's model state follows it, so each is
+    /// published again.
     pub fn catalog_changed(&self) {
         let sessions: Vec<Arc<Session>> = self
             .sessions
@@ -6456,10 +6388,6 @@ impl SessionManager {
             .cloned()
             .collect();
         for session in sessions {
-            session.take_default_model();
-            if session.runtime_picks_model() {
-                session.attach_early();
-            }
             session.publish_summary();
         }
     }
@@ -6655,9 +6583,6 @@ impl SessionManager {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             sessions.insert(session.id.clone(), session.clone());
         }
-        // After it is in the table: a listing that lands between this and the
-        // insert would otherwise reach every session but this one.
-        session.take_default_model();
         if matches!(status, Status::Starting) {
             // A saved conversation is readable the moment it is opened: its
             // history comes from its file, not from the runtime that attaches

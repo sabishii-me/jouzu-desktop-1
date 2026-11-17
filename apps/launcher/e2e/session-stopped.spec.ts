@@ -66,8 +66,12 @@ test("the window reopens the session it shows after the host stopped it", async 
   await page.goto(base);
   const composer = page.getByRole("textbox", { name: /message/i }).first();
   const conversation = page.getByRole("region", { name: /conversation/i }).first();
-  // The host lists the fixture app's one model and gives the new session its default.
-  await expect(page.getByRole("button", { name: "Model", exact: true })).toHaveText(/fixture-model/, { timeout: 20_000 });
+  // A new session has no model until one is picked from the host's list.
+  const model = page.getByRole("button", { name: "Model", exact: true });
+  await expect(model).toHaveText(/select model/i, { timeout: 20_000 });
+  await model.click();
+  await page.getByRole("menuitemradio", { name: /fixture-model/ }).click();
+  await expect(model).toHaveText(/fixture-model/, { timeout: 20_000 });
   await composer.fill("first message");
   await page.getByRole("button", { name: /^send$/i }).first().click();
   // The fixture answers with the prompt: the user row and the reply.
@@ -77,7 +81,9 @@ test("the window reopens the session it shows after the host stopped it", async 
   const bound = sessions.find((session: { title?: string }) => session.title === "first message");
   // The fixture runtime does not write its transcript; write it as the real runtime does.
   const line = (role: string, text: string) => `${JSON.stringify({ type: "message", message: { role, content: [{ type: "text", text }], timestamp: Date.now() } })}\n`;
-  appendFileSync(bound.sessionPath, line("user", "first message") + line("assistant", "first message"));
+  // The runtime records the picked model in the file, as the real one does.
+  const picked = `${JSON.stringify({ type: "model_change", id: "m1", parentId: null, timestamp: new Date().toISOString(), provider: "fixture", modelId: "model" })}\n`;
+  appendFileSync(bound.sessionPath, picked + line("user", "first message") + line("assistant", "first message"));
 
   // What the idle reaper does to it.
   await api(`/v1/sessions/${bound.sessionId}/stop`, "POST");

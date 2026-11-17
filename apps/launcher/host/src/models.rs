@@ -1,22 +1,17 @@
-//! The model catalog: the one list of chat models and the one default model.
+//! The model catalog: the runtime's list of models and its default model, as the
+//! host relays them.
 //!
 //! The host owns it. It is loaded when the host starts and again after every
 //! configuration change (sign-in, keys, providers, catalogs, the default model),
 //! never because a client asked for it. Each load that changes what clients see
 //! raises `revision`; the host then publishes `models.changed` with the view.
 //!
-//! Rows come from Jouzu's `available-models` control action: the runtime
-//! projection joined with the active catalog's limits and prices, thinking levels
-//! from pi-ai. The host never reads `cache/model-catalog/**`. The answer depends on
-//! sign-ins, keys, providers and catalogs, so it is never kept across host starts
-//! (issue #84).
-//!
-//! The default model exists in one place only: the runtime's default-model
-//! setting, which `available-models` reports. When the person picks a model in a
-//! session it is the default at once (`choose_default`), and the host writes it
-//! to the runtime behind the answer (see `lib.rs`); until a listing reports it,
-//! the choice stands over what the runtime still says. The next new session
-//! uses the last selected model.
+//! Rows and the default come from Jouzu's `available-models` control action and
+//! are taken as they are: the host adds no rule of its own about which models
+//! exist or which one a conversation starts on (the runtime decides that when
+//! it starts). The host never reads `cache/model-catalog/**`. The answer depends
+//! on sign-ins, keys, providers and catalogs, so it is never kept across host
+//! starts (issue #84).
 
 use std::{path::Path, sync::Mutex};
 
@@ -85,7 +80,7 @@ pub enum Lookup {
     /// The catalog is not listed yet (loading, or its first load failed).
     Unknown,
     Listed(Value),
-    /// Listed, and this model is not in it (signed out, removed, not a chat model).
+    /// Listed, and this model is not in it (signed out, removed).
     Missing,
 }
 
@@ -93,10 +88,8 @@ struct Inner {
     revision: u64,
     state: State,
     models: Vec<Value>,
-    /// The default the last listing reported.
+    /// The runtime's saved default model, as the last listing reported it.
     default: Option<ModelRef>,
-    /// The person's last pick, while the runtime does not report it yet.
-    chosen: Option<ModelRef>,
     stale: bool,
     error: Option<String>,
 }
@@ -106,8 +99,6 @@ pub struct ModelCatalog {
     /// One load at a time; a load asked for while one runs waits and runs after it,
     /// so it sees every change made before it was asked for.
     loading: tokio::sync::Mutex<()>,
-    /// One write of the default model at a time (see `lib.rs`).
-    saving: tokio::sync::Mutex<()>,
 }
 
 impl Default for ModelCatalog {
@@ -124,12 +115,10 @@ impl ModelCatalog {
                 state: State::Loading,
                 models: Vec::new(),
                 default: None,
-                chosen: None,
                 stale: false,
                 error: None,
             }),
             loading: tokio::sync::Mutex::new(()),
-            saving: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -145,20 +134,15 @@ impl ModelCatalog {
     }
 }
 
-impl Inner {
-    fn default(&self) -> Option<&ModelRef> {
-        self.chosen.as_ref().or(self.default.as_ref())
-    }
-}
-
 impl ModelCatalog {
     /// The catalog as every client shows it (`GET /v1/models`, `models.changed`).
     pub fn view(&self) -> Value {
         let inner = self.inner();
-        let default = inner.default().and_then(|default| {
-            row_of(&inner.models, default).map(|row| {
-                json!({ "provider": default.provider, "id": default.id, "name": row.get("name").cloned().unwrap_or(Value::Null) })
-            })
+        let default = inner.default.as_ref().map(|default| {
+            let name = row_of(&inner.models, default)
+                .and_then(|row| row.get("name").cloned())
+                .unwrap_or_else(|| json!(default.id));
+            json!({ "provider": default.provider, "id": default.id, "name": name })
         });
         json!({
             "revision": inner.revision,
@@ -177,73 +161,6 @@ impl ModelCatalog {
     /// Listed at least once: a model it does not list cannot be used.
     pub fn loaded(&self) -> bool {
         self.inner().state == State::Ready
-    }
-
-    /// Listed, with at least one chat model.
-    pub fn has_models(&self) -> bool {
-        let inner = self.inner();
-        inner.state == State::Ready && !inner.models.is_empty()
-    }
-
-    /// The first listing has not answered yet.
-    pub fn loading(&self) -> bool {
-        self.inner().state == State::Loading
-    }
-
-    /// The model a new conversation starts on, when the runtime has a default it
-    /// can chat with.
-    pub fn default_model(&self) -> Option<ModelRef> {
-        let inner = self.inner();
-        let default = inner.default()?.clone();
-        row_of(&inner.models, &default).map(|_| default)
-    }
-
-    /// The person picked `model`: it is the default from now on. Returns whether
-    /// that changed what clients see. The caller writes it to the runtime and
-    /// reports the outcome with `default_saved`.
-    pub fn choose_default(&self, model: &ModelRef) -> Change {
-        let mut inner = self.inner();
-        if row_of(&inner.models, model).is_none() {
-            return Change::None;
-        }
-        let before = inner.default().cloned();
-        // While an earlier pick may still be written, this one is written too,
-        // even when the runtime already reports it: the last write must be it.
-        inner.chosen = if inner.chosen.is_none() && inner.default.as_ref() == Some(model) {
-            None
-        } else {
-            Some(model.clone())
-        };
-        if inner.default() == before.as_ref() {
-            return Change::None;
-        }
-        inner.revision += 1;
-        Change::View
-    }
-
-    /// Held while the default model is written to the runtime.
-    pub async fn saving(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.saving.lock().await
-    }
-
-    /// The pick that should be in the runtime's settings now, if any.
-    pub fn unsaved_default(&self) -> Option<ModelRef> {
-        self.inner().chosen.clone()
-    }
-
-    /// Writing `model` to the runtime failed: the default is what the runtime
-    /// reports again, unless the person picked another one meanwhile.
-    pub fn default_not_saved(&self, model: &ModelRef) -> Change {
-        let mut inner = self.inner();
-        if inner.chosen.as_ref() != Some(model) {
-            return Change::None;
-        }
-        inner.chosen = None;
-        if inner.default.as_ref() == Some(model) {
-            return Change::None;
-        }
-        inner.revision += 1;
-        Change::View
     }
 
     pub fn lookup(&self, model: &ModelRef) -> Lookup {
@@ -292,7 +209,7 @@ impl ModelCatalog {
         let models: Vec<Value> = answer
             .get("models")
             .and_then(Value::as_array)
-            .map(|rows| rows.iter().filter(|row| chat_model(row)).cloned().collect())
+            .cloned()
             .unwrap_or_default();
         let default = match (
             answer.get("defaultProvider").and_then(Value::as_str),
@@ -302,16 +219,9 @@ impl ModelCatalog {
             _ => None,
         };
         let mut inner = self.inner();
-        let before = inner.default().cloned();
-        // A pick the runtime now reports is settled; one it does not report
-        // yet is still being written and stands.
-        if inner.chosen.is_some() && inner.chosen == default {
-            inner.chosen = None;
-        }
-        let shown = inner.chosen.clone().or_else(|| default.clone());
         let change = if inner.state == State::Ready && inner.models != models {
             Change::Models
-        } else if inner.state != State::Ready || before != shown || inner.stale || inner.error.is_some() {
+        } else if inner.state != State::Ready || inner.default != default || inner.stale || inner.error.is_some() {
             Change::View
         } else {
             Change::None
@@ -356,20 +266,6 @@ fn row_of<'a>(models: &'a [Value], model: &ModelRef) -> Option<&'a Value> {
     })
 }
 
-/// Whether the runtime offers this row for chat. Jouzu registers a catalog
-/// offering with Pi only when the catalog gives its output limit; the control
-/// listing still shows such offerings (translation models), and choosing one
-/// used to fail later with "Model not found". They are not chat models, so the
-/// catalog leaves them out instead of listing them as unusable.
-fn chat_model(row: &Value) -> bool {
-    let catalog = row
-        .get("provider")
-        .and_then(Value::as_str)
-        .is_some_and(|provider| provider.starts_with("catalog:"));
-    let no_limit = row.get("maxTokens").map(Value::is_null).unwrap_or(true);
-    !(catalog && no_limit)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,7 +273,6 @@ mod tests {
     fn listing(default: &str) -> Value {
         json!({
             "models": [
-                { "provider": "catalog:x", "id": "chotto", "name": "Shisa Translate", "maxTokens": null },
                 { "provider": "catalog:x", "id": "qwen", "name": "Qwen 3.8", "maxTokens": 32768 },
                 { "provider": "capy", "id": "other", "name": "Other" }
             ],
@@ -408,7 +303,7 @@ mod tests {
         other_default["defaultModel"] = json!("other");
         assert_eq!(catalog.set_listing(other_default), Change::View);
         assert_eq!(catalog.revision(), 2);
-        assert_eq!(catalog.default_model(), Some(ModelRef::new("capy", "other")));
+        assert_eq!(catalog.view()["default"]["id"], "other");
     }
 
     #[test]
@@ -418,58 +313,6 @@ mod tests {
         let mut fewer = listing("qwen");
         fewer["models"].as_array_mut().unwrap().pop();
         assert_eq!(catalog.set_listing(fewer), Change::Models);
-    }
-
-    /// The last pick is the default at once, stands over listings that still
-    /// report an older default, and settles when the runtime reports it.
-    #[test]
-    fn the_last_pick_is_the_default_until_the_runtime_reports_it() {
-        let catalog = ModelCatalog::new();
-        catalog.set_listing(listing("qwen"));
-        let other = ModelRef::new("capy", "other");
-        let qwen = ModelRef::new("catalog:x", "qwen");
-        assert_eq!(catalog.choose_default(&other), Change::View);
-        assert_eq!(catalog.default_model(), Some(other.clone()));
-        // Picking the runtime's own default again while `other` may still be
-        // written: `qwen` must be written too, so it is kept as the pick.
-        assert_eq!(catalog.choose_default(&qwen), Change::View);
-        assert_eq!(catalog.unsaved_default(), Some(qwen.clone()));
-        // A listing taken after `other` was written still shows the pick.
-        let mut written_other = listing("qwen");
-        written_other["defaultProvider"] = json!("capy");
-        written_other["defaultModel"] = json!("other");
-        catalog.set_listing(written_other);
-        assert_eq!(catalog.default_model(), Some(qwen.clone()));
-        // The runtime reports the pick: settled.
-        catalog.set_listing(listing("qwen"));
-        assert_eq!(catalog.unsaved_default(), None);
-        assert_eq!(catalog.default_model(), Some(qwen));
-    }
-
-    #[test]
-    fn a_pick_that_could_not_be_saved_gives_way_to_the_runtime_default() {
-        let catalog = ModelCatalog::new();
-        catalog.set_listing(listing("qwen"));
-        let other = ModelRef::new("capy", "other");
-        catalog.choose_default(&other);
-        assert_eq!(catalog.default_not_saved(&other), Change::View);
-        assert_eq!(catalog.default_model(), Some(ModelRef::new("catalog:x", "qwen")));
-        // A model the catalog does not list is never the default.
-        assert_eq!(catalog.choose_default(&ModelRef::new("capy", "gone")), Change::None);
-    }
-
-    /// Shisa Translate (no output limit) is not a chat model: not listed, and
-    /// not offered as the default.
-    #[test]
-    fn models_the_runtime_cannot_chat_with_are_not_listed() {
-        let catalog = ModelCatalog::new();
-        catalog.set_listing(listing("chotto"));
-        let view = catalog.view();
-        let ids: Vec<&str> = view["models"].as_array().unwrap().iter().map(|row| row["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, ["qwen", "other"]);
-        assert_eq!(catalog.default_model(), None);
-        assert!(view["default"].is_null());
-        assert_eq!(catalog.lookup(&ModelRef::new("catalog:x", "chotto")), Lookup::Missing);
     }
 
     #[test]
@@ -496,7 +339,7 @@ mod tests {
         catalog.set_listing(json!({ "models": [], "defaultProvider": null, "defaultModel": null }));
         assert!(catalog.loaded());
         assert_eq!(catalog.view()["models"], json!([]));
-        assert_eq!(catalog.default_model(), None);
+        assert!(catalog.view()["default"].is_null());
     }
 
     /// Issue #84: a listing an older host left on disk is removed, never served.

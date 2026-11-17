@@ -69,8 +69,12 @@ test("a failed session ends its turn, says why and restarts on request", async (
   await page.goto(base);
   const composer = page.getByRole("textbox", { name: /message/i }).first();
   const conversation = page.getByRole("region", { name: /conversation/i }).first();
-  // The host lists the fixture app's one model and gives the new session its default.
-  await expect(page.getByRole("button", { name: "Model", exact: true })).toHaveText(/fixture-model/, { timeout: 20_000 });
+  // A new session has no model until one is picked from the host's list.
+  const model = page.getByRole("button", { name: "Model", exact: true });
+  await expect(model).toHaveText(/select model/i, { timeout: 20_000 });
+  await model.click();
+  await page.getByRole("menuitemradio", { name: /fixture-model/ }).click();
+  await expect(model).toHaveText(/fixture-model/, { timeout: 20_000 });
   await composer.fill("first message");
   await page.getByRole("button", { name: /^send$/i }).first().click();
   await expect(conversation.getByText("first message")).toHaveCount(2, { timeout: 15_000 });
@@ -78,7 +82,9 @@ test("a failed session ends its turn, says why and restarts on request", async (
   const { sessions } = await api("/v1/sessions");
   const bound = sessions.find((session: { title?: string }) => session.title === "first message");
   const line = (role: string, text: string) => `${JSON.stringify({ type: "message", message: { role, content: [{ type: "text", text }], timestamp: Date.now() } })}\n`;
-  appendFileSync(bound.sessionPath, line("user", "first message") + line("assistant", "first message"));
+  // The runtime records the picked model in the file, as the real one does.
+  const picked = `${JSON.stringify({ type: "model_change", id: "m1", parentId: null, timestamp: new Date().toISOString(), provider: "fixture", modelId: "model" })}\n`;
+  appendFileSync(bound.sessionPath, picked + line("user", "first message") + line("assistant", "first message"));
 
   // The runtime dies; every replacement refuses the session file.
   writeFileSync(refusal, "Flow session metadata is missing or inconsistent.");

@@ -412,7 +412,10 @@ lines.on("line", line => {
       try {
         const changes = readFileSync(String(value.sessionPath), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.type === "model_change");
         const last = changes.at(-1);
-        if (last) currentModel = { name: last.modelId, provider: last.provider, id: last.modelId };
+        // FAKE_RUNTIME_KNOWN_MODELS: like pi, a saved model the runtime no
+        // longer has is quietly replaced by its own start model.
+        const known = process.env.FAKE_RUNTIME_KNOWN_MODELS?.split(",");
+        if (last && (!known || known.includes(last.modelId))) currentModel = { name: last.modelId, provider: last.provider, id: last.modelId };
       } catch {}
       response(value.id, "switch_session", { cancelled: false });
       break;

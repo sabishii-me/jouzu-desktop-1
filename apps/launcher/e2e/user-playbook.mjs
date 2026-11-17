@@ -572,20 +572,22 @@ async function shisaKeyWithoutRestart() {
  * at all, Send is not offered and the model button is the way to set one up.
  */
 async function firstSessionHasModel() {
-  const name = "First new session after start has a model, or offers setting one up (#99)";
+  const name = "First new session after start: the last picked model or a plain choice; Send only with a model (#99)";
   await newSession().waitFor({ timeout: 30_000 });
   await newSession().click();
   await composer().waitFor({ timeout: 10_000 });
   const modelButton = page.getByRole("button", { name: "Model", exact: true }).first();
   await composer().fill("model check");
-  // The model is known once the button stops loading.
-  await page.waitForFunction(() => document.querySelector('button[aria-label="Model"]')?.getAttribute("aria-busy") !== "true", null, { timeout: 15_000 }).catch(() => {});
+  // Give the model list time to arrive: the label settles on a model or a choice.
+  await page.waitForTimeout(3_000);
   const label = (await modelButton.innerText().catch(() => "")).trim();
+  const warning = await modelButton.evaluate(button => /amber|destructive|red-/.test(button.className)).catch(() => false);
   const sendOffered = await send().isEnabled();
   if (!/^(select model|set up a model)$/i.test(label)) {
-    scenario(name, sendOffered, `model shown: ${label}; Send ${sendOffered ? "offered" : "NOT offered"}`);
+    scenario(name, sendOffered && !warning, `model shown: ${label}; Send ${sendOffered ? "offered" : "NOT offered"}`);
   } else {
-    scenario(name, !sendOffered && /set up a model/i.test(label), `no model: button "${label}", Send ${sendOffered ? "offered (wrong)" : "not offered"}`);
+    // No model is a plain state: no warning look, and no Send.
+    scenario(name, !sendOffered && !warning, `no model: button "${label}"${warning ? " (shown as a warning: wrong)" : ""}, Send ${sendOffered ? "offered (wrong)" : "not offered"}`);
   }
   await composer().fill("");
 }

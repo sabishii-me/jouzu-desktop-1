@@ -266,13 +266,14 @@ describe("SessionStore", () => {
     expect(store.snapshot.modelId).toBe("qwen-3.8");
     expect(store.snapshot.modelState).toBe("ready");
     expect(store.snapshot.thinkingLevels).toEqual(["off", "high"]);
-    // The catalog no longer offers it: still shown, but not sendable.
-    session.emit(event(2, "session.updated", { model: { provider: "shisa", id: "qwen-3.8", name: "Qwen 3.8", state: "unavailable" } }));
-    expect(store.snapshot.modelId).toBe("qwen-3.8");
-    expect(store.snapshot.modelState).toBe("unavailable");
+    // The catalog no longer offers it: the host reports no model, not an error.
+    session.emit(event(2, "session.updated", { model: { provider: null, id: null, name: null, state: "none" } }));
+    expect(store.snapshot.modelId).toBeUndefined();
+    expect(store.snapshot.model).toBeUndefined();
+    expect(store.snapshot.modelState).toBe("none");
     // A summary without the model field leaves it as it is.
     session.emit(event(3, "session.updated", { status: "idle" }));
-    expect(store.snapshot.modelState).toBe("unavailable");
+    expect(store.snapshot.modelState).toBe("none");
   });
 
 
@@ -504,10 +505,10 @@ describe("SessionStore", () => {
   it("keeps no model of its own: a choice goes to the host, the model comes back in the summary", async () => {
     const selected: string[] = [];
     const api = { models: { select: async (_session: string, provider: string, id: string) => { selected.push(`${provider}/${id}`); } } };
-    const session = { ...fakeSession(), initial: { sessionId: "s-test", status: "pending", model: { provider: null, id: null, name: null, state: "resolving" } } };
+    const session = { ...fakeSession(), initial: { sessionId: "s-test", status: "pending", model: { provider: null, id: null, name: null, state: "none" } } };
     const store = SessionStore.attach(session);
     (store as unknown as { api: unknown }).api = api;
-    expect(store.snapshot.modelState).toBe("resolving");
+    expect(store.snapshot.modelState).toBe("none");
     expect(store.snapshot.modelId).toBeUndefined();
     await store.selectModel("p", "picked");
     expect(selected).toEqual(["p/picked"]);

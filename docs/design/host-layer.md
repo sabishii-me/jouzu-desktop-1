@@ -25,7 +25,7 @@ describes no screens; what a person sees is in the UI document.
 
 | State | Single owner | Copies today (to be removed) |
 |---|---|---|
-| Model catalog and default model | host `ModelCatalog` | None (step 4 removed the UI lists, the stored preference and the host's adopt-on-listing) |
+| Model catalog and default model | runtime (control `available-models`); the host relays it in `ModelCatalog` | None (step 4 removed the UI lists and the host's adopt-on-listing) |
 | Run state, including runs started by Flow | host `Session.run` | Host: `active_turn` and `status = Running` disagree. UI: infers busy on its own |
 | Queue of messages sent during a run | host `Session.queue` | UI-local queue |
 | Configuration operations | host `ConfigQueue` | Operations now wait their turn in the host (no `409`); the UI still queues some of its own, and there is no `operationId` yet |
@@ -65,43 +65,42 @@ describes no screens; what a person sees is in the UI document.
 
 ## 4. Model catalog
 
-- The host loads the catalog eagerly at start, with a `revision`. It does not
+Models and the default model are runtime facts. The host relays them and
+enforces only its own contract; it adds no rule of its own about models.
+
+- The host lists the catalog eagerly at start, with a `revision`. It does not
   depend on a client calling `GET /v1/models`. It lists the catalog again after
   every configuration change and after `POST /v1/models/refresh`.
-- The catalog holds chat models only. A catalog model with no output limit
-  (Shisa Translate) is not a chat model and is left out.
+- The catalog is control `available-models` as the runtime answers it: every
+  row and the saved default, unfiltered. The host never drops a row and never
+  decides which models are chat models; if a model should not be offered, the
+  runtime leaves it out.
 - When the catalog changes, the revision increases and `models.changed` is sent.
   A warm runtime is recycled once per settings change (by whatever changed the
   settings) or when refreshed catalogs bring a new list; the first listing
   describes what it already loaded and recycles nothing.
-- If the first listing fails, the catalog is `failed` with its error; new
-  sessions have no model (`unavailable`), and a client retries with
-  `POST /v1/models/refresh` (a plain listing again, as at start).
-- A new session uses the default model. The default exists in one place only:
-  the jouzu runtime's default-model setting. With none saved (a first sign-in),
-  the runtime picks the model a new conversation starts on by its own rules
-  (last used, the catalog's recommended model), which the host does not
-  repeat: the session's runtime is started at once and the session is
-  `resolving` until it reports its model.
-- When the person changes the model in a session, the host calls RPC `set_model`
-  (session only) and, on success, makes it the default at once, so the next new
-  session uses the last selected model however soon it is created. It writes
-  the runtime default through the ConfigQueue behind the answer; writes go one
-  at a time and each writes the latest pick. Until a listing reports it, the
-  pick stands over the runtime's older default; if writing fails, the default
-  is the runtime's again. Settings writes the default the same way, so
-  whichever comes last wins. Since the runtime re-applies the thinking level
-  for the new model, a level picked before the runtime started is sent after
-  the `set_model` answer, and otherwise the host reads the state again.
-- A send needs a model; a slash command (`/flow`, `/textguard`) does not, and a
-  retried message gets its earlier answer before any check.
-- A session's model state is `resolving`, `ready` or `unavailable`. It is
-  derived from the session's model and the catalog, never stored beside them.
-  Send is refused unless it is `ready` (`no-model` or `model-unavailable`).
-- A session with no model takes the default as soon as the catalog has one,
-  whether it was created before the first listing or saved without a model. A
-  saved conversation keeps the model it used, even one the catalog no longer
-  lists (it is then `unavailable` until the person picks another).
+- If the first listing fails, the catalog is `failed` with its error, and a
+  client retries with `POST /v1/models/refresh` (a plain listing again, as at
+  start).
+- A session's model is the one the person picked in it, or, for a saved
+  conversation, the one its file records. The host picks no model for a
+  session: it writes no default, applies no default, and does not take the
+  model a runtime opens on (the runtime quietly substitutes its own when the
+  recorded one is gone). Remembering the last picked model for a new session
+  is the UI's job.
+- Picking a model in a session calls RPC `set_model` (that session only). A
+  model the catalog does not list cannot be picked (`model-unavailable`). Since
+  the runtime re-applies the thinking level for the new model, a level picked
+  before the runtime started is sent after the `set_model` answer, and
+  otherwise the host reads the state again.
+- Settings' default model is control `default-model`, passed through as it is.
+- A session's model state is `ready` (a model the catalog lists, or any model
+  while the catalog is not listed yet) or `none` (no model, or one the catalog
+  no longer lists). `none` is not an error. It is derived from the session's
+  model and the catalog, never stored beside them.
+- A send needs a `ready` model, whatever the text (a slash command too), since
+  without one it would only fail; it is refused with `no-model`. A retried
+  message gets its earlier answer before any check.
 - If changing the model fails, the session keeps its previous model. The failure
   is in that command's result only; it is not a session error.
 
@@ -184,7 +183,7 @@ succeed, the response says so. Examples:
 | `lifecycle` | `pending` / `starting` / `ready` / `recovering` / `stopped` / `failed` |
 | `run` (sent as `activeTurn`) | `id`, `origin` (`user` / `runtime`), `phase` (`starting` / `running` / `cancelling`), `startedAt`, `step`, `clientMessageId?` |
 | `queue[]` | Message, state (`queued` / `held` / `delivering` / `returned`), `error?` |
-| `model` | `provider`, `id`, `name`, `state` (`resolving` / `ready` / `unavailable`), `catalogRevision`, `thinkingLevels` |
+| `model` | `provider`, `id`, `name`, `state` (`ready` / `none`), `catalogRevision`, `thinkingLevels` |
 | `thinkingLevel` | Current value |
 | `lastRun.error` | Failure of the last reply |
 | `lastAction` | Result of the last in-session command |
@@ -199,7 +198,7 @@ through the host, never from its saved file, which has none of it.
 
 | Field | Content |
 |---|---|
-| `models` (`GET /v1/models`, `models.changed`) | `revision`, `state` (`loading` / `ready` / `failed`), `models[]` (chat models), `default`, `stale`, `error` |
+| `models` (`GET /v1/models`, `models.changed`) | `revision`, `state` (`loading` / `ready` / `failed`), `models[]` (as the runtime lists them), `default`, `stale`, `error` |
 | `settings` | Current settings |
 | `config` | `running`, `queued[]`, `lastResult[kind]` |
 | `startup` | State and cause |
@@ -227,7 +226,7 @@ host, then the UI, then verified on the packaged build before the next.
 | Step | Change | Acceptance |
 |---|---|---|
 | 2 | Runs driven by `agent_start` / `agent_settled`; steer decision; `held` / `returned` queue states | A send during a Flow run becomes a steer; after Stop, unused messages are back in the queue |
-| 4 | ModelCatalog: eager, revisioned, remembers the last selected model | A session can be created without any client calling `/models`; after a model change, new sessions use it |
+| 4 | ModelCatalog: eager, revisioned, relayed unfiltered | A session can be created without any client calling `/models`; a new session has no model until one is picked, and a send without one gets `no-model` |
 | 6 | ConfigQueue | Saving a key while the catalog refreshes: both complete, no `409` |
 | 8 | Error slots, escalation, codes, `host.log` | One of two parallel tool calls fails: only its `tool.result` changes; a session ends: exactly one `failure`, cascades in the log; with no model, a direct API send gets `no-model`; every error has code, parameters and original text |
 

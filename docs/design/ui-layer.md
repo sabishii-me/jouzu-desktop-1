@@ -38,7 +38,7 @@ The composer shows what can be done now; it does not explain what cannot.
 
 | Situation | Model button next to Send | Send | Other |
 |---|---|---|---|
-| New session, model still getting ready | Shows that it is loading | Unavailable | Typing works |
+| No model picked (a new session with nothing remembered, or the remembered or recorded model is gone) | "Select model", a plain choice, not a warning | Unavailable | Typing works |
 | No model available | Becomes the way to set one up (opens Settings → Model providers) | Unavailable | Typing works |
 | A reply is running | Normal | Adds the message to the queue above the composer (each item can be edited or removed until the runtime has it) | Stop is next to it |
 | The model has no image input | — | — | The attach-image button is not shown |
@@ -56,8 +56,10 @@ ever appears in the composer's place, and only one at a time.
   shows a small failed mark; its tooltip says why. Nothing else changes.
 - **Stop, compact, export, a command fails**: the result shows at that control
   (the button's state, the command's own output line), not as a session message.
-- A new session starts on the last selected model. The UI does not remember it
-  itself; it shows what the host reports.
+- A new session starts on the model the person last picked. The UI remembers
+  it (the host and runtime keep no such choice) and picks it for the new
+  session if the host's catalog still lists it; otherwise it picks nothing.
+  A send from a new session waits for that pick.
 
 ## 5. Session header and sidebar
 

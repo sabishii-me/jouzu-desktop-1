@@ -646,7 +646,7 @@ async fn create_session(
     {
         state.sessions.hold(client_id, &session.id);
     }
-    // The session was created on the catalog's default model; the attach applies it.
+    // A ready warm runtime attaches now and reports the model it starts on.
     session.attach_early();
     // The session as it stands (model, queue, turn, prompts): the client starts
     // from this and follows events after `cursor`, so nothing published before
@@ -724,53 +724,7 @@ async fn select_session_model(
     let model = session
         .select_model(&request.provider, &request.model)
         .await?;
-    // The last selected model is the default from now on, so the next new
-    // session starts on it, however soon. Writing it to the runtime waits for
-    // the configuration channel and must not hold the answer.
-    if let Some(chosen) = models::ModelRef::from_value(&model) {
-        catalog_changed(&state, state.models.choose_default(&chosen));
-        let state = state.clone();
-        tokio::spawn(async move {
-            let _ = save_default_model(&state).await;
-        });
-    }
     Ok(Json(json!({ "model": model })))
-}
-
-/// Write the last pick to the runtime's default-model setting, then list the
-/// catalog so it reports it. Writes go one at a time and each writes the pick
-/// current when it runs, so the last pick is the last one written. A failure
-/// gives the default back to the runtime's own and is logged; the session's
-/// own model is not affected. Answers the configuration status the write
-/// reported, or `None` when there was nothing left to write.
-async fn save_default_model(state: &AppState) -> Result<Option<Value>, ApiError> {
-    let _one = state.models.saving().await;
-    let Some(model) = state.models.unsaved_default() else {
-        return Ok(None);
-    };
-    let written = state
-        .control
-        .request_for_host(json!({ "action": "default-model", "provider": model.provider, "model": model.id }))
-        .await;
-    match written {
-        Err(error) => {
-            log(
-                state.sessions.home(),
-                "warn",
-                "models.default_not_saved",
-                json!({ "provider": model.provider, "model": model.id, "code": error.code, "message": error.message }),
-            );
-            catalog_changed(state, state.models.default_not_saved(&model));
-            Err(error)
-        }
-        Ok(status) => {
-            let state = state.clone();
-            tokio::spawn(async move {
-                let _ = reload_models(&state, false).await;
-            });
-            Ok(Some(status))
-        }
-    }
 }
 
 /// Tell everyone the catalog changed: sessions first (their model state
@@ -1082,28 +1036,6 @@ async fn control_request(
 ) -> Result<Json<Value>, ApiError> {
     let action = body.get("action").and_then(Value::as_str);
     let reads_only = matches!(action, Some("status" | "available-models"));
-    // The default model is one the catalog offers for chat, whoever asks.
-    if action == Some("default-model") {
-        let chosen = models::ModelRef::new(
-            body.get("provider").and_then(Value::as_str).unwrap_or_default(),
-            body.get("model").and_then(Value::as_str).unwrap_or_default(),
-        );
-        if !matches!(state.models.lookup(&chosen), models::Lookup::Listed(_)) {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                "model-unavailable",
-                "The default model must be one of the available chat models",
-                false,
-            ));
-        }
-        // The same path as a pick in a session, so whichever comes last is
-        // the default and the last one written. The answer is the write's.
-        catalog_changed(&state, state.models.choose_default(&chosen));
-        return match save_default_model(&state).await? {
-            Some(status) => Ok(Json(status)),
-            None => state.control.request(json!({ "action": "status" })).await.map(Json),
-        };
-    }
     let result = state.control.request(body).await;
     if result.is_ok() {
         if !reads_only {
@@ -2967,6 +2899,11 @@ mod session_tests {
     use tokio::sync::mpsc;
     use tower::ServiceExt;
 
+    /// The person picks the fixture's model: a new session has none until then.
+    async fn pick(session: &Arc<crate::session::Session>) {
+        session.select_model("fixture", "model").await.expect("pick a model");
+    }
+
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -3237,6 +3174,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("before-crash", "hello").unwrap();
         wait_status(&session, Status::Running).await;
         let previous = session.runtime_pid().expect("runtime pid");
@@ -3275,6 +3213,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("before-crash", "hello").unwrap();
         wait_until(|| std::fs::read_to_string(&log_path).is_ok_and(|text| text.contains("hello"))).await;
         let previous = session.runtime_pid().expect("runtime pid");
@@ -3302,6 +3241,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("before-crash", "hello").unwrap();
         wait_until(|| std::fs::read_to_string(&log_path).is_ok_and(|text| text.contains("hello"))).await;
         let (_, crashed_at) = session.events_after(0);
@@ -3352,6 +3292,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("first", "one").unwrap();
         wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
         session.send("second", "two").unwrap();
@@ -3381,6 +3322,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("first", "one").unwrap();
         wait_until(|| {
             session.history(50, None)["messages"]
@@ -3440,6 +3382,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("first", "one").unwrap();
         wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
         let receipt = session.send("second", "two").unwrap();
@@ -3481,6 +3424,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("first", "one").unwrap();
         wait_until(|| session.status() == Status::Running).await;
         let receipt = session.send("second", "two").unwrap();
@@ -3516,6 +3460,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("first", "one").unwrap();
         wait_until(|| session.status() == Status::Running).await;
         session.send("second", "two").unwrap();
@@ -3541,6 +3486,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let (_, before) = session.events_after(0);
         session.send("early", "hello").unwrap();
         wait_until(|| session.status() == Status::Running).await;
@@ -3570,6 +3516,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("first", "one").unwrap();
         wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
         session.send("second", "two").unwrap();
@@ -3620,6 +3567,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_until(|| session.summary()["activeTurn"]["origin"] == "runtime").await;
+        pick(&session).await;
         let summary = session.summary();
         assert_eq!(summary["status"], "running", "{summary}");
         assert!(summary["activeTurn"]["clientMessageId"].is_null(), "{summary}");
@@ -3657,6 +3605,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut events = session.subscribe();
         let reader = tokio::spawn(async move {
@@ -3701,6 +3650,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_until(|| session.summary()["activeTurn"]["origin"] == "runtime").await;
+        pick(&session).await;
         session.send("second", "two").unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         session.interrupt().unwrap();
@@ -3736,6 +3686,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("first", "a reply that is long enough to stop part way").unwrap();
         wait_until(|| session.summary()["activeTurn"]["phase"] == "running" && !conversation(&session).iter().any(|row| row.starts_with("assistant:"))).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -3784,6 +3735,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("first", "a reply that would take a good while to write out").unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let stopped = session.interrupt().unwrap();
@@ -3810,6 +3762,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("first", "NOSTART one").unwrap();
         wait_until(|| session.status() == Status::Idle && session.summary()["activeTurn"].is_null()).await;
         session.send("second", "two").unwrap();
@@ -3837,6 +3790,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("mine", "hello").unwrap();
         wait_until(|| session.summary()["queue"][0]["state"] == "delivering").await;
         wait_until(|| session.summary()["activeTurn"]["clientMessageId"] == "mine").await;
@@ -3868,6 +3822,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("mine", "hello").unwrap();
         wait_until(|| session.summary()["queue"][0]["state"] == "delivering").await;
         assert_eq!(session.cancel_message("mine").unwrap()["status"], "cancelling");
@@ -3895,6 +3850,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("first", "one").unwrap();
         wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
         session.send("second", "two").unwrap();
@@ -3932,6 +3888,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let mut rx = session.subscribe();
         session.send("first", "one").unwrap();
         wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
@@ -3962,6 +3919,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("first", "one").unwrap();
         wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
         session.send("second", "HOLD me").unwrap();
@@ -3988,6 +3946,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("first", "one").unwrap();
         wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
         session
@@ -4027,6 +3986,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("kept-by-flow", "hello").unwrap();
         session.send("kept-again", "next").unwrap();
         // Before the fix the host stayed Running forever after a handled prompt.
@@ -4063,6 +4023,7 @@ mod session_tests {
         let session = manager
             .create_pending(workspace.path().to_str().unwrap(), Some(path.clone()), None)
             .unwrap();
+        pick(&session).await;
         session.send("waiting", "hello").unwrap();
         (session, manager, home, workspace, path)
     }
@@ -4113,6 +4074,7 @@ mod session_tests {
         let again = manager
             .create(_workspace.path().to_str().unwrap(), Some(path), None)
             .unwrap();
+        pick(&again).await;
         assert!(!Arc::ptr_eq(&again, &session));
         manager.stop_all();
     }
@@ -4163,6 +4125,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("client-1", "hello").unwrap();
         let state = session
             .request(json!({ "type": "get_state" }), Duration::from_secs(1))
@@ -4257,6 +4220,7 @@ mod session_tests {
         let session = manager.get(&session_id).unwrap();
         assert_eq!(session.status(), Status::Pending);
         assert!(session.runtime_pid().is_none());
+        pick(&session).await;
 
         let list = call(
             app.clone(),
@@ -4434,6 +4398,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager);
         let (mut rx, reader) = subscribe(app, &session.id).await;
         let _ = next_event(&mut rx, "session.snapshot").await;
@@ -4460,6 +4425,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("blocks-2", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
         let history = session.history(50, None);
@@ -4507,6 +4473,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let (mut rx, reader) = subscribe(app, &session.id).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4584,6 +4551,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("retry-1", "go").unwrap();
         let states = step_states(&session).await;
         let retry = states
@@ -4608,6 +4576,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let (mut rx, reader) = subscribe(app, &session.id).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4654,6 +4623,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let (mut rx, reader) = subscribe(app, &session.id).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4682,211 +4652,33 @@ mod session_tests {
         assert_eq!(errors[0]["code"], "extension-error");
     }
 
-    /// The host's control on the stand-in Jouzu app (`tests/fixtures/fake-app`),
-    /// offering `models` from the runtime home it uses.
-    fn fake_app_state(manager: Arc<SessionManager>, models: &[&str]) -> Option<AppState> {
-        let node = std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
-            .arg("node")
-            .output()
-            .ok()
-            .and_then(|out| String::from_utf8(out.stdout).ok())
-            .and_then(|text| text.lines().next().map(|line| PathBuf::from(line.trim())))
-            .filter(|path| path.is_file())?;
-        let install = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-app");
-        let runtime_home = manager.runtime_home().to_path_buf();
-        let rows: Vec<Value> = models
-            .iter()
-            .map(|id| json!({ "provider": "fixture", "id": id, "name": id, "maxTokens": 4096 }))
-            .collect();
-        std::fs::create_dir_all(runtime_home.join("agent")).unwrap();
-        std::fs::write(runtime_home.join("agent/models.json"), json!({ "models": rows }).to_string()).unwrap();
-        let control = control::ControlManager::new(&install, &install, Some(node), &runtime_home, None).ok()?;
-        Some(AppState {
-            token: Arc::new("a".repeat(64)),
-            port: 40123,
-            dist: std::env::temp_dir(),
-            started: Instant::now(),
-            version: "0.1.0".to_string(),
-            models: manager.catalog(),
-            sessions: manager,
-            control: Arc::new(control),
-            events: events::EventHub::new(),
-            web: Arc::new(web_access::WebAccess::disabled()),
-        })
-    }
-
-    /// The last model picked is the next new session's model at once, however
-    /// fast the picks come, and it is what the runtime keeps as its default.
+    /// The catalog is relayed as the runtime gives it, its default included.
+    /// With no model offered at all, a send is refused with a code the client
+    /// can show, never accepted and lost, whatever the text.
     #[tokio::test]
-    async fn the_last_pick_is_the_next_sessions_model_at_once() {
-        let (manager, _home, workspace) = manager_unlisted();
-        let Some(state) = fake_app_state(manager.clone(), &["model", "chosen", "third"]) else {
-            eprintln!("skipped: no node on PATH");
-            return;
-        };
-        reload_models(&state, false).await.expect("first listing");
-        assert_eq!(state.models.view()["default"]["id"], "model");
-        let app = router(state.clone());
-        let create = || {
-            let app = app.clone();
-            let body = json!({ "workspacePath": workspace.path().to_str().unwrap() }).to_string();
-            async move {
-                let created = call(
-                    app,
-                    request(Method::POST, "/v1/sessions")
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(body))
-                        .unwrap(),
-                )
-                .await;
-                serde_json::from_str::<Value>(&created.2).unwrap()
-            }
-        };
-        let pick = |id: String, model: &'static str| {
-            let app = app.clone();
-            async move {
-                let answer = call(
-                    app,
-                    request(Method::POST, &format!("/v1/sessions/{id}/model"))
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(json!({ "provider": "fixture", "model": model }).to_string()))
-                        .unwrap(),
-                )
-                .await;
-                assert_eq!(answer.0, StatusCode::OK, "{}", answer.2);
-            }
-        };
-        let first = create().await;
-        let id = first["sessionId"].as_str().unwrap().to_string();
-        pick(id.clone(), "chosen").await;
-        assert_eq!(create().await["model"]["id"], "chosen");
-        // Back to the runtime's own default before `chosen` is written.
-        pick(id, "model").await;
-        assert_eq!(create().await["model"]["id"], "model");
-        wait_until(|| state.models.unsaved_default().is_none()).await;
-        let settings: Value = serde_json::from_str(
-            &std::fs::read_to_string(manager.runtime_home().join("agent/settings.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(settings["defaultModel"], "model", "{settings}");
-        assert_eq!(state.models.view()["default"]["id"], "model");
-        assert_eq!(create().await["model"]["id"], "model");
-
-        // Settings sets the default right after a pick: Settings came last, so
-        // it is the default, both in the host and in the runtime's settings.
-        let id = create().await["sessionId"].as_str().unwrap().to_string();
-        pick(id, "chosen").await;
-        let saved = call(
-            app.clone(),
-            request(Method::POST, "/v1/control")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({ "action": "default-model", "provider": "fixture", "model": "third" }).to_string()))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(saved.0, StatusCode::OK, "{}", saved.2);
-        assert_eq!(create().await["model"]["id"], "third");
-        wait_until(|| state.models.unsaved_default().is_none()).await;
-        wait_until(|| state.models.view()["default"]["id"] == "third").await;
-        let settings: Value = serde_json::from_str(
-            &std::fs::read_to_string(manager.runtime_home().join("agent/settings.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(settings["defaultModel"], "third", "{settings}");
-        manager.stop_all();
-    }
-
-    /// A first listing that failed is not "on its way": a new session says it
-    /// has no model instead of waiting for one forever.
-    #[tokio::test]
-    async fn a_failed_first_listing_leaves_new_sessions_without_a_model() {
-        let (manager, _home, workspace) = manager_unlisted();
-        let app = app(manager.clone());
-        // `app` has no Jouzu app to run control with, so the listing fails.
-        let catalog = manager.catalog();
-        let control = control::ControlManager::new(&std::env::temp_dir(), &std::env::temp_dir(), None, &std::env::temp_dir().join("data"), None).unwrap();
-        let (_, result) = catalog.load(&control, false).await;
-        assert!(result.is_err());
-        assert_eq!(catalog.view()["state"], "failed");
-        let created = call(
-            app,
-            request(Method::POST, "/v1/sessions")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({ "workspacePath": workspace.path().to_str().unwrap() }).to_string()))
-                .unwrap(),
-        )
-        .await;
-        let created: Value = serde_json::from_str(&created.2).unwrap();
-        assert_eq!(created["model"]["state"], "unavailable", "{created}");
-        let session = manager.get(created["sessionId"].as_str().unwrap()).unwrap();
-        let refused = session.send("m1", "hello").unwrap_err();
-        assert_eq!(refused.code, "no-model");
-        // A slash command is the runtime's to handle: no model needed.
-        session.send("c1", "/flow status").expect("a command needs no model");
-        // A retried message that was accepted keeps its answer.
-        assert!(session.send("c1", "/flow status").is_ok());
-        manager.stop_all();
-    }
-
-    /// The catalog is read from the host as it holds it, and a session created
-    /// over HTTP starts on its default; with no model, a send is refused with
-    /// a code the client can show, never accepted and lost.
-    #[tokio::test]
-    async fn the_catalog_and_the_session_model_over_http() {
+    async fn the_catalog_is_relayed_and_no_model_at_all_refuses_a_send() {
         let (manager, _home, workspace) = manager_unlisted();
         let catalog = manager.catalog();
         let app = app(manager.clone());
-        let listed = call(app.clone(), request(Method::GET, "/v1/models").body(Body::empty()).unwrap()).await;
-        assert_eq!(listed.0, StatusCode::OK, "{}", listed.2);
-        let view: Value = serde_json::from_str(&listed.2).unwrap();
-        assert_eq!(view["state"], "loading", "{view}");
-
-        let create = |app: Router| {
-            let body = json!({ "workspacePath": workspace.path().to_str().unwrap() }).to_string();
-            async move {
-                let created = call(
-                    app,
-                    request(Method::POST, "/v1/sessions")
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(body))
-                        .unwrap(),
-                )
-                .await;
-                serde_json::from_str::<Value>(&created.2).unwrap()
-            }
-        };
-        let early = create(app.clone()).await;
-        assert_eq!(early["model"]["state"], "resolving", "{early}");
-        let session_id = early["sessionId"].as_str().unwrap().to_string();
-        let send = |app: Router, id: String| async move {
-            call(
-                app,
-                request(Method::POST, &format!("/v1/sessions/{id}/messages"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json!({ "clientMessageId": "m1", "text": "hello" }).to_string()))
-                    .unwrap(),
-            )
-            .await
-        };
-        let refused = send(app.clone(), session_id.clone()).await;
-        assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.2);
-        assert!(refused.2.contains("no-model"), "{}", refused.2);
-
-        catalog.set_listing(fixture_listing("default-x"));
-        manager.catalog_changed();
+        catalog.set_listing(fixture_listing("not-listed"));
         let view: Value = serde_json::from_str(
             &call(app.clone(), request(Method::GET, "/v1/models").body(Body::empty()).unwrap()).await.2,
         )
         .unwrap();
         assert_eq!(view["state"], "ready", "{view}");
-        assert_eq!(view["default"]["id"], "default-x", "{view}");
+        assert_eq!(view["default"]["id"], "not-listed", "{view}");
         assert_eq!(view["models"].as_array().unwrap().len(), 5, "{view}");
-        let created = create(app.clone()).await;
-        assert_eq!(created["model"]["id"], "default-x", "{created}");
-        assert_eq!(created["model"]["state"], "ready", "{created}");
-        assert_eq!(created["model"]["thinkingLevels"], json!(["off", "high"]), "{created}");
-        let accepted = send(app, session_id).await;
-        assert_eq!(accepted.0, StatusCode::ACCEPTED, "{}", accepted.2);
+
+        catalog.set_listing(json!({ "models": [], "defaultProvider": null, "defaultModel": null }));
+        manager.catalog_changed();
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        assert_eq!(session.info()["model"]["state"], "none", "{}", session.info());
+        let refused = session.send("m1", "hello").unwrap_err();
+        assert_eq!(refused.code, "no-model");
+        assert!(!refused.retryable);
+        assert_eq!(session.send("c1", "/flow status").unwrap_err().code, "no-model");
         manager.stop_all();
     }
 
@@ -4962,6 +4754,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         assert!(session.select_model("fixture", "missing").await.is_err());
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(session.status(), Status::Idle);
@@ -4970,57 +4763,54 @@ mod session_tests {
         assert!(session.send("again", "hello").is_ok());
     }
 
+    /// The host picks no model for a new conversation, not even the runtime's
+    /// saved default: until the person picks one (or its runtime reports the
+    /// one it opened on) it has none, and a send that could only fail is refused.
     #[tokio::test]
-    async fn the_default_model_shown_on_a_new_session_is_the_one_the_runtime_uses() {
+    async fn a_new_session_has_no_model_until_one_is_picked() {
         let (manager, _home, workspace) = manager(50);
         manager.catalog().set_listing(fixture_listing("default-x"));
         let session = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         let shown = session.info()["model"].clone();
-        assert_eq!(shown["id"], "default-x", "{shown}");
-        assert_eq!(shown["name"], "Default X", "{shown}");
-        assert_eq!(shown["state"], "ready", "{shown}");
+        assert!(shown["id"].is_null(), "{shown}");
+        assert_eq!(shown["state"], "none", "{shown}");
+        let refused = session.send("first", "hello").unwrap_err();
+        assert_eq!(refused.code, "no-model");
+        assert!(!refused.retryable);
+        session.select_model("fixture", "picked").await.unwrap();
+        assert_eq!(session.info()["model"]["state"], "ready");
         session.send("first", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
         let state = session
             .request(json!({ "type": "get_state" }), Duration::from_secs(5))
             .await
             .unwrap();
-        assert_eq!(state["model"]["id"], "default-x", "{state}");
+        assert_eq!(state["model"]["id"], "picked", "{state}");
+        manager.stop_all();
     }
 
-    /// Issue #99 and the message that vanished after "New session": a new session
-    /// created before the catalog was listed had no model, and only a client
-    /// listing the models gave it one. Now its model is resolving, Send is
-    /// refused with a reason (never accepted and lost), and the catalog's first
-    /// listing gives it the default with no client involved.
+    /// Issue #99 and the message that vanished after "New session": a send
+    /// before the session has a model is refused with a reason, never accepted
+    /// and lost. Before the first listing there is nothing to pick from yet.
     #[tokio::test]
-    async fn a_new_session_created_before_the_catalog_takes_the_default_once_listed() {
+    async fn a_send_before_the_catalog_is_listed_is_refused_with_a_reason() {
         let (manager, _home, workspace) = manager_unlisted();
         let folder = workspace.path().to_str().unwrap();
         let session = manager.create_pending(folder, None, None).unwrap();
-        assert_eq!(session.info()["model"]["state"], "resolving", "{}", session.info());
+        assert_eq!(session.info()["model"]["state"], "none", "{}", session.info());
         let refused = session.send("early", "hello").unwrap_err();
         assert_eq!(refused.code, "no-model");
-        assert!(refused.retryable);
         // Nothing to choose from yet, so a choice is refused too.
         let choice = session.select_model("fixture", "picked").await.unwrap_err();
         assert_eq!(choice.code, "model-unavailable");
-
         manager.catalog().set_listing(fixture_listing("default-x"));
         manager.catalog_changed();
-        let shown = session.info()["model"].clone();
-        assert_eq!(shown["id"], "default-x", "{shown}");
-        assert_eq!(shown["state"], "ready", "{shown}");
-        // The shown model is the one the runtime uses.
+        assert_eq!(session.info()["model"]["state"], "none", "{}", session.info());
+        session.select_model("fixture", "picked").await.unwrap();
         session.send("first", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
-        let state = session
-            .request(json!({ "type": "get_state" }), Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert_eq!(state["model"]["id"], "default-x", "{state}");
         manager.stop_all();
     }
 
@@ -5042,33 +4832,6 @@ mod session_tests {
             .await
             .unwrap();
         assert_eq!(state["model"]["id"], "picked", "{state}");
-        manager.stop_all();
-    }
-
-    /// With no saved default, the runtime picks the model a new conversation
-    /// starts on (by rules the host cannot repeat): the session starts its
-    /// runtime at once and is on that model when it reports it; until then a
-    /// send is refused as "not known yet", never accepted and lost.
-    #[tokio::test]
-    async fn a_new_session_without_a_saved_default_starts_on_the_runtimes_pick() {
-        let (manager, _home, workspace) = manager(50);
-        let mut listing = fixture_listing("model");
-        listing["defaultProvider"] = Value::Null;
-        listing["defaultModel"] = Value::Null;
-        manager.catalog().set_listing(listing);
-        let session = manager
-            .create_pending(workspace.path().to_str().unwrap(), None, None)
-            .unwrap();
-        assert_eq!(session.info()["model"]["state"], "resolving", "{}", session.info());
-        let refused = session.send("first", "hello").unwrap_err();
-        assert_eq!(refused.code, "no-model");
-        assert!(refused.retryable);
-        // No warm runtime: it is started anyway.
-        session.attach_early();
-        wait_until(|| session.info()["model"]["state"] == "ready").await;
-        assert_eq!(session.info()["model"]["id"], "model", "{}", session.info());
-        session.send("first", "hello").unwrap();
-        wait_status(&session, Status::Idle).await;
         manager.stop_all();
     }
 
@@ -5104,11 +4867,14 @@ mod session_tests {
             "defaultModel": "model",
         }));
         manager.catalog_changed();
-        assert_eq!(session.info()["model"]["state"], "unavailable", "{}", session.info());
-        assert_eq!(session.send("m1", "hello").unwrap_err().code, "model-unavailable");
+        // A model that is gone is no model: nothing is selected, and that is not an error.
+        assert_eq!(session.info()["model"]["state"], "none", "{}", session.info());
+        assert!(session.info()["model"]["id"].is_null(), "{}", session.info());
+        let refused = session.send("m1", "hello").unwrap_err();
+        assert_eq!(refused.code, "no-model");
+        assert!(!refused.retryable);
         let refused = session.select_model("fixture", "picked").await.unwrap_err();
         assert_eq!(refused.code, "model-unavailable");
-        assert_eq!(session.info()["model"]["id"], "picked", "a refused choice keeps the session's model");
         session.select_model("fixture", "model").await.unwrap();
         session.send("m1", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
@@ -5138,12 +4904,43 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_saved_conversation_whose_model_is_gone_has_no_model() {
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_KNOWN_MODELS", "model")]);
+        manager.catalog().set_listing(fixture_listing("model"));
+        let header = json!({ "type": "session", "version": 3, "id": "gone-model", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let change = json!({ "type": "model_change", "id": "c1", "parentId": null, "timestamp": "2026-01-01T00:00:01Z", "provider": "fixture", "modelId": "retired" });
+        let file = workspace.path().join("gone.jsonl");
+        std::fs::write(&file, format!("{header}\n{change}\n")).unwrap();
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        // The runtime quietly resumed on its own start model ...
+        let state = session
+            .request(json!({ "type": "get_state" }), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(state["model"]["id"], "model", "{state}");
+        // ... which is not the conversation's model: nothing is selected, not an error.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(session.info()["model"]["state"], "none", "{}", session.info());
+        assert!(session.info()["model"]["id"].is_null(), "{}", session.info());
+        assert_eq!(session.send("m1", "hello").unwrap_err().code, "no-model");
+        pick(&session).await;
+        session.send("m1", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        manager.stop_all();
+    }
+
+    #[tokio::test]
     async fn a_new_session_takes_the_warm_runtime_and_the_pool_starts_the_next() {
         let (manager, _home, workspace) = manager(50);
         let pool = manager.enable_warm_runtime().expect("warm pool");
         let session = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
+        pick(&session).await;
         let status = pool.wait_settled(Duration::from_secs(10)).await;
         assert_eq!(status["state"], "ready", "{status}");
         let warm_pid = status["pid"].as_u64().unwrap() as u32;
@@ -5172,18 +4969,17 @@ mod session_tests {
         let aimed = pool.wait_settled(Duration::from_secs(10)).await;
         assert_eq!(aimed["state"], "ready", "{aimed}");
         let warm_pid = aimed["pid"].as_u64().unwrap() as u32;
-        // What create_session does: the catalog's default model, then the early attach.
-        manager.catalog().set_listing(fixture_listing("default-x"));
+        // What create_session does: the early attach.
         let session = manager.create_pending(folder, None, None).unwrap();
         session.attach_early();
         assert_eq!(session.runtime_pid(), Some(warm_pid));
-        // Attached and the model applied with nothing sent.
+        // Attached with nothing picked: the runtime's own start model is not
+        // taken as this session's model; nothing is selected until a pick.
         wait_status(&session, Status::Idle).await;
-        let state = session
-            .request(json!({ "type": "get_state" }), Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert_eq!(state["model"]["id"], "default-x", "{state}");
+        assert_eq!(session.info()["model"]["state"], "none", "{}", session.info());
+        assert_eq!(session.send("m0", "hello").unwrap_err().code, "no-model");
+        pick(&session).await;
+        assert_eq!(session.info()["model"]["state"], "ready", "{}", session.info());
         session.send("m1", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
         assert_eq!(session.runtime_pid(), Some(warm_pid));
@@ -5208,8 +5004,10 @@ mod session_tests {
         let pool = manager.enable_warm_runtime().expect("warm pool");
         let folder = workspace.path().to_str().unwrap();
         let _aim = manager.create_pending(folder, None, None).unwrap();
+        pick(&_aim).await;
         pool.wait_settled(Duration::from_secs(10)).await;
         let left = manager.create_pending(folder, None, None).unwrap();
+        pick(&left).await;
         left.attach_early();
         wait_status(&left, Status::Idle).await;
         let _stream = manager.connect_client("window");
@@ -5219,6 +5017,7 @@ mod session_tests {
         assert!(manager.get(&left.id).is_some());
         // Used: kept until the usual idle time.
         let used = manager.create_pending(folder, None, None).unwrap();
+        pick(&used).await;
         used.send("u1", "hello").unwrap();
         wait_status(&used, Status::Idle).await;
         // The client moves on: the untouched one is released at once, the used one is not.
@@ -5247,6 +5046,7 @@ mod session_tests {
         for n in 0..5 {
             let path = workspace.path().join(format!("s{n}.jsonl"));
             let session = manager.create(folder, Some(path.to_string_lossy().into_owned()), None).unwrap();
+            pick(&session).await;
             manager.hold("window", &session.id);
             wait_status(&session, Status::Idle).await;
             session.send(&format!("m{n}"), "hello").unwrap();
@@ -5359,6 +5159,7 @@ mod session_tests {
                 None,
             )
             .unwrap();
+        pick(&session).await;
         wait_status(&session, Status::Idle).await;
         assert_eq!(session.runtime_pid(), Some(warm_pid));
         session.send("old", "hello").unwrap();
@@ -5432,6 +5233,7 @@ mod session_tests {
                 None,
             )
             .unwrap();
+        pick(&session).await;
         wait_until(|| marker.exists()).await;
         wait_status(&session, Status::Idle).await;
         session.send("old", "hello").unwrap();
@@ -5447,6 +5249,7 @@ mod session_tests {
         let session = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
+        pick(&session).await;
         assert_eq!(pool.status()["state"], "starting");
         let warm_pid = pool.status()["pid"].as_u64().unwrap() as u32;
         session.send("first", "hello").unwrap();
@@ -5508,6 +5311,7 @@ mod session_tests {
         let session = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
+        pick(&session).await;
         let aimed = pool.wait_settled(Duration::from_secs(10)).await;
         assert_eq!(aimed["state"], "ready", "{aimed}");
         assert_ne!(aimed["pid"], scratch["pid"]);
@@ -5590,6 +5394,7 @@ mod session_tests {
         assert_eq!(count(&a), 1, "{}", pool.status());
         // A session in the older folder gets that folder's runtime.
         let session = manager.create_pending(a.to_str().unwrap(), None, None).unwrap();
+        pick(&session).await;
         session.send("in-a", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
         assert_eq!(pool.folders()[0], a, "opening a session makes its folder the most recent");
@@ -5895,6 +5700,7 @@ mod session_tests {
         assert_eq!(session.info()["model"]["id"], "missing");
         session.send("first", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         let (events, _) = session.events_after(1);
         let notice = events
@@ -5945,8 +5751,10 @@ mod session_tests {
         }
         assert_eq!(pool.status()["warm"], 2, "{}", pool.status());
         let first = manager.create_pending(workspace.path().to_str().unwrap(), None, Some("a".into())).unwrap();
+        pick(&first).await;
         first.send("one", "hello").unwrap();
         let second = manager.create_pending(workspace.path().to_str().unwrap(), None, Some("b".into())).unwrap();
+        pick(&second).await;
         second.send("two", "hello").unwrap();
         assert_ne!(first.runtime_pid(), second.runtime_pid());
         wait_status(&first, Status::Idle).await;
@@ -6225,6 +6033,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let (mut rx, reader) = subscribe(app.clone(), &session.id).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -6262,6 +6071,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("client-1", "abcdefgh").unwrap();
         wait_status(&session, Status::Idle).await;
         let cursor = session.cursor();
@@ -6318,6 +6128,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let (mut rx, reader) = subscribe(app, &session.id).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -6355,6 +6166,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("timed", "secret words").unwrap();
         wait_status(&session, Status::Idle).await;
         let log = std::fs::read_to_string(home.path().join("logs").join("host.log")).unwrap();
@@ -6451,6 +6263,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let first = session.send("same", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
         let again = session.send("same", "hello").unwrap();
@@ -6555,6 +6368,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("client-1", "abcdef").unwrap();
         wait_status(&session, Status::Idle).await;
         let cursor = session.cursor();
@@ -6594,6 +6408,16 @@ mod session_tests {
         let value: Value = serde_json::from_str(&response.2).unwrap();
         let session_id = value["sessionId"].as_str().unwrap().to_string();
         assert!(response.1.contains_key(header::LOCATION));
+
+        let picked = call(
+            app.clone(),
+            request(Method::POST, &format!("/v1/sessions/{session_id}/model"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "provider": "fixture", "model": "model" }).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(picked.0, StatusCode::OK, "{}", picked.2);
 
         let send = call(
             app.clone(),
@@ -6646,6 +6470,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let (mut rx, reader) =
             subscribe_as(app.clone(), &session.id, "viewer", "view").await;
@@ -6682,6 +6507,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let (mut rx, reader) =
             subscribe_as(app.clone(), &session.id, "answerer", "view,control,prompts").await;
@@ -6887,6 +6713,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let response = app
             .clone()
@@ -6948,6 +6775,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let (mut rx, reader) =
             subscribe_as(app.clone(), &session.id, "answerer", "view,control,prompts").await;
@@ -6997,6 +6825,7 @@ mod session_tests {
                 .create(workspace.path().to_str().unwrap(), None, None)
                 .unwrap();
             wait_status(&session, Status::Idle).await;
+            pick(&session).await;
             let app = app(manager.clone());
             let (mut rx, reader) =
                 subscribe_as(app.clone(), &session.id, "answerer", "view,control,prompts").await;
@@ -7030,6 +6859,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let (mut rx, reader) =
             subscribe_as(app.clone(), &session.id, "viewer", "view,control").await;
@@ -7069,6 +6899,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let (mut rx, reader) =
             subscribe_as(app.clone(), &session.id, "answerer", "view,control,prompts").await;
@@ -7098,6 +6929,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let (mut rx, reader) =
             subscribe_as(app.clone(), &session.id, "answerer", "view,control,prompts").await;
@@ -7125,6 +6957,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         let app = app(manager.clone());
         let (mut rx, reader) = subscribe_as(app.clone(), &session.id, "viewer", "view").await;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -7200,6 +7033,7 @@ mod session_tests {
         let session = manager
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
+        pick(&session).await;
         wait_status(&session, Status::Idle).await;
         assert_eq!(session.summary()["firstOutput"]["turns"], 0);
         assert!(session.summary()["firstOutput"]["avgMs"].is_null());
@@ -7217,6 +7051,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("model-history", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
 
@@ -7238,6 +7073,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session
             .send_with_client(
                 "attachment-1",
@@ -7288,6 +7124,7 @@ mod session_tests {
         let session = manager
             .create(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
             .unwrap();
+        pick(&session).await;
         wait_status(&session, Status::Idle).await;
 
         let users = |history: &Value| -> Vec<Value> {

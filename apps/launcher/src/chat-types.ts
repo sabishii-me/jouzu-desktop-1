@@ -15,7 +15,8 @@ export interface ChatModel {
   cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
   thinkingLevels?: string[];
 }
-export type ModelState = "resolving" | "ready" | "unavailable";
+/** `ready`: messages can be sent with the session's model; `none`: the person picks one first. */
+export type ModelState = "ready" | "none";
 export interface SessionStats {
   userMessages?: number;
   assistantMessages?: number;

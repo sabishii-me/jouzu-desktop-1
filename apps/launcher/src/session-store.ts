@@ -59,7 +59,7 @@ type Data = Record<string, unknown>;
 
 /** The session's model as the host reports it: which one, and whether it can be sent with. */
 function modelOf(model: Data | undefined): Partial<ChatSnapshot> {
-  const state = model?.state === "ready" || model?.state === "unavailable" ? model.state : "resolving";
+  const state = model?.state === "ready" ? "ready" : "none";
   const provider = typeof model?.provider === "string" && model.provider ? model.provider : undefined;
   const id = typeof model?.id === "string" && model.id ? model.id : undefined;
   return {
