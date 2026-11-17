@@ -1982,7 +1982,11 @@ impl Session {
             .unwrap_or(false);
         // A model chosen before the runtime started (or a new conversation's
         // default) is the session's model; its `set_model` answer settles it.
-        let deferred_model = self.model_applied(value.get("id").and_then(Value::as_str), success);
+        let (applied, deferred_model) = self.model_applied(value.get("id").and_then(Value::as_str), success);
+        if applied && success {
+            // As after a live switch: the level the runtime settled on for this model.
+            self.request_state();
+        }
         if !success {
             let message = value
                 .get("error")
@@ -3680,7 +3684,6 @@ impl Session {
             }
             _ => {}
         }
-        self.check_model()?;
         let now = Instant::now();
         let cancelled = {
             let mut tombstones = self
@@ -3717,6 +3720,12 @@ impl Session {
                 "receipt": "queued",
                 "waiting": waiting,
             }));
+        }
+        // Only a new message is checked: a retried one already has its answer
+        // above. A slash command (`/flow`, `/textguard`) is the runtime's to
+        // handle and needs no model.
+        if !text.starts_with('/') {
+            self.check_model()?;
         }
         let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
         let message_id = format!("m-{counter}");
@@ -3943,6 +3952,9 @@ impl Session {
     }
 
     pub fn retry_failed(self: &Arc<Self>) -> Result<Value, ApiError> {
+        // A retry is a new prompt: it needs a model as much as a message does.
+        // Checked before the failed turn is taken, so a refusal keeps it.
+        self.check_model()?;
         let Some(failed) = self
             .failed_turn
             .lock()
@@ -4191,6 +4203,9 @@ impl Session {
             slot.unapplied = false;
             slot.applying = None;
         }
+        // The runtime re-applies (and clamps) the thinking level for the new
+        // model; its state says which level that is.
+        self.request_state();
         self.publish_summary();
         Ok(self.model_view())
     }
@@ -4249,20 +4264,21 @@ impl Session {
     /// The answer to the `set_model` that applied a model chosen before the
     /// runtime started. Refused: the session's model is unknown until the
     /// runtime reports its own (the caller asks), and the refused one is returned.
-    fn model_applied(&self, request: Option<&str>, success: bool) -> Option<ModelRef> {
+    /// Whether `request` was that `set_model`, and the refused model if it failed.
+    fn model_applied(&self, request: Option<&str>, success: bool) -> (bool, Option<ModelRef>) {
         let refused = {
             let mut slot = self.model_slot();
             if request.is_none() || slot.applying.as_deref() != request {
-                return None;
+                return (false, None);
             }
             slot.applying = None;
             if success {
-                return None;
+                return (true, None);
             }
             slot.current.take()
         };
         self.publish_summary();
-        refused
+        (true, refused)
     }
 
     /// The session's model as clients show it: which one, and whether a message
@@ -4315,7 +4331,8 @@ impl Session {
     /// it restores.
     fn awaits_model(&self) -> bool {
         if self.fresh.load(Ordering::SeqCst) {
-            !self.config.catalog.loaded()
+            // Only while the first listing runs: a failed one is not on its way.
+            self.config.catalog.loading()
         } else {
             matches!(
                 self.status(),
@@ -4399,6 +4416,14 @@ impl Session {
     }
 
     fn apply_pending_preferences(&self) {
+        {
+            // A `set_model` written to a runtime that has since been replaced
+            // was never answered: write it again to this one.
+            let mut slot = self.model_slot();
+            if slot.applying.take().is_some() {
+                slot.unapplied = true;
+            }
+        }
         self.apply_model();
         let level = self
             .pending_thinking
@@ -6588,7 +6613,6 @@ impl SessionManager {
                 .and_then(|model| ModelRef::from_value(&model));
             session.model_slot().current = saved;
         }
-        session.take_default_model();
         {
             let mut sessions = self
                 .sessions
@@ -6596,6 +6620,9 @@ impl SessionManager {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             sessions.insert(session.id.clone(), session.clone());
         }
+        // After it is in the table: a listing that lands between this and the
+        // insert would otherwise reach every session but this one.
+        session.take_default_model();
         if matches!(status, Status::Starting) {
             // A saved conversation is readable the moment it is opened: its
             // history comes from its file, not from the runtime that attaches

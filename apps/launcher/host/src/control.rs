@@ -103,6 +103,8 @@ impl EventBus {
 struct Inflight {
     request_id: String,
     cancel: Arc<Notify>,
+    /// Started by the host itself, not by a client.
+    host: bool,
 }
 
 /// Releases the single control slot and cancels the running operation when the request
@@ -202,16 +204,28 @@ impl ControlManager {
         let Some(active) = inflight.as_ref() else {
             return false;
         };
-        if let Some(requested) = request_id {
-            if requested != active.request_id {
-                return false;
-            }
+        match request_id {
+            Some(requested) if requested != active.request_id => return false,
+            None if active.host => return false,
+            _ => {}
         }
         active.cancel.notify_one();
         true
     }
 
+    /// An operation a client asked for: an id-less cancel stops it.
     pub async fn request(&self, body: Value) -> Result<Value, ApiError> {
+        self.submit(body, false).await
+    }
+
+    /// An operation the host runs on its own (listing the catalog, saving the
+    /// default model). Only a cancel naming its request id stops it, so a
+    /// client cancelling its own sign-in never cancels it instead.
+    pub async fn request_for_host(&self, body: Value) -> Result<Value, ApiError> {
+        self.submit(body, true).await
+    }
+
+    async fn submit(&self, body: Value, host: bool) -> Result<Value, ApiError> {
         let action = body
             .get("action")
             .and_then(Value::as_str)
@@ -237,6 +251,7 @@ impl ControlManager {
             *inflight = Some(Inflight {
                 request_id: request_id.clone(),
                 cancel: cancel.clone(),
+                host,
             });
         }
         // The slot is released on drop, including when the HTTP client goes away and

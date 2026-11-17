@@ -349,6 +349,11 @@ export class HostClient {
     return this.request<unknown>("/v1/models");
   }
 
+  /** Refresh the published catalogs and list the models again; answers the new catalog. */
+  refreshModels(): Promise<unknown> {
+    return this.request<unknown>("/v1/models/refresh", { method: "POST" });
+  }
+
   async selectModel(sessionId: string, provider: string, model: string): Promise<void> {
     await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/model`, {
       method: "POST",

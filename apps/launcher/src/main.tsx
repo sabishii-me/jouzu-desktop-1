@@ -36,7 +36,7 @@ const api = createJouzuApi(client);
 configureSessionPool(api);
 configureEventRouter(client);
 configureControlClient(client);
-configureModelCatalog({ read: () => api.models.catalog() });
+configureModelCatalog({ read: () => api.models.catalog(), refresh: () => api.models.refresh() });
 
 async function boot() {
   try { await api.start(); } catch { /* The App surfaces the host error; it never falls back. */ }

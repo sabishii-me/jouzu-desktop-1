@@ -258,6 +258,8 @@ export interface WorkspaceApi {
 export interface ModelApi {
   /** The host's model catalog (see `model-catalog.ts`); changes arrive as `models.changed`. */
   catalog(): Promise<unknown>;
+  /** List the models again after a failed listing; the answer is the new catalog. */
+  refresh(): Promise<unknown>;
   select(sessionId: string, provider: string, model: string): Promise<void>;
   thinking(sessionId: string, level: string): Promise<void>;
 }

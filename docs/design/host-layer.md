@@ -71,12 +71,24 @@ describes no screens; what a person sees is in the UI document.
 - The catalog holds chat models only. A catalog model with no output limit
   (Shisa Translate) is not a chat model and is left out.
 - When the catalog changes, the revision increases and `models.changed` is sent.
-  The host recycles warm runtimes that loaded an older revision.
+  A warm runtime is recycled once per settings change (by whatever changed the
+  settings) or when refreshed catalogs bring a new list; the first listing
+  describes what it already loaded and recycles nothing.
+- If the first listing fails, the catalog is `failed` with its error; new
+  sessions have no model (`unavailable`), and a client retries with
+  `POST /v1/models/refresh`.
 - A new session uses the default model. The default exists in one place only:
   the jouzu runtime's default-model setting.
 - When the person changes the model in a session, the host calls RPC `set_model`
-  (session only) and, on success, writes the runtime default through the
-  ConfigQueue, so the next new session uses the last selected model.
+  (session only) and, on success, makes it the default at once, so the next new
+  session uses the last selected model however soon it is created. It writes
+  the runtime default through the ConfigQueue behind the answer; writes go one
+  at a time and each writes the latest pick. Until a listing reports it, the
+  pick stands over the runtime's older default; if writing fails, the default
+  is the runtime's again. Since the runtime re-applies the thinking level for
+  the new model, the host reads the session state again after `set_model`.
+- A send needs a model; a slash command (`/flow`, `/textguard`) does not, and a
+  retried message gets its earlier answer before any check.
 - A session's model state is `resolving`, `ready` or `unavailable`. It is
   derived from the session's model and the catalog, never stored beside them.
   Send is refused unless it is `ready` (`no-model` or `model-unavailable`).

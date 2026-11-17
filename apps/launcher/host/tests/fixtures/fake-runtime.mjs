@@ -339,6 +339,8 @@ function run(text, images) {
 }
 
 let currentModel = { name: "fixture-model", provider: "fixture", id: "model" };
+// Like pi, a model switch re-applies the level for the new model (here: "off").
+let thinkingLevel = "off";
 
 const lines = readline.createInterface({ input: process.stdin });
 if (process.env.FAKE_RUNTIME_IGNORE_STDIN === "1") {
@@ -368,7 +370,7 @@ lines.on("line", line => {
       response(value.id, "get_messages", { messages });
       break;
     case "get_state":
-      response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: currentModel, thinkingLevel: "off", sessionFile: null });
+      response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: currentModel, thinkingLevel, sessionFile: null });
       selfRunWhen("ready");
       break;
     case "get_available_models":
@@ -387,10 +389,12 @@ lines.on("line", line => {
         break;
       }
       currentModel = { name: "fixture-model", provider: String(value.provider ?? "fixture"), id: value.modelId };
+      thinkingLevel = "off";
       response(value.id, "set_model", { model: currentModel });
       break;
     case "set_thinking_level":
-      response(value.id, "set_thinking_level", { level: String(value.level ?? "off") });
+      thinkingLevel = String(value.level ?? "off");
+      response(value.id, "set_thinking_level", { level: thinkingLevel });
       break;
     case "switch_session":
       // FAKE_RUNTIME_EXIT_ON_SWITCH_ONCE names a marker file: the first runtime to

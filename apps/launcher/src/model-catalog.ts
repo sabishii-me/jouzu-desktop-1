@@ -63,7 +63,7 @@ export function parseCatalog(value: unknown): ModelCatalog {
   };
 }
 
-type Source = { read(): Promise<unknown> };
+type Source = { read(): Promise<unknown>; refresh?(): Promise<unknown> };
 
 class CatalogStore {
   private current: ModelCatalog = emptyCatalog;
@@ -93,15 +93,19 @@ class CatalogStore {
 
   private async read(): Promise<void> {
     if (!this.source) return;
-    // What the host answers now wins, whatever revision it carries (a restarted
-    // host counts from the start again).
-    try { this.take(parseCatalog(await this.source.read()), true); }
+    try { this.take(parseCatalog(await this.source.read())); }
     catch { /* The stream's next `models.changed` carries it; the composer shows the catalog as loading meanwhile. */ }
   }
 
-  /** An event older than the view shown (racing a read) is ignored. */
-  private take(next: ModelCatalog, read = false): void {
-    if (!read && next.revision < this.current.revision) return;
+  /** Ask the host to list the models again (after a failed listing). The answer, or the host's refusal, arrives as `models.changed`. */
+  async refresh(): Promise<void> {
+    try { if (this.source?.refresh) this.take(parseCatalog(await this.source.refresh())); }
+    catch { /* The failure is in the catalog the host publishes. */ }
+  }
+
+  /** A view older than the one shown (a read racing an event) is ignored. A restarted host reloads the page, so revisions only grow. */
+  private take(next: ModelCatalog): void {
+    if (next.revision < this.current.revision) return;
     this.current = next;
     for (const listener of this.listeners) listener();
   }

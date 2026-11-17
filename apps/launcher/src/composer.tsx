@@ -31,11 +31,12 @@ function modelDetails(model: ChatModel) {
  * loading while it is not known yet, the way to set up a provider when there is
  * no model at all, and the menu of the host's catalog otherwise.
  */
-function ModelMenu({ open, onOpenChange, models, catalogState, model, state, onSelect, onSetup, thinkingLevel, thinkingLevels, onThinking, onRetry }: {
+function ModelMenu({ open, onOpenChange, models, catalogState, catalogError, model, state, onSelect, onSetup, thinkingLevel, thinkingLevels, onThinking, onRetry }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   models: readonly ChatModel[];
   catalogState: ModelCatalog["state"];
+  catalogError?: string | null;
   model?: string;
   state: ModelState;
   onSelect: (provider: string, id: string) => void;
@@ -69,7 +70,7 @@ function ModelMenu({ open, onOpenChange, models, catalogState, model, state, onS
     {open && !setup && <div role="menu" aria-label="Model selection" className="absolute bottom-full right-0 z-30 mb-2 w-80 max-w-[calc(100vw-2rem)] rounded-xl border border-border bg-popover p-2 shadow-xl">
       <Input autoFocus aria-label="Search models" placeholder="Search models" value={query} onChange={event => setQuery(event.target.value)} className="mb-2" />
       <div className="max-h-72 overflow-y-auto">
-        {!models.length && <div className="px-2 py-3">{catalogState === "loading" ? <LoaderCircle className="size-4 animate-spin text-muted-foreground" aria-label="Loading models" /> : <><p className="text-sm text-muted-foreground">No models available.</p>{onRetry && <Button type="button" variant="outline" className="mt-2 h-7 px-2 text-xs" onClick={onRetry}>Retry models</Button>}</>}</div>}
+        {!models.length && <div className="px-2 py-3">{catalogState === "loading" ? <LoaderCircle className="size-4 animate-spin text-muted-foreground" aria-label="Loading models" /> : <><p className="text-sm text-muted-foreground">{catalogState === "failed" && catalogError ? catalogError : "No models available."}</p>{onRetry && <Button type="button" variant="outline" className="mt-2 h-7 px-2 text-xs" onClick={onRetry}>Retry models</Button>}</>}</div>}
         {!!models.length && !visible.length && <p className="px-2 py-3 text-sm text-muted-foreground">No matching models</p>}
         {providers.map(provider => <section key={provider} className="mb-2">
           <h3 className="px-2 pb-1 pt-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">{providerLabel(provider)}</h3>
@@ -171,6 +172,8 @@ export interface ComposerProps {
   /** The host's model catalog. */
   models: readonly ChatModel[];
   catalogState: ModelCatalog["state"];
+  /** Why the host could not list the models, when it could not. */
+  catalogError?: string | null;
   /** The session's model and whether a message can be sent with it. */
   model?: string;
   modelState: ModelState;
@@ -205,7 +208,7 @@ function TextGuardControl({ control }: { control: NonNullable<ComposerProps["tex
     </div>}
   </div>;
 }
-export function Composer({ hero = false, autoFocus = false, textguard, connected, pending, settling = false, opening = false, starting = false, unavailable = false, running, draft, onDraft, onSend, onStop, onCompact, onExport, onReloadMcp, attachments = [], onAddImages, onRemoveImage, readingImages = false, attachmentError, videos = [], onAddVideo, onRemoveVideo, models, catalogState, model, modelState, onSelectModel, onSetupModels, onRetryModels, thinkingLevel, thinkingLevels, onThinkingLevel }: ComposerProps) {
+export function Composer({ hero = false, autoFocus = false, textguard, connected, pending, settling = false, opening = false, starting = false, unavailable = false, running, draft, onDraft, onSend, onStop, onCompact, onExport, onReloadMcp, attachments = [], onAddImages, onRemoveImage, readingImages = false, attachmentError, videos = [], onAddVideo, onRemoveVideo, models, catalogState, catalogError, model, modelState, onSelectModel, onSetupModels, onRetryModels, thinkingLevel, thinkingLevels, onThinkingLevel }: ComposerProps) {
   const active = running || starting;
   const imageInput = useRef<HTMLInputElement>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -270,7 +273,7 @@ export function Composer({ hero = false, autoFocus = false, textguard, connected
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <span className="hidden text-xs text-muted-foreground lg:inline">{!connected ? "Connecting…" : unavailable ? "Session unavailable" : opening ? "Opening session…" : starting ? "Starting…" : pending ? "Sending…" : running ? "Enter to steer: Jouzu reads it at its next step" : "Enter to send · Shift+Enter for newline"}</span>
-          <ModelMenu open={modelOpen} onOpenChange={setModelOpen} models={models} catalogState={catalogState} model={model} state={modelState} onSelect={onSelectModel} onSetup={onSetupModels} onRetry={onRetryModels} thinkingLevel={thinkingLevel} thinkingLevels={thinkingLevels} onThinking={onThinkingLevel} />
+          <ModelMenu open={modelOpen} onOpenChange={setModelOpen} models={models} catalogState={catalogState} catalogError={catalogError} model={model} state={modelState} onSelect={onSelectModel} onSetup={onSetupModels} onRetry={onRetryModels} thinkingLevel={thinkingLevel} thinkingLevels={thinkingLevels} onThinking={onThinkingLevel} />
           {active && <Button type="button" variant="outline" className="h-8 px-2" onClick={onStop}><Square className="size-3.5" />Stop</Button>}
           <Button type="submit" className="h-8 px-2" disabled={(!connected && !opening) || !modelReady || (pending && !running && !starting) || unavailable || readingImages || !draft.trim()}><Send className="size-3.5" />{running ? "Steer" : "Send"}</Button>
         </div>

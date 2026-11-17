@@ -13,8 +13,10 @@
 //!
 //! The default model exists in one place only: the runtime's default-model
 //! setting, which `available-models` reports. When the person picks a model in a
-//! session the host writes it there (see `lib.rs`), so the next new session uses
-//! the last selected model.
+//! session it is the default at once (`choose_default`), and the host writes it
+//! to the runtime behind the answer (see `lib.rs`); until a listing reports it,
+//! the choice stands over what the runtime still says. The next new session
+//! uses the last selected model.
 
 use std::{path::Path, sync::Mutex};
 
@@ -69,9 +71,11 @@ impl State {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Change {
     None,
-    /// Only the default, the stale flag or the error changed.
+    /// The default, the stale flag or the error changed, or the first listing
+    /// arrived (it tells what the runtimes already loaded).
     View,
-    /// The list of models changed: a runtime started before has another catalog.
+    /// The list of models changed since the last listing: a runtime started
+    /// before has another catalog.
     Models,
 }
 
@@ -89,7 +93,10 @@ struct Inner {
     revision: u64,
     state: State,
     models: Vec<Value>,
+    /// The default the last listing reported.
     default: Option<ModelRef>,
+    /// The person's last pick, while the runtime does not report it yet.
+    chosen: Option<ModelRef>,
     stale: bool,
     error: Option<String>,
 }
@@ -99,6 +106,8 @@ pub struct ModelCatalog {
     /// One load at a time; a load asked for while one runs waits and runs after it,
     /// so it sees every change made before it was asked for.
     loading: tokio::sync::Mutex<()>,
+    /// One write of the default model at a time (see `lib.rs`).
+    saving: tokio::sync::Mutex<()>,
 }
 
 impl Default for ModelCatalog {
@@ -115,10 +124,12 @@ impl ModelCatalog {
                 state: State::Loading,
                 models: Vec::new(),
                 default: None,
+                chosen: None,
                 stale: false,
                 error: None,
             }),
             loading: tokio::sync::Mutex::new(()),
+            saving: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -132,11 +143,19 @@ impl ModelCatalog {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
 
+impl Inner {
+    fn default(&self) -> Option<&ModelRef> {
+        self.chosen.as_ref().or(self.default.as_ref())
+    }
+}
+
+impl ModelCatalog {
     /// The catalog as every client shows it (`GET /v1/models`, `models.changed`).
     pub fn view(&self) -> Value {
         let inner = self.inner();
-        let default = inner.default.as_ref().and_then(|default| {
+        let default = inner.default().and_then(|default| {
             row_of(&inner.models, default).map(|row| {
                 json!({ "provider": default.provider, "id": default.id, "name": row.get("name").cloned().unwrap_or(Value::Null) })
             })
@@ -160,12 +179,65 @@ impl ModelCatalog {
         self.inner().state == State::Ready
     }
 
+    /// The first listing has not answered yet.
+    pub fn loading(&self) -> bool {
+        self.inner().state == State::Loading
+    }
+
     /// The model a new conversation starts on, when the runtime has a default it
     /// can chat with.
     pub fn default_model(&self) -> Option<ModelRef> {
         let inner = self.inner();
-        let default = inner.default.clone()?;
+        let default = inner.default()?.clone();
         row_of(&inner.models, &default).map(|_| default)
+    }
+
+    /// The person picked `model`: it is the default from now on. Returns whether
+    /// that changed what clients see. The caller writes it to the runtime and
+    /// reports the outcome with `default_saved`.
+    pub fn choose_default(&self, model: &ModelRef) -> Change {
+        let mut inner = self.inner();
+        if row_of(&inner.models, model).is_none() {
+            return Change::None;
+        }
+        let before = inner.default().cloned();
+        // While an earlier pick may still be written, this one is written too,
+        // even when the runtime already reports it: the last write must be it.
+        inner.chosen = if inner.chosen.is_none() && inner.default.as_ref() == Some(model) {
+            None
+        } else {
+            Some(model.clone())
+        };
+        if inner.default() == before.as_ref() {
+            return Change::None;
+        }
+        inner.revision += 1;
+        Change::View
+    }
+
+    /// Held while the default model is written to the runtime.
+    pub async fn saving(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.saving.lock().await
+    }
+
+    /// The pick that should be in the runtime's settings now, if any.
+    pub fn unsaved_default(&self) -> Option<ModelRef> {
+        self.inner().chosen.clone()
+    }
+
+    /// Writing `model` to the runtime failed: the default is what the runtime
+    /// reports again, unless the person picked another one meanwhile.
+    pub fn default_not_saved(&self, model: &ModelRef) -> Change {
+        let mut inner = self.inner();
+        if inner.chosen.as_ref() != Some(model) {
+            return Change::None;
+        }
+        inner.chosen = None;
+        if inner.default.as_ref() == Some(model) {
+            return Change::None;
+        }
+        inner.revision += 1;
+        Change::View
     }
 
     pub fn lookup(&self, model: &ModelRef) -> Lookup {
@@ -191,7 +263,7 @@ impl ModelCatalog {
                     .await?;
             }
             control
-                .request(json!({ "action": "available-models" }))
+                .request_for_host(json!({ "action": "available-models" }))
                 .await
         }
         .await;
@@ -224,9 +296,16 @@ impl ModelCatalog {
             _ => None,
         };
         let mut inner = self.inner();
-        let change = if inner.state != State::Ready || inner.models != models {
+        let before = inner.default().cloned();
+        // A pick the runtime now reports is settled; one it does not report
+        // yet is still being written and stands.
+        if inner.chosen.is_some() && inner.chosen == default {
+            inner.chosen = None;
+        }
+        let shown = inner.chosen.clone().or_else(|| default.clone());
+        let change = if inner.state == State::Ready && inner.models != models {
             Change::Models
-        } else if inner.default != default || inner.stale || inner.error.is_some() {
+        } else if inner.state != State::Ready || before != shown || inner.stale || inner.error.is_some() {
             Change::View
         } else {
             Change::None
@@ -313,7 +392,8 @@ mod tests {
     #[test]
     fn a_listing_raises_the_revision_only_when_it_changes_what_clients_see() {
         let catalog = ModelCatalog::new();
-        assert_eq!(catalog.set_listing(listing("qwen")), Change::Models);
+        // The first listing describes what runtimes already loaded: not a new list.
+        assert_eq!(catalog.set_listing(listing("qwen")), Change::View);
         assert_eq!(catalog.revision(), 1);
         assert_eq!(catalog.set_listing(listing("qwen")), Change::None);
         assert_eq!(catalog.revision(), 1);
@@ -323,6 +403,53 @@ mod tests {
         assert_eq!(catalog.set_listing(other_default), Change::View);
         assert_eq!(catalog.revision(), 2);
         assert_eq!(catalog.default_model(), Some(ModelRef::new("capy", "other")));
+    }
+
+    #[test]
+    fn a_new_list_of_models_is_a_models_change() {
+        let catalog = ModelCatalog::new();
+        catalog.set_listing(listing("qwen"));
+        let mut fewer = listing("qwen");
+        fewer["models"].as_array_mut().unwrap().pop();
+        assert_eq!(catalog.set_listing(fewer), Change::Models);
+    }
+
+    /// The last pick is the default at once, stands over listings that still
+    /// report an older default, and settles when the runtime reports it.
+    #[test]
+    fn the_last_pick_is_the_default_until_the_runtime_reports_it() {
+        let catalog = ModelCatalog::new();
+        catalog.set_listing(listing("qwen"));
+        let other = ModelRef::new("capy", "other");
+        let qwen = ModelRef::new("catalog:x", "qwen");
+        assert_eq!(catalog.choose_default(&other), Change::View);
+        assert_eq!(catalog.default_model(), Some(other.clone()));
+        // Picking the runtime's own default again while `other` may still be
+        // written: `qwen` must be written too, so it is kept as the pick.
+        assert_eq!(catalog.choose_default(&qwen), Change::View);
+        assert_eq!(catalog.unsaved_default(), Some(qwen.clone()));
+        // A listing taken after `other` was written still shows the pick.
+        let mut written_other = listing("qwen");
+        written_other["defaultProvider"] = json!("capy");
+        written_other["defaultModel"] = json!("other");
+        catalog.set_listing(written_other);
+        assert_eq!(catalog.default_model(), Some(qwen.clone()));
+        // The runtime reports the pick: settled.
+        catalog.set_listing(listing("qwen"));
+        assert_eq!(catalog.unsaved_default(), None);
+        assert_eq!(catalog.default_model(), Some(qwen));
+    }
+
+    #[test]
+    fn a_pick_that_could_not_be_saved_gives_way_to_the_runtime_default() {
+        let catalog = ModelCatalog::new();
+        catalog.set_listing(listing("qwen"));
+        let other = ModelRef::new("capy", "other");
+        catalog.choose_default(&other);
+        assert_eq!(catalog.default_not_saved(&other), Change::View);
+        assert_eq!(catalog.default_model(), Some(ModelRef::new("catalog:x", "qwen")));
+        // A model the catalog does not list is never the default.
+        assert_eq!(catalog.choose_default(&ModelRef::new("capy", "gone")), Change::None);
     }
 
     /// Shisa Translate (no output limit) is not a chat model: not listed, and

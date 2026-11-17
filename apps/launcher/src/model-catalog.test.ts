@@ -35,9 +35,31 @@ describe("model catalog", () => {
     expect(modelCatalog.snapshot.models.map(model => model.id)).toEqual(["a", "b"]);
     emit?.({ id: 11, event: "models.changed", data: view(3, ["old"]) });
     expect(modelCatalog.snapshot.revision).toBe(4);
-    // Missed events: the catalog is read again, and what the host answers wins.
-    read.mockResolvedValueOnce(view(1, ["after-restart"]));
+    // Missed events: the catalog is read again.
+    read.mockResolvedValueOnce(view(5, ["c"]));
     emit?.({ id: 12, event: "resync", data: {} });
-    await vi.waitFor(() => expect(modelCatalog.snapshot.models.map(model => model.id)).toEqual(["after-restart"]));
+    await vi.waitFor(() => expect(modelCatalog.snapshot.models.map(model => model.id)).toEqual(["c"]));
+  });
+
+  it("keeps a change that arrived before the first read answered", async () => {
+    let emit: ((event: ApiEvent) => void) | undefined;
+    eventRouter.start({ clientId: "catalog-race", subscribeEvents: (_id: string, _after: number, onEvent: (event: ApiEvent) => void) => { emit = onEvent; return () => {}; } } as unknown as HostClient);
+    let answer: (value: unknown) => void = () => {};
+    configureModelCatalog({ read: () => new Promise(resolve => { answer = resolve; }) });
+    emit?.({ id: 1, event: "models.changed", data: view(1, ["a"]) });
+    // The read started before the host listed the models answers "loading".
+    answer({ revision: 0, state: "loading", models: [], default: null });
+    await Promise.resolve();
+    expect(modelCatalog.snapshot).toMatchObject({ revision: 1, state: "ready" });
+  });
+
+  it("asks the host to list the models again after a failed listing", async () => {
+    const refresh = vi.fn(async () => view(3, ["a"]));
+    configureModelCatalog({ read: async () => ({ revision: 2, state: "failed", models: [], default: null, error: "Models could not be listed." }), refresh });
+    await vi.waitFor(() => expect(modelCatalog.snapshot.state).toBe("failed"));
+    expect(modelCatalog.snapshot.error).toBe("Models could not be listed.");
+    await modelCatalog.refresh();
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(modelCatalog.snapshot).toMatchObject({ revision: 3, state: "ready" });
   });
 });

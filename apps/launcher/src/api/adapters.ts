@@ -105,6 +105,7 @@ function hostGroups(client: HostClient) {
 
   const models: ModelApi = {
     catalog: () => client.models(),
+    refresh: () => client.refreshModels(),
     async select(sessionId, provider, model) {
       await client.selectModel(sessionId, provider, model);
     },
