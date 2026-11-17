@@ -675,10 +675,9 @@ try {
   const own = [], working = [], readable = [], ended = [];
   let freshOk = true;
   for (let i = 0; i < repeat; i++) {
-    if (i > 0) {
-      await newSession().click();
-      await composer().waitFor({ timeout: 10_000 });
-    }
+    // Every round in a session of its own (the step before left one with a turn in it).
+    await newSession().click();
+    await composer().waitFor({ timeout: 10_000 });
     start = now();
     await composer().fill(prompt);
     await send().click();
