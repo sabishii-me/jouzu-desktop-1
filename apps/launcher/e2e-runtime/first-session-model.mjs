@@ -36,7 +36,9 @@ check('a new session starts with no model, as a plain state', created.model?.sta
 const early = await raw(`/v1/sessions/${created.sessionId}/messages`, { clientMessageId: 'early', text: 'hello' });
 check('a send before a model is picked is refused with a code', early.status === 409 && early.body?.error?.code === 'no-model', `${early.status} ${JSON.stringify(early.body)}`);
 let catalog = await call('/v1/models');
-for (let attempt = 0; attempt < 120 && catalog.state !== 'ready'; attempt += 1) {
+// On a cold home the runtime's first answer can be an empty list; its catalog
+// arrives a few seconds later as a new revision.
+for (let attempt = 0; attempt < 120 && !(catalog.state === 'ready' && catalog.models.length); attempt += 1) {
   await new Promise(resolve => setTimeout(resolve, 250));
   catalog = await call('/v1/models');
 }

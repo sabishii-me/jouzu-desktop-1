@@ -3148,6 +3148,7 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        pick(&session).await;
         session.send("client-1", "hello").unwrap();
         wait_status(&session, Status::Running).await;
         let previous = session.runtime_pid().expect("runtime pid");
@@ -5203,6 +5204,7 @@ mod session_tests {
         let session = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .expect("the installed runtime is used");
+        pick(&session).await;
         assert_eq!(manager.node_executable(), Some(node));
         let pool = manager.warm_runtime().expect("the warm pool started with the runtime");
         let status = pool.wait_settled(Duration::from_secs(10)).await;
