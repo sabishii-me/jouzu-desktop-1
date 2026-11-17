@@ -96,7 +96,8 @@ function activeTurnOf(value: unknown): ActiveTurn | null {
   const turn = record(value);
   const turnId = text(turn?.turnId);
   if (!turn || !turnId) return null;
-  return { turnId, clientMessageId: text(turn.clientMessageId), phase: text(turn.phase) ?? "running", startedAt: time(turn.startedAt), step: stepOf(turn.step) };
+  const origin = turn.origin === "runtime" ? "runtime" as const : turn.origin === "user" ? "user" as const : undefined;
+  return { turnId, origin, clientMessageId: text(turn.clientMessageId), phase: text(turn.phase) ?? "running", startedAt: time(turn.startedAt), step: stepOf(turn.step) };
 }
 
 /** A displayable Flow report: a jouzu-flow message whose text is a JSON object with a kind. */
@@ -146,7 +147,8 @@ function queueOf(value: unknown): QueuedMessage[] {
   return value.flatMap(item => {
     const row = record(item);
     const clientMessageId = text(row?.clientMessageId);
-    return row && clientMessageId ? [{ clientMessageId, text: text(row.text) ?? "", state: text(row.state) ?? "queued", images: typeof row.images === "number" ? row.images : 0 }] : [];
+    const state = row?.state === "delivering" || row?.state === "held" || row?.state === "returned" ? row.state : "queued";
+    return row && clientMessageId ? [{ clientMessageId, text: text(row.text) ?? "", state, images: typeof row.images === "number" ? row.images : 0 }] : [];
   });
 }
 
@@ -546,28 +548,27 @@ export class SessionStore {
   }
 
   /**
-   * Stop: cancel everything this window still has in flight, then the turn the
-   * host is running. The host's cancel works in every phase (tombstone before
-   * acceptance, removal while starting, abort while running).
+   * Stop: cancel the messages this window is still sending (the host drops one
+   * it has not seen yet), then ask the host to stop the run in progress,
+   * whoever started it. The host decides how and reports it: the run's phase
+   * ("cancelling") and its end arrive in its snapshot.
    */
   async stop(): Promise<void> {
     const pending = (this.state.outbox ?? []).filter(entry => entry.state === "sending");
     const turn = this.state.activeTurn;
-    const ids = new Set(pending.map(entry => entry.clientMessageId));
-    if (turn?.clientMessageId) ids.add(turn.clientMessageId);
     if (pending.length) this.setOutbox((this.state.outbox ?? []).filter(entry => entry.state !== "sending"));
-    if (turn) this.update({ activeTurn: { ...turn, phase: "cancelling" } });
     if (turn || pending.length) this.markShown("stop.shown", turn?.clientMessageId ?? pending[0]?.clientMessageId);
     try {
-      if (ids.size) await Promise.all([...ids].map(id => this.session.cancel(id)));
-      else if (turn) await this.session.interrupt();
+      await Promise.all([
+        ...pending.map(entry => this.session.cancel(entry.clientMessageId)),
+        ...(turn ? [this.session.interrupt()] : []),
+      ]);
     } catch (error) {
       // Stop did not take effect: put back what it took away. The messages
       // still being sent finish or fail on their own, as if Stop was not pressed.
       const outbox = this.state.outbox ?? [];
       const restore = pending.filter(entry => !outbox.some(item => item.clientMessageId === entry.clientMessageId));
       if (restore.length) this.setOutbox([...outbox, ...restore]);
-      if (turn && this.state.activeTurn?.turnId === turn.turnId && this.state.activeTurn.phase === "cancelling") this.update({ activeTurn: turn });
       this.update({ error: describeError(error) });
     }
   }
@@ -805,15 +806,8 @@ export class SessionStore {
         this.update({ status: text(data.status) ?? this.state.status });
         if (data.status === "stopped") this.update({ connected: false });
         break;
-      case "turn.start": {
-        // `session.updated` follows with the full turn; this only covers ordering.
-        const turnId = text(data.turnId);
-        if (turnId && this.state.activeTurn?.turnId !== turnId) this.applyTurn({ turnId, phase: text(data.phase) ?? "running" });
-        break;
-      }
-      case "turn.end":
-        if (!this.state.activeTurn || this.state.activeTurn.turnId === text(data.turnId)) this.applyTurn(null);
-        break;
+      // turn.start / turn.end: the run in progress is the host's, and every
+      // change to it arrives as its snapshot (`session.updated`).
       case "message.user": {
         // A waiting message the runtime used: it joins the conversation where it happened.
         const message = historyRowsProjection([data], this.session.id).messages[0];
@@ -873,7 +867,7 @@ export class SessionStore {
             ...(record(data.usage) ? { usage: data.usage as ChatMessage["usage"] } : {}),
           }
           : message);
-        // The turn may continue (more tools); only `turn.end` / the summary end it.
+        // The turn may continue (more tools); only the host's snapshot ends it.
         const tools = { ...this.state.projection.tools };
         for (const [id, tool] of Object.entries(hostToolResults(data.blocks, tools))) if (!tools[id] || tools[id].phase === "running") tools[id] = tool;
         this.update({ projection: { ...this.state.projection, messages, tools, activeMessage: null } });
