@@ -92,6 +92,10 @@ struct Inner {
     default: Option<ModelRef>,
     stale: bool,
     error: Option<String>,
+    /// Bumped when a listing brings a different list of models than the one
+    /// before. A runtime reads the catalog only when it starts, so one started
+    /// before the bump cannot use the new list.
+    models_generation: u64,
 }
 
 pub struct ModelCatalog {
@@ -117,6 +121,7 @@ impl ModelCatalog {
                 default: None,
                 stale: false,
                 error: None,
+                models_generation: 0,
             }),
             loading: tokio::sync::Mutex::new(()),
         }
@@ -156,6 +161,11 @@ impl ModelCatalog {
 
     pub fn revision(&self) -> u64 {
         self.inner().revision
+    }
+
+    /// Which list of models a runtime started now would load (see `Inner`).
+    pub fn models_generation(&self) -> u64 {
+        self.inner().models_generation
     }
 
     /// Listed at least once: a model it does not list cannot be used.
@@ -233,6 +243,9 @@ impl ModelCatalog {
         inner.error = None;
         if change != Change::None {
             inner.revision += 1;
+        }
+        if change == Change::Models {
+            inner.models_generation += 1;
         }
         change
     }

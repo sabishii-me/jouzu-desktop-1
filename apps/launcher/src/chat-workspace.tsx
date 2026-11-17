@@ -15,7 +15,7 @@ import { collectOutputReferences } from "./artifact-references";
 import { PanelStart } from "./panel-start";
 import { FilesPanel } from "./files-panel";
 import { ToolReviewDialog } from "./tool-review-dialog";
-import { SessionStore as ChatConnection, chatPool } from "./session-store";
+import { SessionStore as ChatConnection, chatPool, modelOf } from "./session-store";
 import type { ChatSnapshot, ModelState, PendingPrompt, SessionTiming } from "./chat-types";
 import { modelCatalog, useModelCatalog } from "./model-catalog";
 import { lastModel, rememberModel } from "./last-model";
@@ -49,6 +49,8 @@ type SessionPreview = {
   /** Where the page before it starts in the file; null at the first message; absent when unknown. */
   before?: number | null;
   loading?: boolean;
+  /** The conversation's recorded model as the host reports it; absent until read. */
+  model?: { name?: string; state: ModelState };
 };
 /** Saved messages read per preview page (#20). */
 const PREVIEW_PAGE = 200;
@@ -1045,13 +1047,17 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (cached) {
       // Cached only when whole (see projectionCache): nothing earlier to read.
       setPreview({ path: sessionPath, projection: cached, before: null });
-      return;
     }
-    const previewMessages = api.sessions.messages(sessionPath, { limit: PREVIEW_PAGE });
+    // The page also carries the conversation's recorded model; a cached
+    // transcript still reads it, since the model is the host's to report.
+    const previewMessages = api.sessions.messages(sessionPath, { limit: cached ? 1 : PREVIEW_PAGE });
     void previewMessages.then(page => {
       if (previewRequest.current !== request) return;
       if (normalizedPath(selectedSessionRef.current ?? "") !== normalizedPath(sessionPath)) return;
-      try { setPreview({ path: sessionPath, projection: savedPageProjection(page.messages, page.turn), before: page.nextBefore }); }
+      const shown = modelOf(page.model && typeof page.model === "object" ? page.model as Record<string, unknown> : undefined);
+      const model = { name: shown.model, state: shown.modelState ?? "none" };
+      if (cached) { setPreview(current => current && current.path === sessionPath ? { ...current, model } : current); return; }
+      try { setPreview({ path: sessionPath, projection: savedPageProjection(page.messages, page.turn), before: page.nextBefore, model }); }
       catch (error) { setSessionError(describeError(error)); }
     }).catch(error => {
       if (previewRequest.current === request) setSessionError(describeError(error));
@@ -1248,10 +1254,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const composerRunning = snapshot.projection.running;
   // The session's model as the host reports it. Before a new session is bound
   // (the hero while it attaches) it is the model this window will pick for it.
-  const heroModel = snapshot.sessionId ? null : lastModel(catalog.models);
-  const composerModel: { name?: string; state: ModelState } = snapshot.sessionId
-    ? { name: snapshot.model, state: snapshot.modelState ?? "none" }
-    : { name: heroModel?.name, state: heroModel ? "ready" : "none" };
   // A listing that failed is retried by the host; otherwise a signed-in account
   // can ask its published catalogs again.
   const retryModels = catalog.state === "failed" || catalog.stale ? () => void modelCatalog.refresh() : canRefreshModels ? onRetryModels : undefined;
@@ -1365,6 +1367,15 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   </div>;
   const selectedTitle = sessions.find(session => normalizedPath(session.path) === selectedKey)?.title;
   const activePreview = preview && normalizedPath(preview.path) === selectedKey ? preview : null;
+  // A saved conversation shown before its session opens shows the model the
+  // host read from its file, never the model of the session bound before it.
+  const heroModel = snapshot.sessionId ? null : lastModel(catalog.models);
+  const previewOnly = !!activePreview && normalizedPath(activePreview.path) !== normalizedPath(snapshot.sessionFile ?? "");
+  const composerModel: { name?: string; state: ModelState } = previewOnly
+    ? activePreview?.model ?? { state: "none" }
+    : snapshot.sessionId
+      ? { name: snapshot.model, state: snapshot.modelState ?? "none" }
+      : { name: heroModel?.name, state: heroModel ? "ready" : "none" };
   // A preview is read from disk, so the live connection has no sessionId yet.
   // The session file's UUID is the same identifier the artifact sidecars store.
   const artifactsSessionId = activePreview ? sessionIdFromFile(activePreview.path) : snapshot.sessionId;
@@ -1589,7 +1600,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
             <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now)} running={conversationProjection.running} elapsed={elapsed} settled={settled} />
           </div>
           {promptNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{promptNode}</div>}
-          <Composer autoFocus={composerFocus} connected={snapshot.connected || !!activePreview} pending={snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalog.models} catalogState={catalog.state} model={composerModel.name} modelState={composerModel.state} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModels={onSetupModels} catalogError={catalog.error} onRetryModels={retryModels} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
+          <Composer autoFocus={composerFocus} connected={snapshot.connected || !!activePreview} pending={snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={catalog.models} catalogState={catalog.state} model={composerModel.name} modelState={composerModel.state} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModels={onSetupModels} catalogError={catalog.error} onRetryModels={retryModels} thinkingLevel={previewOnly ? undefined : snapshot.thinkingLevel} thinkingLevels={previewOnly ? [] : snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
         </div>
         <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>

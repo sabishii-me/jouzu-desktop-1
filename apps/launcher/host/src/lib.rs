@@ -728,17 +728,21 @@ async fn select_session_model(
 }
 
 /// Tell everyone the catalog changed: sessions first (their model state
-/// follows the catalog), then clients (`models.changed`).
+/// follows the catalog, and a runtime that loaded an older list of models is
+/// replaced once its session is idle), then clients (`models.changed`). A new
+/// list also retires the unused warm runtime, which loaded the old one.
 fn catalog_changed(state: &AppState, change: models::Change) {
+    if change == models::Change::Models {
+        recycle_warm_runtime(state);
+    }
     if change != models::Change::None {
         state.sessions.catalog_changed();
         state.events.publish_control("models.changed", state.models.view());
     }
 }
 
-/// List the catalog again and tell everyone what changed. Retiring the warm
-/// runtime is the caller's business: whatever changed the settings already
-/// did, and the first listing describes what it loaded.
+/// List the catalog again and tell everyone what changed. The first listing
+/// describes what the runtimes already loaded, so it replaces none.
 pub async fn reload_models(state: &AppState, refresh: bool) -> Result<models::Change, ApiError> {
     let (change, result) = state.models.load(&state.control, refresh).await;
     catalog_changed(state, change);
@@ -1449,10 +1453,9 @@ async fn refresh_models(State(state): State<AppState>) -> Result<Json<Value>, Ap
     // After a failed first listing, list again as at start: refreshing the
     // published catalogs first needs the network, which may be why it failed.
     let refresh = state.models.loaded();
-    // Refreshed catalogs are new settings for a runtime that loaded the old ones.
-    if reload_models(&state, refresh).await? == models::Change::Models {
-        recycle_warm_runtime(&state);
-    }
+    // Refreshed catalogs that bring a new list replace the runtimes that
+    // loaded the old one (see `catalog_changed`).
+    reload_models(&state, refresh).await?;
     Ok(Json(state.models.view()))
 }
 
@@ -4882,6 +4885,66 @@ mod session_tests {
         manager.stop_all();
     }
 
+    /// A runtime reads the catalog only when it starts. One that started
+    /// before a new list of models arrived (a first start, before the catalog
+    /// was downloaded) is replaced once its session is idle, and gets the
+    /// session's model again.
+    #[tokio::test]
+    async fn a_runtime_that_loaded_an_older_model_list_is_replaced_when_idle() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.select_model("fixture", "picked").await.unwrap();
+        let before = session.runtime_pid().expect("a runtime");
+        // A listing that brings nothing new replaces nothing.
+        manager.catalog_changed();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(session.runtime_pid(), Some(before));
+        let mut listing = fixture_listing("model");
+        listing["models"].as_array_mut().unwrap().push(json!({ "provider": "fixture", "id": "newer", "name": "Newer" }));
+        manager.catalog().set_listing(listing);
+        manager.catalog_changed();
+        wait_until(|| session.status() == Status::Idle && session.runtime_pid().is_some_and(|pid| pid != before)).await;
+        assert_eq!(session.info()["model"]["id"], "picked", "{}", session.info());
+        let state = session
+            .request(json!({ "type": "get_state" }), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(state["model"]["id"], "picked", "the session's model is written to the new runtime: {state}");
+        session.select_model("fixture", "newer").await.unwrap();
+        session.send("m1", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        manager.stop_all();
+    }
+
+    /// A turn in progress is never cut to replace its runtime: the
+    /// replacement waits until the turn ends.
+    #[tokio::test]
+    async fn a_new_model_list_waits_for_the_turn_in_progress() {
+        let (manager, _home, workspace) = manager_with_env(50, &[("FAKE_RUNTIME_DELAY_MS", "60")]);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        pick(&session).await;
+        let before = session.runtime_pid().expect("a runtime");
+        session.send("m1", "a reply that takes a while to write out").unwrap();
+        wait_status(&session, Status::Running).await;
+        let mut listing = fixture_listing("model");
+        listing["models"].as_array_mut().unwrap().push(json!({ "provider": "fixture", "id": "newer", "name": "Newer" }));
+        manager.catalog().set_listing(listing);
+        manager.catalog_changed();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(session.status(), Status::Running);
+        assert_eq!(session.runtime_pid(), Some(before));
+        wait_until(|| session.status() == Status::Idle && session.runtime_pid().is_some_and(|pid| pid != before)).await;
+        let history = session.history(50, None);
+        assert!(history["messages"].as_array().unwrap().iter().any(|row| row["kind"] == "assistant"), "{history}");
+        manager.stop_all();
+    }
+
     #[tokio::test]
     async fn a_saved_conversation_keeps_the_model_it_used() {
         let (manager, _home, workspace) = manager(50);
@@ -5829,6 +5892,30 @@ mod session_tests {
         assert_eq!(response.0, StatusCode::OK, "{}", response.2);
         let body: Value = serde_json::from_str(&response.2).unwrap();
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    /// A saved conversation shown before it opens carries the model it
+    /// recorded, so a client never shows another session's model for it; a
+    /// recorded model the catalog no longer lists is no model, not an error.
+    #[tokio::test]
+    async fn a_saved_conversation_preview_carries_its_recorded_model() {
+        let (manager, _home, _workspace) = manager(50);
+        manager.catalog().set_listing(fixture_listing("model"));
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let change = |id: &str| json!({ "type": "model_change", "id": "c1", "parentId": null, "timestamp": "2026-01-01T00:00:01Z", "provider": "fixture", "modelId": id });
+        let user = json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": "hello" }] } });
+        let kept = directory.join("kept.jsonl");
+        std::fs::write(&kept, format!("{}\n{user}\n", change("own-model"))).unwrap();
+        let gone = directory.join("gone.jsonl");
+        std::fs::write(&gone, format!("{}\n{user}\n", change("retired"))).unwrap();
+        let page = manager.messages(&kept.to_string_lossy(), Some(10), None).unwrap();
+        assert_eq!(page["model"]["state"], "ready", "{page}");
+        assert_eq!(page["model"]["id"], "own-model");
+        assert_eq!(page["model"]["name"], "Own model");
+        let page = manager.messages(&gone.to_string_lossy(), Some(10), None).unwrap();
+        assert_eq!(page["model"]["state"], "none", "{page}");
+        assert!(page["model"]["id"].is_null());
     }
 
     async fn wait_status(session: &crate::session::Session, expected: Status) {

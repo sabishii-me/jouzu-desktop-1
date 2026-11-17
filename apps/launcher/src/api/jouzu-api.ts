@@ -129,6 +129,8 @@ export interface SavedMessagesPage {
   nextBefore: number | null;
   /** User messages before this page: the user turn it starts in. */
   turn: number;
+  /** The model the conversation recorded, as the host would show it for a session opened from it. */
+  model?: unknown;
 }
 
 export interface SessionTiming {

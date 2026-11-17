@@ -76,9 +76,13 @@ enforces only its own contract; it adds no rule of its own about models.
   decides which models are chat models; if a model should not be offered, the
   runtime leaves it out.
 - When the catalog changes, the revision increases and `models.changed` is sent.
-  A warm runtime is recycled once per settings change (by whatever changed the
-  settings) or when refreshed catalogs bring a new list; the first listing
-  describes what it already loaded and recycles nothing.
+  A runtime reads the catalog only when it starts, so when a listing brings a
+  new list of models (refreshed catalogs, a sign-in, a first start that
+  downloads the catalog after a runtime started) the warm runtime is recycled
+  and each session's runtime that loaded the older list is replaced as soon as
+  the session is idle (never during a turn); the session's model is written to
+  the new runtime again. A settings change also recycles the warm runtime. The
+  first listing describes what the runtimes already loaded and replaces nothing.
 - If the first listing fails, the catalog is `failed` with its error, and a
   client retries with `POST /v1/models/refresh` (a plain listing again, as at
   start).
@@ -94,6 +98,9 @@ enforces only its own contract; it adds no rule of its own about models.
   before the runtime started is sent after the `set_model` answer, and
   otherwise the host reads the state again.
 - Settings' default model is control `default-model`, passed through as it is.
+- A saved conversation read for display (`GET /v1/sessions/history`) carries
+  `model`: the model its file records, in the same shape and state as a
+  session's, so a client shows that model before the session opens.
 - A session's model state is `ready` (a model the catalog lists, or any model
   while the catalog is not listed yet) or `none` (no model, or one the catalog
   no longer lists). `none` is not an error. It is derived from the session's

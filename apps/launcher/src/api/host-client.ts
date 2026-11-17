@@ -341,7 +341,7 @@ export class HostClient {
     if (page.limit) query.set("limit", String(page.limit));
     if (page.before !== undefined) query.set("before", String(page.before));
     return this.request<Partial<SavedMessagesPage>>(`/v1/sessions/history?${query}`)
-      .then(body => ({ messages: body.messages ?? [], nextBefore: body.nextBefore ?? null, turn: body.turn ?? 0 }));
+      .then(body => ({ messages: body.messages ?? [], nextBefore: body.nextBefore ?? null, turn: body.turn ?? 0, model: body.model }));
   }
 
   /** The host's model catalog: revision, state, models, default. */

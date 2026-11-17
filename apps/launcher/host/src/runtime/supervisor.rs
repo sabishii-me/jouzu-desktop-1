@@ -182,6 +182,15 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// A request written to the runtime is still waiting for its answer.
+    pub fn has_pending(&self) -> bool {
+        !self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+
     pub fn terminate(&self) {
         self.fail_pending("runtime stopped");
         self.job.terminate();

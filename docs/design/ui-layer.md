@@ -60,6 +60,9 @@ ever appears in the composer's place, and only one at a time.
   it (the host and runtime keep no such choice) and picks it for the new
   session if the host's catalog still lists it; otherwise it picks nothing.
   A send from a new session waits for that pick.
+- A saved conversation shown before its session opens shows the model the host
+  read from its file (or "Select model"), never the model of the session shown
+  before it.
 
 ## 5. Session header and sidebar
 

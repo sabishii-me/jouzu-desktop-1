@@ -78,6 +78,48 @@ fn saved_model(path: &Path) -> Option<Value> {
     found
 }
 
+/// A model with its catalog row, when the catalog lists it or is not listed
+/// yet; `None` when the catalog no longer has it.
+fn usable(catalog: &ModelCatalog, model: ModelRef) -> Option<(ModelRef, Option<Value>)> {
+    match catalog.lookup(&model) {
+        Lookup::Listed(row) => Some((model, Some(row))),
+        Lookup::Unknown => Some((model, None)),
+        Lookup::Missing => None,
+    }
+}
+
+/// A model as clients show it: which one, and whether a message can be sent
+/// with it (`ready`, or `none` until the person picks one). Used for a live
+/// session and for a saved conversation that is only being shown.
+fn model_view(catalog: &ModelCatalog, model: Option<&ModelRef>) -> Value {
+    let revision = catalog.revision();
+    let Some((model, row)) = model.cloned().and_then(|model| usable(catalog, model)) else {
+        // No model to send with: none chosen, or one the runtime no longer
+        // offers. That is not an error; the person picks one.
+        return json!({
+            "provider": null,
+            "id": null,
+            "name": null,
+            "state": "none",
+            "catalogRevision": revision,
+        });
+    };
+    let field = |name: &str| {
+        row.as_ref()
+            .and_then(|row| row.get(name))
+            .filter(|value| !value.is_null())
+            .cloned()
+    };
+    json!({
+        "provider": model.provider,
+        "id": model.id,
+        "name": field("name").unwrap_or_else(|| json!(model.id)),
+        "state": "ready",
+        "catalogRevision": revision,
+        "thinkingLevels": field("thinkingLevels").unwrap_or_else(|| json!([])),
+    })
+}
+
 /// The messages a saved session file holds, in the order they were written.
 /// Every message of a saved session file, oldest first. The whole file is read:
 /// a long session's newest messages are at its end (#20).
@@ -702,6 +744,12 @@ pub struct Session {
     tx: broadcast::Sender<SessionEvent>,
     runtime: Mutex<Option<Arc<RuntimeSupervisor>>>,
     runtime_generation: AtomicU64,
+    /// The catalog's models generation when the current runtime was installed:
+    /// the list of models that runtime loaded.
+    catalog_loaded: AtomicU64,
+    /// A task is waiting for this session to be idle to replace a runtime that
+    /// loaded an older list of models.
+    catalog_watch: AtomicBool,
     restarts: crate::runtime::restart::RestartBudget,
     config: SessionConfig,
     lease_path: PathBuf,
@@ -1817,14 +1865,20 @@ impl Session {
     fn request_messages(&self) {
         let id = self.request_id();
         if let Err(error) = self.write_command(pi::command::with_id(pi::command::get_messages(), &id)) {
-            self.fail(error.code, &error.message, error.retryable);
+            // A runtime being replaced is asked again by its successor's handshake.
+            if !matches!(self.status(), Status::Starting | Status::Recovering) {
+                self.fail(error.code, &error.message, error.retryable);
+            }
         }
     }
 
     fn request_state(&self) {
         let id = self.request_id();
         if let Err(error) = self.write_command(pi::command::with_id(pi::command::get_state(), &id)) {
-            self.fail(error.code, &error.message, error.retryable);
+            // A runtime being replaced is asked again by its successor's handshake.
+            if !matches!(self.status(), Status::Starting | Status::Recovering) {
+                self.fail(error.code, &error.message, error.retryable);
+            }
         }
     }
 
@@ -4258,46 +4312,15 @@ impl Session {
         (true, refused)
     }
 
-    /// The session's model as clients show it: which one, and whether a message
-    /// can be sent with it (`ready`, or `none` until the person picks one).
+    /// The session's model as clients show it (see [`model_view`]).
     fn model_view(&self) -> Value {
-        let revision = self.config.catalog.revision();
-        let Some((model, row)) = self.usable_model() else {
-            // No model this session can send with: none chosen, or one the
-            // runtime no longer offers. That is not an error; the person picks one.
-            return json!({
-                "provider": null,
-                "id": null,
-                "name": null,
-                "state": "none",
-                "catalogRevision": revision,
-            });
-        };
-        let field = |name: &str| {
-            row.as_ref()
-                .and_then(|row| row.get(name))
-                .filter(|value| !value.is_null())
-                .cloned()
-        };
-        json!({
-            "provider": model.provider,
-            "id": model.id,
-            "name": field("name").unwrap_or_else(|| json!(model.id)),
-            "state": "ready",
-            "catalogRevision": revision,
-            "thinkingLevels": field("thinkingLevels").unwrap_or_else(|| json!([])),
-        })
+        model_view(&self.config.catalog, self.model_slot().current.as_ref())
     }
 
     /// The session's model when the runtime offers it (or the list is not
     /// known yet), with its catalog row.
     fn usable_model(&self) -> Option<(ModelRef, Option<Value>)> {
-        let model = self.model_slot().current.clone()?;
-        match self.config.catalog.lookup(&model) {
-            Lookup::Listed(row) => Some((model, Some(row))),
-            Lookup::Unknown => Some((model, None)),
-            Lookup::Missing => None,
-        }
+        usable(&self.config.catalog, self.model_slot().current.clone()?)
     }
 
     /// The model this session last used, for its history rows, listed or not.
@@ -4660,6 +4683,8 @@ impl Session {
             tx,
             runtime: Mutex::new(None),
             runtime_generation: AtomicU64::new(0),
+            catalog_loaded: AtomicU64::new(config.catalog.models_generation()),
+            catalog_watch: AtomicBool::new(false),
             restarts: Default::default(),
             config: config.clone(),
             lease_path,
@@ -4893,6 +4918,8 @@ impl Session {
         mut events: tokio::sync::mpsc::Receiver<RuntimeEvent>,
     ) {
         let generation = self.runtime_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.catalog_loaded
+            .store(self.config.catalog.models_generation(), Ordering::SeqCst);
         *self
             .runtime
             .lock()
@@ -4920,6 +4947,84 @@ impl Session {
             }
         });
         self.start_handshake();
+    }
+
+    /// The runtime reads the model catalog only when it starts: one started
+    /// before the catalog brought a new list of models cannot use them
+    /// (`set_model` answers "Model not found"). Such a runtime is replaced as
+    /// soon as the session is idle; a turn in progress is never cut. The
+    /// session's model is written to the new runtime again, since a new
+    /// conversation records it only with its first reply.
+    pub fn follow_catalog(self: &Arc<Self>) {
+        if !self.catalog_outdated() || self.catalog_watch.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let session = self.clone();
+        let mut events = self.tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                if !session.catalog_outdated()
+                    || matches!(session.status(), Status::Stopped | Status::Cancelled | Status::Error)
+                {
+                    break;
+                }
+                if session.status() == Status::Idle && session.reload_runtime_for_catalog() {
+                    break;
+                }
+                if let Err(tokio::sync::broadcast::error::RecvError::Closed) = events.recv().await {
+                    break;
+                }
+            }
+            session.catalog_watch.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Messages waiting to run, or a request the runtime has not answered.
+    fn has_waiting_work(&self) -> bool {
+        self.runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|runtime| runtime.has_pending())
+            || !self.queued_turns.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty()
+            || !self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty()
+            || self.model_slot().applying.is_some()
+    }
+
+    fn catalog_outdated(&self) -> bool {
+        self.catalog_loaded.load(Ordering::SeqCst) != self.config.catalog.models_generation()
+            && self
+                .runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+    }
+
+    /// Replace an idle session's runtime with one that loads the current
+    /// catalog. Not a failure: the restart budget is not touched.
+    fn reload_runtime_for_catalog(self: &Arc<Self>) -> bool {
+        if self.status() != Status::Idle || self.has_waiting_work() {
+            return false;
+        }
+        log(
+            &self.home,
+            "info",
+            "runtime.catalog_reload",
+            json!({ "session": self.id, "loaded": self.catalog_loaded.load(Ordering::SeqCst), "current": self.config.catalog.models_generation() }),
+        );
+        {
+            let mut slot = self.model_slot();
+            if slot.current.is_some() && slot.applying.is_none() {
+                slot.unapplied = true;
+            }
+        }
+        // Events of the replaced runtime (its exit) are not a crash. Starting,
+        // not Recovering: a message sent meanwhile waits for the new runtime.
+        self.runtime_generation.fetch_add(1, Ordering::SeqCst);
+        self.set_status(Status::Starting);
+        let session = self.clone();
+        tokio::spawn(async move { session.restart_runtime().await });
+        true
     }
 
     fn schedule_recovery(self: &Arc<Self>, reason: String) {
@@ -5696,10 +5801,14 @@ impl SessionManager {
             .count();
         messages.truncate(end);
         let page = messages.split_off(start);
+        // The model the conversation recorded, as a session opened from it
+        // would show it, so a client showing the file shows that model.
+        let model = saved_model(&path).and_then(|model| ModelRef::from_value(&model));
         Ok(json!({
             "messages": page,
             "nextBefore": if start > 0 { json!(start) } else { Value::Null },
             "turn": turn,
+            "model": model_view(&self.catalog, model.as_ref()),
         }))
     }
 
@@ -6389,6 +6498,8 @@ impl SessionManager {
             .collect();
         for session in sessions {
             session.publish_summary();
+            // A new list of models: runtimes that loaded the old one are replaced.
+            session.follow_catalog();
         }
     }
 
