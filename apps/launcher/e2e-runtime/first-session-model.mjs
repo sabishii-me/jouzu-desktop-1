@@ -4,8 +4,9 @@ import { join } from 'node:path';
 // Regression check for #99 and the message lost right after "New session": the first
 // new session after the host starts gets the default model with no client listing
 // the models. Against a host JUST started on a throwaway home (JOUZU_E2E_HOST_HOME:
-// the host's --home, with a usable default model): create a new session at once,
-// then read it until its model is known: it must be the catalog's default and ready.
+// the host's --home, with at least one usable model): create a new session at once,
+// then read it until its model is known: it must be ready, and the catalog's default
+// when one is saved (with none saved, the runtime picks it, as for a first sign-in).
 // A send made before then is refused with a code (no-model), never accepted and lost.
 // Never touches the user's data folder.
 const hostHome = process.env.JOUZU_E2E_HOST_HOME;
@@ -44,9 +45,10 @@ for (let attempt = 0; attempt < 120 && model?.state !== 'ready'; attempt += 1) {
 const catalog = await call('/v1/models');
 const expected = catalog.default ? `${catalog.default.provider}/${catalog.default.id}` : null;
 const shown = model?.provider && model?.id ? `${model.provider}/${model.id}` : null;
+const listed = catalog.models.some(row => `${row.provider}/${row.id}` === shown);
 check(
-  'a session created right after the host started gets the default model by itself',
-  expected && shown === expected && model.state === 'ready',
+  'a session created right after the host started gets its model by itself',
+  model?.state === 'ready' && (expected ? shown === expected : listed),
   `at create: ${atCreate?.state ?? 'none'} | default: ${expected ?? 'none'} | shown: ${shown ?? 'none'} (${model?.state ?? 'none'})`,
 );
 

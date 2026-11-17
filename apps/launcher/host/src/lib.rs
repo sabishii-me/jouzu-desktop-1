@@ -5045,19 +5045,42 @@ mod session_tests {
         manager.stop_all();
     }
 
-    /// With models listed but no default, a new session has no model: Send is
-    /// refused (`no-model`, not retryable) until one is chosen.
+    /// With no saved default, the runtime picks the model a new conversation
+    /// starts on (by rules the host cannot repeat): the session starts its
+    /// runtime at once and is on that model when it reports it; until then a
+    /// send is refused as "not known yet", never accepted and lost.
     #[tokio::test]
-    async fn a_new_session_without_a_default_needs_a_choice() {
+    async fn a_new_session_without_a_saved_default_starts_on_the_runtimes_pick() {
+        let (manager, _home, workspace) = manager(50);
+        let mut listing = fixture_listing("model");
+        listing["defaultProvider"] = Value::Null;
+        listing["defaultModel"] = Value::Null;
+        manager.catalog().set_listing(listing);
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        assert_eq!(session.info()["model"]["state"], "resolving", "{}", session.info());
+        let refused = session.send("first", "hello").unwrap_err();
+        assert_eq!(refused.code, "no-model");
+        assert!(refused.retryable);
+        // No warm runtime: it is started anyway.
+        session.attach_early();
+        wait_until(|| session.info()["model"]["state"] == "ready").await;
+        assert_eq!(session.info()["model"]["id"], "model", "{}", session.info());
+        session.send("first", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        manager.stop_all();
+    }
+
+    /// A saved default the catalog does not list (signed out of its provider)
+    /// is no default; the person can pick a model before any runtime reports one.
+    #[tokio::test]
+    async fn a_new_session_with_an_unlisted_default_takes_a_pick() {
         let (manager, _home, workspace) = manager(50);
         manager.catalog().set_listing(fixture_listing("not-listed"));
         let session = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
-        assert_eq!(session.info()["model"]["state"], "unavailable", "{}", session.info());
-        let refused = session.send("first", "hello").unwrap_err();
-        assert_eq!(refused.code, "no-model");
-        assert!(!refused.retryable);
         session.select_model("fixture", "chosen").await.unwrap();
         assert_eq!(session.info()["model"]["state"], "ready", "{}", session.info());
         session.send("first", "hello").unwrap();

@@ -4246,6 +4246,17 @@ impl Session {
         }
     }
 
+    /// A new conversation with no model while the runtime has no saved default:
+    /// the runtime picks the model it starts on by its own rules (the model
+    /// last used, the catalog's recommended one), which the host cannot
+    /// repeat. Its runtime is started to report it.
+    fn runtime_picks_model(&self) -> bool {
+        self.fresh.load(Ordering::SeqCst)
+            && self.model_slot().current.is_none()
+            && self.config.catalog.has_models()
+            && self.config.catalog.default_model().is_none()
+    }
+
     /// What the runtime says it uses. A model chosen and not applied yet stays
     /// the session's model until the runtime answers its `set_model`.
     fn runtime_reported_model(&self, reported: &Value) {
@@ -4332,8 +4343,14 @@ impl Session {
     /// it restores.
     fn awaits_model(&self) -> bool {
         if self.fresh.load(Ordering::SeqCst) {
-            // Only while the first listing runs: a failed one is not on its way.
+            // While the first listing runs (a failed one is not on its way), or
+            // while the runtime that picks the model starts.
             self.config.catalog.loading()
+                || (self.runtime_picks_model()
+                    && matches!(
+                        self.status(),
+                        Status::Pending | Status::Starting | Status::Recovering
+                    ))
         } else {
             matches!(
                 self.status(),
@@ -4770,7 +4787,9 @@ impl Session {
             .warm
             .get()
             .is_some_and(|pool| pool.ready_for(Path::new(&self.runtime_cwd())));
-        if !ready {
+        // Without a warm runtime, start one anyway when only a runtime can say
+        // which model this conversation starts on.
+        if !ready && !self.runtime_picks_model() {
             return;
         }
         log(&self.home, "info", "session.attach_early", json!({ "session": self.id }));
@@ -6438,6 +6457,9 @@ impl SessionManager {
             .collect();
         for session in sessions {
             session.take_default_model();
+            if session.runtime_picks_model() {
+                session.attach_early();
+            }
             session.publish_summary();
         }
     }

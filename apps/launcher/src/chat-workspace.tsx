@@ -1223,10 +1223,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // the first turn.
   const composerRunning = snapshot.projection.running;
   // The session's model as the host reports it. Before a session is bound (the
-  // hero while it attaches) a new session will start on the catalog's default.
+  // hero while it attaches) a new session will start on the catalog's default,
+  // or, with none saved, on the one its runtime picks.
   const composerModel: { name?: string; state: ModelState } = snapshot.sessionId
     ? { name: snapshot.model, state: snapshot.modelState ?? "resolving" }
-    : { name: catalog.default?.name, state: catalog.default ? "ready" : catalog.state === "loading" ? "resolving" : "unavailable" };
+    : { name: catalog.default?.name, state: catalog.default ? "ready" : catalog.state === "loading" || (catalog.state === "ready" && catalog.models.length) ? "resolving" : "unavailable" };
   // A listing that failed is retried by the host; otherwise a signed-in account
   // can ask its published catalogs again.
   const retryModels = catalog.state === "failed" || catalog.stale ? () => void modelCatalog.refresh() : canRefreshModels ? onRetryModels : undefined;

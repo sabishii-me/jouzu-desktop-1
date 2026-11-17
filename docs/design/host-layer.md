@@ -78,7 +78,11 @@ describes no screens; what a person sees is in the UI document.
   sessions have no model (`unavailable`), and a client retries with
   `POST /v1/models/refresh` (a plain listing again, as at start).
 - A new session uses the default model. The default exists in one place only:
-  the jouzu runtime's default-model setting.
+  the jouzu runtime's default-model setting. With none saved (a first sign-in),
+  the runtime picks the model a new conversation starts on by its own rules
+  (last used, the catalog's recommended model), which the host does not
+  repeat: the session's runtime is started at once and the session is
+  `resolving` until it reports its model.
 - When the person changes the model in a session, the host calls RPC `set_model`
   (session only) and, on success, makes it the default at once, so the next new
   session uses the last selected model however soon it is created. It writes

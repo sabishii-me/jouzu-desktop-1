@@ -179,6 +179,12 @@ impl ModelCatalog {
         self.inner().state == State::Ready
     }
 
+    /// Listed, with at least one chat model.
+    pub fn has_models(&self) -> bool {
+        let inner = self.inner();
+        inner.state == State::Ready && !inner.models.is_empty()
+    }
+
     /// The first listing has not answered yet.
     pub fn loading(&self) -> bool {
         self.inner().state == State::Loading
