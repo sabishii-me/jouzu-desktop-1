@@ -8,3 +8,6 @@ playwright-report/
 e2e-runtime/*-result.json
 .build-id
 .build-commit
+# The stand-in Jouzu app the host tests install from.
+!host/tests/fixtures/fake-app/app/node_modules/
+!host/tests/fixtures/fake-app/**/dist/

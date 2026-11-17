@@ -13,11 +13,8 @@ import { emptyProjection, historyRowsProjection, hostBlocks, prependHistory, hos
 import { describeError } from "./runtime-errors";
 import { classifyNotice, type SessionNotice, type TextGuardMode } from "./session-notices";
 import {
-  readModelPreference,
-  writeModelPreference,
   type ActiveTurn,
   type ChatImage,
-  type ChatModel,
   type ChatSnapshot,
   type OutboxItem,
   type PendingPrompt,
@@ -51,7 +48,6 @@ const emptySnapshot = (): ChatSnapshot => ({
   connected: false,
   pending: false,
   error: null,
-  models: [],
   thinkingLevels: [],
   prompts: [],
   outbox: [],
@@ -59,17 +55,21 @@ const emptySnapshot = (): ChatSnapshot => ({
   activeTurn: null,
 });
 
-const modelOf = (model: Awaited<ReturnType<JouzuApi["models"]["list"]>>[number]): ChatModel => ({
-  provider: model.provider,
-  id: model.id,
-  name: model.name,
-  contextWindow: model.contextWindow,
-  maxTokens: model.maxTokens,
-  cost: model.cost,
-  thinkingLevels: model.thinkingLevels,
-});
-
 type Data = Record<string, unknown>;
+
+/** The session's model as the host reports it: which one, and whether it can be sent with. */
+function modelOf(model: Data | undefined): Partial<ChatSnapshot> {
+  const state = model?.state === "ready" || model?.state === "unavailable" ? model.state : "resolving";
+  const provider = typeof model?.provider === "string" && model.provider ? model.provider : undefined;
+  const id = typeof model?.id === "string" && model.id ? model.id : undefined;
+  return {
+    model: provider && id ? (typeof model?.name === "string" && model.name ? model.name : id) : undefined,
+    modelProvider: provider,
+    modelId: id,
+    modelState: state,
+    thinkingLevels: Array.isArray(model?.thinkingLevels) ? model.thinkingLevels.filter((level): level is string => typeof level === "string") : [],
+  };
+}
 const text = (value: unknown): string | undefined => typeof value === "string" ? value : undefined;
 
 /** A slash command the host wrote to the runtime: who issued it, and its text. */
@@ -222,7 +222,6 @@ export class SessionStore {
   private following = false;
   private routerUnsubscribe?: () => void;
   private disposed = false;
-  private preferred = readModelPreference();
   private api?: JouzuApi;
   private noticeSeq = 0;
   /** The last reply of each open Flow command that releases a hold, by command id. */
@@ -314,9 +313,6 @@ export class SessionStore {
 
   private async load(): Promise<void> {
     await this.refreshHistory();
-    await this.loadModels();
-    this.loadThinkingLevels();
-    await this.applyPreferredModel();
     void this.loadStats();
   }
 
@@ -479,30 +475,14 @@ export class SessionStore {
     this.update({ outbox, pending: outbox.some(entry => entry.state === "sending") });
   }
 
-  async loadModels(): Promise<void> {
-    try {
-      if (!this.api) return;
-      const models = (await this.api.models.list(this.session.id)).map(modelOf);
-      this.update({ models, modelsLoaded: true });
-    } catch {
-      // The composer shows "No models available" with a retry; no second error surface.
-      this.update({ modelsLoaded: true });
-    }
-  }
-
+  /**
+   * Change this session's model. The host owns it: the new model (and its
+   * state) arrives in the session summary; a refusal is this call's error and
+   * leaves the session on its previous model.
+   */
   async selectModel(provider: string, id: string): Promise<void> {
     if (!this.api) return;
     await this.api.models.select(this.session.id, provider, id);
-    const name = this.state.models?.find(model => model.provider === provider && model.id === id)?.name ?? id;
-    this.preferred = { provider, id };
-    writeModelPreference(this.preferred);
-    this.update({ model: name, modelProvider: provider, modelId: id });
-  }
-
-  loadThinkingLevels(): void {
-    const levels = new Set<string>();
-    for (const model of this.state.models ?? []) for (const level of model.thinkingLevels ?? []) levels.add(level);
-    this.update({ thinkingLevels: [...levels] });
   }
 
   async setThinkingLevel(level: string): Promise<void> {
@@ -609,7 +589,6 @@ export class SessionStore {
     if (!this.api) return;
     await this.api.commands.reload(this.session.id);
     await this.refreshHistory();
-    await this.loadModels();
   }
 
   /**
@@ -656,25 +635,6 @@ export class SessionStore {
     for (const listener of this.listeners) listener(this.state);
   }
 
-  private async applyPreferredModel(): Promise<void> {
-    const preferred = this.preferred;
-    if (!preferred) return;
-    if (this.state.modelProvider === preferred.provider && this.state.modelId === preferred.id) return;
-    // No list (still loading, or the host could not list them) says nothing
-    // about the choice: keep it for the next session instead of forgetting it.
-    if (!this.state.models?.length) return;
-    if (!this.state.models.some(model => model.provider === preferred.provider && model.id === preferred.id)) {
-      this.preferred = undefined;
-      writeModelPreference(undefined);
-      return;
-    }
-    try { await this.selectModel(preferred.provider, preferred.id); }
-    catch {
-      this.preferred = undefined;
-      writeModelPreference(undefined);
-    }
-  }
-
   private addPrompt(prompt: PendingPrompt | null): void {
     if (!prompt) return;
     const prompts = this.state.prompts ?? [];
@@ -710,13 +670,8 @@ export class SessionStore {
   private applySummary(data: Data): void {
     const prompts = promptsOf(data.pendingApprovals, data.pendingQuestions);
     const failed = record(data.failedTurn);
-    // The host owns the session's model; show what it reports.
-    const selected = record(data.model);
-    const provider = selected ? text(selected.provider) : undefined;
-    const id = selected ? text(selected.id) : undefined;
-    const name = provider && id ? this.state.models?.find(model => model.provider === provider && model.id === id)?.name ?? text(selected?.name) ?? id : undefined;
     this.update({
-      ...(provider && id ? { model: name, modelProvider: provider, modelId: id } : {}),
+      ...("model" in data ? modelOf(record(data.model)) : {}),
       sessionId: text(data.sessionId) ?? this.state.sessionId,
       sessionFile: text(data.sessionPath) ?? this.state.sessionFile,
       status: text(data.status) ?? this.state.status,

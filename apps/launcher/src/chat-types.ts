@@ -14,10 +14,8 @@ export interface ChatModel {
   maxTokens?: number;
   cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
   thinkingLevels?: string[];
-  /** False when the runtime cannot use this model now; `unavailableReason` says why. */
-  available?: boolean;
-  unavailableReason?: string | null;
 }
+export type ModelState = "resolving" | "ready" | "unavailable";
 export interface SessionStats {
   userMessages?: number;
   assistantMessages?: number;
@@ -27,20 +25,6 @@ export interface SessionStats {
   contextUsage?: { percent?: number | null; tokens?: number; contextWindow?: number };
 }
 export interface SessionTiming { modelMs: number; toolMs: number; turns: number; steps: number; outputTokens: number }
-const MODEL_PREFERENCE_KEY = "jouzu.chat.model";
-
-export function readModelPreference(): { provider: string; id: string } | undefined {
-  try {
-    const value = JSON.parse(localStorage.getItem(MODEL_PREFERENCE_KEY) ?? "null");
-    return value && typeof value.provider === "string" && typeof value.id === "string" ? value : undefined;
-  } catch { return undefined; }
-}
-export function writeModelPreference(value: { provider: string; id: string } | undefined) {
-  try {
-    if (value) localStorage.setItem(MODEL_PREFERENCE_KEY, JSON.stringify(value));
-    else localStorage.removeItem(MODEL_PREFERENCE_KEY);
-  } catch { /* A webview without storage keeps the selection for this session only. */ }
-}
 
 /** The host's view of the turn in progress (`session.updated.activeTurn`). */
 /** What the running turn is doing now, as the host reports it. */
@@ -114,13 +98,18 @@ export interface ChatSnapshot {
   activeTurn?: ActiveTurn | null;
   prompts?: PendingPrompt[];
   outbox?: OutboxItem[];
+  /** The session's model, as the host reports it. */
   model?: string;
   modelProvider?: string;
   modelId?: string;
-  models?: ChatModel[];
-  modelsLoaded?: boolean;
+  /**
+   * Whether a message can be sent with it: `resolving` (not known yet),
+   * `ready`, or `unavailable` (none, or one the catalog no longer offers).
+   */
+  modelState?: ModelState;
   stats?: SessionStats;
   thinkingLevel?: string;
+  /** The levels the session's model supports. */
   thinkingLevels?: string[];
   /** Host-measured time from a prompt reaching the runtime to its first output. */
   firstOutput?: { turns: number; avgMs: number | null; lastMs: number | null };

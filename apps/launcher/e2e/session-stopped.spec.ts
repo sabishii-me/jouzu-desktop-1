@@ -19,6 +19,8 @@ const hostBin = process.env.JOUZU_HOST_BIN
   ?? join(root, "host", "target", "debug", process.platform === "win32" ? "jouzu-host.exe" : "jouzu-host");
 const dist = join(root, "dist");
 const fixture = join(root, "host", "tests", "fixtures", "fake-runtime.mjs");
+// Lists one model, fixture-model, through the real control adapter.
+const fakeApp = join(root, "host", "tests", "fixtures", "fake-app");
 
 test.skip(!existsSync(hostBin) || !existsSync(join(dist, "index.html")), "build the UI and the host first");
 
@@ -31,7 +33,7 @@ test.beforeEach(async () => {
   scratch = mkdtempSync(join(tmpdir(), "jouzu-session-stopped-"));
   const home = join(scratch, "home");
   host = spawn(hostBin, [
-    "--dist", dist, "--home", home, "--runtime-home", join(scratch, "runtime"),
+    "--dist", dist, "--home", home, "--runtime-home", join(scratch, "runtime"), "--install", fakeApp,
     "--runtime", process.execPath, "--runtime-arg", fixture,
   ], { env: { ...process.env, HOME: scratch, USERPROFILE: scratch }, stdio: "ignore" });
   const deadline = Date.now() + 20_000;
@@ -57,8 +59,6 @@ const api = async (path: string, method = "GET") => {
 };
 
 test("the window reopens the session it shows after the host stopped it", async ({ page }) => {
-  // The fixture runtime has no model catalog; offer its one model.
-  await page.route("**/v1/models", route => route.fulfill({ json: { models: [{ id: "model", name: "fixture-model", provider: "fixture", available: true }] } }));
   await page.addInitScript(([url, value]) => {
     (window as unknown as { __JOUZU_HOST__?: unknown }).__JOUZU_HOST__ = { baseUrl: url, token: value };
     localStorage.setItem("jouzu.ui.language", "en");
@@ -66,8 +66,8 @@ test("the window reopens the session it shows after the host stopped it", async 
   await page.goto(base);
   const composer = page.getByRole("textbox", { name: /message/i }).first();
   const conversation = page.getByRole("region", { name: /conversation/i }).first();
-  await page.getByRole("button", { name: /model/i }).first().click({ timeout: 20_000 });
-  await page.getByText("fixture-model").last().click();
+  // The host lists the fixture app's one model and gives the new session its default.
+  await expect(page.getByRole("button", { name: "Model", exact: true })).toHaveText(/fixture-model/, { timeout: 20_000 });
   await composer.fill("first message");
   await page.getByRole("button", { name: /^send$/i }).first().click();
   // The fixture answers with the prompt: the user row and the reply.

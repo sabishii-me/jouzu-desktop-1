@@ -168,7 +168,7 @@ describe("A-API contract suite", () => {
     const unsubscribe = api.subscribe("h1", "c", ["view"], 0, () => {});
     expect(typeof unsubscribe).toBe("function");
     unsubscribe();
-    await expect(api.models.list("h1")).resolves.toEqual([{ id: "m", name: "Model", provider: "p" }]);
+    await expect(api.models.catalog()).resolves.toMatchObject({ models: [{ id: "m", name: "Model", provider: "p" }] });
     await expect(api.commands.stats("h1")).resolves.toBeDefined();
   });
 

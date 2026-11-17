@@ -67,7 +67,7 @@ describe("HostClient", () => {
       return response({});
     }) as typeof fetch;
     const client = new HostClient({ baseUrl: "http://host", fetchImpl });
-    expect((await client.models()).models[0].id).toBe("model");
+    expect(await client.models()).toMatchObject({ models: [{ id: "model" }] });
     await client.selectModel("h1", "fixture", "model");
     await client.setThinking("h1", "high");
     expect(calls.map(call => call.url)).toEqual([

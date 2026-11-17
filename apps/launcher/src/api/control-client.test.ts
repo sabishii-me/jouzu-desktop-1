@@ -36,10 +36,10 @@ describe("control client", () => {
   });
 
   it("surfaces the host's message on failure", async () => {
-    useClient(answer(409, { error: { code: "control-busy", message: "Another configuration operation is running" } }));
+    useClient(answer(500, { error: { code: "internal", message: "Could not read Jouzu configuration. No settings were changed." } }));
 
     await expect(controlRequest({ action: "status" })).rejects.toThrow(
-      "Another configuration operation is running",
+      "Could not read Jouzu configuration. No settings were changed.",
     );
   });
 

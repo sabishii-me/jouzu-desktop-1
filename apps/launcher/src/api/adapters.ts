@@ -104,9 +104,7 @@ function hostGroups(client: HostClient) {
   };
 
   const models: ModelApi = {
-    async list() {
-      return (await client.models()).models;
-    },
+    catalog: () => client.models(),
     async select(sessionId, provider, model) {
       await client.selectModel(sessionId, provider, model);
     },

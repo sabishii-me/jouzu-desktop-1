@@ -210,9 +210,18 @@ async fn main() -> ExitCode {
         sessions: sessions.clone(),
         control,
         events,
-        models: std::sync::Arc::new(jouzu_host::models::Models::new(&home)),
+        models: sessions.catalog(),
         web: std::sync::Arc::new(jouzu_host::web_access::WebAccess::load(&home)),
     };
+    // The model catalog is listed now, not when a client first asks for it: a
+    // new session takes its default model from it at creation.
+    jouzu_host::models::ModelCatalog::remove_legacy_file(&home);
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _ = jouzu_host::reload_models(&state, false).await;
+        });
+    }
     // Web access listeners follow the saved scope; addresses can change (DHCP,
     // Tailscale reconnect), so re-check them periodically.
     jouzu_host::reconcile_web_access(&state).await;

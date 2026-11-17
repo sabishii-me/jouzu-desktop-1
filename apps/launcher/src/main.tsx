@@ -6,6 +6,7 @@ import { HostClient } from "./api/host-client";
 import { configureSessionPool } from "./session-store";
 import { configureControlClient } from "./api/control-client";
 import { configureEventRouter } from "./event-router";
+import { configureModelCatalog } from "./model-catalog";
 import "./styles.css";
 
 /**
@@ -35,6 +36,7 @@ const api = createJouzuApi(client);
 configureSessionPool(api);
 configureEventRouter(client);
 configureControlClient(client);
+configureModelCatalog({ read: () => api.models.catalog() });
 
 async function boot() {
   try { await api.start(); } catch { /* The App surfaces the host error; it never falls back. */ }

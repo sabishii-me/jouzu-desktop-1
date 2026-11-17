@@ -60,7 +60,7 @@ pub struct AppState {
     pub sessions: Arc<SessionManager>,
     pub control: Arc<control::ControlManager>,
     pub events: Arc<events::EventHub>,
-    pub models: Arc<models::Models>,
+    pub models: Arc<models::ModelCatalog>,
     pub web: Arc<web_access::WebAccess>,
 }
 
@@ -640,14 +640,13 @@ async fn create_session(
             .sessions
             .create(&request.workspace_path, request.session_path, request.key)?
     };
-    session.adopt_default_model(state.models.default_model());
     if let Some(client_id) = client_id
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
         state.sessions.hold(client_id, &session.id);
     }
-    // After the default model is chosen, so the attach applies it.
+    // The session was created on the catalog's default model; the attach applies it.
     session.attach_early();
     // The session as it stands (model, queue, turn, prompts): the client starts
     // from this and follows events after `cursor`, so nothing published before
@@ -722,18 +721,55 @@ async fn select_session_model(
     Json(request): Json<SessionModelRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
-    // Refuse what the runtime cannot use now, instead of accepting it and
-    // running the session on another model.
-    state
-        .models
-        .check_usable(&request.provider, &request.model)
-        .map_err(|reason| {
-            ApiError::new(StatusCode::BAD_REQUEST, "model-unavailable", reason, false)
-        })?;
     let model = session
         .select_model(&request.provider, &request.model)
         .await?;
+    // The last selected model is the runtime's default from now on, so the
+    // next new session starts on it. The session already uses it; writing the
+    // default waits for the configuration channel and must not hold the answer.
+    if let Some(chosen) = models::ModelRef::from_value(&model) {
+        let state = state.clone();
+        tokio::spawn(async move { remember_model(&state, &chosen).await });
+    }
     Ok(Json(json!({ "model": model })))
+}
+
+/// Make `model` the runtime's default model, then list the catalog again so
+/// every client sees the new default. A failure leaves the old default and is
+/// logged; the session's own model is not affected.
+async fn remember_model(state: &AppState, model: &models::ModelRef) {
+    if state.models.default_model().as_ref() == Some(model) {
+        return;
+    }
+    let written = state
+        .control
+        .request(json!({ "action": "default-model", "provider": model.provider, "model": model.id }))
+        .await;
+    if let Err(error) = written {
+        log(
+            state.sessions.home(),
+            "warn",
+            "models.default_not_saved",
+            json!({ "provider": model.provider, "model": model.id, "code": error.code, "message": error.message }),
+        );
+        return;
+    }
+    let _ = reload_models(state, false).await;
+}
+
+/// List the catalog again and tell everyone what changed: sessions first (their
+/// model state follows the catalog), then clients (`models.changed`). A new
+/// list of models also retires the warm runtime, which loaded the old one.
+pub async fn reload_models(state: &AppState, refresh: bool) -> Result<(), ApiError> {
+    let (change, result) = state.models.load(&state.control, refresh).await;
+    if change != models::Change::None {
+        state.sessions.catalog_changed();
+        if change == models::Change::Models {
+            recycle_warm_runtime(state);
+        }
+        state.events.publish_control("models.changed", state.models.view());
+    }
+    result
 }
 
 #[derive(Deserialize)]
@@ -1030,12 +1066,20 @@ async fn control_request(
         Some("status" | "available-models")
     );
     let result = state.control.request(body).await;
-    // Sign-ins, providers, profiles and catalogs change what a runtime loads at
-    // start; an unused warm runtime would still have the old ones.
-    if !reads_only && result.is_ok() {
-        recycle_warm_runtime(&state);
-        // The model list depends on the same settings (#84).
-        state.models.invalidate();
+    if result.is_ok() {
+        if !reads_only {
+            // Sign-ins, providers, profiles and catalogs change what a runtime loads at
+            // start; an unused warm runtime would still have the old ones.
+            recycle_warm_runtime(&state);
+        }
+        // The catalog depends on the same settings (#84). A read that worked
+        // also shows the channel works again after a first listing failed.
+        if !reads_only || !state.models.loaded() {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = reload_models(&state, false).await;
+            });
+        }
     }
     result.map(Json)
 }
@@ -1414,29 +1458,25 @@ async fn save_environment(
     environment::save(state.sessions.runtime_home(), &entries).map_err(ApiError::bad_request)?;
     recycle_warm_runtime(&state);
     // A saved key (SHISA_API_KEY, a provider key) changes which models are usable (#84).
-    state.models.invalidate();
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _ = reload_models(&state, false).await;
+        });
+    }
     Ok(Json(json!({ "entries": entries })))
 }
 
-async fn models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let snapshot = state.models.get(&state.control).await?;
-    adopt_listed_default(&state);
-    Ok(Json(snapshot))
+/// The catalog as the host holds it. Reading it starts nothing.
+async fn models(State(state): State<AppState>) -> Json<Value> {
+    Json(state.models.view())
 }
 
-/// A session created before the list was known has no model yet (#99).
-fn adopt_listed_default(state: &AppState) {
-    state
-        .sessions
-        .adopt_default_model_where_missing(state.models.default_model());
-}
-
-/// Jouzu refreshes its catalog, then the host re-reads the snapshot. A failure keeps
-/// the previous snapshot and marks it stale.
+/// Jouzu refreshes its published catalogs, then the host lists the models again.
+/// A failure keeps the rows already listed (marked stale) and is the answer.
 async fn refresh_models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let snapshot = state.models.refresh(&state.control).await?;
-    adopt_listed_default(&state);
-    Ok(Json(snapshot))
+    reload_models(&state, true).await?;
+    Ok(Json(state.models.view()))
 }
 
 async fn tools_snapshot(State(state): State<AppState>) -> Json<Value> {
@@ -2401,23 +2441,24 @@ mod tests {
     }
 
     fn state(dist: PathBuf) -> AppState {
+        let sessions = Arc::new(SessionManager::new(
+            None,
+            dist.clone(),
+            dist.clone(),
+            None,
+            10,
+            None,
+        ));
         AppState {
             token: Arc::new("a".repeat(64)),
             port: 40123,
             dist: dist.clone(),
             started: Instant::now(),
             version: "0.1.0".to_string(),
-            sessions: Arc::new(SessionManager::new(
-                None,
-                dist.clone(),
-                dist.clone(),
-                None,
-                10,
-                None,
-            )),
+            models: sessions.catalog(),
+            sessions,
             control: control_manager(&dist),
             events: events::EventHub::new(),
-            models: Arc::new(models::Models::new(&dist)),
             web: Arc::new(web_access::WebAccess::disabled()),
         }
     }
@@ -2902,6 +2943,39 @@ mod session_tests {
             replay,
             None,
         ));
+        manager.catalog().set_listing(fixture_listing("model"));
+        (manager, home, workspace)
+    }
+
+    /// What the fake runtime's control would list: its models, with `default`
+    /// as the runtime's default model.
+    fn fixture_listing(default: &str) -> Value {
+        let row = |id: &str, name: &str| json!({ "provider": "fixture", "id": id, "name": name, "thinkingLevels": ["off", "high"] });
+        json!({
+            "models": [
+                row("model", "fixture-model"),
+                row("default-x", "Default X"),
+                row("chosen", "Chosen"),
+                row("picked", "Picked"),
+                row("own-model", "Own model"),
+            ],
+            "defaultProvider": "fixture",
+            "defaultModel": default,
+        })
+    }
+
+    /// A manager whose catalog has not been listed yet, as just after the host started.
+    fn manager_unlisted() -> (Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir) {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::new(
+            Some(RuntimeSpec::node_script(&fixture())),
+            home.path().to_path_buf(),
+            home.path().join("data"),
+            None,
+            50,
+            None,
+        ));
         (manager, home, workspace)
     }
 
@@ -2966,10 +3040,10 @@ mod session_tests {
             dist: home.clone(),
             started: Instant::now(),
             version: "0.1.0".to_string(),
+            models: manager.catalog(),
             sessions: manager,
             control: Arc::new(control::ControlManager::new(&home, &home, None, &home.join("data"), None).expect("control manager")),
             events: events::EventHub::new(),
-            models: Arc::new(models::Models::new(&home)),
             web: Arc::new(web_access::WebAccess::disabled()),
         }
         .pipe(router)
@@ -4563,6 +4637,68 @@ mod session_tests {
         assert_eq!(errors[0]["code"], "extension-error");
     }
 
+    /// The catalog is read from the host as it holds it, and a session created
+    /// over HTTP starts on its default; with no model, a send is refused with
+    /// a code the client can show, never accepted and lost.
+    #[tokio::test]
+    async fn the_catalog_and_the_session_model_over_http() {
+        let (manager, _home, workspace) = manager_unlisted();
+        let catalog = manager.catalog();
+        let app = app(manager.clone());
+        let listed = call(app.clone(), request(Method::GET, "/v1/models").body(Body::empty()).unwrap()).await;
+        assert_eq!(listed.0, StatusCode::OK, "{}", listed.2);
+        let view: Value = serde_json::from_str(&listed.2).unwrap();
+        assert_eq!(view["state"], "loading", "{view}");
+
+        let create = |app: Router| {
+            let body = json!({ "workspacePath": workspace.path().to_str().unwrap() }).to_string();
+            async move {
+                let created = call(
+                    app,
+                    request(Method::POST, "/v1/sessions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await;
+                serde_json::from_str::<Value>(&created.2).unwrap()
+            }
+        };
+        let early = create(app.clone()).await;
+        assert_eq!(early["model"]["state"], "resolving", "{early}");
+        let session_id = early["sessionId"].as_str().unwrap().to_string();
+        let send = |app: Router, id: String| async move {
+            call(
+                app,
+                request(Method::POST, &format!("/v1/sessions/{id}/messages"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "clientMessageId": "m1", "text": "hello" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+        };
+        let refused = send(app.clone(), session_id.clone()).await;
+        assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.2);
+        assert!(refused.2.contains("no-model"), "{}", refused.2);
+
+        catalog.set_listing(fixture_listing("default-x"));
+        manager.catalog_changed();
+        let view: Value = serde_json::from_str(
+            &call(app.clone(), request(Method::GET, "/v1/models").body(Body::empty()).unwrap()).await.2,
+        )
+        .unwrap();
+        assert_eq!(view["state"], "ready", "{view}");
+        assert_eq!(view["default"]["id"], "default-x", "{view}");
+        assert_eq!(view["models"].as_array().unwrap().len(), 5, "{view}");
+        let created = create(app.clone()).await;
+        assert_eq!(created["model"]["id"], "default-x", "{created}");
+        assert_eq!(created["model"]["state"], "ready", "{created}");
+        assert_eq!(created["model"]["thinkingLevels"], json!(["off", "high"]), "{created}");
+        let accepted = send(app, session_id).await;
+        assert_eq!(accepted.0, StatusCode::ACCEPTED, "{}", accepted.2);
+        manager.stop_all();
+    }
+
     #[tokio::test]
     async fn model_and_thinking_endpoints_update_the_session() {
         let (manager, _home, workspace) = manager(50);
@@ -4643,10 +4779,14 @@ mod session_tests {
     #[tokio::test]
     async fn the_default_model_shown_on_a_new_session_is_the_one_the_runtime_uses() {
         let (manager, _home, workspace) = manager(50);
+        manager.catalog().set_listing(fixture_listing("default-x"));
         let session = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
-        session.adopt_default_model(Some(json!({ "provider": "fixture", "id": "default-x" })));
+        let shown = session.info()["model"].clone();
+        assert_eq!(shown["id"], "default-x", "{shown}");
+        assert_eq!(shown["name"], "Default X", "{shown}");
+        assert_eq!(shown["state"], "ready", "{shown}");
         session.send("first", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
         let state = session
@@ -4656,25 +4796,29 @@ mod session_tests {
         assert_eq!(state["model"]["id"], "default-x", "{state}");
     }
 
+    /// Issue #99 and the message that vanished after "New session": a new session
+    /// created before the catalog was listed had no model, and only a client
+    /// listing the models gave it one. Now its model is resolving, Send is
+    /// refused with a reason (never accepted and lost), and the catalog's first
+    /// listing gives it the default with no client involved.
     #[tokio::test]
-    async fn a_new_session_created_before_the_model_list_takes_the_default_once_listed() {
-        // Issue #99: at startup the first new session is created before the model
-        // list is known, so create_session has no default to give it. It has not
-        // started its runtime, so nothing else would ever report a model.
-        let (manager, _home, workspace) = manager(50);
+    async fn a_new_session_created_before_the_catalog_takes_the_default_once_listed() {
+        let (manager, _home, workspace) = manager_unlisted();
         let folder = workspace.path().to_str().unwrap();
         let session = manager.create_pending(folder, None, None).unwrap();
-        session.adopt_default_model(None);
-        assert!(session.info()["model"].is_null(), "{}", session.info());
-        // A session the user already gave a model keeps it.
-        let chosen = manager.create_pending(folder, None, None).unwrap();
-        chosen.select_model("fixture", "picked").await.unwrap();
-        // The list arrives.
-        manager.adopt_default_model_where_missing(Some(
-            json!({ "provider": "fixture", "id": "default-x", "name": "Default X" }),
-        ));
-        assert_eq!(session.info()["model"]["id"], "default-x", "{}", session.info());
-        assert_eq!(chosen.info()["model"]["id"], "picked", "{}", chosen.info());
+        assert_eq!(session.info()["model"]["state"], "resolving", "{}", session.info());
+        let refused = session.send("early", "hello").unwrap_err();
+        assert_eq!(refused.code, "no-model");
+        assert!(refused.retryable);
+        // Nothing to choose from yet, so a choice is refused too.
+        let choice = session.select_model("fixture", "picked").await.unwrap_err();
+        assert_eq!(choice.code, "model-unavailable");
+
+        manager.catalog().set_listing(fixture_listing("default-x"));
+        manager.catalog_changed();
+        let shown = session.info()["model"].clone();
+        assert_eq!(shown["id"], "default-x", "{shown}");
+        assert_eq!(shown["state"], "ready", "{shown}");
         // The shown model is the one the runtime uses.
         session.send("first", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
@@ -4686,9 +4830,78 @@ mod session_tests {
         manager.stop_all();
     }
 
+    /// A model the person picked is kept when the catalog changes; the default
+    /// only fills a new session that has none.
+    #[tokio::test]
+    async fn a_catalog_change_keeps_a_chosen_model() {
+        let (manager, _home, workspace) = manager(50);
+        let folder = workspace.path().to_str().unwrap();
+        let chosen = manager.create_pending(folder, None, None).unwrap();
+        chosen.select_model("fixture", "picked").await.unwrap();
+        manager.catalog().set_listing(fixture_listing("default-x"));
+        manager.catalog_changed();
+        assert_eq!(chosen.info()["model"]["id"], "picked", "{}", chosen.info());
+        chosen.send("first", "hello").unwrap();
+        wait_status(&chosen, Status::Idle).await;
+        let state = chosen
+            .request(json!({ "type": "get_state" }), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(state["model"]["id"], "picked", "{state}");
+        manager.stop_all();
+    }
+
+    /// With models listed but no default, a new session has no model: Send is
+    /// refused (`no-model`, not retryable) until one is chosen.
+    #[tokio::test]
+    async fn a_new_session_without_a_default_needs_a_choice() {
+        let (manager, _home, workspace) = manager(50);
+        manager.catalog().set_listing(fixture_listing("not-listed"));
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        assert_eq!(session.info()["model"]["state"], "unavailable", "{}", session.info());
+        let refused = session.send("first", "hello").unwrap_err();
+        assert_eq!(refused.code, "no-model");
+        assert!(!refused.retryable);
+        session.select_model("fixture", "chosen").await.unwrap();
+        assert_eq!(session.info()["model"]["state"], "ready", "{}", session.info());
+        session.send("first", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        manager.stop_all();
+    }
+
+    /// A model the catalog no longer lists (signed out, removed) cannot be sent
+    /// with; picking another one works.
+    #[tokio::test]
+    async fn a_model_the_catalog_no_longer_lists_is_unavailable() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.select_model("fixture", "picked").await.unwrap();
+        manager.catalog().set_listing(json!({
+            "models": [{ "provider": "fixture", "id": "model", "name": "fixture-model" }],
+            "defaultProvider": "fixture",
+            "defaultModel": "model",
+        }));
+        manager.catalog_changed();
+        assert_eq!(session.info()["model"]["state"], "unavailable", "{}", session.info());
+        assert_eq!(session.send("m1", "hello").unwrap_err().code, "model-unavailable");
+        let refused = session.select_model("fixture", "picked").await.unwrap_err();
+        assert_eq!(refused.code, "model-unavailable");
+        assert_eq!(session.info()["model"]["id"], "picked", "a refused choice keeps the session's model");
+        session.select_model("fixture", "model").await.unwrap();
+        session.send("m1", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        manager.stop_all();
+    }
+
     #[tokio::test]
     async fn a_saved_conversation_keeps_the_model_it_used() {
         let (manager, _home, workspace) = manager(50);
+        manager.catalog().set_listing(fixture_listing("default-x"));
         let header = json!({ "type": "session", "version": 3, "id": "saved-model", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
         let change = json!({ "type": "model_change", "id": "c1", "parentId": null, "timestamp": "2026-01-01T00:00:01Z", "provider": "fixture", "modelId": "own-model" });
         let file = workspace.path().join("saved.jsonl");
@@ -4696,9 +4909,7 @@ mod session_tests {
         let session = manager
             .create(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
             .unwrap();
-        // What opening a session does (create_session): the default is offered.
-        session.adopt_default_model(Some(json!({ "provider": "fixture", "id": "default-x" })));
-        // Before the runtime answers, the saved model is what is shown.
+        // Before the runtime answers, the saved model is what is shown, not the default.
         assert_eq!(session.info()["model"]["id"], "own-model", "{}", session.info());
         wait_status(&session, Status::Idle).await;
         let state = session
@@ -4744,9 +4955,9 @@ mod session_tests {
         let aimed = pool.wait_settled(Duration::from_secs(10)).await;
         assert_eq!(aimed["state"], "ready", "{aimed}");
         let warm_pid = aimed["pid"].as_u64().unwrap() as u32;
-        // What create_session does: the default model, then the early attach.
+        // What create_session does: the catalog's default model, then the early attach.
+        manager.catalog().set_listing(fixture_listing("default-x"));
         let session = manager.create_pending(folder, None, None).unwrap();
-        session.adopt_default_model(Some(json!({ "provider": "fixture", "id": "default-x" })));
         session.attach_early();
         assert_eq!(session.runtime_pid(), Some(warm_pid));
         // Attached and the model applied with nothing sent.
@@ -4956,6 +5167,7 @@ mod session_tests {
         // The host binary asks for a warm runtime at start, before the install.
         assert!(manager.enable_warm_runtime().is_none());
         assert!(manager.node_executable().is_none());
+        manager.catalog().set_listing(fixture_listing("model"));
         let error = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .err()
@@ -5455,6 +5667,10 @@ mod session_tests {
     #[tokio::test]
     async fn a_model_chosen_before_start_that_fails_is_reported_and_not_shown() {
         let (manager, _home, workspace) = manager(50);
+        // Listed, but the runtime refuses it when it starts.
+        let mut listing = fixture_listing("model");
+        listing["models"].as_array_mut().unwrap().push(json!({ "provider": "fixture", "id": "missing", "name": "missing" }));
+        manager.catalog().set_listing(listing);
         let session = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
@@ -6044,6 +6260,7 @@ mod session_tests {
             50,
             None,
         ));
+        manager.catalog().set_listing(fixture_listing("model"));
         let session = manager
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();

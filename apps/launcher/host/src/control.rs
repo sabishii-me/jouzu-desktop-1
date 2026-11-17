@@ -1,6 +1,6 @@
 //! Jouzu configuration executed by the host.
 //!
-//! One operation at a time, a shared update lock, both pipes read concurrently, the
+//! One operation at a time (later ones wait their turn, in order), a shared update lock, both pipes read concurrently, the
 //! child in its own job object, device codes from stderr as events, and a cancel or a
 //! 190 second deadline that terminates the tree. The shell no longer runs this code.
 
@@ -125,6 +125,12 @@ impl Drop for InflightGuard<'_> {
 
 pub struct ControlManager {
     context: adapter::ControlContext,
+    /// The configuration service runs one operation at a time. An operation
+    /// waits here for the ones before it (first come, first served) instead of
+    /// being refused: the host and every client share this channel, and none of
+    /// them can know when another is using it. A caller that goes away while
+    /// waiting leaves the line.
+    turn: tokio::sync::Mutex<()>,
     inflight: Mutex<Option<Inflight>>,
     bus: Arc<EventBus>,
 }
@@ -147,6 +153,7 @@ impl ControlManager {
                 app,
                 home: runtime_home.to_path_buf(),
             },
+            turn: tokio::sync::Mutex::new(()),
             inflight: Mutex::new(None),
             bus: Arc::new(EventBus::new(events)),
         })
@@ -220,20 +227,13 @@ impl ControlManager {
             .map(ToString::to_string)
             .unwrap_or_else(new_request_id);
 
+        let _turn = self.turn.lock().await;
         let cancel = Arc::new(Notify::new());
         {
             let mut inflight = self
                 .inflight
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if inflight.is_some() {
-                return Err(ApiError::new(
-                    axum::http::StatusCode::CONFLICT,
-                    "control-busy",
-                    "Another configuration operation is running",
-                    true,
-                ));
-            }
             *inflight = Some(Inflight {
                 request_id: request_id.clone(),
                 cancel: cancel.clone(),
@@ -296,7 +296,8 @@ impl ControlManager {
             .envs(spec.env.iter().map(|(key, value)| (key, value)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
         #[cfg(windows)]
         {
             command.creation_flags(0x08000000);
@@ -453,6 +454,7 @@ fn now() -> String {
 
 /// A job object that owns the control child. `Drop` closes the job, which terminates
 /// whatever remains because the limit is KILL_ON_JOB_CLOSE.
+#[cfg_attr(not(windows), allow(dead_code))]
 struct Job {
     handle: isize,
 }
@@ -496,9 +498,12 @@ impl Job {
         }
     }
 
+    /// Elsewhere the adapter is one Node process with no children of its own, so
+    /// the child handle owns all of it: killing it (or dropping it, see
+    /// `kill_on_drop`) ends the operation, as the runtime's own job does there.
     #[cfg(not(windows))]
     fn adopt(_pid: u32) -> Option<Job> {
-        None
+        Some(Job { handle: 0 })
     }
 
     #[cfg(windows)]

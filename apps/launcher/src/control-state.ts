@@ -6,9 +6,6 @@ export interface ControlState {
   customProviders: { id: string; url: string; model: string; editable: boolean; imageInput?: boolean; contextWindow?: number; maxTokens?: number }[];
   providers: { id: string; name: string; oauth?: boolean; oauthName?: string; apiKey?: boolean }[];
   credentials: { providerId: string }[];
-  models: { provider: string; id: string; name: string }[];
-  defaultProvider?: string;
-  defaultModel?: string;
   /** The last catalog refresh: what happened, and a held revision when one waits. */
   catalog?: CatalogOutcome;
   /** Jouzu's own language settings (localization.json), as a new runtime resolves them. */
@@ -68,7 +65,7 @@ export function parseControlState(value: unknown): ControlState {
   if (value.schemaVersion !== 1 || !record(value.account) || typeof value.account.signedIn !== "boolean" || !(value.profile === null || typeof value.profile === "string")) return fail();
   if (value.modelReady !== undefined && typeof value.modelReady !== "boolean") return fail();
   if (value.account.revocation !== undefined && !["confirmed", "unconfirmed", "not-linked"].includes(value.account.revocation as string)) return fail();
-  const fields = { credentials: ["providerId"], providers: ["id", "name"], models: ["provider", "id", "name"], customProviders: ["id"] };
+  const fields = { credentials: ["providerId"], providers: ["id", "name"], customProviders: ["id"] };
   for (const [key, required] of Object.entries(fields)) {
     const rows = value[key];
     if (!Array.isArray(rows) || !rows.every(row => record(row) && required.every(field => typeof row[field] === "string" && (row[field] as string).length > 0))) return fail();
@@ -81,7 +78,6 @@ export function parseControlState(value: unknown): ControlState {
     if (row.apiKey !== undefined && typeof row.apiKey !== "boolean") return fail();
     for (const key of ["oauthName"]) if (row[key] !== undefined && typeof row[key] !== "string") return fail();
   }
-  for (const key of ["defaultProvider", "defaultModel"]) if (value[key] !== undefined && typeof value[key] !== "string") return fail();
   if (value.connectionCheck !== undefined && (!record(value.connectionCheck) || typeof value.connectionCheck.provider !== "string" || typeof value.connectionCheck.status !== "string")) return fail();
   if (value.catalog !== undefined) {
     const catalog = value.catalog;

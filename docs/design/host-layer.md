@@ -25,10 +25,10 @@ describes no screens; what a person sees is in the UI document.
 
 | State | Single owner | Copies today (to be removed) |
 |---|---|---|
-| Model catalog and default model | host `ModelCatalog` | UI: catalog list fetched once, per-session list, stored preference, Settings list. Host: the default is adopted only when a client calls `GET /v1/models` |
+| Model catalog and default model | host `ModelCatalog` | None (step 4 removed the UI lists, the stored preference and the host's adopt-on-listing) |
 | Run state, including runs started by Flow | host `Session.run` | Host: `active_turn` and `status = Running` disagree. UI: infers busy on its own |
 | Queue of messages sent during a run | host `Session.queue` | UI-local queue |
-| Configuration operations | host `ConfigQueue` | One operation at a time with `409`, partly queued in the UI, bypassed by environment save |
+| Configuration operations | host `ConfigQueue` | Operations now wait their turn in the host (no `409`); the UI still queues some of its own, and there is no `operationId` yet |
 | Errors | host error slots (section 6) | UI builds one notice list from about 14 inputs |
 
 ## 3. Runs
@@ -66,7 +66,10 @@ describes no screens; what a person sees is in the UI document.
 ## 4. Model catalog
 
 - The host loads the catalog eagerly at start, with a `revision`. It does not
-  depend on a client calling `GET /v1/models`.
+  depend on a client calling `GET /v1/models`. It lists the catalog again after
+  every configuration change and after `POST /v1/models/refresh`.
+- The catalog holds chat models only. A catalog model with no output limit
+  (Shisa Translate) is not a chat model and is left out.
 - When the catalog changes, the revision increases and `models.changed` is sent.
   The host recycles warm runtimes that loaded an older revision.
 - A new session uses the default model. The default exists in one place only:
@@ -74,8 +77,13 @@ describes no screens; what a person sees is in the UI document.
 - When the person changes the model in a session, the host calls RPC `set_model`
   (session only) and, on success, writes the runtime default through the
   ConfigQueue, so the next new session uses the last selected model.
-- A session's model state is `resolving`, `ready` or `unavailable`. Send is
-  refused unless it is `ready` (`no-model` or `model-unavailable`).
+- A session's model state is `resolving`, `ready` or `unavailable`. It is
+  derived from the session's model and the catalog, never stored beside them.
+  Send is refused unless it is `ready` (`no-model` or `model-unavailable`).
+- A session with no model takes the default as soon as the catalog has one,
+  whether it was created before the first listing or saved without a model. A
+  saved conversation keeps the model it used, even one the catalog no longer
+  lists (it is then `unavailable` until the person picks another).
 - If changing the model fails, the session keeps its previous model. The failure
   is in that command's result only; it is not a session error.
 
@@ -83,7 +91,9 @@ describes no screens; what a person sees is in the UI document.
 
 - Every operation that changes configuration (save key, sign in, refresh the
   catalog, save environment variables, language) goes through one host queue and
-  runs serially. `409 control-busy` is removed.
+  runs serially. `409 control-busy` is removed. (Done in step 4: an operation
+  waits its turn instead of being refused. Still open: `operationId` and
+  `AppView.config`.)
 - Each operation immediately gets an `operationId` and its queue position.
   `AppView.config` shows what is running, what is queued and the last result of
   each kind of operation.
@@ -156,7 +166,7 @@ succeed, the response says so. Examples:
 | `lifecycle` | `pending` / `starting` / `ready` / `recovering` / `stopped` / `failed` |
 | `run` (sent as `activeTurn`) | `id`, `origin` (`user` / `runtime`), `phase` (`starting` / `running` / `cancelling`), `startedAt`, `step`, `clientMessageId?` |
 | `queue[]` | Message, state (`queued` / `held` / `delivering` / `returned`), `error?` |
-| `model` | `provider`, `id`, `name`, `state` (`resolving` / `ready` / `unavailable`), `catalogRevision` |
+| `model` | `provider`, `id`, `name`, `state` (`resolving` / `ready` / `unavailable`), `catalogRevision`, `thinkingLevels` |
 | `thinkingLevel` | Current value |
 | `lastRun.error` | Failure of the last reply |
 | `lastAction` | Result of the last in-session command |
@@ -171,7 +181,7 @@ through the host, never from its saved file, which has none of it.
 
 | Field | Content |
 |---|---|
-| `models` | `revision`, `stale`, `chat[]`, `image[]`, `default` |
+| `models` (`GET /v1/models`, `models.changed`) | `revision`, `state` (`loading` / `ready` / `failed`), `models[]` (chat models), `default`, `stale`, `error` |
 | `settings` | Current settings |
 | `config` | `running`, `queued[]`, `lastResult[kind]` |
 | `startup` | State and cause |
@@ -186,9 +196,9 @@ through the host, never from its saved file, which has none of it.
 
 ## 8. Host code to remove
 
-- `adopt_listed_default`: the default model adopted only on `GET /v1/models`.
+- ~~`adopt_listed_default`~~ (removed in step 4).
 - Steer decided from `active_turn`.
-- The single-operation `409` in control and its retry loop in `models.rs`.
+- ~~The single-operation `409` in control and its retry loop in `models.rs`~~ (removed in step 4).
 - Operation failures and runtime information mixed into `session.notice`.
 
 ## 9. Host steps
@@ -208,8 +218,5 @@ host, then the UI, then verified on the packaged build before the next.
 - Every kind of failure goes into one per-session notice list; operation failures
   (Stop, model change) and runtime information (MCP status) land there too, so
   one failure can be reported more than once.
-- The configuration channel allows one operation at a time and refuses the rest
-  with `409 control-busy`.
-- Send is accepted before a new session has a model.
 - Steer vs. prompt is decided from host-started turns only, so a run started by
   the runtime (Flow) is not treated as running.

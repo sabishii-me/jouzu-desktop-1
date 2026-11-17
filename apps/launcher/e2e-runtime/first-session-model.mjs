@@ -1,13 +1,13 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-// Regression check for #99: the first new session after the host starts gets the
-// default model. At startup the UI creates the session before the model list is
-// known, so the host had no default to give it, and nothing else ever did.
-// Against a host JUST started on a throwaway home (JOUZU_E2E_HOST_HOME: the host's
-// --home, with a usable default model) and before any client listed the models:
-// create a new session, list the models, then read the session: it must have the
-// default model, with nothing sent. Never touches the user's data folder.
+// Regression check for #99 and the message lost right after "New session": the first
+// new session after the host starts gets the default model with no client listing
+// the models. Against a host JUST started on a throwaway home (JOUZU_E2E_HOST_HOME:
+// the host's --home, with a usable default model): create a new session at once,
+// then read it until its model is known: it must be the catalog's default and ready.
+// A send made before then is refused with a code (no-model), never accepted and lost.
+// Never touches the user's data folder.
 const hostHome = process.env.JOUZU_E2E_HOST_HOME;
 const workspace = process.env.JOUZU_E2E_WORKSPACE;
 if (!hostHome || !workspace) {
@@ -26,20 +26,28 @@ const call = async (path, body) => {
 const results = [];
 const check = (name, ok, detail) => { results.push({ name, ok: !!ok, detail }); };
 
+const raw = async (path, body) => {
+  const response = await fetch(base + path, { method: 'POST', headers, body: JSON.stringify(body) });
+  return { status: response.status, body: await response.json() };
+};
 const created = await call('/v1/sessions', { workspacePath: workspace });
 const atCreate = created.model ?? null;
-const list = await call('/v1/models');
-const expected = list.defaultProvider && list.defaultModel ? `${list.defaultProvider}/${list.defaultModel}` : null;
-let shown = null;
-for (let attempt = 0; attempt < 20 && !shown; attempt += 1) {
-  const info = await call(`/v1/sessions/${created.sessionId}`);
-  shown = info.model?.provider && info.model?.id ? `${info.model.provider}/${info.model.id}` : null;
-  if (!shown) await new Promise(resolve => setTimeout(resolve, 250));
+if (atCreate?.state !== 'ready') {
+  const early = await raw(`/v1/sessions/${created.sessionId}/messages`, { clientMessageId: 'early', text: 'hello' });
+  check('a send before the session has a model is refused with a code', early.status === 409 && ['no-model', 'model-unavailable'].includes(early.body?.error?.code), `${early.status} ${JSON.stringify(early.body)}`);
 }
+let model = atCreate;
+for (let attempt = 0; attempt < 120 && model?.state !== 'ready'; attempt += 1) {
+  await new Promise(resolve => setTimeout(resolve, 250));
+  model = (await call(`/v1/sessions/${created.sessionId}`)).model;
+}
+const catalog = await call('/v1/models');
+const expected = catalog.default ? `${catalog.default.provider}/${catalog.default.id}` : null;
+const shown = model?.provider && model?.id ? `${model.provider}/${model.id}` : null;
 check(
-  'a session created before the model list has the default once it is listed',
-  expected && shown === expected,
-  `at create: ${atCreate ? `${atCreate.provider}/${atCreate.id}` : 'none'} | default: ${expected ?? 'none'} | shown: ${shown ?? 'none'}`,
+  'a session created right after the host started gets the default model by itself',
+  expected && shown === expected && model.state === 'ready',
+  `at create: ${atCreate?.state ?? 'none'} | default: ${expected ?? 'none'} | shown: ${shown ?? 'none'} (${model?.state ?? 'none'})`,
 );
 
 writeFileSync('first-session-model-result.json', `${JSON.stringify({ results }, null, 2)}\n`);

@@ -59,7 +59,7 @@ export async function stubHost(
     }
     if (path === "/v1/environment") return route.fulfill(json({ entries: method === "PUT" ? request.postDataJSON() : [] }));
     if (path === "/v1/sessions" || path === "/v1/sessions/persisted") return route.fulfill(json({ sessions: [] }));
-    if (path === "/v1/models") return route.fulfill(json({ models: [] }));
+    if (path === "/v1/models") return route.fulfill(json({ revision: 1, state: "ready", models: [], default: null, stale: false, error: null }));
     if (path === "/v1/runtime/warm") return route.fulfill(json({ state: "off" }));
     if (path === "/v1/artifacts/counts") return route.fulfill(json({ counts: {} }));
     return route.fulfill(json({ error: { code: "not-found", message: `No stub for ${method} ${path}` } }, 404));

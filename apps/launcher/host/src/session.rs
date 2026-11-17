@@ -109,6 +109,7 @@ use tokio::sync::broadcast;
 
 use crate::awake::AwakeInstant;
 use crate::log;
+use crate::models::{Lookup, ModelCatalog, ModelRef};
 use crate::runtime::adapter::pi::{self, DeltaKind, Record as PiRecord};
 use crate::runtime::{same_place, RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec, WarmPool};
 
@@ -171,6 +172,19 @@ impl RuntimeSpec {
     }
 }
 
+/// A session's model, as the host knows it.
+#[derive(Default)]
+struct ModelSlot {
+    /// What the runtime reported, what the person chose, a new conversation's
+    /// default from the catalog, or (until the runtime reports) what a saved
+    /// file last used.
+    current: Option<ModelRef>,
+    /// Chosen before the runtime started: written (`set_model`) once it starts.
+    unapplied: bool,
+    /// The `set_model` request applying it, until the runtime answers.
+    applying: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct SessionConfig {
     pub spec: RuntimeSpec,
@@ -185,6 +199,9 @@ pub struct SessionConfig {
     pub events: Option<Arc<crate::events::EventHub>>,
     /// The runtime started ahead of need, shared by every session.
     pub warm: Arc<std::sync::OnceLock<Arc<WarmPool>>>,
+    /// The one model catalog: a new session's default, and whether a session's
+    /// model can be used.
+    pub catalog: Arc<ModelCatalog>,
 }
 
 impl SessionConfig {
@@ -744,11 +761,9 @@ pub struct Session {
     assistant_text: Mutex<String>,
     assistant_blocks: Mutex<Vec<Value>>,
     step: Mutex<StepState>,
-    model: Mutex<Option<Value>>,
-    pending_model: Mutex<Option<Value>>,
-    /// The request that applies a model chosen before the runtime started; its
-    /// failure is reported to the user, since nobody is waiting on it.
-    pending_model_request: Mutex<Option<(String, Value)>>,
+    /// The session's model. Its state (resolving / ready / unavailable) is
+    /// derived from it and the catalog, never stored beside it.
+    model: Mutex<ModelSlot>,
     pending_thinking: Mutex<Option<String>>,
     /// The reasoning level the runtime reports (or the one chosen and not yet applied).
     thinking_level: Mutex<Option<String>>,
@@ -885,17 +900,8 @@ impl Session {
                     "partial": true,
                     "cursor": 0,
                 });
-                if let Some(model) = self
-                    .model
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-                {
-                    row["model"] = model
-                        .get("name")
-                        .or_else(|| model.get("id"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
+                if let Some(name) = self.model_name() {
+                    row["model"] = json!(name);
                 }
                 page.insert(0, row);
             }
@@ -1448,20 +1454,10 @@ impl Session {
             }
         }
         if row.get("model").map(Value::is_null).unwrap_or(true) {
-            if let Some(model) = self
-                .model
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-            {
-                row["model"] = model
-                    .get("name")
-                    .or_else(|| model.get("id"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                if let Some(provider) = model.get("provider") {
-                    row["provider"] = provider.clone();
-                }
+            let current = self.model_slot().current.clone();
+            if let Some(model) = current {
+                row["model"] = json!(self.model_name().unwrap_or_else(|| model.id.clone()));
+                row["provider"] = json!(model.provider);
             }
         }
         self.push_history(row.clone());
@@ -1967,14 +1963,8 @@ impl Session {
                         }),
                     );
                 }
-                // A choice made before the runtime started wins until it is applied.
-                let choice_waiting = self
-                    .pending_model
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .is_some();
-                if let (Some(model), false) = (state.model.clone(), choice_waiting) {
-                    self.set_model(Some(model));
+                if let Some(model) = state.model.as_ref() {
+                    self.runtime_reported_model(model);
                 }
                 let level_waiting = self
                     .pending_thinking
@@ -1990,20 +1980,9 @@ impl Session {
             .get("success")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // A model chosen before the runtime started was shown as the session's
-        // model; on failure say it was not applied and show the real one.
-        let deferred_model = {
-            let mut deferred = self
-                .pending_model_request
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match deferred.as_ref() {
-                Some((id, _)) if Some(id.as_str()) == value.get("id").and_then(Value::as_str) => {
-                    deferred.take().map(|(_, model)| model)
-                }
-                _ => None,
-            }
-        };
+        // A model chosen before the runtime started (or a new conversation's
+        // default) is the session's model; its `set_model` answer settles it.
+        let deferred_model = self.model_applied(value.get("id").and_then(Value::as_str), success);
         if !success {
             let message = value
                 .get("error")
@@ -2036,7 +2015,7 @@ impl Session {
             // prompt ends its turn. A rejected model switch used to stop the
             // whole session, and every later message got "session-stopped".
             if let Some(model) = deferred_model {
-                let name = model.get("model").and_then(Value::as_str).unwrap_or("the chosen model");
+                let name = model.id.as_str();
                 self.publish(
                     "session.notice",
                     json!({
@@ -2044,7 +2023,6 @@ impl Session {
                         "message": format!("Could not switch to {name}: {message}. This session keeps the runtime's current model."),
                     }),
                 );
-                self.set_model(None);
                 self.request_state();
             }
             // A refused level leaves the runtime's own; ask which one that is.
@@ -3702,6 +3680,7 @@ impl Session {
             }
             _ => {}
         }
+        self.check_model()?;
         let now = Instant::now();
         let cancelled = {
             let mut tombstones = self
@@ -4161,80 +4140,225 @@ impl Session {
             .unwrap_or(0)
     }
 
-    pub async fn select_model(&self, provider: &str, model: &str) -> Result<Value, ApiError> {
-        if matches!(
+    /// Change this session's model. The catalog decides whether it can be used;
+    /// a running runtime switches now, one not started yet when it starts. A
+    /// refusal leaves the session on its previous model and is this call's answer.
+    pub async fn select_model(&self, provider: &str, id: &str) -> Result<Value, ApiError> {
+        let chosen = ModelRef::new(provider, id);
+        let live = !matches!(
             self.status(),
             Status::Pending | Status::Starting | Status::Recovering
-        ) {
-            *self
-                .pending_model
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some(json!({ "provider": provider, "model": model }));
-            // The runtime applies it once started; the session's model is the
-            // choice from now on, so every client shows the same one.
-            let chosen = json!({ "provider": provider, "id": model });
-            self.set_model(Some(chosen.clone()));
-            return Ok(json!({ "provider": provider, "id": model, "name": model }));
+        );
+        match self.config.catalog.lookup(&chosen) {
+            Lookup::Listed(_) => {}
+            // A running runtime knows what it can use; nothing else does yet.
+            Lookup::Unknown if live => {}
+            Lookup::Unknown => {
+                return Err(ApiError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    "model-unavailable",
+                    "The model list is not loaded yet",
+                    true,
+                ))
+            }
+            Lookup::Missing => {
+                return Err(ApiError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    "model-unavailable",
+                    format!("{provider}/{id} is not an available chat model"),
+                    false,
+                ))
+            }
+        }
+        if !live {
+            {
+                let mut slot = self.model_slot();
+                slot.current = Some(chosen);
+                slot.unapplied = true;
+                slot.applying = None;
+            }
+            self.publish_summary();
+            return Ok(self.model_view());
         }
         self.request(
-            pi::command::set_model(provider, model),
+            pi::command::set_model(provider, id),
             Duration::from_secs(30),
         )
         .await?;
-        let state = self
-            .request(pi::command::get_state(), Duration::from_secs(10))
-            .await?;
-        let selected = state.get("model").cloned().unwrap_or(Value::Null);
-        if !selected.is_null() {
-            self.set_model(Some(selected.clone()));
+        {
+            let mut slot = self.model_slot();
+            slot.current = Some(chosen);
+            slot.unapplied = false;
+            slot.applying = None;
         }
-        Ok(selected)
+        self.publish_summary();
+        Ok(self.model_view())
     }
 
-    /// A new conversation with no model yet starts from the default. A saved
-    /// one is left alone: the runtime restores its model and reports it.
-    pub fn adopt_default_model(&self, model: Option<Value>) {
-        let Some(model) = model else {
+    fn model_slot(&self) -> std::sync::MutexGuard<'_, ModelSlot> {
+        self.model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A session without a model starts on the catalog's default, applied when
+    /// its runtime starts (or now, when it runs): a new conversation, or a saved
+    /// one whose file names no model, which the runtime would open on its
+    /// default anyway. Called at creation and whenever the catalog changes; a
+    /// session that has a model keeps it.
+    fn take_default_model(self: &Arc<Self>) {
+        if self.run_id().is_some() {
+            return;
+        }
+        let Some(default) = self.config.catalog.default_model() else {
             return;
         };
-        let unset = self
-            .model
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_none();
-        if !self.fresh.load(Ordering::SeqCst) {
-            // Shown until the runtime reports its own: the model the file
-            // last used, as the runtime restores it, else the default it
-            // falls back to. Display only; nothing is applied to the runtime.
-            if unset {
-                let saved = self.saved_path().and_then(|path| saved_model(Path::new(&path)));
-                self.set_model(Some(saved.unwrap_or(model)));
+        let live = {
+            let mut slot = self.model_slot();
+            if slot.current.is_some() {
+                return;
             }
-            return;
+            slot.current = Some(default);
+            slot.unapplied = true;
+            !matches!(
+                self.status(),
+                Status::Pending | Status::Starting | Status::Recovering
+            )
+        };
+        if live {
+            self.apply_model();
         }
-        let unset = self
-            .model
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_none();
-        if !unset {
+    }
+
+    /// What the runtime says it uses. A model chosen and not applied yet stays
+    /// the session's model until the runtime answers its `set_model`.
+    fn runtime_reported_model(&self, reported: &Value) {
+        let Some(reported) = ModelRef::from_value(reported) else {
             return;
-        }
-        // The shown model is the one the runtime uses: apply it on start like a choice.
-        if let (Some(provider), Some(id)) = (
-            model.get("provider").and_then(Value::as_str),
-            model.get("id").and_then(Value::as_str),
-        ) {
-            let mut pending = self
-                .pending_model
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if pending.is_none() {
-                *pending = Some(json!({ "provider": provider, "model": id }));
+        };
+        {
+            let mut slot = self.model_slot();
+            if slot.unapplied || slot.applying.is_some() || slot.current.as_ref() == Some(&reported) {
+                return;
             }
+            slot.current = Some(reported);
         }
-        self.set_model(Some(model));
+        self.publish_summary();
+    }
+
+    /// The answer to the `set_model` that applied a model chosen before the
+    /// runtime started. Refused: the session's model is unknown until the
+    /// runtime reports its own (the caller asks), and the refused one is returned.
+    fn model_applied(&self, request: Option<&str>, success: bool) -> Option<ModelRef> {
+        let refused = {
+            let mut slot = self.model_slot();
+            if request.is_none() || slot.applying.as_deref() != request {
+                return None;
+            }
+            slot.applying = None;
+            if success {
+                return None;
+            }
+            slot.current.take()
+        };
+        self.publish_summary();
+        refused
+    }
+
+    /// The session's model as clients show it: which one, and whether a message
+    /// can be sent with it (`resolving`, `ready`, `unavailable`).
+    fn model_view(&self) -> Value {
+        let current = self.model_slot().current.clone();
+        let catalog = &self.config.catalog;
+        let revision = catalog.revision();
+        let Some(model) = current else {
+            let state = if self.awaits_model() { "resolving" } else { "unavailable" };
+            return json!({
+                "provider": null,
+                "id": null,
+                "name": null,
+                "state": state,
+                "catalogRevision": revision,
+            });
+        };
+        let (state, row) = match catalog.lookup(&model) {
+            Lookup::Listed(row) => ("ready", Some(row)),
+            // Not listed yet: the runtime judges when the message is sent.
+            Lookup::Unknown => ("ready", None),
+            Lookup::Missing => ("unavailable", None),
+        };
+        let field = |name: &str| {
+            row.as_ref()
+                .and_then(|row| row.get(name))
+                .filter(|value| !value.is_null())
+                .cloned()
+        };
+        json!({
+            "provider": model.provider,
+            "id": model.id,
+            "name": field("name").unwrap_or_else(|| json!(model.id)),
+            "state": state,
+            "catalogRevision": revision,
+            "thinkingLevels": field("thinkingLevels").unwrap_or_else(|| json!([])),
+        })
+    }
+
+    fn model_name(&self) -> Option<String> {
+        self.model_view()
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    }
+
+    /// No model yet, and one is on its way: a new conversation waits for the
+    /// catalog (its default), a saved one for its runtime to report the model
+    /// it restores.
+    fn awaits_model(&self) -> bool {
+        if self.fresh.load(Ordering::SeqCst) {
+            !self.config.catalog.loaded()
+        } else {
+            matches!(
+                self.status(),
+                Status::Pending | Status::Starting | Status::Recovering
+            )
+        }
+    }
+
+    /// A message needs a model the catalog offers. A client shows Send as
+    /// unavailable until then, so a refusal here is a race or a client bug.
+    fn check_model(&self) -> Result<(), ApiError> {
+        let current = self.model_slot().current.clone();
+        let refusal = match current {
+            None => {
+                let waiting = self.awaits_model();
+                ApiError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    "no-model",
+                    if waiting {
+                        "This session's model is not known yet"
+                    } else {
+                        "This session has no model; choose one first"
+                    },
+                    waiting,
+                )
+            }
+            Some(model) => match self.config.catalog.lookup(&model) {
+                Lookup::Missing => ApiError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    "model-unavailable",
+                    format!("{}/{} is not available; choose another model", model.provider, model.id),
+                    false,
+                ),
+                Lookup::Listed(_) | Lookup::Unknown => return Ok(()),
+            },
+        };
+        log(
+            &self.home,
+            "warn",
+            "ui.illegal_path",
+            json!({ "session": self.id, "command": "send", "code": refusal.code }),
+        );
+        Err(refusal)
     }
 
     /// The reasoning level is part of the session summary; publish it when it changes.
@@ -4247,25 +4371,6 @@ impl Session {
             let changed = *current != level;
             *current = level;
             changed
-        };
-        if changed {
-            self.publish_summary();
-        }
-    }
-
-    /// The model is part of the session summary; publish it when it changes.
-    fn set_model(&self, model: Option<Value>) {
-        let changed = {
-            let mut current = self
-                .model
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if *current == model {
-                false
-            } else {
-                *current = model;
-                true
-            }
         };
         if changed {
             self.publish_summary();
@@ -4294,29 +4399,7 @@ impl Session {
     }
 
     fn apply_pending_preferences(&self) {
-        let model = self
-            .pending_model
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(model) = model {
-            let Some(provider) = model.get("provider").and_then(Value::as_str) else {
-                return;
-            };
-            let Some(id) = model.get("model").and_then(Value::as_str) else {
-                return;
-            };
-            let request = self.request_id();
-            *self
-                .pending_model_request
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some((request.clone(), model.clone()));
-            let _ = self.write_command(pi::command::with_id(
-                pi::command::set_model(provider, id),
-                &request,
-            ));
-        }
+        self.apply_model();
         let level = self
             .pending_thinking
             .lock()
@@ -4329,6 +4412,29 @@ impl Session {
                 &request,
             ));
         }
+    }
+
+    /// Write a model chosen before the runtime started (or a new conversation's
+    /// default) to the runtime. Its answer is handled in `model_applied`.
+    fn apply_model(&self) {
+        let request = self.request_id();
+        let model = {
+            let mut slot = self.model_slot();
+            if !slot.unapplied {
+                return;
+            }
+            let Some(model) = slot.current.clone() else {
+                slot.unapplied = false;
+                return;
+            };
+            slot.unapplied = false;
+            slot.applying = Some(request.clone());
+            model
+        };
+        let _ = self.write_command(pi::command::with_id(
+            pi::command::set_model(&model.provider, &model.id),
+            &request,
+        ));
     }
 
     pub fn stop(&self) {
@@ -4426,11 +4532,7 @@ impl Session {
             "running": self.run_guard().is_some(),
             "activeTurn": self.active_turn_view(),
             "runtimePid": self.runtime_pid(),
-            "model": self
-                .model
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
+            "model": self.model_view(),
             "runtimeParseErrors": self.runtime_parse_errors(),
             "cursor": self.cursor(),
             "pendingApprovals": self.pending_approvals(),
@@ -4533,11 +4635,7 @@ impl Session {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
-            "model": self
-                .model
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
+            "model": self.model_view(),
             "thinkingLevel": self
                 .thinking_level
                 .lock()
@@ -4609,9 +4707,7 @@ impl Session {
             assistant_text: Mutex::new(String::new()),
             assistant_blocks: Mutex::new(Vec::new()),
             step: Mutex::new(StepState::new()),
-            model: Mutex::new(None),
-            pending_model: Mutex::new(None),
-            pending_model_request: Mutex::new(None),
+            model: Mutex::new(ModelSlot::default()),
             pending_thinking: Mutex::new(None),
             first_output: Mutex::new(FirstOutput::default()),
             warm_attach: Mutex::new(None),
@@ -5226,6 +5322,7 @@ pub struct SessionManager {
     /// left open does not keep a runtime alive for every session it visited.
     holders: Mutex<HashMap<String, Holder>>,
     persisted_cache: Mutex<Option<Vec<Value>>>,
+    catalog: Arc<ModelCatalog>,
 }
 
 struct ManagedRuntime {
@@ -5318,6 +5415,7 @@ impl SessionManager {
         events: Option<Arc<crate::events::EventHub>>,
     ) -> Self {
         let config = std::sync::OnceLock::new();
+        let catalog = Arc::new(ModelCatalog::new());
         if let Some(spec) = spec {
             let _ = config.set(SessionConfig {
                 spec,
@@ -5328,6 +5426,7 @@ impl SessionManager {
                 replay_limit,
                 events,
                 warm: Arc::new(std::sync::OnceLock::new()),
+                catalog: catalog.clone(),
             });
         }
         Self {
@@ -5340,6 +5439,7 @@ impl SessionManager {
             clients: Mutex::new(HashMap::new()),
             holders: Mutex::new(HashMap::new()),
             persisted_cache: Mutex::new(None),
+            catalog,
         }
     }
 
@@ -5382,6 +5482,7 @@ impl SessionManager {
                 replay_limit: managed.replay_limit,
                 events: managed.events.clone(),
                 warm: Arc::new(std::sync::OnceLock::new()),
+                catalog: self.catalog.clone(),
             }
         });
         if found {
@@ -6280,14 +6381,16 @@ impl SessionManager {
             .collect()
     }
 
-    /// The model list just became known (issue #99). A new conversation created
-    /// before it was known got no default model; it has not started its runtime,
-    /// so nothing would ever report one and the user could not send. Give each
-    /// such session the default now, the same way creation would have.
-    pub fn adopt_default_model_where_missing(&self, model: Option<Value>) {
-        let Some(model) = model else {
-            return;
-        };
+    /// The catalog every session takes its model from.
+    pub fn catalog(&self) -> Arc<ModelCatalog> {
+        self.catalog.clone()
+    }
+
+    /// The catalog changed. A new conversation still without a model takes the
+    /// default now (#99: one created before the first listing had none, and
+    /// nothing else would give it one); every session's model state follows the
+    /// catalog, so each is published again.
+    pub fn catalog_changed(&self) {
         let sessions: Vec<Arc<Session>> = self
             .sessions
             .lock()
@@ -6296,11 +6399,8 @@ impl SessionManager {
             .cloned()
             .collect();
         for session in sessions {
-            if matches!(session.status(), Status::Pending)
-                && session.fresh.load(Ordering::SeqCst)
-            {
-                session.adopt_default_model(Some(model.clone()));
-            }
+            session.take_default_model();
+            session.publish_summary();
         }
     }
 
@@ -6479,6 +6579,16 @@ impl SessionManager {
             &config,
         );
         session.fresh.store(fresh, Ordering::SeqCst);
+        if !fresh {
+            // Shown until the runtime reports the model it restores: the one the
+            // file last used. Nothing is applied to the runtime.
+            let saved = session
+                .saved_path()
+                .and_then(|path| saved_model(Path::new(&path)))
+                .and_then(|model| ModelRef::from_value(&model));
+            session.model_slot().current = saved;
+        }
+        session.take_default_model();
         {
             let mut sessions = self
                 .sessions
@@ -6868,6 +6978,7 @@ mod environment_tests {
             replay_limit: DEFAULT_REPLAY_LIMIT,
             events: None,
             warm: Arc::new(std::sync::OnceLock::new()),
+            catalog: Arc::new(ModelCatalog::new()),
         }
     }
 

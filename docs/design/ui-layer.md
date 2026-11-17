@@ -102,8 +102,10 @@ else comes from host snapshots.
 
 ## 10. UI code to remove
 
-- The four model copies (catalog list fetched once, per-session list, stored
-  preference, the Settings list) and the one-second wait for a default model.
+- ~~The four model copies (catalog list fetched once, per-session list, stored
+  preference, the Settings list) and the one-second wait for a default model.~~
+  Removed in step 5: the page reads the host catalog once and follows
+  `models.changed`; the composer shows the session's model and its state.
 - Inferring busy state locally.
 - The local steer queue.
 - Partial queuing of configuration operations and handling of `409`.
@@ -128,10 +130,7 @@ build before the next.
 - Errors from every source are collected into one list above the composer: they
   stack, one failure can appear twice, and operation failures (Stop, model change)
   look like session errors.
-- Send is available before a new session has a model, so a message can vanish.
 - A dropped event stream is shown as a session error.
-- One settings action running makes the others fail with "Another configuration
-  operation is running".
 - MCP status repeats on every runtime start, with terminal advice.
 - Chat text is hard-coded English; notices grow with their text and push the
   composer.

@@ -568,29 +568,50 @@ async function shisaKeyWithoutRestart() {
  * The first new session after the app starts (#99). It was created before the
  * model list was known and showed "Select model", and Send did nothing without
  * a reason. Runs before the reload below, so the host is as freshly started as
- * the user's. Pass: the session shows a model; with no model at all, Send says
- * why above the composer instead of doing nothing.
+ * the user's. Pass: the session shows a model and Send is offered; with no model
+ * at all, Send is not offered and the model button is the way to set one up.
  */
 async function firstSessionHasModel() {
-  const name = "First new session after start has a model, or Send says why (#99)";
+  const name = "First new session after start has a model, or offers setting one up (#99)";
   await newSession().waitFor({ timeout: 30_000 });
   await newSession().click();
   await composer().waitFor({ timeout: 10_000 });
   const modelButton = page.getByRole("button", { name: "Model", exact: true }).first();
-  const shown = async () => !/^\s*select model\s*$/i.test(await modelButton.innerText().catch(() => ""));
-  const end = now() + 15_000;
-  while (now() < end && !await shown()) await page.waitForTimeout(100);
-  if (await shown()) {
-    scenario(name, true, `model shown: ${(await modelButton.innerText()).trim()}`);
-    return;
-  }
-  // Nothing to send with: the press must be answered with the reason.
   await composer().fill("model check");
-  await send().click();
-  const reason = page.getByText(/Choose a model before sending|No model is available/).first();
-  const explained = await reason.waitFor({ timeout: 20_000 }).then(() => true, () => false);
-  scenario(name, explained, explained ? "no model configured; Send explained why" : "no model shown and Send gave no reason");
+  // The model is known once the button stops loading.
+  await page.waitForFunction(() => document.querySelector('button[aria-label="Model"]')?.getAttribute("aria-busy") !== "true", null, { timeout: 15_000 }).catch(() => {});
+  const label = (await modelButton.innerText().catch(() => "")).trim();
+  const sendOffered = await send().isEnabled();
+  if (!/^(select model|set up a model)$/i.test(label)) {
+    scenario(name, sendOffered, `model shown: ${label}; Send ${sendOffered ? "offered" : "NOT offered"}`);
+  } else {
+    scenario(name, !sendOffered && /set up a model/i.test(label), `no model: button "${label}", Send ${sendOffered ? "offered (wrong)" : "not offered"}`);
+  }
   await composer().fill("");
+}
+
+/**
+ * A message sent the moment a new session opens is kept and answered (rc.2: it
+ * showed, then vanished, when sent before the session had its model). Also
+ * checks the new session starts on the model chosen last. Records how long
+ * Send takes to be offered after "New session".
+ */
+async function sendRightAfterNewSession(modelName) {
+  const name = "Message sent right after New session is kept and answered; new session uses the last chosen model";
+  const prompt = "What is 12 × 12? Reply with only the number.";
+  const start = now();
+  await newSession().click();
+  await composer().waitFor({ timeout: 10_000 });
+  await composer().fill(prompt);
+  // Send is offered once the session's model is ready; the press goes in at once.
+  await send().click({ timeout: 15_000 });
+  record("newSessionSendOffered", [now() - start]);
+  const modelLabel = (await page.getByRole("button", { name: "Model", exact: true }).first().innerText()).trim();
+  const kept = await waitForConversationText(prompt, 5_000).then(() => true, () => false);
+  const answered = kept && await waitForConversationText("144", 60_000).then(() => true, () => false);
+  await turnEnds().catch(() => {});
+  const composerEmpty = (await composer().inputValue()) === "";
+  scenario(name, kept && answered && composerEmpty && modelName.test(modelLabel), `kept: ${kept}, answered: ${answered}, composer cleared: ${composerEmpty}, model: ${modelLabel}`);
 }
 
 try {
@@ -640,6 +661,7 @@ try {
   await model.click();
   await page.getByText(modelName).first().waitFor({ timeout: 5_000 });
   scenario("P0-4 model selection", true);
+  await sendRightAfterNewSession(modelName);
 
   // The first turn of a new session, PLAYBOOK_REPEAT times (default 5), each in a
   // session of its own on the selected model.

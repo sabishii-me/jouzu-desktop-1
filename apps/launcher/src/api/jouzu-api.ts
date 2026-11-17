@@ -154,9 +154,6 @@ export interface Model {
   cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
   reasoning?: boolean;
   thinkingLevels?: string[];
-  /** False when the runtime cannot use this model now; `unavailableReason` says why. */
-  available?: boolean;
-  unavailableReason?: string | null;
 }
 
 export interface RuntimeStatus {
@@ -259,7 +256,8 @@ export interface WorkspaceApi {
 }
 
 export interface ModelApi {
-  list(sessionId: string): Promise<Model[]>;
+  /** The host's model catalog (see `model-catalog.ts`); changes arrive as `models.changed`. */
+  catalog(): Promise<unknown>;
   select(sessionId: string, provider: string, model: string): Promise<void>;
   thinking(sessionId: string, level: string): Promise<void>;
 }

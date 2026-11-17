@@ -257,16 +257,24 @@ describe("SessionStore", () => {
     expect(store.snapshot.projection.running).toBe(false);
   });
 
-  it("shows the model the host reports for the session", () => {
+  it("shows the model the host reports for the session, with its state", () => {
     const session = fakeSession();
     const store = SessionStore.attach(session);
-    session.emit(event(1, "session.updated", { model: { provider: "shisa", id: "qwen-3.8", name: "Qwen 3.8" } }));
+    session.emit(event(1, "session.updated", { model: { provider: "shisa", id: "qwen-3.8", name: "Qwen 3.8", state: "ready", thinkingLevels: ["off", "high"] } }));
     expect(store.snapshot.model).toBe("Qwen 3.8");
     expect(store.snapshot.modelProvider).toBe("shisa");
     expect(store.snapshot.modelId).toBe("qwen-3.8");
-    session.emit(event(2, "session.updated", { model: null }));
+    expect(store.snapshot.modelState).toBe("ready");
+    expect(store.snapshot.thinkingLevels).toEqual(["off", "high"]);
+    // The catalog no longer offers it: still shown, but not sendable.
+    session.emit(event(2, "session.updated", { model: { provider: "shisa", id: "qwen-3.8", name: "Qwen 3.8", state: "unavailable" } }));
     expect(store.snapshot.modelId).toBe("qwen-3.8");
+    expect(store.snapshot.modelState).toBe("unavailable");
+    // A summary without the model field leaves it as it is.
+    session.emit(event(3, "session.updated", { status: "idle" }));
+    expect(store.snapshot.modelState).toBe("unavailable");
   });
+
 
   it("shows a tool call in the live reply as soon as it starts", () => {
     const session = fakeSession();
@@ -493,40 +501,24 @@ describe("SessionStore", () => {
     expect(cancelled).toEqual(["c-2"]);
   });
 
-  it("keeps the remembered model when the model list could not be loaded (#99)", async () => {
-    const stored = new Map<string, string>([["jouzu.chat.model", JSON.stringify({ provider: "p", id: "remembered" })]]);
-    vi.stubGlobal("localStorage", {
-      getItem: (key: string) => stored.get(key) ?? null,
-      setItem: (key: string, value: string) => { stored.set(key, value); },
-      removeItem: (key: string) => { stored.delete(key); },
-    });
-    try {
-      const selected: string[] = [];
-      let listed: Array<{ provider: string; id: string; name: string }> | null = null;
-      const api = {
-        models: {
-          list: async () => { if (!listed) throw new Error("models-unavailable"); return listed; },
-          select: async (_session: string, provider: string, id: string) => { selected.push(`${provider}/${id}`); },
-        },
-      };
-      const store = SessionStore.attach(fakeSession(), undefined, api as never);
-      const load = (store as unknown as { load: () => Promise<void> }).load.bind(store);
-      // The host could not list the models yet: nothing says the choice is gone.
-      await load();
-      expect(stored.get("jouzu.chat.model")).toContain("remembered");
-      expect(selected).toEqual([]);
-      // The next session, with the list, applies it.
-      listed = [{ provider: "p", id: "remembered", name: "Remembered" }];
-      const next = SessionStore.attach(fakeSession(), undefined, api as never);
-      await (next as unknown as { load: () => Promise<void> }).load.call(next);
-      expect(selected).toEqual(["p/remembered"]);
-      expect(next.snapshot.modelId).toBe("remembered");
-      store.dispose();
-      next.dispose();
-    } finally {
-      vi.unstubAllGlobals();
-    }
+  it("keeps no model of its own: a choice goes to the host, the model comes back in the summary", async () => {
+    const selected: string[] = [];
+    const api = { models: { select: async (_session: string, provider: string, id: string) => { selected.push(`${provider}/${id}`); } } };
+    const session = { ...fakeSession(), initial: { sessionId: "s-test", status: "pending", model: { provider: null, id: null, name: null, state: "resolving" } } };
+    const store = SessionStore.attach(session);
+    (store as unknown as { api: unknown }).api = api;
+    expect(store.snapshot.modelState).toBe("resolving");
+    expect(store.snapshot.modelId).toBeUndefined();
+    await store.selectModel("p", "picked");
+    expect(selected).toEqual(["p/picked"]);
+    // Nothing changes until the host says so.
+    expect(store.snapshot.modelId).toBeUndefined();
+    session.emit(event(1, "session.updated", { model: { provider: "p", id: "picked", name: "Picked", state: "ready" } }));
+    expect(store.snapshot.model).toBe("Picked");
+    expect(store.snapshot.modelState).toBe("ready");
+    store.dispose();
   });
+
 
   it("disposes exactly once", () => {
     const onDispose = vi.fn();

@@ -14,7 +14,6 @@ import {
   type FileEntry,
   type HistoryPage,
   type SavedMessagesPage,
-  type Model,
   type Receipt,
   type RuntimeStatus,
   type WarmRuntime,
@@ -345,8 +344,9 @@ export class HostClient {
       .then(body => ({ messages: body.messages ?? [], nextBefore: body.nextBefore ?? null, turn: body.turn ?? 0 }));
   }
 
-  models(): Promise<{ models: Model[] }> {
-    return this.request<{ models: Model[] }>("/v1/models");
+  /** The host's model catalog: revision, state, models, default. */
+  models(): Promise<unknown> {
+    return this.request<unknown>("/v1/models");
   }
 
   async selectModel(sessionId: string, provider: string, model: string): Promise<void> {

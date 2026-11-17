@@ -8,7 +8,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use jouzu_host::{control::ControlManager, models::Models};
+use jouzu_host::{control::ControlManager, models::ModelCatalog};
 use serde_json::json;
 
 fn app_dir() -> Option<PathBuf> {
@@ -108,9 +108,8 @@ async fn cancelling_idle_control_is_a_no_op() {
 }
 
 #[tokio::test]
-async fn models_snapshot_comes_from_the_real_adapter() {
+async fn the_catalog_is_listed_from_the_real_adapter() {
     let Some(app) = app_dir() else { return };
-    let temp = tempfile::tempdir().unwrap();
     let home = match std::env::var_os("JOUZU_HOST_TEST_HOME") {
         Some(value) => PathBuf::from(value),
         None => {
@@ -119,33 +118,75 @@ async fn models_snapshot_comes_from_the_real_adapter() {
         }
     };
     let control = manager(&app, &home);
-    let cache = temp.path().join("host");
-    let models = Models::new(&cache);
+    let catalog = ModelCatalog::new();
 
-    let snapshot = models.get(&control).await.expect("model snapshot");
-    let list = snapshot["models"].as_array().expect("models array");
-    assert!(!list.is_empty(), "adapter returned no models: {snapshot}");
-    assert!(snapshot["generatedAt"].is_string());
-    assert_eq!(snapshot["stale"], false);
+    let (_, result) = catalog.load(&control, false).await;
+    result.expect("catalog listing");
+    let view = catalog.view();
+    assert_eq!(view["state"], "ready", "{view}");
+    assert_eq!(view["stale"], false);
+    assert!(view["revision"].as_u64().unwrap() >= 1);
+    let list = view["models"].as_array().expect("models array");
+    assert!(!list.is_empty(), "adapter returned no models: {view}");
     let first = &list[0];
     assert!(first["provider"].is_string() && first["id"].is_string() && first["name"].is_string());
-    assert!(cache.join("host-state").join("models.json").is_file(), "snapshot was not cached");
-
-    // A second read is served from the cache: no adapter process is needed.
-    let cached = models.get(&control).await.expect("cached snapshot");
-    assert_eq!(cached["generatedAt"], snapshot["generatedAt"]);
 }
 
 #[tokio::test]
-async fn a_fresh_home_has_no_usable_model() {
+async fn a_fresh_home_lists_no_model() {
     let Some(app) = app_dir() else { return };
     let temp = tempfile::tempdir().unwrap();
     let control = manager(&app, &temp.path().to_path_buf());
-    let models = Models::new(temp.path());
+    let catalog = ModelCatalog::new();
 
-    // No provider is configured in a fresh home; the host must say so instead of
-    // exposing the unconfigured global catalog as selectable models.
-    let error = models.get(&control).await.expect_err("fresh home has no model");
-    assert_eq!(error.code, "models-unavailable", "{error:?}");
+    // No provider is configured in a fresh home: the catalog is listed and
+    // empty, instead of exposing the unconfigured global catalog as selectable
+    // models. Listed-and-empty is an answer, not a failure.
+    let (_, result) = catalog.load(&control, false).await;
+    result.expect("catalog listing");
+    let view = catalog.view();
+    assert_eq!(view["state"], "ready", "{view}");
+    assert_eq!(view["models"], json!([]), "{view}");
+    assert!(view["default"].is_null(), "{view}");
 }
 
+
+/// The stand-in app in `tests/fixtures/fake-app` runs the real adapter on every
+/// platform: the catalog lists its model and default, and choosing a default
+/// that the catalog does not list is refused.
+#[tokio::test]
+async fn the_catalog_and_its_default_through_the_adapter() {
+    let install = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-app");
+    let home = tempfile::tempdir().unwrap();
+    // The host runs the adapter on the runtime's Node; here, the one on PATH.
+    let node = std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+        .arg("node")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|text| text.lines().next().map(|line| PathBuf::from(line.trim())));
+    let Some(node) = node.filter(|path| path.is_file()) else {
+        eprintln!("skipped: no node on PATH");
+        return;
+    };
+    let control = Arc::new(
+        ControlManager::new(&install, &install, Some(node), home.path(), None).expect("control manager"),
+    );
+    let catalog = ModelCatalog::new();
+
+    let (_, result) = catalog.load(&control, false).await;
+    result.expect("catalog listing");
+    let view = catalog.view();
+    assert_eq!(view["state"], "ready", "{view}");
+    assert_eq!(view["models"][0]["name"], "fixture-model", "{view}");
+    assert_eq!(view["default"]["id"], "model", "{view}");
+
+    control
+        .request(json!({ "action": "default-model", "provider": "fixture", "model": "model" }))
+        .await
+        .expect("a listed model is saved as the default");
+    let refused = control
+        .request(json!({ "action": "default-model", "provider": "fixture", "model": "gone" }))
+        .await;
+    assert!(refused.is_err(), "an unlisted default was saved");
+}
