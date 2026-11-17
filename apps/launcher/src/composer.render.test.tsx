@@ -26,6 +26,8 @@ describe("composer model state", () => {
     expect(send(renderToStaticMarkup(<Composer {...base} />))).not.toContain(`disabled=""`);
     expect(send(renderToStaticMarkup(<Composer {...base} modelState="resolving" model={undefined} />))).toContain(`disabled=""`);
     expect(send(renderToStaticMarkup(<Composer {...base} modelState="unavailable" model={undefined} />))).toContain(`disabled=""`);
+    // A command needs no model.
+    expect(send(renderToStaticMarkup(<Composer {...base} draft="/flow clear" modelState="unavailable" model={undefined} />))).not.toContain(`disabled=""`);
   });
 
   it("shows the model loading while it is not known yet", () => {

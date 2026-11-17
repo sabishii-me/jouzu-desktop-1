@@ -217,8 +217,9 @@ export function Composer({ hero = false, autoFocus = false, textguard, connected
   const [videoError, setVideoError] = useState<string | null>(null);
   const [modelOpen, setModelOpen] = useState(false);
   // Send is offered only with a model the host says is ready; the model button
-  // next to it shows why not (loading, or the way to set one up).
-  const modelReady = modelState === "ready";
+  // next to it shows why not (loading, or the way to set one up). A command
+  // (`/flow`, `/textguard`) is the runtime's to handle and needs no model.
+  const modelReady = modelState === "ready" || draft.trimStart().startsWith("/");
   const submit = () => { if ((connected || opening) && modelReady && !unavailable && !readingImages && (draft.trim() || videos.length) && (running || starting || !pending)) onSend(); };
   const compactDisabled = !connected || pending || settling || opening || unavailable || running;
   const exportDisabled = !connected || pending || settling || opening || unavailable;

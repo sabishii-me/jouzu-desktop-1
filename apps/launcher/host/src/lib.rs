@@ -730,7 +730,9 @@ async fn select_session_model(
     if let Some(chosen) = models::ModelRef::from_value(&model) {
         catalog_changed(&state, state.models.choose_default(&chosen));
         let state = state.clone();
-        tokio::spawn(async move { save_default_model(&state).await });
+        tokio::spawn(async move {
+            let _ = save_default_model(&state).await;
+        });
     }
     Ok(Json(json!({ "model": model })))
 }
@@ -739,27 +741,36 @@ async fn select_session_model(
 /// catalog so it reports it. Writes go one at a time and each writes the pick
 /// current when it runs, so the last pick is the last one written. A failure
 /// gives the default back to the runtime's own and is logged; the session's
-/// own model is not affected.
-async fn save_default_model(state: &AppState) {
+/// own model is not affected. Answers the configuration status the write
+/// reported, or `None` when there was nothing left to write.
+async fn save_default_model(state: &AppState) -> Result<Option<Value>, ApiError> {
     let _one = state.models.saving().await;
     let Some(model) = state.models.unsaved_default() else {
-        return;
+        return Ok(None);
     };
     let written = state
         .control
         .request_for_host(json!({ "action": "default-model", "provider": model.provider, "model": model.id }))
         .await;
-    if let Err(error) = written {
-        log(
-            state.sessions.home(),
-            "warn",
-            "models.default_not_saved",
-            json!({ "provider": model.provider, "model": model.id, "code": error.code, "message": error.message }),
-        );
-        catalog_changed(state, state.models.default_not_saved(&model));
-        return;
+    match written {
+        Err(error) => {
+            log(
+                state.sessions.home(),
+                "warn",
+                "models.default_not_saved",
+                json!({ "provider": model.provider, "model": model.id, "code": error.code, "message": error.message }),
+            );
+            catalog_changed(state, state.models.default_not_saved(&model));
+            Err(error)
+        }
+        Ok(status) => {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = reload_models(&state, false).await;
+            });
+            Ok(Some(status))
+        }
     }
-    let _ = reload_models(state, false).await;
 }
 
 /// Tell everyone the catalog changed: sessions first (their model state
@@ -1085,6 +1096,13 @@ async fn control_request(
                 false,
             ));
         }
+        // The same path as a pick in a session, so whichever comes last is
+        // the default and the last one written. The answer is the write's.
+        catalog_changed(&state, state.models.choose_default(&chosen));
+        return match save_default_model(&state).await? {
+            Some(status) => Ok(Json(status)),
+            None => state.control.request(json!({ "action": "status" })).await.map(Json),
+        };
     }
     let result = state.control.request(body).await;
     if result.is_ok() {
@@ -1496,8 +1514,11 @@ async fn models(State(state): State<AppState>) -> Json<Value> {
 /// Jouzu refreshes its published catalogs, then the host lists the models again.
 /// A failure keeps the rows already listed (marked stale) and is the answer.
 async fn refresh_models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    // After a failed first listing, list again as at start: refreshing the
+    // published catalogs first needs the network, which may be why it failed.
+    let refresh = state.models.loaded();
     // Refreshed catalogs are new settings for a runtime that loaded the old ones.
-    if reload_models(&state, true).await? == models::Change::Models {
+    if reload_models(&state, refresh).await? == models::Change::Models {
         recycle_warm_runtime(&state);
     }
     Ok(Json(state.models.view()))
@@ -4661,9 +4682,6 @@ mod session_tests {
         assert_eq!(errors[0]["code"], "extension-error");
     }
 
-    /// The catalog is read from the host as it holds it, and a session created
-    /// over HTTP starts on its default; with no model, a send is refused with
-    /// a code the client can show, never accepted and lost.
     /// The host's control on the stand-in Jouzu app (`tests/fixtures/fake-app`),
     /// offering `models` from the runtime home it uses.
     fn fake_app_state(manager: Arc<SessionManager>, models: &[&str]) -> Option<AppState> {
@@ -4702,7 +4720,7 @@ mod session_tests {
     #[tokio::test]
     async fn the_last_pick_is_the_next_sessions_model_at_once() {
         let (manager, _home, workspace) = manager_unlisted();
-        let Some(state) = fake_app_state(manager.clone(), &["model", "chosen"]) else {
+        let Some(state) = fake_app_state(manager.clone(), &["model", "chosen", "third"]) else {
             eprintln!("skipped: no node on PATH");
             return;
         };
@@ -4753,6 +4771,28 @@ mod session_tests {
         assert_eq!(settings["defaultModel"], "model", "{settings}");
         assert_eq!(state.models.view()["default"]["id"], "model");
         assert_eq!(create().await["model"]["id"], "model");
+
+        // Settings sets the default right after a pick: Settings came last, so
+        // it is the default, both in the host and in the runtime's settings.
+        let id = create().await["sessionId"].as_str().unwrap().to_string();
+        pick(id, "chosen").await;
+        let saved = call(
+            app.clone(),
+            request(Method::POST, "/v1/control")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "action": "default-model", "provider": "fixture", "model": "third" }).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(saved.0, StatusCode::OK, "{}", saved.2);
+        assert_eq!(create().await["model"]["id"], "third");
+        wait_until(|| state.models.unsaved_default().is_none()).await;
+        wait_until(|| state.models.view()["default"]["id"] == "third").await;
+        let settings: Value = serde_json::from_str(
+            &std::fs::read_to_string(manager.runtime_home().join("agent/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["defaultModel"], "third", "{settings}");
         manager.stop_all();
     }
 
@@ -4788,6 +4828,9 @@ mod session_tests {
         manager.stop_all();
     }
 
+    /// The catalog is read from the host as it holds it, and a session created
+    /// over HTTP starts on its default; with no model, a send is refused with
+    /// a code the client can show, never accepted and lost.
     #[tokio::test]
     async fn the_catalog_and_the_session_model_over_http() {
         let (manager, _home, workspace) = manager_unlisted();

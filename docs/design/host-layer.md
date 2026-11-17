@@ -76,7 +76,7 @@ describes no screens; what a person sees is in the UI document.
   describes what it already loaded and recycles nothing.
 - If the first listing fails, the catalog is `failed` with its error; new
   sessions have no model (`unavailable`), and a client retries with
-  `POST /v1/models/refresh`.
+  `POST /v1/models/refresh` (a plain listing again, as at start).
 - A new session uses the default model. The default exists in one place only:
   the jouzu runtime's default-model setting.
 - When the person changes the model in a session, the host calls RPC `set_model`
@@ -85,8 +85,10 @@ describes no screens; what a person sees is in the UI document.
   the runtime default through the ConfigQueue behind the answer; writes go one
   at a time and each writes the latest pick. Until a listing reports it, the
   pick stands over the runtime's older default; if writing fails, the default
-  is the runtime's again. Since the runtime re-applies the thinking level for
-  the new model, the host reads the session state again after `set_model`.
+  is the runtime's again. Settings writes the default the same way, so
+  whichever comes last wins. Since the runtime re-applies the thinking level
+  for the new model, a level picked before the runtime started is sent after
+  the `set_model` answer, and otherwise the host reads the state again.
 - A send needs a model; a slash command (`/flow`, `/textguard`) does not, and a
   retried message gets its earlier answer before any check.
 - A session's model state is `resolving`, `ready` or `unavailable`. It is

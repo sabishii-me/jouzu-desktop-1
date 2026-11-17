@@ -1983,8 +1983,9 @@ impl Session {
         // A model chosen before the runtime started (or a new conversation's
         // default) is the session's model; its `set_model` answer settles it.
         let (applied, deferred_model) = self.model_applied(value.get("id").and_then(Value::as_str), success);
-        if applied && success {
-            // As after a live switch: the level the runtime settled on for this model.
+        // The level picked before the runtime started goes now; without one,
+        // as after a live switch, the host reads the level the runtime settled on.
+        if applied && !self.apply_pending_thinking() && success {
             self.request_state();
         }
         if !success {
@@ -4425,18 +4426,30 @@ impl Session {
             }
         }
         self.apply_model();
+        // The runtime re-applies a level when it switches model, and it may
+        // handle the next line before that switch ends: a level picked before
+        // the runtime started goes after the `set_model` answer.
+        if self.model_slot().applying.is_none() {
+            self.apply_pending_thinking();
+        }
+    }
+
+    /// Write a level picked before the runtime started. Returns whether there was one.
+    fn apply_pending_thinking(&self) -> bool {
         let level = self
             .pending_thinking
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        if let Some(level) = level {
-            let request = self.request_id();
-            let _ = self.write_command(pi::command::with_id(
-                pi::command::set_thinking_level(&level),
-                &request,
-            ));
-        }
+        let Some(level) = level else {
+            return false;
+        };
+        let request = self.request_id();
+        let _ = self.write_command(pi::command::with_id(
+            pi::command::set_thinking_level(&level),
+            &request,
+        ));
+        true
     }
 
     /// Write a model chosen before the runtime started (or a new conversation's
