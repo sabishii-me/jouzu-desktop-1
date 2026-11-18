@@ -1405,7 +1405,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const activeMessage = conversationProjection.activeMessage === null ? undefined : conversationProjection.messages[conversationProjection.activeMessage];
   // While the host opens the session on screen, the bound store is still the
   // previous session: nothing of it (model, run, Stop) is shown for this one.
-  const elsewhere = !!activePreview && normalizedPath(activePreview.path) !== activeSession;
+  const elsewhere = !hero && !!selectedSession && selectedKey !== activeSession;
   // The host says when the step is reasoning; the words are the step's reasoning block being written.
   const turnStep = conversationProjection.running ? snapshot.activeTurn?.step : undefined;
   const streamingBlock = turnStep?.state === "thinking" ? activeMessage?.content.at(-1) : undefined;
