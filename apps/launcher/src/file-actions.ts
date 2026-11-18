@@ -24,8 +24,8 @@ export function revealMessage(reason: string | undefined): string {
 
 function failureReason(error: unknown): RevealFailure {
   const text = typeof error === "string" ? error : error instanceof Error ? error.message : "";
-  const normalized = text.toLowerCase().replace(/[\s_]+/gu, "-");
-  return (Object.keys(MESSAGES) as RevealFailure[]).find(key => normalized.includes(key)) ?? "reveal-failed";
+  // The native command answers with the failure's code itself (attachments.rs reveal_target).
+  return text in MESSAGES ? text as RevealFailure : "reveal-failed";
 }
 
 /** One in-flight reveal per path, so a double click cannot spawn two shells. */
