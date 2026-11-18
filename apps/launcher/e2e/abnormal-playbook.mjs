@@ -32,7 +32,7 @@ import { join } from "node:path";
  *   PLAYBOOK_FIXTURE  the fixture provider (fault control at /__fault)
  *   PLAYBOOK_WORLD    the exam's world control (runtime kill, freeze, slow start, files)
  *   PLAYBOOK_LANG     interface language of this run (en, ja, zh-Hans, zh-Hant)
- *   PLAYBOOK_ONLY     run only cases whose names contain this text
+ *   PLAYBOOK_ONLY     run only cases whose names contain this text (several: separate with |)
  *   PLAYBOOK_OUT, PLAYBOOK_SHOTS  report file and screenshot folder
  */
 const lang = process.env.PLAYBOOK_LANG ?? "en";
@@ -620,6 +620,8 @@ add("A file that is not an image, named .png", "A broken attachment is refused a
     if (!(await textbox().inputValue()).includes("Look at this file")) c.fail("the typed text was lost");
   } else c.fail("the file was neither attached nor refused visibly");
   await page.keyboard.press("Escape").catch(() => {});
+  // Leave nothing for the next case: the typed text and the refused file stay in this composer.
+  await textbox().fill("").catch(() => {});
 }, { langs: ["en", "ja"] });
 
 // ---- Settings and files ----
@@ -665,9 +667,17 @@ add("Settings file cannot be written", "When a setting cannot be saved, that car
     const combo = dialog.getByRole("combobox").first();
     await combo.click();
     await page.getByRole("option").nth(2).click();
-    const shown = await firstProblem(now(), 10_000);
-    if (!shown) c.fail("a save that cannot be written showed nothing");
-    else judgeShown(c, shown.list.filter(item => item.scope === "settings"), { scope: "settings", before, after: await layout() });
+    // Only a problem on the settings card counts: a line left by an earlier case elsewhere
+    // (a composer warning) is not this save's answer.
+    let shown = null;
+    for (const until = now() + 10_000; now() < until && !shown; await sleep(100)) {
+      const list = (await problems()).filter(item => item.scope === "settings");
+      if (list.length) shown = list;
+    }
+    if (!shown) {
+      await page.screenshot({ path: join(shots, `${slug(c.record.name)}-shown.png`) }).catch(() => {});
+      c.fail("a save that cannot be written showed nothing on the settings card");
+    } else judgeShown(c, shown, { scope: "settings", before, after: await layout() });
     await page.keyboard.press("Escape");
   } finally {
     await control("/file", { path: "data/agent/settings.json", readOnly: false });
@@ -683,7 +693,11 @@ add("Missing tools.json", "A data folder without tools settings opens the Tools 
   await control("/file", { path: "data/agent/tools.json", remove: true });
   const dialog = await openSettings(/^(tools|ツール|工具)$/i);
   await sleep(2_000);
-  const shown = (await problems()).filter(item => item.scope === "settings");
+  await page.screenshot({ path: join(shots, `${slug(c.record.name)}-shown.png`) }).catch(() => {});
+  // Only the Tools page itself: a problem inside another tab of the dialog is not this page's.
+  const panel = dialog.getByRole("tabpanel").first();
+  const words = (await panel.count()) ? await panel.innerText().catch(() => "") : "";
+  const shown = (await problems()).filter(item => item.scope === "settings" && (!words || words.includes(item.text)));
   if (shown.length) c.fail(`the Tools page shows a problem: ${shown.map(item => item.text).join(" | ")}`);
   if (!await dialog.isVisible()) c.fail("the settings window closed");
   await page.keyboard.press("Escape");
@@ -760,7 +774,7 @@ if (await page.evaluate(() => localStorage.getItem("jouzu.ui.language")).catch((
 await newSession().waitFor({ timeout: 60_000 }).catch(error => result.errors.push(`the app never became usable: ${error.message}`));
 for (const item of cases) {
   if (!item.langs.includes(lang)) continue;
-  if (only && !item.name.toLowerCase().includes(only.toLowerCase())) continue;
+  if (only && !only.toLowerCase().split("|").some(part => item.name.toLowerCase().includes(part.trim()))) continue;
   const c = caseRecorder(item.name, item.why);
   current = c;
   const started = now();

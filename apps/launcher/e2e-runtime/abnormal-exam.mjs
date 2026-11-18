@@ -29,7 +29,7 @@ import { startFixtureServer } from './fixture-server.mjs';
 //     ABN_RUNTIME_APP  a folder with the runtime's bootstrap.mjs (node_modules/jouzu)
 // Common:
 //   ABN_LANGS    interface languages to run, comma separated (default en,ja)
-//   ABN_ONLY     run only the cases whose names contain this text
+//   ABN_ONLY     run only the cases whose names contain this text (several: separate with |)
 //   ABN_OUT      report folder (default ./abnormal-exam-<time>)
 const here = import.meta.dirname;
 const launcher = resolve(here, '..');
@@ -221,12 +221,20 @@ function descendants(rootPid) {
 function runtimes(hostPid) {
   return processTable().filter(row => row.ppid === hostPid && (/^jouzu$/.test(row.name) || (/node/i.test(row.name) && /\brpc\b/.test(row.args))));
 }
-function kill(pid) {
-  try {
-    if (windows) execFileSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
-    else process.kill(pid, 'SIGKILL');
-    return true;
-  } catch { return false; }
+function kill(pid) { return killAll([pid]).length === 1; }
+/**
+ * Kill these processes at the same moment. One by one took about 2 s on Windows, and the
+ * host meanwhile moved the session onto a warm runtime that was also on the list: one
+ * "kill" became a crash loop. Returns the ids that are gone afterwards.
+ */
+function killAll(pids) {
+  if (!pids.length) return [];
+  if (windows) {
+    try { execFileSync('taskkill.exe', [...pids.flatMap(pid => ['/PID', String(pid)]), '/T', '/F'], { stdio: 'ignore' }); } catch { /* some were gone already */ }
+    const alive = new Set(processTable().map(row => row.pid));
+    return pids.filter(pid => !alive.has(pid));
+  }
+  return pids.filter(pid => { try { process.kill(pid, 'SIGKILL'); return true; } catch { return false; } });
 }
 function suspend(pids, on) {
   if (!pids.length) return;
@@ -262,12 +270,12 @@ function worldServer(stack) {
         if (url.pathname === '/runtime/kill') {
           const list = runtimes(hostPid).sort((a, b) => b.pid - a.pid);
           const chosen = input.which === 'all' ? list : list.slice(0, 1);
-          return reply({ killed: chosen.filter(row => kill(row.pid)).map(row => row.pid) });
+          return reply({ killed: killAll(chosen.map(row => row.pid)) });
         }
         if (url.pathname === '/runtime/kill-loop') {
           const until = Date.now() + (input.ms ?? 10_000);
           let killed = 0;
-          while (Date.now() < until) { for (const row of runtimes(hostPid)) if (kill(row.pid)) killed += 1; await sleep(300); }
+          while (Date.now() < until) { killed += killAll(runtimes(hostPid).map(row => row.pid)).length; await sleep(300); }
           return reply({ killed });
         }
         if (url.pathname === '/runtime/delay') {
