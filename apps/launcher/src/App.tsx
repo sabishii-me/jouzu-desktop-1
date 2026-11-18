@@ -183,6 +183,24 @@ export function App() {
   const [provider, setProvider] = useState("");
   const [token, setToken] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // The default-model choices are the warm runtime's own model list (what it
+  // can run). A settings change restarts that runtime, so the list is read once
+  // the host reports the new one started: never an older runtime's answer.
+  const [runtimeModels, setRuntimeModels] = useState<{ provider: string; id: string; name: string }[]>([]);
+  useEffect(() => {
+    if (!settingsOpen) return;
+    let current = true;
+    setRuntimeModels([]);
+    void (async () => {
+      try {
+        let warm = await api.runtime.warmState(0);
+        while (current && warm.state === "starting") warm = await api.runtime.warmState(5000);
+        const models = current ? await api.models.list("") : [];
+        if (current) setRuntimeModels(models);
+      } catch { if (current) setRuntimeModels([]); }
+    })();
+    return () => { current = false; };
+  }, [api, settingsOpen, setup]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key === ",") {
@@ -401,30 +419,22 @@ export function App() {
   useEffect(() => {
     if (activePath) localStorage.setItem("jouzu.chat.workspace", activePath);
   }, [activePath]);
-  // A signed-in account supplies models through Jouzu's published catalog. The chat shell
-  // asks for a refresh only when the connected runtime has no models, so warm starts do not
-  // pay a network round trip. A successful refresh restarts the session with the new catalog.
-  // A refresh is cheap and the runtime's own terminal build does it at startup, so the
-  // desktop does it too. Only an activated revision needs a new runtime; a held revision
+  // A signed-in account supplies models through Jouzu's published catalog. The runtime's
+  // own terminal build refreshes it at startup, so the desktop does it once per launch and
+  // when the user asks. Only an activated revision needs a new runtime; a held revision
   // waits for the user's decision in the catalog dialog.
   async function refreshModelCatalog(force = false) {
     if (catalogAttempted.current && !force) return;
     catalogAttempted.current = true;
     setCatalogRefreshing(true);
     try {
-      // A newly issued account key can lag its catalog by a moment. Retry the
-      // refresh before leaving a signed-in install with an empty model list.
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const next = await configure({ action: "refresh-catalogs" });
-        if (next) {
-          const outcome = next.catalog;
-          if (outcome?.held) setHeldCatalog(outcome.held);
-          // Nothing changed on disk unless a source activated a revision. An adapter
-          // that reports no outcome keeps the older behaviour and rebinds.
-          if (!outcome || outcome.sources.some(source => source.status === "activated")) requestSessionRestart();
-          return;
-        }
-        if (attempt < 2) await new Promise(resolve => window.setTimeout(resolve, 1000 * (attempt + 1)));
+      const next = await configure({ action: "refresh-catalogs" });
+      if (next) {
+        const outcome = next.catalog;
+        if (outcome?.held) setHeldCatalog(outcome.held);
+        // Nothing changed on disk unless a source activated a revision. An adapter
+        // that reports no outcome keeps the older behaviour and rebinds.
+        if (!outcome || outcome.sources.some(source => source.status === "activated")) requestSessionRestart();
       }
     }
     finally { setCatalogRefreshing(false); }
@@ -511,7 +521,7 @@ export function App() {
                   <div className="space-y-4 border-t border-border pt-4">
 
                     {provider && <>{providerOauth && <div className="space-y-3 rounded-lg border border-border p-3"><p className="text-sm text-muted-foreground">{providerInfo?.oauthName ?? t.oauthHint}</p>{providerSignedIn ? <div className="flex items-center justify-between gap-2"><span className="text-sm">{t.oauthConnected}</span><Button variant="outline" disabled={busy} onClick={() => void configure({ action: "provider-remove", provider })}>{t.removeCredential}</Button></div> : <div className="flex justify-end"><Button disabled={busy} onClick={async () => { await configure({ action: "provider-oauth", provider }); }}>{t.oauthSignIn}</Button></div>}{providerDevice?.provider === provider && <div className="space-y-3"><Input readOnly aria-label={t.loginUrl} value={providerDevice.url} onFocus={event => event.target.select()} />{providerDevice.code && <Input readOnly aria-label={t.deviceCode} value={providerDevice.code} onFocus={event => event.target.select()} />}<p className="text-xs text-muted-foreground">{t.loginHint}</p><div className="flex items-center justify-end gap-2"><Button variant="outline" onClick={() => void controlCancel()}>{t.cancel}</Button><Button onClick={async () => { try { await openDeviceUrl(providerDevice.url); } catch (error) { fail("settings", error); } }}><ArrowUpRight />{t.openBrowser}</Button></div></div>}</div>}{providerApiKey && <><Label>{t.apiKey}</Label><Input type="password" autoComplete="off" aria-label={t.apiKey} placeholder={t.apiKey} value={token} onChange={event => setToken(event.target.value)} /><div className="flex justify-end gap-2"><Button disabled={busy || !token.trim()} onClick={async () => { if (await configure({ action: "provider-key", provider, token })) { setToken(""); setAddingConnection(false); } }}>{t.save}</Button>{setup?.credentials.some(c => c.providerId === provider) && <Button variant="outline" disabled={busy} onClick={() => void configure({ action: "provider-remove", provider })}>{t.removeCredential}</Button>}</div></>}
-                    <Label>{t.defaultModel}</Label><Select value={setup?.defaultProvider === provider ? setup.defaultModel : ""} onValueChange={model => void configure({ action: "default-model", provider, model })}><SelectTrigger className="w-full" aria-label={t.defaultModel}><SelectValue placeholder={t.defaultModel} /></SelectTrigger><SelectContent>{setup?.models.filter(m => m.provider === provider).map(m => <SelectItem key={m.id} value={m.id}>{m.name}</SelectItem>)}</SelectContent></Select></>}
+                    <Label>{t.defaultModel}</Label><Select value={setup?.defaultProvider === provider ? setup.defaultModel : ""} onValueChange={model => void configure({ action: "default-model", provider, model })}><SelectTrigger className="w-full" aria-label={t.defaultModel}><SelectValue placeholder={t.defaultModel} /></SelectTrigger><SelectContent>{runtimeModels.filter(m => m.provider === provider).map(m => <SelectItem key={m.id} value={m.id}>{m.name}</SelectItem>)}</SelectContent></Select></>}
                   </div>}
                   {connectionMode === "custom" &&<div className="space-y-3 border-t border-border pt-4"><p className="text-sm text-muted-foreground">{t.customHint}</p><Label>{t.providerId}</Label><Input placeholder={t.providerId} aria-label={t.providerId} disabled={custom.edit} value={custom.provider} onChange={event => setCustom({...custom,provider:event.target.value})} /><Label>{t.endpoint}</Label><Input placeholder={t.endpoint} aria-label={t.endpoint} value={custom.url} onChange={event => setCustom({...custom,url:event.target.value})} /><Label>{t.modelId}</Label><Input placeholder={t.modelId} aria-label={t.modelId} value={custom.model} onChange={event => setCustom({...custom,model:event.target.value})} /><div className="flex items-center justify-between gap-3"><Label htmlFor="custom-image-input">{t.imageInput}</Label><Switch id="custom-image-input" checked={custom.imageInput} onCheckedChange={imageInput => setCustom(value=>({...value,imageInput}))} /></div><p className="text-xs text-muted-foreground">{t.imageInputHint}</p><Label>{t.contextWindow}</Label><Input type="number" min={1024} max={2000000} step={1024} aria-label={t.contextWindow} value={custom.contextWindow} onChange={event => setCustom(value=>({...value,contextWindow:Number(event.target.value)}))} /><p className="text-xs text-muted-foreground">{t.contextWindowHint}</p><Label>{t.maxOutput}</Label><Input type="number" min={1} max={custom.contextWindow} step={1} aria-label={t.maxOutput} value={custom.maxTokens} onChange={event => setCustom(value=>({...value,maxTokens:Number(event.target.value)}))} /><p className="text-xs text-muted-foreground">{t.maxOutputHint}</p><Label>{t.apiKey}</Label><Input type="password" autoComplete="off" aria-label={t.apiKey} placeholder={t.apiKey} value={token} onChange={event=>setToken(event.target.value)}/><div className="flex justify-end pt-1"><Button disabled={busy || !custom.provider || !custom.url || !custom.model} onClick={async () => { if (await configure({action:"custom-provider",...custom})) { setCustom(value=>({...value,edit:true})); if (token.trim() && !await configure({action:"provider-key",provider:custom.provider,token})) return; setToken("");setAddingConnection(false); } }}>{t.save}</Button></div></div>}
                   </div></section>}
@@ -753,9 +763,6 @@ export function App() {
           if (!booting) entryReady.current = true;
         }}
         catalogRefreshing={catalogRefreshing}
-        canRefreshModels={setup?.account.signedIn === true}
-        onModelsMissing={() => void refreshModelCatalog()}
-        onRetryModels={() => void refreshModelCatalog(true)}
         workspaces={state?.recent ?? []}
         onSelect={setActivePath}
         onAddFolder={() => void chooseFolder()}

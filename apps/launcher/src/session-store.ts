@@ -18,6 +18,7 @@ import {
   type ActiveTurn,
   type ChatImage,
   type ChatModel,
+  type ModelState,
   type ChatSnapshot,
   type OutboxItem,
   type PendingPrompt,
@@ -59,18 +60,27 @@ const emptySnapshot = (): ChatSnapshot => ({
   activeTurn: null,
 });
 
-const modelOf = (model: Awaited<ReturnType<JouzuApi["models"]["list"]>>[number]): ChatModel => ({
-  provider: model.provider,
-  id: model.id,
-  name: model.name,
-  contextWindow: model.contextWindow,
-  maxTokens: model.maxTokens,
-  cost: model.cost,
-  thinkingLevels: model.thinkingLevels,
-});
-
 type Data = Record<string, unknown>;
 const text = (value: unknown): string | undefined => typeof value === "string" ? value : undefined;
+
+/** One row of the runtime's model list, as the host relays it. */
+const modelOf = (value: unknown): ChatModel | null => {
+  const row = value && typeof value === "object" ? value as Data : null;
+  const provider = text(row?.provider);
+  const id = text(row?.id);
+  if (!row || !provider || !id) return null;
+  const cost = row.cost && typeof row.cost === "object" ? row.cost as ChatModel["cost"] : undefined;
+  return {
+    provider,
+    id,
+    name: text(row.name) ?? id,
+    contextWindow: typeof row.contextWindow === "number" ? row.contextWindow : undefined,
+    maxTokens: typeof row.maxTokens === "number" ? row.maxTokens : undefined,
+    cost,
+    input: Array.isArray(row.input) ? row.input.filter((kind): kind is string => typeof kind === "string") : undefined,
+  };
+};
+const modelStateOf = (value: unknown): ModelState => value === "ready" || value === "none" ? value : "resolving";
 
 /** A slash command the host wrote to the runtime: who issued it, and its text. */
 type CommandRef = { id: string; text: string; origin: "host" | "user" };
@@ -220,9 +230,13 @@ export class SessionStore {
   /** Images of messages waiting in the host queue, so Edit can give them back. */
   private waitingImages = new Map<string, ChatImage[]>();
   private following = false;
+  /** The last session event this store applied (the host's per-session cursor). */
+  private seen = 0;
   private routerUnsubscribe?: () => void;
   private disposed = false;
+  /** The last model the person picked (UI memory), applied once per session. */
   private preferred = readModelPreference();
+  private preferenceTried = false;
   private api?: JouzuApi;
   private noticeSeq = 0;
   /** The last reply of each open Flow command that releases a hold, by command id. */
@@ -232,25 +246,31 @@ export class SessionStore {
   private constructor(
     readonly session: SessionPort,
     private readonly onDispose?: () => void,
+    api?: JouzuApi,
+    /** A new conversation (not a saved one): the remembered model applies to it. */
+    private readonly fresh = false,
   ) {
+    this.api = api;
     // The file is known from the attach: a send right after opening a saved
     // session must see it is in that session, not wait for the first event.
     this.state = { ...this.state, sessionId: session.id, connected: true, ...(session.sessionPath ? { sessionFile: session.sessionPath } : {}) };
     // Start from the host's state at attach: what it published before this
     // store subscribed (the model it set at creation) never arrives as an event.
-    if (session.initial) this.applySummary(session.initial as Data);
+    if (session.initial) {
+      if (typeof session.initial.cursor === "number") this.seen = session.initial.cursor;
+      this.applySummary(session.initial as Data);
+    }
   }
 
   static async open(api: JouzuApi, workspacePath: string, sessionPath?: string): Promise<SessionStore> {
     const session = await HostChatSession.open(api, workspacePath, sessionPath);
-    const store = SessionStore.attach(session, undefined, api);
+    const store = SessionStore.attach(session, undefined, api, sessionPath === undefined);
     await store.load();
     return store;
   }
 
-  static attach(session: SessionPort, onDispose?: () => void, api?: JouzuApi): SessionStore {
-    const store = new SessionStore(session, onDispose);
-    store.api = api;
+  static attach(session: SessionPort, onDispose?: () => void, api?: JouzuApi, fresh = false): SessionStore {
+    const store = new SessionStore(session, onDispose, api, fresh);
     if (api) {
       store.resume();
     } else {
@@ -273,6 +293,16 @@ export class SessionStore {
       if (event.sessionId !== this.session.id) return;
       this.handle(event);
     });
+    // Events published between the attach answer and this subscription went
+    // past this store: read the session as it stands, unless a newer event
+    // already arrived.
+    const snapshot = this.api?.sessions?.snapshot;
+    if (!snapshot) return;
+    void snapshot(this.session.id).then(data => {
+      if (this.disposed || typeof data.cursor !== "number" || data.cursor < this.seen) return;
+      this.seen = data.cursor;
+      this.applySummary(data as Data);
+    }, () => undefined);
   }
 
   /** Stop listening to the router; this does not close any host session. */
@@ -314,9 +344,6 @@ export class SessionStore {
 
   private async load(): Promise<void> {
     await this.refreshHistory();
-    await this.loadModels();
-    this.loadThinkingLevels();
-    await this.applyPreferredModel();
     void this.loadStats();
   }
 
@@ -479,36 +506,18 @@ export class SessionStore {
     this.update({ outbox, pending: outbox.some(entry => entry.state === "sending") });
   }
 
-  async loadModels(): Promise<void> {
-    try {
-      if (!this.api) return;
-      const models = (await this.api.models.list(this.session.id)).map(modelOf);
-      this.update({ models, modelsLoaded: true });
-    } catch {
-      // The composer shows "No models available" with a retry; no second error surface.
-      this.update({ modelsLoaded: true });
-    }
-  }
-
+  /** Change the session's model. The host's snapshot shows the result. */
   async selectModel(provider: string, id: string): Promise<void> {
     if (!this.api) return;
     await this.api.models.select(this.session.id, provider, id);
-    const name = this.state.models?.find(model => model.provider === provider && model.id === id)?.name ?? id;
     this.preferred = { provider, id };
     writeModelPreference(this.preferred);
-    this.update({ model: name, modelProvider: provider, modelId: id });
   }
 
-  loadThinkingLevels(): void {
-    const levels = new Set<string>();
-    for (const model of this.state.models ?? []) for (const level of model.thinkingLevels ?? []) levels.add(level);
-    this.update({ thinkingLevels: [...levels] });
-  }
-
+  /** Change the reasoning level; the runtime reports the level it set. */
   async setThinkingLevel(level: string): Promise<void> {
     if (!this.api) return;
     await this.api.models.thinking(this.session.id, level);
-    this.update({ thinkingLevel: level });
   }
 
   async loadStats(): Promise<void> {
@@ -609,7 +618,6 @@ export class SessionStore {
     if (!this.api) return;
     await this.api.commands.reload(this.session.id);
     await this.refreshHistory();
-    await this.loadModels();
   }
 
   /**
@@ -656,23 +664,21 @@ export class SessionStore {
     for (const listener of this.listeners) listener(this.state);
   }
 
-  private async applyPreferredModel(): Promise<void> {
+  /**
+   * Remembering the last picked model is the UI's own convenience (the
+   * runtime does not restore it in RPC mode yet). A new conversation whose
+   * runtime is ready on another model switches to it once, when its own list
+   * offers it; a refusal leaves the runtime's model.
+   */
+  private applyPreferredModel(): void {
     const preferred = this.preferred;
-    if (!preferred) return;
+    // Only a new conversation: a saved one keeps the model the runtime restored.
+    if (!preferred || !this.fresh || !this.api || this.preferenceTried) return;
+    if (this.state.modelState !== "ready" || !this.state.models?.length) return;
+    this.preferenceTried = true;
     if (this.state.modelProvider === preferred.provider && this.state.modelId === preferred.id) return;
-    // No list (still loading, or the host could not list them) says nothing
-    // about the choice: keep it for the next session instead of forgetting it.
-    if (!this.state.models?.length) return;
-    if (!this.state.models.some(model => model.provider === preferred.provider && model.id === preferred.id)) {
-      this.preferred = undefined;
-      writeModelPreference(undefined);
-      return;
-    }
-    try { await this.selectModel(preferred.provider, preferred.id); }
-    catch {
-      this.preferred = undefined;
-      writeModelPreference(undefined);
-    }
+    if (!this.state.models.some(model => model.provider === preferred.provider && model.id === preferred.id)) return;
+    void this.selectModel(preferred.provider, preferred.id).catch(() => {});
   }
 
   private addPrompt(prompt: PendingPrompt | null): void {
@@ -710,13 +716,16 @@ export class SessionStore {
   private applySummary(data: Data): void {
     const prompts = promptsOf(data.pendingApprovals, data.pendingQuestions);
     const failed = record(data.failedTurn);
-    // The host owns the session's model; show what it reports.
+    // The session's model, its list and levels are the runtime's, as the host relays them.
     const selected = record(data.model);
-    const provider = selected ? text(selected.provider) : undefined;
-    const id = selected ? text(selected.id) : undefined;
-    const name = provider && id ? this.state.models?.find(model => model.provider === provider && model.id === id)?.name ?? text(selected?.name) ?? id : undefined;
+    const modelState = selected ? modelStateOf(selected.state) : this.state.modelState;
+    const ready = modelState === "ready" && selected;
+    const provider = ready ? text(selected.provider) : undefined;
+    const id = ready ? text(selected.id) : undefined;
     this.update({
-      ...(provider && id ? { model: name, modelProvider: provider, modelId: id } : {}),
+      ...(selected ? { modelState, model: provider && id ? text(selected.name) ?? id : undefined, modelProvider: provider, modelId: id } : {}),
+      ...(Array.isArray(data.models) ? { models: data.models.map(modelOf).filter((model): model is ChatModel => !!model) } : {}),
+      ...(Array.isArray(data.thinkingLevels) ? { thinkingLevels: data.thinkingLevels.filter((level): level is string => typeof level === "string") } : {}),
       sessionId: text(data.sessionId) ?? this.state.sessionId,
       sessionFile: text(data.sessionPath) ?? this.state.sessionFile,
       status: text(data.status) ?? this.state.status,
@@ -729,6 +738,7 @@ export class SessionStore {
       ...("statuses" in data ? { statuses: statusesOf(data.statuses) } : {}),
     });
     if ("activeTurn" in data) this.applyTurn(activeTurnOf(data.activeTurn));
+    this.applyPreferredModel();
   }
 
   private applyNotice(message: string, level: unknown, command?: CommandRef): void {
@@ -781,13 +791,14 @@ export class SessionStore {
 
   private handle(event: ApiEvent): void {
     const data = (event.data ?? {}) as Data;
+    const at = event.sessionSeq ?? (event.seq === undefined ? event.id : undefined);
+    if (typeof at === "number" && at > this.seen) this.seen = at;
     switch (event.event) {
       case "session.snapshot": {
         // The same fields as `session.updated` (queue, failed message, turn,
         // prompts), sent whole when the stream (re)attaches.
         const empty = this.state.projection.messages.length === 0;
         this.applySummary(data);
-        if (Array.isArray(data.thinkingLevels)) this.update({ thinkingLevels: data.thinkingLevels.filter((level): level is string => typeof level === "string") });
         // The stream can attach after turns already happened: reload the transcript.
         if (empty && typeof data.cursor === "number" && data.cursor > 0) void this.refreshHistory();
         break;
