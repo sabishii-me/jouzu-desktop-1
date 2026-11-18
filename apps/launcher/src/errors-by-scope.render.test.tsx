@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { Composer } from "./composer";
 import { AgentAction } from "./chat-live";
+import { SessionStatsBar } from "./session-stats-bar";
 import { ErrorLine } from "./session-alerts-view";
 import { ChatConversation } from "./chat-conversation";
 import { emptyProjection, type ChatMessage } from "./chat-projection";
@@ -38,7 +39,8 @@ describe("the session's one error takes the composer's place", () => {
     const html = composer({ blocked: { text: "This session's runtime stopped and could not recover.", details: "runtime exited", action: { label: "Restart session", run: noop } } });
     expect(html).toContain("data-session-blocked");
     expect(html).toContain("Restart session");
-    expect(html).not.toContain("<textarea");
+    // The composer is kept only for its size, hidden and out of reach (#156).
+    expect(html).toMatch(/<form[^>]*aria-hidden="true"[^>]*inert=""[^>]*class="[^"]*\binvisible\b/u);
     // The original text waits behind Details.
     expect(html).not.toContain("runtime exited");
   });
@@ -123,6 +125,13 @@ describe("a failure is shown on the thing that failed", () => {
     expect(html).toContain('data-result="ok"');
     expect(html).toMatch(/data-result-anchor="true" class="[^"]*\bh-0 w-0\b/u);
     expect(html).toMatch(/data-result="ok"[^>]*class="absolute /u);
+  });
+
+  it("the usage row under the composer keeps its height with or without numbers (#153)", () => {
+    const empty = renderToStaticMarkup(<SessionStatsBar />);
+    const full = renderToStaticMarkup(<SessionStatsBar stats={{ tokens: { total: 10, input: 10 }, contextUsage: { percent: 42 } } as never} />);
+    expect(empty).toContain("h-8");
+    expect(full).toContain("min-h-8");
   });
 
   it("an idle status line keeps its row, so a failure appearing moves nothing", () => {
