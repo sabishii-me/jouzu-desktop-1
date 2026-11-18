@@ -76,6 +76,8 @@ export function ToolsPanel() {
   const [providers, setProviders] = useState<ImageProvider[] | null>(null);
   const [models, setModels] = useState<ImageModel[]>([]);
   const [error, setError] = useState<unknown>(null);
+  // The image tool is not installed yet: a state of the tool, not a failure (#157).
+  const [notInstalled, setNotInstalled] = useState(false);
   const [busy, setBusy] = useState(false);
 
   async function refreshModels(provider: string, currentModel: string, currentSize: string, base?: ToolsSettings, known?: ImageModel[] | null) {
@@ -109,7 +111,8 @@ export function ToolsPanel() {
         try {
           list = readProviders((await api.tools.providers()).providers);
         } catch (failure) {
-          setError(failure);
+          if ((failure as { code?: unknown } | null)?.code === "tools-unavailable") setNotInstalled(true);
+          else setError(failure);
         }
         setProviders(list);
         // Only a provider that can generate images now is offered. The saved
@@ -186,6 +189,7 @@ export function ToolsPanel() {
           </select>
         </label>
       </div>
+      {notInstalled && <p role="status" data-tools-not-installed className="text-xs text-muted-foreground">{t.codeToolsUnavailable}</p>}
       {unusable.length > 0 && <ul aria-label={t.unavailableImageProviders} className="space-y-1 text-xs text-muted-foreground">
         {unusable.map(provider => <li key={provider.id}>{provider.label}: {provider.reason || t.notAvailable}</li>)}
       </ul>}
