@@ -161,7 +161,8 @@ async function shellHost(stack, timeout = 60_000) {
   while (Date.now() < until) {
     if (stack.shell.exitCode !== null) throw new Error('Jouzu Desktop exited at once: another Jouzu Desktop is probably open on this computer. Close it to run the installed-app exam (the exam never closes it).');
     const host = descendants(stack.shell.pid).find(row => /jouzu-host/i.test(row.name));
-    if (host && existsSync(join(stack.paths.home, 'host.json'))) { stack.host = { pid: host.pid }; return hostInfo(stack.paths.home); }
+    // The app reads the host's token itself; the exam only needs the host's process.
+    if (host && existsSync(join(stack.paths.home, 'host.json'))) { stack.host = { pid: host.pid }; return; }
     await sleep(500);
   }
   throw new Error('The installed app did not start its host within 60 s');
@@ -175,16 +176,33 @@ function startHost(stack) {
       '--runtime', process.execPath, '--runtime-arg', join(resolve(process.env.ABN_RUNTIME_APP), 'bootstrap.mjs'), '--runtime-arg', '--mode', '--runtime-arg', 'rpc'];
   for (const dir of ['localappdata', 'appdata']) mkdirSync(join(paths.root, dir), { recursive: true });
   try { rmSync(join(paths.home, 'host.json')); } catch { /* first start */ }
-  const child = spawn(pkg ? pkg.host : resolve(process.env.ABN_HOST), args, { env: cleanEnv(paths.root), cwd: paths.workspace, stdio: 'ignore', windowsHide: true });
+  const child = spawn(pkg ? pkg.host : resolve(process.env.ABN_HOST), args, { env: cleanEnv(paths.root), cwd: paths.workspace, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
   children.add(child);
   child.on('exit', () => children.delete(child));
   stack.host = child;
+  // Since #130 the host gives its port and token only to its starter, on its first output
+  // line; host.json no longer has the token. Older hosts (1.1.3 and before) have it there.
+  stack.ready = null;
+  let text = '';
+  child.stdout.on('data', chunk => {
+    if (stack.ready) return;
+    text += chunk;
+    const end = text.indexOf('\n');
+    if (end < 0) return;
+    try { stack.ready = JSON.parse(text.slice(0, end)); } catch { stack.ready = {}; }
+  });
 }
 
-async function hostInfo(home, timeout = 30_000) {
+async function hostInfo(stack, timeout = 30_000) {
   const until = Date.now() + timeout;
   while (Date.now() < until) {
-    try { return JSON.parse(readFileSync(join(home, 'host.json'), 'utf8')); } catch { await sleep(200); }
+    if (stack.ready?.token && stack.ready?.port) return stack.ready;
+    try {
+      const file = JSON.parse(readFileSync(join(stack.paths.home, 'host.json'), 'utf8'));
+      if (file.token && file.port) return file;
+    } catch { /* not yet */ }
+    if (stack.host?.exitCode != null) throw new Error(`The host exited (${stack.host.exitCode}) before it was ready`);
+    await sleep(200);
   }
   throw new Error('The host did not start');
 }
@@ -353,7 +371,7 @@ try {
       await shellHost(stack);
     } else {
       startHost(stack);
-      const info = await hostInfo(stack.paths.home);
+      const info = await hostInfo(stack);
       browser = await openBrowser(info, language, port);
     }
     const world = await worldServer(stack);
