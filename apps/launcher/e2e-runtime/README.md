@@ -113,3 +113,39 @@ refuses any request carrying a PNG with a side of 10 px or less, with the provid
 composer with "Remove images" and "New session", a second message must fail the same way
 without hanging, and after "Remove images" the next message must get a reply. Results are
 written to `rejected-image-result.json`.
+
+## Abnormal paths: errors are tests too
+
+```powershell
+# Installed package (release acceptance, Windows); never touches the user's data folder
+$env:ABN_INSTALL = '<installed app folder>'          # holds jouzu-host.exe and the UI
+$env:ABN_MANAGED = "$env:LOCALAPPDATA\Shisa.ai\JouzuDesktop"  # its runtime/, app/, bin/ are linked read-only
+$env:ABN_LANGS = 'en,ja,zh-Hans,zh-Hant'
+node e2e-runtime/abnormal-exam.mjs
+```
+
+On a source build set `ABN_HOST`, `ABN_DIST` and `ABN_RUNTIME_APP` (a folder with the runtime's
+`bootstrap.mjs`, its dependencies flattened as the desktop installs them) instead of `ABN_INSTALL`.
+`ABN_ONLY` runs the cases whose names contain its text.
+
+Each language gets a throwaway home whose only model is the fixture provider, plus saved
+sessions as earlier versions and accidents leave them (older format, a half-written last line,
+an unknown entry, an empty file, a deleted folder). `e2e/abnormal-playbook.mjs` then breaks one
+thing per case and judges only what a person sees, against the error rules of
+`docs/design/ui-layer.md`: the failure is shown (never silent), on the thing that failed, once,
+in the interface language without raw technical text, nothing moves or widens, no spinner stays,
+what was typed is kept, Send stays usable, and the next message gets its reply once the cause
+is gone. Timings start at the person's action.
+
+What it can break:
+
+| World | How |
+|---|---|
+| Model provider | the fixture's `/__fault`: key rejected (401), model gone (404), rate limit (429), provider error (500), unreachable, never answers, slow first word, stream cut, images refused |
+| Runtime | kill one or all (only children of the exam's own host), keep killing for a while, slow start (`runtime-delay.mjs` through `NODE_OPTIONS`) |
+| Computer asleep | the exam's host and runtimes are suspended, then resumed |
+| Files | change, remove or make read-only a file in the throwaway home |
+
+Results: `abnormal-exam.json` (every case: problems, notes, timings), a screenshot when a problem
+is shown and at the end of each case, and each home's `host.log`. A case fails on any rule it
+breaks; a runtime-caused failure still fails here and is recorded for the runtime.
