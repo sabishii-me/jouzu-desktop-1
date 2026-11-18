@@ -187,7 +187,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Err(error) = write_host_file(&home, port, &token, VERSION) {
+    if let Err(error) = write_host_file(&home, port, VERSION) {
         eprintln!("cannot write host.json: {error}");
         return ExitCode::FAILURE;
     }
@@ -197,9 +197,8 @@ async fn main() -> ExitCode {
         "host.start",
         json!({ "port": port, "pid": std::process::id(), "dist": dist.to_string_lossy(), "version": env!("CARGO_PKG_VERSION"), "build": jouzu_host::BUILD_ID, "commit": jouzu_host::COMMIT }),
     );
-    println!(
-        "jouzu-host listening on http://127.0.0.1:{port}/ (token in host.json; open /?token=<token>)"
-    );
+    // The token is handed to whoever started the host, here and nowhere else (#130).
+    println!("{}", jouzu_host::ready_line(port, &token));
 
     let state = AppState {
         token: std::sync::Arc::new(token.clone()),
@@ -240,7 +239,7 @@ async fn main() -> ExitCode {
         .await;
 
     sessions.shutdown();
-    remove_host_file(&home, &token);
+    remove_host_file(&home, port);
     log(
         &home,
         "info",

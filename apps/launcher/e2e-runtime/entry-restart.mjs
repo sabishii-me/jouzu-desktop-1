@@ -2,6 +2,7 @@ import { chromium } from '@playwright/test';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { hostAccess } from './host-access.mjs';
 
 // Regression check for #73: the startup loader must end even when a catalog revision
 // activated at startup restarts the chat while its first session lease is still
@@ -19,7 +20,7 @@ if (!hostHome) {
   console.error('JOUZU_E2E_HOST_HOME is not set; skipping the entry restart check.');
   process.exit(2);
 }
-const host = JSON.parse(readFileSync(join(hostHome, 'host.json'), 'utf8'));
+const host = hostAccess(hostHome);
 const base = `http://127.0.0.1:${host.port}`;
 const profile = mkdtempSync(join(tmpdir(), 'jouzu-entry-restart-'));
 const results = [];

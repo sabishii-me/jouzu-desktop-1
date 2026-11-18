@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { deflateSync } from 'node:zlib';
+import { hostAccess } from './host-access.mjs';
 
 // Regression check for #17: a session whose history holds an image the model refuses
 // can continue after "Remove images", and is never left hanging.
@@ -53,7 +54,7 @@ function png(width, height) {
 const image = `rejected-${Date.now()}.png`;
 writeFileSync(join(workspace, image), png(256, 1));
 
-const host = JSON.parse(readFileSync(join(hostHome, 'host.json'), 'utf8'));
+const host = hostAccess(hostHome);
 const base = `http://127.0.0.1:${host.port}`;
 const results = [];
 const check = (name, ok, detail) => { results.push({ name, ok: !!ok, detail }); };

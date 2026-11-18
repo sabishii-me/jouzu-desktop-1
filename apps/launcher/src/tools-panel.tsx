@@ -4,6 +4,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./com
 import { Label } from "./components/ui/label";
 import { Switch } from "./components/ui/switch";
 import { ErrorLine } from "./session-alerts-view";
+import { fill, useChatText } from "./chat-text";
 
 interface ImageSettings {
   enabled: boolean;
@@ -69,6 +70,7 @@ function readProviders(value: unknown): ImageProvider[] {
  * extension (CLI mode) so adding a provider does not touch this page.
  */
 export function ToolsPanel() {
+  const t = useChatText();
   const api = useApi();
   const [tools, setTools] = useState<ToolsSettings | null>(null);
   const [providers, setProviders] = useState<ImageProvider[] | null>(null);
@@ -135,7 +137,7 @@ export function ToolsPanel() {
     }
   }
 
-  if (!tools) return <p className="text-sm text-muted-foreground">{error ?? "Loading tools…"}</p>;
+  if (!tools) return <p className="text-sm text-muted-foreground">{error ?? t.loadingTools}</p>;
   const image = tools.image;
   const sizes = models.find(model => model.id === image.model)?.sizes ?? SIZES;
   const usable = (providers ?? []).filter(provider => provider.available);
@@ -144,52 +146,52 @@ export function ToolsPanel() {
 
   return <Card className="border-border shadow-none">
     <CardHeader>
-      <CardTitle>Image generation</CardTitle>
-      <CardDescription>Defaults for the generate_image tool. The image model is independent of the chat model.</CardDescription>
+      <CardTitle>{t.imageGeneration}</CardTitle>
+      <CardDescription>{t.imageGenerationHint}</CardDescription>
     </CardHeader>
     <CardContent className="space-y-4">
       <div className="flex items-center justify-between gap-4">
-        <Label htmlFor="image-enabled">Enable image generation</Label>
-        <Switch id="image-enabled" aria-label="Enable image generation" checked={image.enabled} disabled={busy} onCheckedChange={enabled => void save({ enabled })} />
+        <Label htmlFor="image-enabled">{t.enableImageGeneration}</Label>
+        <Switch id="image-enabled" aria-label={t.enableImageGeneration} checked={image.enabled} disabled={busy} onCheckedChange={enabled => void save({ enabled })} />
       </div>
       <div className="grid gap-3 sm:grid-cols-2">
-        <label className="text-sm"><span className="text-muted-foreground">Image provider</span>
-          <select aria-label="Image provider" className={select} value={noProvider ? "" : image.provider} disabled={busy || !usable.length} onChange={event => {
+        <label className="text-sm"><span className="text-muted-foreground">{t.imageProvider}</span>
+          <select aria-label={t.imageProvider} className={select} value={noProvider ? "" : image.provider} disabled={busy || !usable.length} onChange={event => {
             const provider = usable.find(entry => entry.id === event.target.value);
             if (provider) void refreshModels(provider.id, "", "", undefined, provider.models);
           }}>
-            {providers === null && <option value={image.provider}>Loading…</option>}
-            {noProvider && <option value="">No image provider available</option>}
+            {providers === null && <option value={image.provider}>{t.loading}</option>}
+            {noProvider && <option value="">{t.noImageProvider}</option>}
             {usable.map(provider => <option key={provider.id} value={provider.id}>{provider.label}</option>)}
           </select>
         </label>
-        <label className="text-sm"><span className="text-muted-foreground">Image model</span>
-          <select aria-label="Image model" className={select} value={noProvider ? "" : image.model} disabled={busy || noProvider || !models.length} onChange={event => {
+        <label className="text-sm"><span className="text-muted-foreground">{t.imageModel}</span>
+          <select aria-label={t.imageModel} className={select} value={noProvider ? "" : image.model} disabled={busy || noProvider || !models.length} onChange={event => {
             const model = models.find(entry => entry.id === event.target.value);
             const size = model && model.sizes.includes(image.size) ? image.size : model?.sizes[0];
             void save({ model: event.target.value, ...(size ? { size } : {}) });
           }}>
-            {(noProvider || !models.length) && <option value={noProvider ? "" : image.model}>{noProvider || !image.model ? "No models" : image.model}</option>}
+            {(noProvider || !models.length) && <option value={noProvider ? "" : image.model}>{noProvider || !image.model ? t.noModels : image.model}</option>}
             {!noProvider && models.map(model => <option key={model.id} value={model.id}>{model.id}</option>)}
           </select>
         </label>
-        {sizes.length > 0 && <label className="text-sm"><span className="text-muted-foreground">Image size</span>
-          <select aria-label="Image size" className={select} value={image.size} disabled={busy || noProvider} onChange={event => void save({ size: event.target.value })}>
+        {sizes.length > 0 && <label className="text-sm"><span className="text-muted-foreground">{t.imageSize}</span>
+          <select aria-label={t.imageSize} className={select} value={image.size} disabled={busy || noProvider} onChange={event => void save({ size: event.target.value })}>
             {sizes.map(size => <option key={size} value={size}>{size}</option>)}
           </select>
         </label>}
-        <label className="text-sm"><span className="text-muted-foreground">Images per call</span>
-          <select aria-label="Images per call" className={select} value={image.maxImages} disabled={busy} onChange={event => void save({ maxImages: Number(event.target.value) })}>
+        <label className="text-sm"><span className="text-muted-foreground">{t.imagesPerCall}</span>
+          <select aria-label={t.imagesPerCall} className={select} value={image.maxImages} disabled={busy} onChange={event => void save({ maxImages: Number(event.target.value) })}>
             {MAX_IMAGES.map(max => <option key={max} value={max}>{max}</option>)}
           </select>
         </label>
       </div>
-      {unusable.length > 0 && <ul aria-label="Unavailable image providers" className="space-y-1 text-xs text-muted-foreground">
-        {unusable.map(provider => <li key={provider.id}>{provider.label}: {provider.reason || "Not available."}</li>)}
+      {unusable.length > 0 && <ul aria-label={t.unavailableImageProviders} className="space-y-1 text-xs text-muted-foreground">
+        {unusable.map(provider => <li key={provider.id}>{provider.label}: {provider.reason || t.notAvailable}</li>)}
       </ul>}
-      {error && <ErrorLine raw={error} failed="This tools change did not complete." onDismiss={() => setError(null)} />}
+      {error && <ErrorLine raw={error} failed={t.toolsChangeFailed} onDismiss={() => setError(null)} />}
       <div className="border-t border-border pt-3 text-xs text-muted-foreground">
-        Reviewed calls: {tools.reviewTools.join(", ")}
+        {fill(t.reviewedCalls, { names: tools.reviewTools.join(", ") })}
       </div>
     </CardContent>
   </Card>;

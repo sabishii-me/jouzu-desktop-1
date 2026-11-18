@@ -63,12 +63,15 @@ cargo run --manifest-path host/Cargo.toml -- --dist dist --home <host home> `
 Use a throwaway `--home` and `--runtime-home` for experiments; never point a development host
 at a real installation's data.
 
-The window's listener is loopback only, and the host prints its URL. `host.json` in the home folder names the
-port and a per-run token:
+The window's listener is loopback only. When it is listening, the host writes one line to its
+standard output: `{"event":"ready","port":…,"token":…,"build":…}`. That line is the only place
+the per-run API token leaves the host: `host.json` in the home folder names the port, pid and
+build, never the token, because the agent's tools run as the same user and can read any file
+there (#130). Whoever starts the host keeps the token:
 
 ```powershell
-$h = Get-Content <host home>\host.json | ConvertFrom-Json
-Invoke-RestMethod "http://127.0.0.1:$($h.port)/v1/health" -Headers @{ Authorization = "Bearer $($h.token)" }
+$ready = (& jouzu-host --home <throwaway home> ... | Select-Object -First 1) | ConvertFrom-Json
+Invoke-RestMethod "http://127.0.0.1:$($ready.port)/v1/health" -Headers @{ Authorization = "Bearer $($ready.token)" }
 ```
 
 Opening `http://127.0.0.1:<port>/?token=<token>` in a browser exchanges the token for an

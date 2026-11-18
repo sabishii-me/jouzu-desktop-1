@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '../components/ui/button';
 import { ErrorLine } from "../session-alerts-view";
+import { useChatText } from "../chat-text";
 
 /** One row of the System section: which copy a component uses, and what is still missing. */
 export function ComponentSection({ title, status, note, tone, busy, error, install, installLabel }: {
@@ -10,6 +11,7 @@ export function ComponentSection({ title, status, note, tone, busy, error, insta
   busy: boolean; error: string | null;
   install?: () => void; installLabel: string;
 }) {
+  const t = useChatText();
   return <section className="flex flex-col gap-2 border-t border-border px-5 py-4" aria-label={title}>
     <div>
       <h3 className="font-medium">{title}</h3>
@@ -22,7 +24,7 @@ export function ComponentSection({ title, status, note, tone, busy, error, insta
         {<Button disabled={busy || !install} onClick={install}>{installLabel}</Button>}
     </div>
     {note && <p role="status" className="text-xs text-muted-foreground">{note}</p>}
-    {error && <ErrorLine raw={error} failed="This component action did not complete." />}
+    {error && <ErrorLine raw={error} failed={t.componentActionFailed} />}
   </section>;
 }
 

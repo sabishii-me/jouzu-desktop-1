@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ansiParts, imageBlocks } from "./tool-output";
+import { chatTexts } from "../chat-text";
 
 describe("tool output ANSI rendering", () => {
   it("preserves plain text and removes SGR escapes", () => {
@@ -21,18 +22,18 @@ describe("tool output ANSI rendering", () => {
 });
 describe("tool output images", () => {
   it("extracts a supported image block", () => {
-    const images = imageBlocks({ content: [{ type: "text", text: "x" }, { type: "image", mimeType: "image/png", data: "QUJD" }] });
+    const images = imageBlocks({ content: [{ type: "text", text: "x" }, { type: "image", mimeType: "image/png", data: "QUJD" }] }, chatTexts.en.toolOutputImage);
     expect(images).toEqual([{ mime: "image/png", data: "QUJD", alt: "Tool output image", bytes: 3, tooLarge: false }]);
   });
 
   it("keeps an unsupported type so the card can explain it", () => {
-    expect(imageBlocks({ content: [{ type: "image", mimeType: "image/svg+xml", data: "x" }] })).toEqual([
+    expect(imageBlocks({ content: [{ type: "image", mimeType: "image/svg+xml", data: "x" }] }, chatTexts.en.toolOutputImage)).toEqual([
       { mime: "image/svg+xml", data: "x", alt: "Tool output image", bytes: 0, tooLarge: false },
     ]);
   });
 
   it("keeps oversized data for the card instead of dropping it", () => {
-    const [image] = imageBlocks({ content: [{ type: "image", mimeType: "image/png", data: "x".repeat(12 * 1024 * 1024) }] });
+    const [image] = imageBlocks({ content: [{ type: "image", mimeType: "image/png", data: "x".repeat(12 * 1024 * 1024) }] }, chatTexts.en.toolOutputImage);
     expect(image.tooLarge).toBe(true);
     expect(image.bytes).toBeGreaterThan(8 * 1024 * 1024);
   });

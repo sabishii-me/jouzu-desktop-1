@@ -2,13 +2,18 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde_json::Value;
 use tauri::Manager;
 
 pub struct HostProcess(pub Mutex<Option<(Child, isize)>>);
+
+/// Where this app's host listens and the token that opens its API. The host
+/// hands the token only to this process (its first stdout line); it is never in
+/// a file the agent's tools could read (#130).
+static HOST_API: Mutex<Option<(u64, String)>> = Mutex::new(None);
 
 pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
     let managed = crate::runtime::managed_root()?;
@@ -28,7 +33,7 @@ pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
         .arg("--runtime-home")
         .arg(&runtime_home)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     // The host is a console program; without this flag Windows opens an empty
     // console window next to the app.
@@ -50,30 +55,41 @@ pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
         }
     };
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            return Err("The host did not publish host.json in time".into());
-        }
-        if let Ok(text) = std::fs::read_to_string(&info_path) {
-            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                let port = value.get("port").and_then(Value::as_u64);
-                let token = value.get("token").and_then(Value::as_str);
-                if let (Some(port), Some(token)) = (port, token) {
-                    if let Err(error) = check_build(value.get("build").and_then(Value::as_str)) {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        close_job(job);
-                        return Err(error);
-                    }
-                    app.manage(HostProcess(Mutex::new(Some((child, job)))));
-                    return Ok(format!("http://127.0.0.1:{port}/?token={token}"));
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    // The host's first stdout line says where it listens and gives the token.
+    // Whatever it writes after that is read and dropped so it never blocks.
+    let (ready, line) = std::sync::mpsc::channel::<String>();
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let mut reader = BufReader::new(stdout);
+            let mut first = String::new();
+            let _ = reader.read_line(&mut first);
+            let _ = ready.send(first);
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+        });
     }
+    let failed = |child: &mut Child, error: String| -> Result<String, String> {
+        let _ = child.kill();
+        let _ = child.wait();
+        close_job(job);
+        Err(error)
+    };
+    let first = match line.recv_timeout(Duration::from_secs(15)) {
+        Ok(first) => first,
+        Err(_) => return failed(&mut child, "The host did not start in time".into()),
+    };
+    let value = serde_json::from_str::<Value>(first.trim()).unwrap_or(Value::Null);
+    let port = value.get("port").and_then(Value::as_u64);
+    let token = value.get("token").and_then(Value::as_str).map(str::to_string);
+    let (Some(port), Some(token)) = (port, token) else {
+        return failed(&mut child, "The host stopped before it was ready".into());
+    };
+    if let Err(error) = check_build(value.get("build").and_then(Value::as_str)) {
+        return failed(&mut child, error);
+    }
+    *HOST_API.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((port, token.clone()));
+    app.manage(HostProcess(Mutex::new(Some((child, job)))));
+    Ok(format!("http://127.0.0.1:{port}/?token={token}"))
 }
 
 pub fn stop(app: &tauri::AppHandle) {
@@ -237,15 +253,11 @@ fn host_binary(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 /// Ask the running host to stop every session before an update swaps the runtime.
 pub fn stop_sessions() -> Result<(), String> {
-    let managed = crate::runtime::managed_root()?;
-    let text = std::fs::read_to_string(managed.join("host.json"))
-        .map_err(|_| "The host is not running.".to_string())?;
-    let value: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
-    let port = value.get("port").and_then(Value::as_u64).ok_or("The host has no port.")?;
-    let token = value
-        .get("token")
-        .and_then(Value::as_str)
-        .ok_or("The host has no token.")?;
+    let (port, token) = HOST_API
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .ok_or("The host is not running.")?;
     reqwest::blocking::Client::new()
         .post(format!("http://127.0.0.1:{port}/v1/sessions/stop-all"))
         .bearer_auth(token)

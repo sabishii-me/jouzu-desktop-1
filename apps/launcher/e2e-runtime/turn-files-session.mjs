@@ -2,6 +2,7 @@ import { chromium } from '@playwright/test';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { hostAccess } from './host-access.mjs';
 
 // Regression check for #79: the files a turn changed are shown only under the session
 // that ran the turn, never under another session put on screen afterwards.
@@ -20,7 +21,7 @@ if (!hostHome || !wsA || !wsB) {
   console.error('JOUZU_E2E_HOST_HOME, JOUZU_E2E_WS_A and JOUZU_E2E_WS_B must be set; skipping.');
   process.exit(2);
 }
-const host = JSON.parse(readFileSync(join(hostHome, 'host.json'), 'utf8'));
+const host = hostAccess(hostHome);
 const base = `http://127.0.0.1:${host.port}`;
 const results = [];
 const check = (name, ok, detail) => { results.push({ name, ok: !!ok, detail }); };

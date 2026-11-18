@@ -1,5 +1,6 @@
 import type { ChatImage } from "./chat-types";
 import { newId } from "./secure-context";
+import { InputError } from "./input-error";
 
 export const IMAGE_ACCEPT = "image/png,image/jpeg,image/webp,image/gif";
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -18,13 +19,13 @@ export interface ImageAttachment { id: string; name: string; size: number; image
 type ImageFile = { type: string; size: number };
 
 export function validateImageSelection(existing: readonly { size: number }[], files: readonly ImageFile[]) {
-  if (existing.length + files.length > MAX_IMAGES) throw new Error("Attach at most 4 images.");
+  if (existing.length + files.length > MAX_IMAGES) throw new InputError("image-count", "Attach at most 4 images.", { n: MAX_IMAGES });
   for (const file of files) {
-    if (!IMAGE_ACCEPT.split(",").includes(file.type)) throw new Error("Choose PNG, JPEG, WebP, or GIF images only.");
-    if (!Number.isSafeInteger(file.size) || file.size <= 0) throw new Error("Images must not be empty.");
+    if (!IMAGE_ACCEPT.split(",").includes(file.type)) throw new InputError("image-type", "Choose PNG, JPEG, WebP, or GIF images only.");
+    if (!Number.isSafeInteger(file.size) || file.size <= 0) throw new InputError("image-empty", "Images must not be empty.");
   }
   if ([...existing, ...files].reduce((total, file) => total + file.size, 0) > MAX_TOTAL_IMAGE_BYTES) {
-    throw new Error("Images must total 20 MB or less.");
+    throw new InputError("image-total", "Images must total 20 MB or less.");
   }
 }
 
@@ -37,7 +38,7 @@ export function validateImageBytes(bytes: Uint8Array, mimeType: string): ChatIma
     : mimeType === "image/gif" ? starts([71, 73, 70, 56, 55, 97]) || starts([71, 73, 70, 56, 57, 97])
     : mimeType === "image/webp" ? starts([82, 73, 70, 70]) && bytes.length >= 12 && starts([87, 69, 66, 80], 8)
     : false;
-  if (!valid || bytes.length > MAX_IMAGE_BYTES) throw new Error("Image contents do not match a supported image type or exceed 10 MB.");
+  if (!valid || bytes.length > MAX_IMAGE_BYTES) throw new InputError("image-invalid", "Image contents do not match a supported image type or exceed 10 MB.");
   return mimeType as ChatImage["mimeType"];
 }
 
@@ -86,7 +87,7 @@ export function assertMinimumImageSide(bytes: Uint8Array, mimeType: string): voi
   const size = imageDimensions(bytes, mimeType);
   if (!size) return;
   if (Math.min(size.width, size.height) < MIN_IMAGE_SIDE) {
-    throw new Error(`This image is ${size.width}\u00d7${size.height}px. Every side must be at least ${MIN_IMAGE_SIDE}px for the model to accept it.`);
+    throw new InputError("image-too-small", `This image is ${size.width}\u00d7${size.height}px. Every side must be at least ${MIN_IMAGE_SIDE}px for the model to accept it.`, { width: size.width, height: size.height, min: MIN_IMAGE_SIDE });
   }
 }
 
@@ -116,14 +117,14 @@ async function encode(bitmap: ImageBitmap, scale: number): Promise<Uint8Array | 
 export async function fitForSend(bytes: Uint8Array, mimeType: ChatImage["mimeType"]): Promise<{ bytes: Uint8Array; mimeType: ChatImage["mimeType"] }> {
   if (base64Length(bytes.length) <= MAX_SEND_IMAGE_BASE64) return { bytes, mimeType };
   // Re-encoding a still GIF would drop the animation; leave small ones alone and refuse huge ones.
-  if (mimeType === "image/gif") throw new Error("This GIF is too large to send. Use a smaller GIF or a still image.");
+  if (mimeType === "image/gif") throw new InputError("gif-too-large", "This GIF is too large to send. Use a smaller GIF or a still image.");
   let bitmap: ImageBitmap | undefined;
   try {
     const copy = new Uint8Array(bytes.length);
     copy.set(bytes);
     bitmap = await createImageBitmap(new Blob([copy.buffer], { type: mimeType }));
   } catch {
-    throw new Error("This image could not be read.");
+    throw new InputError("image-unreadable", "This image could not be read.");
   }
   try {
     let scale = Math.min(1, MAX_EDGE / Math.max(bitmap.width, bitmap.height));
@@ -136,13 +137,13 @@ export async function fitForSend(bytes: Uint8Array, mimeType: ChatImage["mimeTyp
   } finally {
     bitmap.close();
   }
-  throw new Error("This image is too large to send. Crop it or choose a smaller one.");
+  throw new InputError("image-too-large", "This image is too large to send. Crop it or choose a smaller one.");
 }
 
 export async function readImageAttachment(file: File): Promise<ImageAttachment> {
   validateImageSelection([], [file]);
   const bytes = new Uint8Array(await file.arrayBuffer());
-  if (bytes.length !== file.size) throw new Error("Image size changed while reading.");
+  if (bytes.length !== file.size) throw new InputError("image-changed", "Image size changed while reading.");
   const mimeType = validateImageBytes(bytes, file.type);
   assertMinimumImageSide(bytes, mimeType);
   const prepared = await fitForSend(bytes, mimeType);
