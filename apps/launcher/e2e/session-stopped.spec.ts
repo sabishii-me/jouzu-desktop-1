@@ -5,10 +5,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 /**
- * Issue #111: the host stops the session the window shows (its idle reaper, first
- * tick after the machine resumes from sleep). The window must reopen that
- * conversation by itself, with its transcript, and the next message must go
- * through; it must never stay on "Starting session…".
+ * Issue #111: the host stops the session the window shows. A stopped session is
+ * still that session: the window keeps its transcript and model, Send stays
+ * usable, and the next message starts a runtime for it in the host. It must never
+ * stay on "Starting session…" or mark the message "not sent".
  *
  * Runs the built UI (dist/) against a real host binary with the fixture runtime,
  * on a throwaway home. Build both first: `npm run build` and `cargo build` in host/.
@@ -56,7 +56,7 @@ const api = async (path: string, method = "GET") => {
   return response.json();
 };
 
-test("the window reopens the session it shows after the host stopped it", async ({ page }) => {
+test("the session the window shows takes the next message after the host stopped it", async ({ page }) => {
   // The fixture runtime has no model catalog; offer its one model.
   await page.route("**/v1/models", route => route.fulfill({ json: { models: [{ id: "model", name: "fixture-model", provider: "fixture", available: true }] } }));
   await page.addInitScript(([url, value]) => {
@@ -84,17 +84,18 @@ test("the window reopens the session it shows after the host stopped it", async 
 
   await expect(page.getByText("Starting session…")).toHaveCount(0, { timeout: 5_000 });
   await expect(conversation.getByText("first message").first()).toBeVisible({ timeout: 5_000 });
-  await expect.poll(async () => (await api("/v1/sessions")).sessions
-    .some((session: { sessionPath?: string; status?: string }) => session.sessionPath === bound.sessionPath && session.status === "idle"),
-  { timeout: 5_000 }).toBe(true);
 
   await composer.fill("second message");
   await page.getByRole("button", { name: /^send$/i }).first().click();
   await expect(conversation.getByText("second message")).toHaveCount(2, { timeout: 15_000 });
   await expect(conversation.getByText("first message").first()).toBeVisible();
+  await expect(page.getByText("Not sent")).toHaveCount(0);
+  // The same host session ran it.
+  const after = (await api("/v1/sessions")).sessions.filter((session: { sessionPath?: string }) => session.sessionPath === bound.sessionPath);
+  expect(after.map((session: { sessionId: string }) => session.sessionId)).toEqual([bound.sessionId]);
 });
 
-test("a session stopped right after a model change reopens on that model", async ({ page }) => {
+test("a session stopped right after a model change sends on that model", async ({ page }) => {
   await page.addInitScript(([url, value]) => {
     (window as unknown as { __JOUZU_HOST__?: unknown }).__JOUZU_HOST__ = { baseUrl: url, token: value };
     localStorage.setItem("jouzu.ui.language", "en");
@@ -114,15 +115,19 @@ test("a session stopped right after a model change reopens on that model", async
   await page.getByRole("menuitemradio").filter({ hasText: "Fixture Other" }).first().click();
   await page.waitForTimeout(1_500);
   await api(`/v1/sessions/${bound.sessionId}/stop`, "POST");
-  await expect.poll(async () => (await api("/v1/sessions")).sessions
-    .some((session: { sessionPath?: string; status?: string }) => session.sessionPath === bound.sessionPath && session.status === "idle"),
-  { timeout: 5_000 }).toBe(true);
+  // Stopped, it shows its model without waiting on a runtime.
+  const model = page.getByRole("button", { name: "Model", exact: true }).first();
+  await expect(model).toContainText("Fixture Other", { timeout: 5_000 });
+  await expect(page.locator(".animate-spin")).toHaveCount(0);
   await composer.fill("second message");
   await page.getByRole("button", { name: /^send$/i }).first().click();
   await expect(conversation.getByText("second message")).toHaveCount(2, { timeout: 15_000 });
+  await expect(model).toContainText("Fixture Other");
+  const summary = await api(`/v1/sessions/${bound.sessionId}`);
+  expect(JSON.stringify(summary)).toContain("other");
 });
 
-test("a saved session picked a model from its file view, then stopped, reopens", async ({ page }) => {
+test("a saved session opened from the sidebar shows its own model and sends on it", async ({ page }) => {
   await page.addInitScript(([url, value]) => {
     (window as unknown as { __JOUZU_HOST__?: unknown }).__JOUZU_HOST__ = { baseUrl: url, token: value };
     localStorage.setItem("jouzu.ui.language", "en");
@@ -130,29 +135,37 @@ test("a saved session picked a model from its file view, then stopped, reopens",
   await page.goto(base);
   const composer = page.getByRole("textbox", { name: /message/i }).first();
   const conversation = page.getByRole("region", { name: /conversation/i }).first();
+  const model = page.getByRole("button", { name: "Model", exact: true }).first();
   await composer.fill("alpha message");
   await page.getByRole("button", { name: /^send$/i }).first().click();
   await expect(conversation.getByText("alpha message")).toHaveCount(2, { timeout: 15_000 });
+  await expect(model).toContainText("fixture-model");
   const alpha = (await api("/v1/sessions")).sessions.find((session: { title?: string }) => session.title === "alpha message");
   const line = (role: string, text: string) => `${JSON.stringify({ type: "message", message: { role, content: [{ type: "text", text }], timestamp: Date.now() } })}\n`;
   appendFileSync(alpha.sessionPath, line("user", "alpha message") + line("assistant", "alpha message"));
-  // Another session, while alpha is stopped (not running when it is clicked again).
+  await api(`/v1/sessions/${alpha.sessionId}/stop`, "POST");
+  // Another session, on another model.
   await page.getByRole("button", { name: /new session/i }).first().click();
+  await model.click();
+  await page.getByRole("menuitemradio").filter({ hasText: "Fixture Other" }).first().click();
+  await expect(model).toContainText("Fixture Other");
   await composer.fill("beta message");
   await page.getByRole("button", { name: /^send$/i }).first().click();
   await expect(conversation.getByText("beta message")).toHaveCount(2, { timeout: 15_000 });
-  await api(`/v1/sessions/${alpha.sessionId}/stop`, "POST");
+  // Back to alpha (stopped): its own model, never beta's.
   await page.getByText("alpha message").first().click();
-  await page.waitForTimeout(2_500);
-  await page.getByRole("button", { name: "Model", exact: true }).first().click();
+  await expect(model).toContainText("fixture-model", { timeout: 5_000 });
+  await expect(model).not.toContainText("Fixture Other");
+  // A pick on it, then the host stops it again: the message goes out on the pick.
+  await model.click();
   await page.getByRole("menuitemradio").filter({ hasText: "Fixture Other" }).first().click();
-  await page.waitForTimeout(1_500);
-  const opened = (await api("/v1/sessions")).sessions.find((session: { sessionPath?: string; status?: string }) => session.sessionPath === alpha.sessionPath && session.status !== "stopped");
-  console.log("opened", JSON.stringify(opened));
-  await api(`/v1/sessions/${opened.sessionId}/stop`, "POST");
-  await page.waitForTimeout(3_000);
-  console.log("after stop", JSON.stringify((await api("/v1/sessions")).sessions.filter((session: { sessionPath?: string }) => session.sessionPath === alpha.sessionPath)));
+  await expect(model).toContainText("Fixture Other");
+  for (const session of (await api("/v1/sessions")).sessions.filter((item: { sessionPath?: string }) => item.sessionPath === alpha.sessionPath)) {
+    await api(`/v1/sessions/${session.sessionId}/stop`, "POST");
+  }
   await composer.fill("gamma message");
   await page.getByRole("button", { name: /^send$/i }).first().click();
   await expect(conversation.getByText("gamma message")).toHaveCount(2, { timeout: 15_000 });
+  await expect(model).toContainText("Fixture Other");
+  await expect(page.getByText("Not sent")).toHaveCount(0);
 });
