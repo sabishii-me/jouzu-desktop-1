@@ -84,7 +84,7 @@ export function AgentAction({ thinking, label, running, elapsed, settled, failur
     return <div role="status" data-flow-hold className={`${row} text-amber-700 dark:text-amber-300`}>
       <AlertTriangle className="size-3.5 shrink-0" aria-hidden="true" />
       <span className="min-w-0 flex-1 truncate" title={t.flowHolding}>{t.flowHolding}</span>
-      <DetailsPopover details={hold.details} />
+      {hold.details && <DetailsPopover details={hold.details} />}
       {hold.paused && <Button type="button" variant="outline" className={small} disabled={hold.busy} onClick={hold.onResume}>{t.resume}</Button>}
       <Button type="button" variant="outline" className={small} disabled={hold.busy} onClick={hold.onRelease}>{t.release}</Button>
       <Button type="button" variant="ghost" className={small} disabled={hold.busy} onClick={hold.onOff}>{t.turnOffFlow}</Button>
