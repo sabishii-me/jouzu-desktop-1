@@ -5390,7 +5390,11 @@ mod session_tests {
         // dropped, never handed to a session; after repeated deaths the pool
         // reports the failure and stops trying.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_ne!(pool.status()["pid"].as_u64(), dead, "{}", pool.status());
+        // On a slow machine the first one can die before it answers: then
+        // there is no pid to compare, only the failure below.
+        if dead.is_some() {
+            assert_ne!(pool.status()["pid"].as_u64(), dead, "{}", pool.status());
+        }
         let deadline = Instant::now() + Duration::from_secs(20);
         while pool.status()["state"] != "failed" && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -5520,7 +5524,13 @@ mod session_tests {
         wait_model_state(&session, "ready").await;
         session.send("in-a", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
-        assert_eq!(pool.folders()[0], a, "opening a session makes its folder the most recent");
+        // Its runtime's own session file names the folder as the runtime spells
+        // it (on Windows without the `\\?\` prefix canonicalize adds): the same place.
+        assert!(
+            crate::runtime::warm::same_place(&pool.folders()[0], &a),
+            "opening a session makes its folder the most recent: {:?}",
+            pool.folders()
+        );
         manager.stop_all();
     }
 
