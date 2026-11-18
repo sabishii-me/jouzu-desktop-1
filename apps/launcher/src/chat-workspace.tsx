@@ -1413,6 +1413,18 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       ? { more: activePreview.before !== null, loading: !!activePreview.loading, load: loadEarlierPreview }
       : undefined;
   const activeMessage = conversationProjection.activeMessage === null ? undefined : conversationProjection.messages[conversationProjection.activeMessage];
+  // The composer's model is the shown session's. A saved session shown from its file
+  // (its runtime not attached yet) is not the store's session: its model is the one its
+  // last reply used, as the file records it, until its own runtime reports.
+  const previewOnly = !!activePreview && normalizedPath(activePreview.path) !== normalizedPath(snapshot.sessionFile ?? "");
+  const previewModel = previewOnly ? (() => {
+    const last = [...activePreview!.projection.messages].reverse().find(message => message.provider && message.model);
+    if (!last) return undefined;
+    return knownModels.models.find(model => model.provider === last.provider && model.id === last.model)?.name ?? last.model;
+  })() : undefined;
+  const composerModel = previewOnly
+    ? { models: knownModels.models, model: previewModel, modelState: "resolving" as const, thinkingLevel: undefined, thinkingLevels: [] as string[] }
+    : { models: snapshot.models ?? [], model: snapshot.model, modelState: snapshot.modelState ?? "resolving", thinkingLevel: snapshot.thinkingLevel, thinkingLevels: snapshot.thinkingLevels ?? [] };
   // The host says when the step is reasoning; the words are the step's reasoning block being written.
   const turnStep = conversationProjection.running ? snapshot.activeTurn?.step : undefined;
   const streamingBlock = turnStep?.state === "thinking" ? activeMessage?.content.at(-1) : undefined;
@@ -1633,7 +1645,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
             <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now)} running={conversationProjection.running} elapsed={elapsed} settled={settled} failure={settled === "failed" ? { details: replyError ?? undefined, action: replyRecovery } : undefined} noReply={noReply} hold={hold} notice={runtimeNotice} />
           </div>
           {promptNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{promptNode}</div>}
-          <Composer autoFocus={composerFocus} blocked={blocked} results={controlResults} connected={snapshot.connected || !!activePreview} pending={snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={snapshot.models ?? []} model={snapshot.model} modelState={snapshot.modelState ?? "resolving"} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
+          <Composer autoFocus={composerFocus} blocked={blocked} results={controlResults} connected={snapshot.connected || !!activePreview} pending={snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={composerModel.models} model={composerModel.model} modelState={composerModel.modelState} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={composerModel.thinkingLevel} thinkingLevels={composerModel.thinkingLevels} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
         </div>
         <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>
