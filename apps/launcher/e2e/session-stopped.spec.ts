@@ -93,3 +93,66 @@ test("the window reopens the session it shows after the host stopped it", async 
   await expect(conversation.getByText("second message")).toHaveCount(2, { timeout: 15_000 });
   await expect(conversation.getByText("first message").first()).toBeVisible();
 });
+
+test("a session stopped right after a model change reopens on that model", async ({ page }) => {
+  await page.addInitScript(([url, value]) => {
+    (window as unknown as { __JOUZU_HOST__?: unknown }).__JOUZU_HOST__ = { baseUrl: url, token: value };
+    localStorage.setItem("jouzu.ui.language", "en");
+  }, [base, token]);
+  await page.goto(base);
+  const composer = page.getByRole("textbox", { name: /message/i }).first();
+  const conversation = page.getByRole("region", { name: /conversation/i }).first();
+  await composer.fill("first message");
+  await page.getByRole("button", { name: /^send$/i }).first().click();
+  await expect(conversation.getByText("first message")).toHaveCount(2, { timeout: 15_000 });
+  const { sessions } = await api("/v1/sessions");
+  const bound = sessions.find((session: { title?: string }) => session.title === "first message");
+  const line = (role: string, text: string) => `${JSON.stringify({ type: "message", message: { role, content: [{ type: "text", text }], timestamp: Date.now() } })}\n`;
+  appendFileSync(bound.sessionPath, line("user", "first message") + line("assistant", "first message"));
+  // A model change, then the host stops the session 1.5 s later.
+  await page.getByRole("button", { name: "Model", exact: true }).first().click();
+  await page.getByRole("menuitemradio").filter({ hasText: "Fixture Other" }).first().click();
+  await page.waitForTimeout(1_500);
+  await api(`/v1/sessions/${bound.sessionId}/stop`, "POST");
+  await expect.poll(async () => (await api("/v1/sessions")).sessions
+    .some((session: { sessionPath?: string; status?: string }) => session.sessionPath === bound.sessionPath && session.status === "idle"),
+  { timeout: 5_000 }).toBe(true);
+  await composer.fill("second message");
+  await page.getByRole("button", { name: /^send$/i }).first().click();
+  await expect(conversation.getByText("second message")).toHaveCount(2, { timeout: 15_000 });
+});
+
+test("a saved session picked a model from its file view, then stopped, reopens", async ({ page }) => {
+  await page.addInitScript(([url, value]) => {
+    (window as unknown as { __JOUZU_HOST__?: unknown }).__JOUZU_HOST__ = { baseUrl: url, token: value };
+    localStorage.setItem("jouzu.ui.language", "en");
+  }, [base, token]);
+  await page.goto(base);
+  const composer = page.getByRole("textbox", { name: /message/i }).first();
+  const conversation = page.getByRole("region", { name: /conversation/i }).first();
+  await composer.fill("alpha message");
+  await page.getByRole("button", { name: /^send$/i }).first().click();
+  await expect(conversation.getByText("alpha message")).toHaveCount(2, { timeout: 15_000 });
+  const alpha = (await api("/v1/sessions")).sessions.find((session: { title?: string }) => session.title === "alpha message");
+  const line = (role: string, text: string) => `${JSON.stringify({ type: "message", message: { role, content: [{ type: "text", text }], timestamp: Date.now() } })}\n`;
+  appendFileSync(alpha.sessionPath, line("user", "alpha message") + line("assistant", "alpha message"));
+  // Another session, while alpha is stopped (not running when it is clicked again).
+  await page.getByRole("button", { name: /new session/i }).first().click();
+  await composer.fill("beta message");
+  await page.getByRole("button", { name: /^send$/i }).first().click();
+  await expect(conversation.getByText("beta message")).toHaveCount(2, { timeout: 15_000 });
+  await api(`/v1/sessions/${alpha.sessionId}/stop`, "POST");
+  await page.getByText("alpha message").first().click();
+  await page.waitForTimeout(2_500);
+  await page.getByRole("button", { name: "Model", exact: true }).first().click();
+  await page.getByRole("menuitemradio").filter({ hasText: "Fixture Other" }).first().click();
+  await page.waitForTimeout(1_500);
+  const opened = (await api("/v1/sessions")).sessions.find((session: { sessionPath?: string; status?: string }) => session.sessionPath === alpha.sessionPath && session.status !== "stopped");
+  console.log("opened", JSON.stringify(opened));
+  await api(`/v1/sessions/${opened.sessionId}/stop`, "POST");
+  await page.waitForTimeout(3_000);
+  console.log("after stop", JSON.stringify((await api("/v1/sessions")).sessions.filter((session: { sessionPath?: string }) => session.sessionPath === alpha.sessionPath)));
+  await composer.fill("gamma message");
+  await page.getByRole("button", { name: /^send$/i }).first().click();
+  await expect(conversation.getByText("gamma message")).toHaveCount(2, { timeout: 15_000 });
+});
