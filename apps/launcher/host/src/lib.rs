@@ -5023,6 +5023,12 @@ mod session_tests {
         let model = &session.info()["model"];
         assert_eq!(model["state"], "ready", "{model}");
         assert_eq!(model["id"], first.info()["model"]["id"], "{model}");
+        // While its runtime starts, the model it is expected to report is that one too.
+        session.attach_early();
+        let opening = &session.info()["model"];
+        if opening["state"] == "resolving" {
+            assert_eq!(opening["expected"]["id"], first.info()["model"]["id"], "{opening}");
+        }
         manager.stop_all();
     }
 

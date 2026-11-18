@@ -4655,9 +4655,7 @@ impl Session {
             .clone();
         if !self.runtime_live() {
             // No runtime, so nothing is on its way: the session shows its model.
-            // A saved file that names none (written by an older version) gets the
-            // model a runtime starts it with, as the runtimes last answered.
-            return match self.resting_model().or_else(|| self.config.known.start_model()) {
+            return match self.resting_model() {
                 Some(Value::Object(mut object)) => {
                     object.insert("state".into(), json!("ready"));
                     Value::Object(object)
@@ -4718,6 +4716,9 @@ impl Session {
                 Some((saved.get("provider")?.as_str()?.to_string(), saved.get("id")?.as_str()?.to_string()))
             })
             .map(|(provider, id)| known.find(&provider, &id).unwrap_or_else(|| json!({ "provider": provider, "id": id })))
+            // A saved file that names no model (written by an older version) is
+            // opened on the model a runtime starts with, as the runtimes last answered.
+            .or_else(|| known.start_model())
     }
 
     /// The session's runtime's list once it answered; until then the latest
