@@ -241,6 +241,8 @@ function requestUi(text) {
 
 let inputPhase = false;
 function prompt(id, text, images) {
+  // "/refuse <text>": a slash command the runtime refuses with <text>.
+  if (String(text).startsWith("/refuse ")) { promptLog(text); failure(id, "prompt", String(text).slice(8)); return; }
   if (handledPrompts || String(text).startsWith("/flow ")) {
     promptLog(text);
     if (flowNotices && String(text).trim() === "/flow clear") notify("Flow clear released 1 request hold. Receipt evidence was preserved. Continue with a new message.");
@@ -248,6 +250,9 @@ function prompt(id, text, images) {
     return;
   }
   promptLog(text);
+  // "REFUSE <text>": an input handler refuses the prompt with <text> (like Flow
+  // when its request history is full); no run starts.
+  if (String(text).startsWith("REFUSE ")) { failure(id, "prompt", String(text).slice(7)); return; }
   // "EXTERR <text>" first reports an extension failure, like a real extension would.
   if (String(text).startsWith("EXTERR ")) out({ type: "extension_error", extensionPath: "fake", event: "turn_start", error: String(text).slice(7) });
   // Like the runtime: prompt() awaits the extensions' input handlers before the
@@ -465,6 +470,8 @@ lines.on("line", line => {
       break;
     }
     case "abort":
+      // FAKE_RUNTIME_REFUSE_ABORT=1: the runtime refuses Stop and the run goes on.
+      if (process.env.FAKE_RUNTIME_REFUSE_ABORT === "1") { failure(value.id, "abort", "abort refused"); break; }
       response(value.id, "abort", {});
       if (busy && !inputPhase) {
         interrupted = true;

@@ -1631,7 +1631,7 @@ async fn capabilities(
         "runtimeKind": crate::runtime::adapter::pi::KIND,
         "features": ["chat", "sse", "replay", "prompts", "history-paging", "history-blocks", "models", "config", "tools", "mcp", "recovery", "deferred-sessions"],
         "scopes": scopes,
-        "limits": { "maxMessageBytes": 32768, "maxUploadBytes": 26214400 },
+        "limits": { "maxUploadBytes": 26214400 },
         "defaultWorkspace": default_workspace,
     }))
 }
@@ -3715,13 +3715,19 @@ mod session_tests {
             .unwrap();
         wait_status(&session, Status::Idle).await;
         session.send("mine", "hello").unwrap();
+        // The runtime's own run displaces the prompt for 500 ms: it waits as "delivering".
         wait_until(|| session.summary()["queue"][0]["state"] == "delivering").await;
-        wait_until(|| session.summary()["activeTurn"]["clientMessageId"] == "mine").await;
-        wait_until(|| session.status() == Status::Idle).await;
+        // The prompt's own run is short (a few 15 ms steps), too short to catch
+        // by polling on a loaded machine. Wait for its outcome instead: it was
+        // the run's own message, after the runtime's reply, then answered.
+        wait_until(|| {
+            session.status() == Status::Idle
+                && conversation(&session) == vec!["assistant:ok", "user:hello", "assistant:hello"]
+        })
+        .await;
         let summary = session.summary();
         assert!(summary["failedTurn"].is_null() && summary["queue"].as_array().is_some_and(Vec::is_empty), "{summary}");
-        let rows = conversation(&session);
-        assert_eq!(rows, vec!["assistant:ok", "user:hello", "assistant:hello"], "{rows:?}");
+
         assert_eq!(std::fs::read_to_string(&steer_log).unwrap_or_default(), "", "never steered");
     }
 
@@ -3952,9 +3958,11 @@ mod session_tests {
         assert_eq!(summary["status"], "error", "{summary}");
         assert!(summary["activeTurn"].is_null(), "a failed session keeps no turn waiting: {summary}");
         assert_eq!(session.runtime_pid(), None, "a failed session keeps no runtime");
+        // The one session-level error is the snapshot's `failure`, never also an event.
+        assert_eq!(summary["failure"]["code"], code, "{summary}");
+        assert_eq!(summary["failure"]["recovery"], "restart", "{summary}");
         let (events, _) = session.events_after(1);
-        let error = events.iter().rev().find(|event| event.event == "error").expect("an error event");
-        assert_eq!(error.data["code"], code, "{}", error.data);
+        assert!(events.iter().all(|event| event.event != "error"), "a failure is not reported twice");
         // Stop has nothing left to wait for (it used to answer "cancelling" or
         // leave "Stopping…" up forever).
         let stop = session.cancel_message("waiting").unwrap();
@@ -3972,10 +3980,9 @@ mod session_tests {
         .await;
         wait_until(|| session.status() == Status::Error).await;
         assert_failed_and_settled(&session, "session-attach-failed");
-        let (events, _) = session.events_after(1);
-        let error = events.iter().rev().find(|event| event.event == "error").unwrap();
-        let message = error.data["message"].as_str().unwrap();
-        assert!(message.contains("Flow session metadata is missing or inconsistent."), "{message}");
+        // The runtime's own words, unwrapped: the client localizes from the code.
+        let summary = session.summary();
+        assert_eq!(summary["failure"]["text"], "Flow session metadata is missing or inconsistent.", "{summary}");
         // The refusal is about the file, not the runtime: no restart may follow.
         tokio::time::sleep(Duration::from_millis(600)).await;
         let started = std::fs::read_to_string(starts.path()).unwrap().lines().count();
@@ -4513,7 +4520,7 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn an_extension_failure_is_reported_but_a_stale_context_race_is_not() {
+    async fn an_extension_failure_is_a_notice_not_a_session_error_and_a_stale_context_race_is_neither() {
         let (manager, _home, workspace) = manager(50);
         let session = manager
             .create(workspace.path().to_str().unwrap(), None, None)
@@ -4534,7 +4541,8 @@ mod session_tests {
                     .await
                     .expect("timed out")
                     .expect("stream closed");
-                if name == "error" {
+                assert_ne!(name, "error", "an extension failure is not a session error: {data}");
+                if name == "session.notice" && data["source"] == "extension" {
                     errors.push(data);
                 } else if name == "turn.end" {
                     break;
@@ -4544,7 +4552,89 @@ mod session_tests {
         reader.abort();
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0]["message"], "flow guard crashed");
-        assert_eq!(errors[0]["code"], "extension-error");
+        assert_eq!(errors[0]["level"], "error");
+        // The run it happened in carries on and the session stays usable.
+        assert_eq!(session.status(), Status::Idle);
+        assert!(session.summary()["failure"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_refused_prompt_is_that_message_failure_only() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("refused-1", "REFUSE Request history is full").unwrap();
+        wait_until(|| !session.summary()["failedTurn"].is_null()).await;
+        let summary = session.summary();
+        // The message that got no reply carries the runtime's own words.
+        assert_eq!(summary["failedTurn"]["clientMessageId"], "refused-1", "{summary}");
+        assert_eq!(summary["failedTurn"]["error"]["code"], "prompt-refused", "{summary}");
+        assert_eq!(summary["failedTurn"]["error"]["text"], "Request history is full", "{summary}");
+        // Nothing else: the session is not failed and no session-wide error is published.
+        assert!(summary["failure"].is_null() && summary["activeTurn"].is_null(), "{summary}");
+        wait_status(&session, Status::Idle).await;
+        let (events, _) = session.events_after(1);
+        assert!(events.iter().all(|event| event.event != "error"), "{events:?}");
+        // The next message clears it.
+        session.send("after-1", "hello").unwrap();
+        assert!(session.summary()["failedTurn"].is_null());
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_refused_slash_command_is_its_answer_and_leaves_the_failed_message() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("refused-1", "REFUSE Request history is full").unwrap();
+        wait_until(|| !session.summary()["failedTurn"].is_null()).await;
+        wait_status(&session, Status::Idle).await;
+        // The command meant to rescue it is refused: that is the command's answer.
+        session.send("command-1", "/refuse nothing to clear").unwrap();
+        wait_until(|| {
+            session.events_after(1).0.iter().any(|event| {
+                event.event == "session.command_done" && event.data["id"] == "command-1"
+            })
+        })
+        .await;
+        let (events, _) = session.events_after(1);
+        let done = events
+            .iter()
+            .find(|event| event.event == "session.command_done" && event.data["id"] == "command-1")
+            .unwrap();
+        assert_eq!(done.data["success"], false, "{:?}", done.data);
+        assert_eq!(done.data["error"], "nothing to clear", "{:?}", done.data);
+        wait_status(&session, Status::Idle).await;
+        // The failed message, and its Retry, are still the refused message.
+        let summary = session.summary();
+        assert_eq!(summary["failedTurn"]["clientMessageId"], "refused-1", "{summary}");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_refused_stop_says_so_at_stop_and_the_run_goes_on() {
+        let (manager, _home, workspace) = manager_with_env(
+            200,
+            &[("FAKE_RUNTIME_DELAY_MS", "60"), ("FAKE_RUNTIME_REFUSE_ABORT", "1")],
+        );
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("first", "a reply that is long enough to stop part way").unwrap();
+        wait_until(|| session.summary()["activeTurn"]["phase"] == "running").await;
+        assert_eq!(session.interrupt().unwrap()["status"], "cancelling");
+        wait_until(|| session.summary()["activeTurn"]["stopError"] == "abort refused").await;
+        let summary = session.summary();
+        // Not "Stopping…" forever: the run is running, and Stop says why it did not stop.
+        assert_eq!(summary["activeTurn"]["phase"], "running", "{summary}");
+        assert!(summary["failure"].is_null(), "{summary}");
+        wait_status(&session, Status::Idle).await;
+        manager.stop_all();
     }
 
     #[tokio::test]

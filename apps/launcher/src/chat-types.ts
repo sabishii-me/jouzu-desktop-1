@@ -59,6 +59,8 @@ export interface ActiveTurn {
   phase: string;
   startedAt?: number;
   step?: TurnStep;
+  /** The runtime refused the last Stop (its words); the run goes on. */
+  stopError?: string;
 }
 /** A message waiting for the running turn (steer) or, after Stop, for Continue. */
 /**
@@ -89,6 +91,9 @@ export interface OutboxItem {
   text: string;
   images: ChatImage[];
   state: "sending" | "failed";
+  /** The host's code for why it was not sent; the UI words it. */
+  code?: string;
+  /** The original text of the failure, for Details. */
   error?: string;
   at: number;
 }
@@ -98,8 +103,12 @@ export interface ChatSnapshot {
   connected: boolean;
   /** True while one of the user's own messages has not been confirmed by the host. */
   pending: boolean;
-  /** The last error for this session, shown in the banner area. */
-  error: string | null;
+  /** Why this window has no live connection to the session (attach failed or the stream dropped). */
+  connectionError: string | null;
+  /** The host ended the session because of an error (`failure`): the one session-level error. */
+  failure?: { code: string; text: string } | null;
+  /** The runtime refused to list its models (its words); shown at the model control. */
+  modelListError?: string | null;
   /** The session is open but its transcript could not be read. */
   historyError?: string;
   /** Earlier messages exist before the loaded history (#20). */
@@ -126,7 +135,8 @@ export interface ChatSnapshot {
   /** Host-measured time from a prompt reaching the runtime to its first output. */
   firstOutput?: { turns: number; avgMs: number | null; lastMs: number | null };
   queue?: QueuedMessage[];
-  failedTurn?: { clientMessageId: string; text: string } | null;
+  /** The last message that got no reply, with the runtime's reason when it refused it. */
+  failedTurn?: { clientMessageId: string; text: string; error?: { code: string; text: string } } | null;
   /** Extension widgets and status lines, as the host last reported them. */
   widgets?: Record<string, string[]>;
   statuses?: Record<string, string>;
@@ -135,5 +145,5 @@ export interface ChatSnapshot {
   /** TextGuard's mode as last confirmed by the runtime, and any content it withheld. */
   textguard?: { mode?: TextGuardMode; alert?: string };
   /** The latest transient runtime notice (command replies and the like). */
-  notice?: { id: number; text: string; level: "info" | "warning" | "error" } | null;
+  notice?: { id: number; text: string; level: "info" | "warning" | "error"; source?: "extension" } | null;
 }

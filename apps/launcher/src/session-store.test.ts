@@ -222,9 +222,9 @@ describe("SessionStore", () => {
     session.cancel = async () => { throw new Error("host unreachable"); };
     const store = SessionStore.attach(session);
     const pending = store.send("hello", [], "client-1");
-    await store.stop();
+    // The failure goes back to whoever pressed Stop; it is not a session error.
+    await expect(store.stop()).rejects.toThrow("host unreachable");
     expect(store.snapshot.outbox).toMatchObject([{ clientMessageId: "client-1", text: "hello", state: "sending" }]);
-    expect(store.snapshot.error).toContain("host unreachable");
     release();
     await pending;
     expect(store.snapshot.outbox).toEqual([]);
@@ -372,8 +372,9 @@ describe("SessionStore", () => {
     const session = fakeSession();
     const store = SessionStore.attach(session);
     session.emit(event(1, "session.notice", { message: "Flow control is holding your message: budget. Run /flow for the control that releases it." }));
-    await store.flow("clear");
-    expect(session.sent).toMatchObject([{ text: "/flow clear" }]);
+    // The command settles when the runtime has answered it, not when it is accepted.
+    const cleared = store.flow("clear");
+    await vi.waitFor(() => expect(session.sent).toMatchObject([{ text: "/flow clear" }]));
     const id = (session.sent[0] as { clientMessageId: string }).clientMessageId;
     const command = { id, text: "/flow clear", origin: "user" };
     // Accepted is not answered: the banner stays until the runtime has replied.
@@ -381,8 +382,43 @@ describe("SessionStore", () => {
     session.emit(event(2, "session.notice", { message: "Flow clear released 1 request hold. Receipt evidence was preserved. Continue with a new message.", command }));
     session.emit(event(3, "session.command_done", { ...command, success: true }));
     expect(store.snapshot.flowHold).toBeNull();
-    await store.setTextGuardMode("off");
-    expect(session.sent).toMatchObject([{ text: "/flow clear" }, { text: "/textguard off" }]);
+    await cleared;
+    const off = store.setTextGuardMode("off");
+    await vi.waitFor(() => expect(session.sent).toMatchObject([{ text: "/flow clear" }, { text: "/textguard off" }]));
+    const second = (session.sent[1] as { clientMessageId: string }).clientMessageId;
+    session.emit(event(4, "session.command_done", { id: second, text: "/textguard off", origin: "user", success: true }));
+    await off;
+  });
+
+  it("a refused slash command rejects with the runtime's words, at the control that ran it", async () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    const run = store.flow("resume");
+    await vi.waitFor(() => expect(session.sent).toHaveLength(1));
+    const id = (session.sent[0] as { clientMessageId: string }).clientMessageId;
+    session.emit(event(1, "session.command_done", { id, text: "/flow resume", origin: "user", success: false, error: "Nothing is paused" }));
+    await expect(run).rejects.toThrow("Nothing is paused");
+    // It is not the session's failed message.
+    expect(store.snapshot.failedTurn ?? null).toBeNull();
+  });
+
+  it("a command whose turn ends without an answer has run", async () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    const run = store.runCommand("/flow status");
+    await vi.waitFor(() => expect(session.sent).toHaveLength(1));
+    const id = (session.sent[0] as { clientMessageId: string }).clientMessageId;
+    session.emit(event(1, "session.updated", { activeTurn: { turnId: "t-1", clientMessageId: id, phase: "running" } }));
+    session.emit(event(2, "session.updated", { activeTurn: null }));
+    await expect(run).resolves.toBeUndefined();
+  });
+
+  it("Stop refused by the runtime, and a model list it could not give, are kept for their controls", () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "session.updated", { activeTurn: { turnId: "t-1", phase: "running", stopError: "abort failed" }, modelListError: "registry down" }));
+    expect(store.snapshot.activeTurn?.stopError).toBe("abort failed");
+    expect(store.snapshot.modelListError).toBe("registry down");
   });
 
   it("keeps the banner when /flow clear reports a hold it could not lift", async () => {
@@ -556,5 +592,32 @@ describe("SessionStore", () => {
     store.dispose();
     store.dispose();
     expect(onDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("takes the session's one failure from the host snapshot, and nothing from a bare error event", async () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "error", { code: "runtime-error", message: "boom" }));
+    expect(store.snapshot.failure ?? null).toBeNull();
+    session.emit(event(2, "session.updated", { status: "error", failure: { code: "runtime-crashed", text: "runtime exited", recovery: "restart" } }));
+    expect(store.snapshot.failure).toEqual({ code: "runtime-crashed", text: "runtime exited" });
+    expect(store.snapshot.connectionError).toBeNull();
+  });
+
+  it("keeps a refused message's reason with that message", async () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "session.updated", { failedTurn: { clientMessageId: "c-1", text: "hello", error: { code: "prompt-refused", text: "Request history is full" } } }));
+    expect(store.snapshot.failedTurn).toEqual({ clientMessageId: "c-1", text: "hello", error: { code: "prompt-refused", text: "Request history is full" } });
+    session.emit(event(2, "session.updated", { failedTurn: null }));
+    expect(store.snapshot.failedTurn).toBeNull();
+  });
+
+  it("shows an extension's failure as the runtime's notice, not a session error", async () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "session.notice", { message: "flow guard crashed", level: "error", source: "extension" }));
+    expect(store.snapshot.notice).toMatchObject({ text: "flow guard crashed", level: "error", source: "extension" });
+    expect(store.snapshot.failure ?? null).toBeNull();
   });
 });

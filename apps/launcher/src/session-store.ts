@@ -51,7 +51,7 @@ const emptySnapshot = (): ChatSnapshot => ({
   projection: emptyProjection(),
   connected: false,
   pending: false,
-  error: null,
+  connectionError: null,
   models: [],
   thinkingLevels: [],
   prompts: [],
@@ -62,6 +62,8 @@ const emptySnapshot = (): ChatSnapshot => ({
 
 type Data = Record<string, unknown>;
 const text = (value: unknown): string | undefined => typeof value === "string" ? value : undefined;
+/** The host's code on a refused request, when it has one. */
+const errorCode = (error: unknown): string | undefined => error && typeof error === "object" ? text((error as { code?: unknown }).code) : undefined;
 
 /** One row of the runtime's model list, as the host relays it. */
 const modelOf = (value: unknown): ChatModel | null => {
@@ -107,7 +109,7 @@ function activeTurnOf(value: unknown): ActiveTurn | null {
   const turnId = text(turn?.turnId);
   if (!turn || !turnId) return null;
   const origin = turn.origin === "runtime" ? "runtime" as const : turn.origin === "user" ? "user" as const : undefined;
-  return { turnId, origin, clientMessageId: text(turn.clientMessageId), phase: text(turn.phase) ?? "running", startedAt: time(turn.startedAt), step: stepOf(turn.step) };
+  return { turnId, origin, clientMessageId: text(turn.clientMessageId), phase: text(turn.phase) ?? "running", startedAt: time(turn.startedAt), step: stepOf(turn.step), ...(text(turn.stopError) ? { stopError: text(turn.stopError) } : {}) };
 }
 
 /** A displayable Flow report: a jouzu-flow message whose text is a JSON object with a kind. */
@@ -241,6 +243,8 @@ export class SessionStore {
   private noticeSeq = 0;
   /** The last reply of each open Flow command that releases a hold, by command id. */
   private flowReplies = new Map<string, SessionNotice | null>();
+  /** Slash commands this window ran, until the runtime answers each. */
+  private commandWaits = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
   private shownOutput: string | null = null;
 
   private constructor(
@@ -364,7 +368,6 @@ export class SessionStore {
 
   isDisposed(): boolean { return this.disposed; }
 
-  clearError(): void { this.update({ error: null }); }
 
   retryHistory(): Promise<void> { return this.refreshHistory(); }
 
@@ -443,7 +446,7 @@ export class SessionStore {
   async send(messageText: string, images: readonly ChatImage[] = [], clientMessageId: string = newId()): Promise<Receipt> {
     const existing = this.state.outbox?.find(item => item.clientMessageId === clientMessageId);
     const item: OutboxItem = existing
-      ? { ...existing, state: "sending", error: undefined }
+      ? { ...existing, state: "sending", error: undefined, code: undefined }
       : { clientMessageId, text: messageText, images: [...images], state: "sending", at: Date.now() };
     this.setOutbox([...(this.state.outbox ?? []).filter(entry => entry.clientMessageId !== clientMessageId), item]);
     if (!existing) this.markShown("message.shown", clientMessageId);
@@ -457,7 +460,7 @@ export class SessionStore {
       return receipt;
     } catch (error) {
       if (this.state.outbox?.some(entry => entry.clientMessageId === clientMessageId)) {
-        this.setOutbox((this.state.outbox ?? []).map(entry => entry.clientMessageId === clientMessageId ? { ...entry, state: "failed", error: describeError(error) } : entry));
+        this.setOutbox((this.state.outbox ?? []).map(entry => entry.clientMessageId === clientMessageId ? { ...entry, state: "failed", error: describeError(error), code: errorCode(error) } : entry));
       }
       throw error;
     }
@@ -528,9 +531,27 @@ export class SessionStore {
     } catch { /* Session counters are ancillary; chat remains usable. */ }
   }
 
+  /**
+   * Run a slash command and settle when the runtime has answered it: a refusal
+   * rejects with the runtime's words, so the control that ran it says so
+   * (a refused command is never a failed message).
+   */
   async runCommand(command: string): Promise<void> {
     if (this.running) throw new Error("Wait for the current turn to finish before running a command.");
-    await this.session.send({ clientMessageId: newId(), text: command });
+    const id = newId();
+    const answered = new Promise<void>((resolve, reject) => this.commandWaits.set(id, { resolve, reject }));
+    try { await this.session.send({ clientMessageId: id, text: command }); }
+    catch (error) { this.commandWaits.delete(id); throw error; }
+    return answered;
+  }
+
+  /** A command's answer arrived (or its turn ended without one: it ran). */
+  private finishCommand(id: string | undefined, refused?: string): void {
+    const wait = id ? this.commandWaits.get(id) : undefined;
+    if (!wait || !id) return;
+    this.commandWaits.delete(id);
+    if (refused === undefined) wait.resolve();
+    else wait.reject(new Error(refused || "The runtime refused the command."));
   }
 
   /** TextGuard's three modes; the runtime's reply confirms the mode shown. */
@@ -550,10 +571,6 @@ export class SessionStore {
    */
   async flow(verb: "clear" | "resume" | "off" | "on" | "status"): Promise<void> {
     await this.runCommand(verb === "status" ? "/flow" : `/flow ${verb}`);
-  }
-
-  dismissFlowHold(): void {
-    this.update({ flowHold: null });
   }
 
   /**
@@ -578,15 +595,14 @@ export class SessionStore {
       const outbox = this.state.outbox ?? [];
       const restore = pending.filter(entry => !outbox.some(item => item.clientMessageId === entry.clientMessageId));
       if (restore.length) this.setOutbox([...outbox, ...restore]);
-      this.update({ error: describeError(error) });
+      throw error;
     }
   }
 
   /** Remove a waiting message; it never reaches the runtime. */
   async unqueue(clientMessageId: string): Promise<void> {
     this.waitingImages.delete(clientMessageId);
-    try { await this.session.cancel(clientMessageId); }
-    catch (error) { this.update({ error: describeError(error) }); }
+    await this.session.cancel(clientMessageId);
   }
 
   /** Take a waiting message back to edit it: its text and images, removed from the queue. */
@@ -599,8 +615,7 @@ export class SessionStore {
   }
 
   async queue(action: "continue" | "discard" | "retry"): Promise<void> {
-    try { await this.session.queue(action); }
-    catch (error) { this.update({ error: describeError(error) }); }
+    await this.session.queue(action);
   }
 
   async compactSession(): Promise<void> {
@@ -640,6 +655,7 @@ export class SessionStore {
   close(): Promise<void> {
     if (this.disposed) return Promise.resolve();
     this.disposed = true;
+    for (const id of [...this.commandWaits.keys()]) this.finishCommand(id);
     this.detachStream();
     this.session.detach();
     this.listeners.clear();
@@ -649,6 +665,7 @@ export class SessionStore {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    for (const id of [...this.commandWaits.keys()]) this.finishCommand(id);
     this.detachStream();
     this.session.detach();
     this.onDispose?.();
@@ -656,7 +673,7 @@ export class SessionStore {
   }
 
   private fail(error: unknown): void {
-    this.update({ connected: false, error: describeError(error) });
+    this.update({ connected: false, connectionError: describeError(error) });
   }
 
   private update(patch: Partial<ChatSnapshot>): void {
@@ -701,6 +718,8 @@ export class SessionStore {
       ? activeTurn.startedAt ?? (previous?.turnId === activeTurn.turnId ? previous.startedAt : undefined) ?? Date.now()
       : undefined;
     const turn = activeTurn ? { ...activeTurn, startedAt } : null;
+    // A command's turn ended without a refusal: it ran.
+    if (previous?.clientMessageId && previous.clientMessageId !== turn?.clientMessageId) this.finishCommand(previous.clientMessageId);
     this.update({
       activeTurn: turn,
       projection: {
@@ -716,6 +735,8 @@ export class SessionStore {
   private applySummary(data: Data): void {
     const prompts = promptsOf(data.pendingApprovals, data.pendingQuestions);
     const failed = record(data.failedTurn);
+    const failedError = record(failed?.error);
+    const failure = record(data.failure);
     // The session's model, its list and levels are the runtime's, as the host relays them.
     const selected = record(data.model);
     const modelState = selected ? modelStateOf(selected.state) : this.state.modelState;
@@ -732,7 +753,9 @@ export class SessionStore {
       ...(text(data.thinkingLevel) ? { thinkingLevel: text(data.thinkingLevel) } : {}),
       ...(record(data.firstOutput) ? { firstOutput: firstOutputOf(record(data.firstOutput)!) } : {}),
       ...("queue" in data ? { queue: queueOf(data.queue) } : {}),
-      ...("failedTurn" in data ? { failedTurn: failed && text(failed.clientMessageId) ? { clientMessageId: text(failed.clientMessageId)!, text: text(failed.text) ?? "" } : null } : {}),
+      ...("failedTurn" in data ? { failedTurn: failed && text(failed.clientMessageId) ? { clientMessageId: text(failed.clientMessageId)!, text: text(failed.text) ?? "", ...(failedError ? { error: { code: text(failedError.code) ?? "", text: text(failedError.text) ?? "" } } : {}) } : null } : {}),
+      ...("failure" in data ? { failure: failure ? { code: text(failure.code) ?? "", text: text(failure.text) ?? "" } : null } : {}),
+      ...("modelListError" in data ? { modelListError: text(data.modelListError) ?? null } : {}),
       ...(prompts ? { prompts } : {}),
       ...("widgets" in data ? { widgets: widgetsOf(data.widgets) } : {}),
       ...("statuses" in data ? { statuses: statusesOf(data.statuses) } : {}),
@@ -741,8 +764,13 @@ export class SessionStore {
     this.applyPreferredModel();
   }
 
-  private applyNotice(message: string, level: unknown, command?: CommandRef): void {
+  private applyNotice(message: string, level: unknown, command?: CommandRef, extension = false): void {
     if (!message.trim()) return;
+    // An extension's failure is the runtime's word to the person, shown as it is.
+    if (extension) {
+      this.update({ notice: { id: ++this.noticeSeq, text: message, level: "error", source: "extension" } });
+      return;
+    }
     const notice = classifyNotice(message, level);
     if (command && releasesFlow(command.text)) {
       this.flowReplies.set(command.id, notice);
@@ -936,15 +964,14 @@ export class SessionStore {
         break;
       }
       case "session.notice":
-        this.applyNotice(text(data.message) ?? "", data.level, commandOf(data.command));
+        this.applyNotice(text(data.message) ?? "", data.level, commandOf(data.command), data.source === "extension");
         break;
-      case "session.command_done":
-        this.settleCommand(commandOf(data));
+      case "session.command_done": {
+        const command = commandOf(data);
+        this.settleCommand(command);
+        this.finishCommand(command?.id, command?.success === false ? text(data.error) ?? "" : undefined);
         break;
-      case "error":
-        // Turn state is not touched here: the host's summary says whether the turn ended.
-        this.update({ error: text(data.message) ?? "The model runtime reported an error." });
-        break;
+      }
       default:
         break;
     }
