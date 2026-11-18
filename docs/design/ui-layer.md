@@ -27,8 +27,13 @@ not one piece of screen.
   when opened, its output. Tool calls running beside it carry on, and so does the
   reply.
 - **A reply fails** (the model provider stopped it, timed out, ran out of credit).
-  The reply ends with a failed marker and a short reason. The latest failed reply
-  has Retry; earlier ones are just marked. The person can type and send as usual.
+  The reply ends with a failed marker and a short reason, once, on the reply (the
+  status line does not repeat it). The latest failed reply has what recovers it:
+  Retry, or Sign in when the key was refused, Settings when the account is out of
+  credit, Remove images when an image was refused; earlier ones are just marked.
+  Until the runtime can rerun a reply (G12), Retry sends the message again, and a
+  message with images gets no Retry. A request the runtime is still retrying is
+  not a failed reply. The person can type and send as usual.
 - **A message could not be sent.** The message stays in the conversation, dimmed,
   with Retry and Discard. Its text is never lost.
 

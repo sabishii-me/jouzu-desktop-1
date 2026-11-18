@@ -156,7 +156,7 @@ Each error is written to the slot that matches what it interrupted.
 | A message not delivered | The send's response code (the client marks that message) | Sent or discarded |
 | A message the runtime refused, or that lost its runtime | `failedTurn {clientMessageId, text, error {code, text}}`; messages waiting behind it wait for Continue | The next message (not a slash command), or Retry |
 | A slash command the runtime refused | Its answer: `session.command_done` with `success: false` and the runtime's `error` | Next command |
-| A reply (run) | The reply's record (`stopReason: error`, the provider's text) | Never; history |
+| A reply (run) | The reply's record (`stopReason: error`, the provider's text, and `errorCode`: `auth`, `quota`, `rate-limit`, `model-unavailable`, `image`, `unavailable` or `other`, read from that text in one place, `provider_error.rs`, until the runtime gives codes, G6). While the runtime retries, the step's `retry` carries the same code | Never; history |
 | A command in a session (stop, compact, export, model change) | The command's response code. Commands the host sends without a caller waiting keep the runtime's words for their control: Stop's abort as `activeTurn.stopError` (the run goes on), the model list as `modelListError` | Next command of that kind; a list that arrives |
 | The session ended | `failure`, `lifecycle = failed`, entered only through `Session::fail` | Recovery succeeds |
 | A settings operation | `AppView.config.lastResult[kind]` | Next operation of that kind |
