@@ -102,6 +102,12 @@ describes no screens; what a person sees is in the UI document.
   session keeps its model. The host writes no default.
 - The thinking level is the runtime's: the host follows `thinking_level_changed`.
 - A new session starts its runtime when it is created (a warm one when ready).
+  Its file is the runtime's own: the blank session a runtime opens at start in
+  its folder. A new session takes over that session as it is (the warm
+  runtime's `get_state` names its file and model), so its first message takes
+  the same path as every later one, with no `switch_session`. The host writes no
+  session file of its own. Without a warm runtime for the folder, the session's
+  file is known once its runtime reports it.
 - A model change the runtime makes on its own (a slash command) is not reported
   in RPC mode; the host does not work around that (runtime G3). A new runtime for
   the session (recovery) makes the model `resolving` again until it answers; the
