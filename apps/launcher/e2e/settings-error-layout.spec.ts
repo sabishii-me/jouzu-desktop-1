@@ -39,3 +39,18 @@ test('settings that cannot be read do not move the panel', async ({ page }) => {
   const dialog = await openSettings(page);
   await expectNoShift(dialog, dialog.getByRole('alert').filter({ hasText: 'control unavailable' }));
 });
+
+test('a failed action on a card does not move that card or the cards below', async ({ page }) => {
+  await stubHostControl(page, body => { if (body.action === 'shisa-login') throw new Error('sign-in refused'); return emptyControlState; });
+  const dialog = await openSettings(page);
+  const signIn = dialog.getByRole('button', { name: 'Sign in to Shisa.AI', exact: true });
+  const add = dialog.getByRole('button', { name: 'Add provider', exact: true });
+  const before = [await top(signIn), await top(add)];
+  await signIn.click();
+  const alert = dialog.getByRole('alert').filter({ hasText: 'sign-in refused' });
+  await expect(alert).toBeVisible();
+  expect([await top(signIn), await top(add)]).toEqual(before);
+  await alert.getByRole('button', { name: 'Dismiss', exact: true }).click();
+  await expect(alert).toHaveCount(0);
+  expect([await top(signIn), await top(add)]).toEqual(before);
+});
