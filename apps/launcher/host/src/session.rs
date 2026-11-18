@@ -15,7 +15,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, SecondsFormat, Utc};
 
-fn canonical_path(path: &str) -> String {
+pub(crate) fn canonical_path(path: &str) -> String {
     path.strip_prefix("\\\\?\\").unwrap_or(path).to_string()
 }
 
@@ -6576,11 +6576,28 @@ impl SessionManager {
             })
             .map(|(id, _)| id.clone())
             .collect();
+        let mut left = false;
         for id in stale {
             if let Some(session) = sessions.remove(&id) {
                 session.discard();
+                left = true;
             }
         }
+        drop(sessions);
+        // The saved-session index stands for everything not in the table. A
+        // session leaving it may have written its file this run (a new one, or
+        // a newer time); the index read at start knows neither, so it is read
+        // again on its next use.
+        if left {
+            self.forget_persisted();
+        }
+    }
+
+    fn forget_persisted(&self) {
+        *self
+            .persisted_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     fn scan_persisted(&self) -> Vec<Value> {

@@ -1248,6 +1248,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!map.has(key)) map.set(key, { id: key, path: session.workspace, name: workspaceLabel(session.workspace), sessions: [] });
       map.get(key)!.sessions.push(session);
     }
+    // Most recent first, by the time each row shows: the list merges saved and
+    // live sessions and arrives in no order of its own.
+    for (const group of map.values()) group.sessions.sort((left, right) => right.updated - left.updated);
     let result = [...map.values()];
     if (search.trim()) {
       const query = search.trim().toLowerCase();

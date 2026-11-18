@@ -5056,6 +5056,30 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_conversation_from_this_run_stays_listed_after_it_leaves_the_table() {
+        let (manager, _home, workspace) = manager(50);
+        // The saved list is read once, before the conversation exists.
+        assert!(manager.persisted(None, false).is_empty());
+        let session = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("m1", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        let path = session.info()["sessionPath"].as_str().expect("path").to_string();
+        // What the runtime saves of the turn.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut file, b"{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n").unwrap();
+        drop(file);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
+        assert!(manager.get(&session.id).is_none(), "released");
+        let listed = manager.persisted(None, false);
+        assert!(
+            listed.iter().any(|entry| entry["sessionPath"].as_str().is_some_and(|value| crate::session::canonical_path(&path) == value)),
+            "{path} missing from {listed:?}"
+        );
+        manager.stop_all();
+    }
+
+    #[tokio::test]
     async fn a_new_session_starts_its_runtime_at_once_without_a_warm_one() {
         let (manager, _home, workspace) = manager(50);
         let session = manager
