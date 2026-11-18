@@ -182,6 +182,8 @@ pub struct SessionConfig {
     pub warm: Arc<std::sync::OnceLock<Arc<WarmPool>>>,
     /// The runtimes' latest answers about models (`known_models`).
     pub known: Arc<KnownModels>,
+    /// What replies said about each provider's sign-in (`provider_answers`).
+    pub providers: Arc<crate::provider_answers::ProviderAnswers>,
 }
 
 impl SessionConfig {
@@ -1578,6 +1580,17 @@ impl Session {
                     .unwrap_or(Value::Null);
                 if let Some(provider) = model.get("provider") {
                     row["provider"] = provider.clone();
+                }
+            }
+        }
+        // A reply the provider ended says whether it takes the stored sign-in.
+        if !interrupted {
+            if let Some(provider) = row.get("provider").and_then(Value::as_str) {
+                let at = Self::now_iso();
+                match (row.get("errorCode").and_then(Value::as_str), row.get("errorMessage").and_then(Value::as_str)) {
+                    (Some("auth"), Some(text)) => self.config.providers.reply(provider, Some(text), &at),
+                    (None, _) => self.config.providers.reply(provider, None, &at),
+                    _ => {}
                 }
             }
         }
@@ -5791,6 +5804,8 @@ fn same_session_file(left: &str, right: &str) -> bool {
 }
 
 pub struct SessionManager {
+    /// What replies said about each provider's sign-in, for Settings.
+    providers: Arc<crate::provider_answers::ProviderAnswers>,
     /// How runtimes are started. Kept from the moment the runtime is found; see
     /// `config()`.
     config: std::sync::OnceLock<SessionConfig>,
@@ -5900,6 +5915,11 @@ impl SessionManager {
         &self.home
     }
 
+    /// What replies said about each provider's sign-in.
+    pub fn providers(&self) -> Arc<crate::provider_answers::ProviderAnswers> {
+        self.providers.clone()
+    }
+
     pub fn new(
         spec: Option<RuntimeSpec>,
         home: PathBuf,
@@ -5908,6 +5928,7 @@ impl SessionManager {
         replay_limit: usize,
         events: Option<Arc<crate::events::EventHub>>,
     ) -> Self {
+        let providers = Arc::new(crate::provider_answers::ProviderAnswers::new());
         let config = std::sync::OnceLock::new();
         if let Some(spec) = spec {
             let _ = config.set(SessionConfig {
@@ -5920,9 +5941,11 @@ impl SessionManager {
                 events,
                 warm: Arc::new(std::sync::OnceLock::new()),
                 known: Arc::new(KnownModels::new()),
+                providers: providers.clone(),
             });
         }
         Self {
+            providers,
             config,
             managed: None,
             warm_wanted: AtomicBool::new(false),
@@ -5976,6 +5999,7 @@ impl SessionManager {
                 events: managed.events.clone(),
                 warm: Arc::new(std::sync::OnceLock::new()),
                 known: Arc::new(KnownModels::new()),
+                providers: self.providers.clone(),
             }
         });
         if found {
@@ -7561,6 +7585,7 @@ mod environment_tests {
             events: None,
             warm: Arc::new(std::sync::OnceLock::new()),
             known: Arc::new(KnownModels::new()),
+            providers: Arc::new(crate::provider_answers::ProviderAnswers::new()),
         }
     }
 

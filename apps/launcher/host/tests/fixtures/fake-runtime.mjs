@@ -133,6 +133,15 @@ function tick() {
     timer = setTimeout(tick, delay);
     return;
   }
+  // The provider refuses the request with this text while the file holds it.
+  const refusal = process.env.FAKE_RUNTIME_REPLY_ERROR_FILE && existsSync(process.env.FAKE_RUNTIME_REPLY_ERROR_FILE)
+    ? readFileSync(process.env.FAKE_RUNTIME_REPLY_ERROR_FILE, "utf8").trim()
+    : "";
+  if (refusal) {
+    out({ type: "message_end", message: { role: "assistant", content: [], model: "fixture-model", provider: "fixture", stopReason: "error", errorMessage: refusal } });
+    settled(false);
+    return;
+  }
   out({
     type: "message_end",
     message: { role: "assistant", content: [{ type: "text", text: parts.join("") }], model: "fixture-model", provider: "fixture" },

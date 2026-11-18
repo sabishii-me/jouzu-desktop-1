@@ -19,6 +19,7 @@ mod environment;
 pub mod events;
 mod files;
 pub mod known_models;
+pub mod provider_answers;
 mod provider_error;
 pub mod runtime;
 pub mod sessions_repair;
@@ -5080,6 +5081,24 @@ mod session_tests {
             listed.iter().any(|entry| entry["sessionPath"].as_str().is_some_and(|value| crate::session::canonical_path(&path) == value)),
             "{path} missing from {listed:?}"
         );
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_refused_sign_in_is_kept_for_its_provider_until_a_reply_is_answered() {
+        let refusal = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(refusal.path(), "401 Unauthorized: invalid api key").unwrap();
+        let file = refusal.path().to_string_lossy().to_string();
+        let (manager, _home, workspace) = manager_with_env(50, &[("FAKE_RUNTIME_REPLY_ERROR_FILE", file.as_str())]);
+        let session = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("m1", "hello").unwrap();
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["errorCode"] == "auth"))).await;
+        assert_eq!(manager.providers().view()["fixture"]["text"], "401 Unauthorized: invalid api key");
+        wait_status(&session, Status::Idle).await;
+        std::fs::write(refusal.path(), "").unwrap();
+        session.send("m2", "again").unwrap();
+        wait_until(|| manager.providers().view().get("fixture").is_none()).await;
         manager.stop_all();
     }
 
