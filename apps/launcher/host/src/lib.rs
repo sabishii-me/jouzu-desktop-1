@@ -19,6 +19,7 @@ mod environment;
 pub mod events;
 mod files;
 pub mod known_models;
+mod provider_error;
 pub mod runtime;
 pub mod sessions_repair;
 pub mod session;

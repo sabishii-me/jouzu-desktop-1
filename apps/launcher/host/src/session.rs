@@ -1561,6 +1561,9 @@ impl Session {
                 }
             }
         }
+        if let Some(error) = row.get("errorMessage").and_then(Value::as_str) {
+            row["errorCode"] = json!(crate::provider_error::code(error));
+        }
         if row.get("model").map(Value::is_null).unwrap_or(true) {
             if let Some(model) = self
                 .model
@@ -1591,6 +1594,7 @@ impl Session {
                 "provider": row.get("provider").cloned().unwrap_or(Value::Null),
                 "usage": row.get("usage").cloned().unwrap_or(Value::Null),
                 "errorMessage": row.get("errorMessage").cloned().unwrap_or(Value::Null),
+                "errorCode": row.get("errorCode").cloned().unwrap_or(Value::Null),
             }),
         );
     }
@@ -2560,10 +2564,13 @@ impl Session {
             }));
             if role == "assistant" {
                 if let Some(row) = rows.last_mut() {
-                    for field in ["model", "provider", "usage", "stopReason"] {
+                    for field in ["model", "provider", "usage", "stopReason", "errorMessage"] {
                         if let Some(value) = message.get(field).filter(|value| !value.is_null()) {
                             row[field] = value.clone();
                         }
+                    }
+                    if let Some(error) = row.get("errorMessage").and_then(Value::as_str) {
+                        row["errorCode"] = json!(crate::provider_error::code(error));
                     }
                 }
             }
@@ -2827,6 +2834,7 @@ impl Session {
                     "maxAttempts": value.get("maxAttempts"),
                     "delayMs": value.get("delayMs"),
                     "error": value.get("errorMessage"),
+                    "code": value.get("errorMessage").and_then(Value::as_str).map(crate::provider_error::code),
                 });
                 self.log_step("retry.start", retry.clone());
                 self.step_guard().retry = Some(retry);
