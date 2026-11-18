@@ -679,10 +679,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     while (Date.now() < end && !sendCancelRef.current) {
       const current = connection.current;
       if (current?.snapshot.connected) return current;
-      if (current && current.snapshot.status === "stopped" && !switchingRef.current) {
-        if (!await reopenBoundSession()) return null;
-        continue;
-      }
       if (current?.snapshot.connectionError && !current.snapshot.connected && !switchingRef.current) return null;
       await new Promise(resolve => setTimeout(resolve, 25));
     }
@@ -1061,17 +1057,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     try { return await promise; }
     finally { if (switchPromise.current === current) switchPromise.current = null; }
   }
-  // Reopen automatically once per stopped connection. A failure is reported and
-  // left to the user's next send, so a runtime that cannot start is not retried
-  // in a loop.
-  const reopenTried = useRef<ChatConnection | null>(null);
-  useEffect(() => {
-    const stale = connection.current;
-    if (!stale || snapshot.connected || snapshot.status !== "stopped" || switching) return;
-    if (reopenTried.current === stale) return;
-    reopenTried.current = stale;
-    void reopenBoundSession();
-  }, [snapshot.connected, snapshot.status, switching]);
   function loadPreview(sessionPath: string) {
     const request = ++previewRequest.current;
     const cached = projectionCache.current.get(normalizedPath(sessionPath));
@@ -1174,7 +1159,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       startSwitch(sessionPath);
       return;
     }
+    // The session shown is the session the composer works on: the host opens it
+    // now (no runtime until a message needs one), so its model, its state and
+    // where Send goes are its own. Its saved transcript fills the screen meanwhile.
     loadPreview(sessionPath);
+    if (switchingRef.current) queuedSwitch.current = sessionPath;
+    else startSwitch(sessionPath);
   }
   async function forkTurn(prompt: string, turn: number) {
     const client = connection.current;
@@ -1413,18 +1403,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       ? { more: activePreview.before !== null, loading: !!activePreview.loading, load: loadEarlierPreview }
       : undefined;
   const activeMessage = conversationProjection.activeMessage === null ? undefined : conversationProjection.messages[conversationProjection.activeMessage];
-  // The composer's model is the shown session's. A saved session shown from its file
-  // (its runtime not attached yet) is not the store's session: its model is the one its
-  // last reply used, as the file records it, until its own runtime reports.
-  const previewOnly = !!activePreview && normalizedPath(activePreview.path) !== normalizedPath(snapshot.sessionFile ?? "");
-  const previewModel = previewOnly ? (() => {
-    const last = [...activePreview!.projection.messages].reverse().find(message => message.provider && message.model);
-    if (!last) return undefined;
-    return knownModels.models.find(model => model.provider === last.provider && model.id === last.model)?.name ?? last.model;
-  })() : undefined;
-  const composerModel = previewOnly
-    ? { models: knownModels.models, model: previewModel, modelState: "resolving" as const, thinkingLevel: undefined, thinkingLevels: [] as string[] }
-    : { models: snapshot.models ?? [], model: snapshot.model, modelState: snapshot.modelState ?? "resolving", thinkingLevel: snapshot.thinkingLevel, thinkingLevels: snapshot.thinkingLevels ?? [] };
+  // While the host opens the session on screen, the bound store is still the
+  // previous session: nothing of it (model, run, Stop) is shown for this one.
+  const elsewhere = !!activePreview && normalizedPath(activePreview.path) !== activeSession;
   // The host says when the step is reasoning; the words are the step's reasoning block being written.
   const turnStep = conversationProjection.running ? snapshot.activeTurn?.step : undefined;
   const streamingBlock = turnStep?.state === "thinking" ? activeMessage?.content.at(-1) : undefined;
@@ -1645,7 +1626,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
             <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now)} running={conversationProjection.running} elapsed={elapsed} settled={settled} failure={settled === "failed" ? { details: replyError ?? undefined, action: replyRecovery } : undefined} noReply={noReply} hold={hold} notice={runtimeNotice} />
           </div>
           {promptNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{promptNode}</div>}
-          <Composer autoFocus={composerFocus} blocked={blocked} results={controlResults} connected={snapshot.connected || !!activePreview} pending={snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={composerModel.models} model={composerModel.model} modelState={composerModel.modelState} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={composerModel.thinkingLevel} thinkingLevels={composerModel.thinkingLevels} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
+          <Composer autoFocus={composerFocus} blocked={blocked} results={controlResults} connected={snapshot.connected || !!activePreview} pending={elsewhere ? locked : snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={elsewhere || (opening && !activePreview)} starting={!elsewhere && composerStarting} unavailable={!!sessionError} running={!elsewhere && composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={elsewhere ? [] : snapshot.models ?? []} model={elsewhere ? undefined : snapshot.model} modelState={elsewhere ? "resolving" : snapshot.modelState ?? "resolving"} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={elsewhere ? undefined : snapshot.thinkingLevel} thinkingLevels={elsewhere ? [] : snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
         </div>
         <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>

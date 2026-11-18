@@ -843,8 +843,9 @@ export class SessionStore {
         this.update({ sessionFile: text(data.sessionPath) ?? this.state.sessionFile });
         break;
       case "session.status":
+        // A stopped session is still this session: the host starts it again for
+        // the next message, so the connection stays.
         this.update({ status: text(data.status) ?? this.state.status });
-        if (data.status === "stopped") this.update({ connected: false });
         break;
       // turn.start / turn.end: the run in progress is the host's, and every
       // change to it arrives as its snapshot (`session.updated`).
