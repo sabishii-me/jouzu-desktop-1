@@ -4,6 +4,11 @@ import { chromium } from "@playwright/test";
  * Black-box user playbook. It uses accessible actions, visible text and a unique
  * reply sentinel only. It never reads host logs, endpoints, DOM structure or
  * layout. UI changes may require updating only the semantic locators below.
+ *
+ * Controls are found by the words the app renders, taken from its own text tables
+ * in the app's current interface language, so the playbook runs in any of them.
+ * PLAYBOOK_LOCALE=en|ja|zh-Hans|zh-Hant switches the app to that language first.
+ * The tables are TypeScript, imported with Node's type stripping (Node 22.18+).
  */
 const cdp = process.env.PLAYBOOK_CDP ?? "http://127.0.0.1:9223";
 const out = process.env.PLAYBOOK_OUT;
@@ -39,16 +44,34 @@ const record = (name, samples) => {
   result.samples = { ...(result.samples ?? {}), [name]: sorted };
 };
 
+// The words the app shows, in the language it is set to (#101): the playbook finds
+// controls by the same text tables the app renders from, so it runs in every
+// interface language. PLAYBOOK_LOCALE switches the app to one first.
+const { messages, resolveLocale } = await import("../src/i18n.ts");
+const { chatTexts } = await import("../src/chat-text.ts");
+const { webAccessText } = await import("../src/web-access-text.ts");
+if (process.env.PLAYBOOK_LOCALE) {
+  await page.evaluate(locale => localStorage.setItem("jouzu.ui.language", locale), resolveLocale(process.env.PLAYBOOK_LOCALE));
+  await page.reload();
+}
+const locale = resolveLocale(await page.evaluate(() => document.documentElement.lang || localStorage.getItem("jouzu.ui.language") || navigator.language));
+const L = messages[locale];
+const C = chatTexts[locale];
+const W = webAccessText[locale];
+result.locale = locale;
+const literal = text => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const either = (...texts) => new RegExp(`^(?:${texts.map(literal).join("|")})$`);
+
 page.on("pageerror", error => result.errors.push(String(error)));
 page.on("console", message => {
   if (message.type() === "error" && !/Failed to load resource/.test(message.text())) result.errors.push(message.text());
 });
 
-const newSession = () => page.getByRole("button", { name: /new session/i }).first();
-const composer = () => page.getByRole("textbox", { name: /message/i }).first();
-const send = () => page.getByRole("button", { name: /^send$/i }).first();
-const stop = () => page.getByRole("button", { name: /^stop$/i }).first();
-const conversation = () => page.getByRole("region", { name: /conversation/i }).first();
+const newSession = () => page.getByRole("button", { name: C.newSession, exact: true }).first();
+const composer = () => page.getByRole("textbox", { name: C.messageJouzu, exact: true }).first();
+const send = () => page.getByRole("button", { name: C.send, exact: true }).first();
+const stop = () => page.getByRole("button", { name: C.stop, exact: true }).first();
+const conversation = () => page.getByRole("region", { name: C.conversation, exact: true }).first();
 
 async function waitForConversationText(text, timeout = 30_000) {
   await conversation().getByText(text, { exact: true }).first().waitFor({ timeout });
@@ -93,20 +116,20 @@ async function imageSurvivesSessionSwitch(otherPrompt) {
   const name = "Image in a sent message stays after switching sessions (#119)";
   await newSession().click();
   await composer().waitFor({ timeout: 10_000 });
-  const chooser = page.getByLabel("Choose images", { exact: true });
+  const chooser = page.getByLabel(C.chooseImages, { exact: true });
   if (!await chooser.count()) {
     result.scenarios.push({ name, ok: true, skipped: true, detail: "the selected model takes no images" });
     return;
   }
   const imagePrompt = "What color is this square? Reply with one word.";
   await chooser.setInputFiles({ name: "red-square.png", mimeType: "image/png", buffer: await redSquarePng() });
-  await page.getByRole("list", { name: "Attached images" }).waitFor({ timeout: 10_000 });
+  await page.getByRole("list", { name: C.attachedImages }).waitFor({ timeout: 10_000 });
   await composer().fill(imagePrompt);
   await send().click();
   await waitForConversationText(imagePrompt, 5_000);
   await stop().waitFor({ state: "detached", timeout: 60_000 }).catch(() => {});
-  await page.getByRole("button", { name: /^send$/i }).waitFor({ timeout: 60_000 });
-  const sentImage = () => conversation().getByRole("img", { name: "Conversation attachment" }).first();
+  await send().waitFor({ timeout: 60_000 });
+  const sentImage = () => conversation().getByRole("img", { name: C.conversationAttachment }).first();
   const before = await sentImage().isVisible();
   await page.getByText(otherPrompt, { exact: false }).first().click();
   await conversation().getByText(otherPrompt, { exact: false }).first().waitFor({ timeout: 10_000 });
@@ -133,16 +156,16 @@ async function imageProviderScenario() {
     return;
   }
   const openTools = async () => {
-    await page.getByRole("button", { name: "Settings", exact: true }).first().click();
+    await page.getByRole("button", { name: C.settings, exact: true }).first().click();
     const dialog = page.getByRole("dialog");
-    await dialog.getByRole("tab", { name: /tools|ツール/i }).click();
-    await dialog.getByText("Image generation", { exact: true }).waitFor({ timeout: 10_000 });
+    await dialog.getByRole("tab", { name: L.toolsTab, exact: true }).click();
+    await dialog.getByText(C.imageGeneration, { exact: true }).waitFor({ timeout: 10_000 });
     return dialog;
   };
   const closeSettings = () => page.keyboard.press("Escape");
   let dialog = await openTools();
-  const provider = dialog.getByLabel("Image provider");
-  const model = dialog.getByLabel("Image model");
+  const provider = dialog.getByLabel(C.imageProvider);
+  const model = dialog.getByLabel(C.imageModel);
   const original = await provider.inputValue();
   const options = await provider.locator("option").allTextContents();
   const listed = options.includes(label);
@@ -189,15 +212,15 @@ const settingsDialog = () => page.getByRole("dialog").first();
 async function webAccessScenario() {
   const visitor = await chromium.launch();
   const openWebAccess = async () => {
-    await openSettingsTab("Web access");
+    await openSettingsTab(W.title);
     return settingsDialog();
   };
   const choose = async (dialog, option) => {
-    await dialog.getByRole("combobox", { name: "Who can connect" }).click();
+    await dialog.getByRole("combobox", { name: W.scope }).click();
     await page.getByRole("option", { name: option, exact: true }).click();
   };
   const save = async dialog => {
-    const button = dialog.getByRole("button", { name: "Save", exact: true });
+    const button = dialog.getByRole("button", { name: W.save, exact: true });
     if (await button.count()) await button.click();
   };
   const visit = async url => {
@@ -211,17 +234,17 @@ async function webAccessScenario() {
   };
   try {
     let dialog = await openWebAccess();
-    await choose(dialog, "This computer and trusted networks");
+    await choose(dialog, W.networks);
     const lan = dialog.getByRole("switch").first();
     const hasNetwork = await lan.count() > 0;
     if (hasNetwork) {
       if ((await lan.getAttribute("aria-checked")) !== "true") await lan.click();
     } else {
-      await choose(dialog, "This computer only");
+      await choose(dialog, W.local);
     }
     await save(dialog);
-    await dialog.getByText(/Serving at:/).waitFor({ timeout: 15_000 });
-    await dialog.getByRole("button", { name: "Pair a device" }).click();
+    await dialog.getByText(new RegExp(`${literal(W.serving)}:`)).waitFor({ timeout: 15_000 });
+    await dialog.getByRole("button", { name: W.pair }).click();
     // The pairing links render after the click: read them once they are there.
     await page.waitForFunction(() => [...document.querySelectorAll('[role="dialog"] input, [role="dialog"] textarea')].some(node => node.value.includes("/pair?code=")), null, { timeout: 15_000 });
     const links = await dialog.getByRole("textbox").evaluateAll(nodes => nodes.map(node => node.value).filter(value => value.includes("/pair?code=")));
@@ -229,7 +252,7 @@ async function webAccessScenario() {
     const network = links.find(url => !url.startsWith("http://127.0.0.1:"));
     // With the network on, the pairing links may name only network addresses; this
     // computer's address is the one "Serving at" lists.
-    const serving = await dialog.getByText(/Serving at:/).innerText();
+    const serving = await dialog.getByText(new RegExp(`${literal(W.serving)}:`)).innerText();
     const base = local ? new URL(local).origin : /http:\/\/127\.0\.0\.1:\d+/.exec(serving)?.[0];
     if (!base) throw new Error(`no address on this computer in: ${serving}`);
 
@@ -250,17 +273,17 @@ async function webAccessScenario() {
 
     // Remove the device on the desktop: the browser is sent back to pairing.
     dialog = settingsDialog();
-    await dialog.getByRole("button", { name: /^Remove / }).first().click();
-    await dialog.getByText("No device is paired yet.").waitFor({ timeout: 10_000 });
+    await dialog.getByRole("button", { name: new RegExp(`^${literal(W.remove)} `) }).first().click();
+    await dialog.getByText(W.noDevices).waitFor({ timeout: 10_000 });
     await paired.tab.reload();
     await paired.tab.waitForTimeout(1_000);
     scenario("Web access: a removed device is sent back to pairing (#91)", paired.tab.url().endsWith("/pair"), paired.tab.url());
     await paired.context.close();
 
     // Off: the port closes.
-    await choose(dialog, "Off");
+    await choose(dialog, W.off);
     await save(dialog);
-    await dialog.getByText("Browsers and other devices cannot connect.").waitFor({ timeout: 10_000 });
+    await dialog.getByText(W.offHint).waitFor({ timeout: 10_000 });
     const closed = await fetch(base + "/pair").then(() => false, () => true);
     scenario("Web access: turning it off closes the port (#91)", closed, base);
     await page.keyboard.press("Escape");
@@ -285,12 +308,12 @@ async function longSessionScenario() {
   const start = now();
   // Earlier messages are either already loaded (Show N earlier) or read from the host
   // (Load earlier messages); either way the user keeps asking until neither is offered.
-  const earlier = () => conversation().getByRole("button", { name: /^(Show \d+ earlier messages?|Load earlier messages)$/ }).first();
+  const earlier = () => conversation().getByRole("button", { name: C.loadEarlier, exact: true }).first();
   let clicks = 0;
   while (await earlier().isVisible().catch(() => false)) {
     await earlier().click();
     clicks += 1;
-    await conversation().getByRole("button", { name: /Loading earlier messages/ }).waitFor({ state: "detached", timeout: 30_000 }).catch(() => {});
+    await conversation().getByRole("button", { name: C.loadingEarlier }).waitFor({ state: "detached", timeout: 30_000 }).catch(() => {});
     if (clicks > turns * 3) break;
   }
   await mark("longSessionToFirstMessage", now() - start);
@@ -310,12 +333,12 @@ async function longSessionScenario() {
     return;
   }
   // Branch from the first turn: its footer is the first one in the conversation.
-  await conversation().getByRole("button", { name: "Branch into a new conversation" }).first().click();
+  await conversation().getByRole("button", { name: C.branchConversation }).first().click();
   // The branch opens as its own conversation: turn 1 there, the long session's last turn gone.
-  await page.waitForFunction(last => {
-    const text = document.querySelector('[aria-label="Conversation"]')?.textContent ?? "";
+  await page.waitForFunction(({ last, label }) => {
+    const text = document.querySelector(`[aria-label="${label}"]`)?.textContent ?? "";
     return /Long session question 1(?!\d)/.test(text) && !text.includes(`Long session answer ${last}`);
-  }, turns, { timeout: 30_000 }).catch(() => {});
+  }, { last: turns, label: C.conversation }, { timeout: 30_000 }).catch(() => {});
   const branched = await conversation().textContent();
   const has = pattern => new RegExp(`${pattern}(?!\\d)`).test(branched);
   const ok = has("Long session question 1") && has("Long session answer 1")
@@ -338,17 +361,17 @@ const longPrompt = "SLOW: count from 1 to 300, one number per line, nothing else
  */
 // Anything shown as failed: a failure line (role=alert) or a failed mark at a control.
 const alerts = () => page.locator('[role="alert"], [data-result="failed"]').filter({ hasNotText: /Flow control paused after an interrupt/i });
-const queued = () => page.getByRole("region", { name: "Queued messages" });
+const queued = () => page.getByRole("region", { name: C.queuedMessages });
 const userCount = text => conversation().getByText(text, { exact: true }).count();
 /** The composer's submit button: "Send" when idle, "Steer" while a reply runs. */
-const submit = () => page.getByRole("button", { name: /^(send|steer)$/i }).first();
+const submit = () => page.getByRole("button", { name: either(C.send, C.steer) }).first();
 /** The reply has really started writing: the fixture's marker, or a line "3" of the count. */
 async function replyWriting(timeout = 60_000) {
-  await page.waitForFunction(prompt => {
-    const region = document.querySelector('[aria-label="Conversation"], [aria-label="conversation"]');
+  await page.waitForFunction(({ prompt, label }) => {
+    const region = document.querySelector(`[aria-label="${label}"]`);
     const text = (region?.textContent ?? document.body.innerText).replace(prompt, "");
     return /waiting-for-steer|\b3\b/.test(text);
-  }, longPrompt, { timeout });
+  }, { prompt: longPrompt, label: C.conversation }, { timeout });
 }
 /** Wait until `text` is shown exactly `n` times (the transcript may still be catching up). */
 async function shownTimes(text, n = 1, timeout = 10_000) {
@@ -366,7 +389,7 @@ async function staysIdle() {
   return !await stop().isVisible() && await send().isVisible();
 }
 async function chooseModel() {
-  await page.getByRole("button", { name: /model/i }).first().click();
+  await page.getByRole("button", { name: C.model, exact: true }).first().click();
   const modelName = new RegExp(process.env.PLAYBOOK_MODEL ?? "qwen 3\\.8 flash next", "i");
   await page.getByRole("menuitemradio").filter({ hasText: modelName }).first().click();
   await page.getByText(modelName).first().waitFor({ timeout: 5_000 });
@@ -377,8 +400,8 @@ async function freshSession() {
 }
 async function sendText(text, image = false) {
   if (image) {
-    await page.getByLabel("Choose images", { exact: true }).setInputFiles({ name: "red-square.png", mimeType: "image/png", buffer: await redSquarePng() });
-    await page.getByRole("list", { name: "Attached images" }).waitFor({ timeout: 10_000 });
+    await page.getByLabel(C.chooseImages, { exact: true }).setInputFiles({ name: "red-square.png", mimeType: "image/png", buffer: await redSquarePng() });
+    await page.getByRole("list", { name: C.attachedImages }).waitFor({ timeout: 10_000 });
   }
   await composer().fill(text);
   await submit().click();
@@ -389,7 +412,7 @@ async function turnEnds(timeout = 180_000) {
 }
 /** Continue messages Stop returned, if any; then wait for the session to be idle. */
 async function continueReturned() {
-  const resume = queued().getByRole("button", { name: "Continue", exact: true });
+  const resume = queued().getByRole("button", { name: C.continue, exact: true });
   if (await resume.count()) {
     await resume.click();
     // The continued message starts a turn of its own; it may also end before Stop is seen.
@@ -399,7 +422,7 @@ async function continueReturned() {
 }
 
 async function runOwnershipScenarios() {
-  const images = async () => (await page.getByLabel("Choose images", { exact: true }).count()) > 0;
+  const images = async () => (await page.getByLabel(C.chooseImages, { exact: true }).count()) > 0;
 
   // 1. Sent while a reply runs: the reply reads it (text, then text with an image);
   //    nothing is refused, nothing errors, each message shows once.
@@ -492,11 +515,11 @@ async function runOwnershipScenarios() {
 }
 
 async function openSettingsTab(name) {
-  await page.getByRole("button", { name: "Settings", exact: true }).first().click();
-  await settingsDialog().getByRole("tab", { name }).click();
+  await page.getByRole("button", { name: C.settings, exact: true }).first().click();
+  await settingsDialog().getByRole("tab", { name, exact: true }).click();
 }
 async function modelMenuItems() {
-  await page.getByRole("button", { name: /model/i }).first().click();
+  await page.getByRole("button", { name: C.model, exact: true }).first().click();
   await page.getByRole("menuitemradio").first().waitFor({ timeout: 5_000 });
   const items = await page.getByRole("menuitemradio").allInnerTexts();
   return items.map(item => item.trim());
@@ -525,22 +548,22 @@ async function shisaKeyWithoutRestart() {
   await page.keyboard.press("Escape");
 
   let start = now();
-  await openSettingsTab("Environment");
-  await settingsDialog().getByRole("button", { name: "Add variable" }).click();
-  await settingsDialog().getByRole("textbox", { name: "Name" }).last().fill("SHISA_API_KEY");
-  await settingsDialog().getByLabel("Value").last().fill(key);
-  const save = settingsDialog().getByRole("button", { name: "Save", exact: true });
+  await openSettingsTab(L.environment);
+  await settingsDialog().getByRole("button", { name: L.addEntry }).click();
+  await settingsDialog().getByRole("textbox", { name: L.variableName, exact: true }).last().fill("SHISA_API_KEY");
+  await settingsDialog().getByLabel(L.variableValue, { exact: true }).last().fill(key);
+  const save = settingsDialog().getByRole("button", { name: L.save, exact: true });
   await save.click();
   await save.waitFor({ state: "visible" });
-  await settingsDialog().getByRole("tab", { name: "Model providers" }).click();
+  await settingsDialog().getByRole("tab", { name: L.providers, exact: true }).click();
   // The key alone counts as a Shisa.AI connection, so the refresh control appears.
-  const refresh = settingsDialog().getByRole("button", { name: "Refresh models" });
+  const refresh = settingsDialog().getByRole("button", { name: L.refreshModels });
   await refresh.waitFor({ timeout: 15_000 });
   await refresh.click();
-  await page.waitForFunction(() => {
-    const button = [...document.querySelectorAll("button")].find(item => item.textContent?.includes("Refresh models"));
+  await page.waitForFunction(label => {
+    const button = [...document.querySelectorAll("button")].find(item => item.textContent?.includes(label));
     return button && !button.disabled;
-  }, null, { timeout: 30_000 });
+  }, L.refreshModels, { timeout: 30_000 });
   await page.keyboard.press("Escape");
 
   await newSession().click();
@@ -575,13 +598,13 @@ async function firstSessionHasModel() {
   await newSession().waitFor({ timeout: 30_000 });
   await newSession().click();
   await composer().waitFor({ timeout: 10_000 });
-  const modelButton = page.getByRole("button", { name: "Model", exact: true }).first();
+  const modelButton = page.getByRole("button", { name: C.model, exact: true }).first();
   const label = async () => (await modelButton.innerText().catch(() => "")).trim();
   // Empty while the runtime has not answered (a spinner); then a model or a setup offer.
   const end = now() + 30_000;
   while (now() < end && !await label()) await page.waitForTimeout(100);
   const shown = await label();
-  if (shown && !/^(select model|set up a model)$/i.test(shown)) {
+  if (shown && !either(C.selectModel, C.setUpModel).test(shown)) {
     scenario(name, true, `model shown: ${shown}`);
     return;
   }
@@ -629,7 +652,7 @@ try {
   await mark("newSessionUsable", now() - start);
 
   start = now();
-  await page.getByRole("button", { name: /model/i }).first().click();
+  await page.getByRole("button", { name: C.model, exact: true }).first().click();
   // PLAYBOOK_MODEL names another model (e.g. "Deterministic" on the fixture provider).
   const modelName = new RegExp(process.env.PLAYBOOK_MODEL ?? "qwen 3\\.8 flash next", "i");
   const model = page.getByRole("menuitemradio").filter({ hasText: modelName }).first();
@@ -666,7 +689,7 @@ try {
     readable.push(now() - start);
     // Turn end = Stop gone and Send enabled; no hint string is used.
     await stop().waitFor({ state: "detached", timeout: 30_000 }).catch(() => {});
-    await page.getByRole("button", { name: /^send$/i }).waitFor({ timeout: 30_000 });
+    await send().waitFor({ timeout: 30_000 });
     ended.push(now() - start);
     // A reply faster than Stop could be seen shows the turn as done instead.
     working.push(stopMs ?? readable[readable.length - 1]);
@@ -705,17 +728,17 @@ try {
   // Image tool settings (#64, #67). Holds whatever the account can do: a
   // provider is offered only when it lists image models, otherwise the page says
   // why; the tab renders whether or not tools settings were ever saved.
-  await page.getByRole("button", { name: /^settings$/i }).first().click();
+  await page.getByRole("button", { name: C.settings, exact: true }).first().click();
   const settings = page.getByRole("dialog");
-  await settings.getByRole("tab", { name: /^tools$/i }).click();
-  await settings.getByText("Image generation", { exact: true }).waitFor({ timeout: 10_000 });
+  await settings.getByRole("tab", { name: L.toolsTab, exact: true }).click();
+  await settings.getByText(C.imageGeneration, { exact: true }).waitFor({ timeout: 10_000 });
   scenario("Tools tab opens without saved tools settings (#67)", true);
-  const provider = settings.getByLabel("Image provider", { exact: true });
-  await page.waitForFunction(() => !document.querySelector('select[aria-label="Image provider"]')?.textContent?.includes("Loading"), null, { timeout: 25_000 });
+  const provider = settings.getByLabel(C.imageProvider, { exact: true });
+  await page.waitForFunction(({ label, loading }) => !document.querySelector(`select[aria-label="${label}"]`)?.textContent?.includes(loading), { label: C.imageProvider, loading: C.loading }, { timeout: 25_000 });
   const offered = await provider.isEnabled();
-  const modelText = await settings.getByLabel("Image model", { exact: true }).inputValue();
-  const reasons = settings.getByRole("list", { name: "Unavailable image providers" });
-  const failedChange = await settings.getByText("This tools change did not complete.").count();
+  const modelText = await settings.getByLabel(C.imageModel, { exact: true }).inputValue();
+  const reasons = settings.getByRole("list", { name: C.unavailableImageProviders });
+  const failedChange = await settings.getByText(C.toolsChangeFailed).count();
   const usableProviderOk = offered
     ? modelText !== ""
     : (await provider.inputValue()) === "" && await reasons.isVisible();
@@ -734,15 +757,15 @@ try {
   // language. Why: the setting is Jouzu's own (shared with Jouzu in a terminal); the
   // desktop once had no way to see or change it. The previous value is restored after.
   const openLanguageSettings = async () => {
-    await page.getByRole("button", { name: "Settings", exact: true }).click();
-    await page.getByRole("tab", { name: "Language", exact: true }).click();
-    return page.getByRole("combobox", { name: /reply language/i });
+    await page.getByRole("button", { name: C.settings, exact: true }).click();
+    await page.getByRole("tab", { name: L.general, exact: true }).click();
+    return page.getByRole("combobox", { name: L.responseLanguage, exact: true });
   };
   let replyLanguage = await openLanguageSettings();
   const previousReplyLanguage = (await replyLanguage.innerText()).trim();
   await replyLanguage.click();
   await page.getByRole("option", { name: "日本語", exact: true }).click();
-  await page.getByRole("combobox", { name: /reply language/i }).filter({ hasText: "日本語" }).waitFor({ timeout: 15_000 });
+  await page.getByRole("combobox", { name: L.responseLanguage, exact: true }).filter({ hasText: "日本語" }).waitFor({ timeout: 15_000 });
   await page.keyboard.press("Escape");
   await newSession().click();
   await composer().waitFor({ timeout: 10_000 });
@@ -751,7 +774,7 @@ try {
   await send().click();
   await waitForConversationText(languagePrompt, 5_000);
   await stop().waitFor({ state: "detached", timeout: 60_000 }).catch(() => {});
-  await page.getByRole("button", { name: /^send$/i }).waitFor({ timeout: 60_000 });
+  await send().waitFor({ timeout: 60_000 });
   const languageReply = (await conversation().innerText()).replace(languagePrompt, "");
   scenario("Reply language set in Settings applies to the next new session", /[\u3040-\u30ff]/.test(languageReply), languageReply.slice(0, 200));
   await page.screenshot({ path: process.env.TEMP + "\\playbook-03-reply-language.png" });
