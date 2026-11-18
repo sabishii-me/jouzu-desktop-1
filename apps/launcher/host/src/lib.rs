@@ -44,7 +44,8 @@ use serde_json::{json, Value};
 use tokio::{io::AsyncReadExt, sync::broadcast};
 
 pub const COOKIE_NAME: &str = "jouzu_host";
-pub const HOST_SCHEMA: u32 = 1;
+/// 2: `host.json` no longer carries the API token (#130).
+pub const HOST_SCHEMA: u32 = 2;
 /// Stamped by `scripts/build-app.mjs`; the shell checks it matches its own.
 pub const BUILD_ID: &str = env!("JOUZU_BUILD_ID");
 pub const COMMIT: &str = env!("JOUZU_COMMIT");
@@ -70,7 +71,6 @@ pub struct HostInfo {
     pub build: String,
     pub pid: u32,
     pub port: u16,
-    pub token: String,
     #[serde(rename = "startedAt")]
     pub started_at: String,
 }
@@ -160,12 +160,10 @@ pub fn host_file_path(home: &Path) -> PathBuf {
     home.join("host.json")
 }
 
-pub fn write_host_file(
-    home: &Path,
-    port: u16,
-    token: &str,
-    version: &str,
-) -> Result<PathBuf, String> {
+/// Writes what a client needs to find this host. Never the API token: the
+/// agent's tools run as the same user and can read every file here (#130).
+/// The token goes only to the process that started the host (`ready_line`).
+pub fn write_host_file(home: &Path, port: u16, version: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(home).map_err(|error| format!("Cannot create host home: {error}"))?;
     let info = HostInfo {
         schema: HOST_SCHEMA,
@@ -173,7 +171,6 @@ pub fn write_host_file(
         build: BUILD_ID.to_string(),
         pid: std::process::id(),
         port,
-        token: token.to_string(),
         started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     };
     let path = host_file_path(home);
@@ -182,8 +179,8 @@ pub fn write_host_file(
     Ok(path)
 }
 
-/// Removes the discovery file only when it still names this process and token.
-pub fn remove_host_file(home: &Path, token: &str) {
+/// Removes the discovery file only when it still names this process and port.
+pub fn remove_host_file(home: &Path, port: u16) {
     let path = host_file_path(home);
     let Ok(bytes) = std::fs::read(&path) else {
         return;
@@ -194,7 +191,7 @@ pub fn remove_host_file(home: &Path, token: &str) {
     if value.get("pid").and_then(Value::as_u64) != Some(std::process::id() as u64) {
         return;
     }
-    if value.get("token").and_then(Value::as_str) != Some(token) {
+    if value.get("port").and_then(Value::as_u64) != Some(port as u64) {
         return;
     }
     let _ = std::fs::remove_file(path);
@@ -225,6 +222,13 @@ pub fn log(home: &Path, level: &str, event: &str, fields: Value) {
     {
         let _ = file.write_all(line.as_bytes());
     }
+}
+
+/// The host's first and only stdout line, for the process that started it:
+/// where it listens and the token that opens its API. It is the one place the
+/// token leaves the process.
+pub fn ready_line(port: u16, token: &str) -> String {
+    json!({ "event": "ready", "port": port, "token": token, "build": BUILD_ID }).to_string()
 }
 
 pub fn new_token() -> String {
@@ -2726,16 +2730,16 @@ mod tests {
             r#"{"schema":1,"hostVersion":"0.0.0","pid":1,"port":1,"token":"old","startedAt":"x"}"#,
         )
         .unwrap();
-        let path = write_host_file(home.path(), 40123, &"a".repeat(64), "0.1.0").unwrap();
+        let path = write_host_file(home.path(), 40123, "0.1.0").unwrap();
         let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        assert_eq!(value["schema"], 1);
+        assert_eq!(value["schema"], 2);
         assert_eq!(value["hostVersion"], "0.1.0");
         assert_eq!(value["build"], BUILD_ID);
         assert_eq!(value["port"], 40123);
-        assert_eq!(value["token"], "a".repeat(64));
+        assert!(value.get("token").is_none(), "the token is never written (#130)");
         assert!(value["startedAt"].as_str().unwrap().contains('T'));
 
-        remove_host_file(home.path(), &"a".repeat(64));
+        remove_host_file(home.path(), 40123);
         assert!(!host_file_path(home.path()).exists());
     }
 
@@ -2805,7 +2809,7 @@ mod tests {
     #[test]
     fn a_live_lock_refuses_a_second_host_and_keeps_host_json() {
         let home = tempfile::tempdir().unwrap();
-        write_host_file(home.path(), 40123, &"b".repeat(64), "0.1.0").unwrap();
+        write_host_file(home.path(), 40123, "0.1.0").unwrap();
         let first = HostLock::acquire(home.path()).unwrap();
         let before = std::fs::read(host_file_path(home.path())).unwrap();
         let error = HostLock::acquire(home.path()).unwrap_err();
@@ -2830,12 +2834,11 @@ mod tests {
     #[test]
     fn clean_exit_removes_host_json_and_lock() {
         let home = tempfile::tempdir().unwrap();
-        let token = "c".repeat(64);
-        write_host_file(home.path(), 40124, &token, "0.1.0").unwrap();
+        write_host_file(home.path(), 40124, "0.1.0").unwrap();
         let lock = HostLock::acquire(home.path()).unwrap();
         assert!(host_file_path(home.path()).exists());
         assert!(host_lock_path(home.path()).exists());
-        remove_host_file(home.path(), &token);
+        remove_host_file(home.path(), 40124);
         assert!(!host_file_path(home.path()).exists());
         drop(lock);
         assert!(!host_lock_path(home.path()).exists());
