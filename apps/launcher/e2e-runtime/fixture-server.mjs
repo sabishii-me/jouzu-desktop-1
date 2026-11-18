@@ -20,9 +20,80 @@ function imageSizes(messages) {
   return sizes;
 }
 
+/**
+ * Provider faults a test switches on and off while the app runs, to see what the
+ * person sees when the model provider misbehaves. POST /__fault with one of:
+ *   {}                                   no fault (the default)
+ *   { status: 401|404|429|500, message } each request is refused with that status and an
+ *                                        OpenAI-style error body: key rejected, model
+ *                                        gone, rate limited, provider failure
+ *   { reset: true }                      the connection drops before any answer
+ *                                        (provider or network unreachable)
+ *   { hang: true }                       requests are accepted and never answered; clearing
+ *                                        the fault drops the held connections
+ *   { firstByteMs: n }                   the answer starts after n ms
+ *   { cutAfter: n }                      n pieces of text are streamed, then the
+ *                                        connection drops
+ *   { refuseImages: true }               a request carrying any image is refused (400) with
+ *                                        the provider text of #17
+ * GET /__fault returns the fault, the requests answered and the requests refused.
+ */
+const faultBodies = {
+  401: { code: 'invalid_api_key', type: 'invalid_request_error', message: 'Incorrect API key provided.' },
+  404: { code: 'model_not_found', type: 'invalid_request_error', message: 'The model `deterministic` does not exist or you do not have access to it.' },
+  429: { code: 'rate_limit_exceeded', type: 'requests', message: 'Rate limit reached for requests. Please try again in 20s.' },
+  500: { code: 'server_error', type: 'server_error', message: 'The server had an error while processing your request.' },
+};
+
 export function startFixtureServer(port = 0) {
   const requests = [];
+  let fault = {};
+  let refused = 0;
+  const held = new Set();
+  const control = (request, response) => {
+    let body = '';
+    request.on('data', chunk => { body += chunk; });
+    request.on('end', () => {
+      if (request.method === 'POST') {
+        try { fault = body ? JSON.parse(body) : {}; } catch { response.writeHead(400).end(); return; }
+        if (!fault.hang) { for (const drop of held) drop(); held.clear(); }
+      }
+      response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ fault, requests: requests.length, refused }));
+    });
+  };
   const server = createServer((request, response) => {
+    if (request.url === '/__fault') { control(request, response); return; }
+    if (request.method === 'POST' && request.url?.endsWith('/chat/completions') && Object.keys(fault).length) {
+      if (fault.reset) { refused += 1; request.socket.destroy(); return; }
+      if (fault.status) {
+        refused += 1;
+        request.resume();
+        response.writeHead(fault.status, { 'content-type': 'application/json', ...(fault.status === 429 ? { 'retry-after': '20' } : {}) });
+        response.end(JSON.stringify({ error: { ...faultBodies[fault.status], ...(fault.message ? { message: fault.message } : {}) } }));
+        return;
+      }
+      if (fault.hang) {
+        refused += 1;
+        request.resume();
+        const drop = () => request.socket.destroy();
+        held.add(drop);
+        response.on('close', () => held.delete(drop));
+        return;
+      }
+      if (fault.firstByteMs) { setTimeout(() => serve(request, response), fault.firstByteMs); return; }
+      if (fault.cutAfter) {
+        let pieces = 0;
+        const write = response.write.bind(response);
+        response.write = (data, ...rest) => {
+          if (String(data).includes('"content"') && ++pieces > fault.cutAfter) { response.socket?.destroy(); return false; }
+          return write(data, ...rest);
+        };
+        response.end = () => response;
+      }
+    }
+    serve(request, response);
+  });
+  const serve = (request, response) => {
     if (request.method !== 'POST' || !request.url?.endsWith('/chat/completions')) {
       response.writeHead(404).end();
       return;
@@ -39,7 +110,8 @@ export function startFixtureServer(port = 0) {
       const system = messages.filter(message => message.role === 'system' || message.role === 'developer').map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content ?? '')).join('\n');
       requests.push({ model: data.model, text, system, images: imageSizes(messages) });
       // A real provider refuses an image with a side of 10 px or less, with this text (#17).
-      const tiny = imageSizes(messages).find(([width, height]) => Math.min(width, height) <= 10);
+      const tiny = imageSizes(messages).find(([width, height]) => Math.min(width, height) <= 10)
+        ?? (fault.refuseImages ? imageSizes(messages)[0] : undefined);
       if (tiny) {
         response.writeHead(400, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ error: { code: 'invalid_parameter_error', type: 'invalid_request_error', message: `The image length and width do not meet the model restrictions. [height:${tiny[1]} or width:${tiny[0]} must be larger than 10]` } }));
@@ -48,6 +120,18 @@ export function startFixtureServer(port = 0) {
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       const chunk = (delta, finish = null) => response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'deterministic', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
       chunk({ role: 'assistant' });
+      // LONG: a reply that streams for about 12 s, one numbered line every 300 ms.
+      if (text.includes('LONG')) {
+        let line = 0;
+        const timer = setInterval(() => {
+          if (response.destroyed || !response.socket) { clearInterval(timer); return; }
+          line += 1;
+          chunk({ content: `line ${line}\n` });
+          if (line === 40) { clearInterval(timer); chunk({}, 'stop'); response.end('data: [DONE]\n\n'); }
+        }, 300);
+        response.on('close', () => clearInterval(timer));
+        return;
+      }
       if (text.includes('SLOW')) {
         chunk({ content: 'waiting-for-steer' });
         setTimeout(() => {
@@ -82,8 +166,8 @@ export function startFixtureServer(port = 0) {
       chunk({}, 'stop');
       response.end('data: [DONE]\n\n');
     });
-  });
-  return new Promise(resolve => server.listen(port, '127.0.0.1', () => resolve({ server, requests, port: server.address().port })));
+  };
+  return new Promise(resolve => server.listen(port, '127.0.0.1', () => resolve({ server, requests, port: server.address().port, setFault: next => { fault = next ?? {}; if (!fault.hang) { for (const drop of held) drop(); held.clear(); } } })));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
