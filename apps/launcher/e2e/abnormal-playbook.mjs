@@ -41,8 +41,20 @@ const world = process.env.PLAYBOOK_WORLD;
 const only = process.env.PLAYBOOK_ONLY ?? "";
 const shots = process.env.PLAYBOOK_SHOTS ?? process.env.TEMP ?? ".";
 mkdirSync(shots, { recursive: true });
-const browser = await chromium.connectOverCDP(process.env.PLAYBOOK_CDP ?? "http://127.0.0.1:9223");
-const page = browser.contexts()[0].pages()[0] ?? await browser.contexts()[0].newPage();
+async function connect(url, timeout = 60_000) {
+  const until = Date.now() + timeout;
+  for (;;) {
+    try {
+      const connected = await chromium.connectOverCDP(url);
+      const found = connected.contexts().flatMap(context => context.pages()).find(item => !item.url().startsWith("devtools:"));
+      if (found) return { connected, found };
+      await connected.close();
+    } catch (error) { if (Date.now() > until) throw error; }
+    if (Date.now() > until) throw new Error(`no app page at ${url}`);
+    await new Promise(resolve => setTimeout(resolve, 1_000));
+  }
+}
+const { connected: browser, found: page } = await connect(process.env.PLAYBOOK_CDP ?? "http://127.0.0.1:9223");
 const result = { startedAt: new Date().toISOString(), lang, cases: [], errors: [] };
 const now = () => Date.now();
 const sleep = ms => page.waitForTimeout(ms);
@@ -738,6 +750,13 @@ function tinyPng() {
 }
 
 // ---- Run ----
+// The installed app's window cannot be given a language before it loads: set it as the app
+// keeps it and load again.
+await page.waitForLoadState("domcontentloaded").catch(() => {});
+if (await page.evaluate(() => localStorage.getItem("jouzu.ui.language")).catch(() => null) !== lang) {
+  await page.evaluate(value => localStorage.setItem("jouzu.ui.language", value), lang);
+  await page.reload();
+}
 await newSession().waitFor({ timeout: 60_000 }).catch(error => result.errors.push(`the app never became usable: ${error.message}`));
 for (const item of cases) {
   if (!item.langs.includes(lang)) continue;

@@ -12,8 +12,14 @@ import { startFixtureServer } from './fixture-server.mjs';
 // frozen app, bad files). It never touches a user's data folder and only ever stops
 // processes it started itself.
 //
-// Two ways to run it:
-//   Installed package (release acceptance, Windows):
+// Three ways to run it:
+//   Installed app, as a person starts it (release acceptance, Windows):
+//     ABN_SHELL    the installed "Jouzu Desktop.exe"; it runs with its own LOCALAPPDATA, so
+//                  its data folder, WebView profile and host files are all throwaway.
+//                  Windows lets one Jouzu Desktop run at a time: if the person's own app is
+//                  open the exam stops and says so; it never closes it.
+//     ABN_MANAGED  as below
+//   Installed package's host and UI in a test browser (no app window):
 //     ABN_INSTALL  the installed app folder (holds jouzu-host.exe or resources\host\)
 //     ABN_MANAGED  the installation's managed folder (%LOCALAPPDATA%\Shisa.ai\JouzuDesktop);
 //                  only its runtime/, app/ and bin/ are used, linked read-only
@@ -34,6 +40,11 @@ const children = new Set();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function installed() {
+  if (process.env.ABN_SHELL) {
+    const managed = process.env.ABN_MANAGED ?? join(process.env.LOCALAPPDATA ?? '', 'Shisa.ai', 'JouzuDesktop');
+    if (!existsSync(process.env.ABN_SHELL)) throw new Error(`No app at ${process.env.ABN_SHELL}`);
+    return { shell: process.env.ABN_SHELL, managed };
+  }
   const install = process.env.ABN_INSTALL;
   if (!install) return null;
   const managed = process.env.ABN_MANAGED ?? join(process.env.LOCALAPPDATA ?? '', 'Shisa.ai', 'JouzuDesktop');
@@ -46,7 +57,8 @@ function installed() {
 /** A throwaway root: the host's home, its data folder, a workspace, the runtime linked in. */
 function makeRoot(fixturePort, pkg) {
   const root = mkdtempSync(join(tmpdir(), 'jouzu-abnormal-'));
-  const home = join(root, 'home');
+  // The app keeps its files in %LOCALAPPDATA%\Shisa.ai\JouzuDesktop; the exam gives it its own.
+  const home = pkg?.shell ? join(root, 'localappdata', 'Shisa.ai', 'JouzuDesktop') : join(root, 'home');
   const data = join(home, 'data');
   const workspace = join(root, 'workspace');
   for (const dir of [home, join(data, 'agent'), workspace]) mkdirSync(dir, { recursive: true });
@@ -130,6 +142,27 @@ function sourceInstall(root) {
   const install = join(root, 'install');
   if (!existsSync(join(install, 'app'))) { mkdirSync(install, { recursive: true }); symlinkSync(resolve(process.env.ABN_RUNTIME_APP), join(install, 'app'), 'junction'); }
   return install;
+}
+
+/** The installed app as a person starts it; the host is its child. */
+function startShell(stack, port) {
+  const { pkg, paths } = stack;
+  for (const dir of ['localappdata', 'appdata']) mkdirSync(join(paths.root, dir), { recursive: true });
+  const env = cleanEnv(paths.root, { WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}` });
+  const child = spawn(pkg.shell, [], { env, cwd: paths.workspace, stdio: 'ignore', detached: false });
+  children.add(child);
+  child.on('exit', () => children.delete(child));
+  stack.shell = child;
+}
+async function shellHost(stack, timeout = 60_000) {
+  const until = Date.now() + timeout;
+  while (Date.now() < until) {
+    if (stack.shell.exitCode !== null) throw new Error('Jouzu Desktop exited at once: another Jouzu Desktop is probably open on this computer. Close it to run the installed-app exam (the exam never closes it).');
+    const host = descendants(stack.shell.pid).find(row => /jouzu-host/i.test(row.name));
+    if (host && existsSync(join(stack.paths.home, 'host.json'))) { stack.host = { pid: host.pid }; return hostInfo(stack.paths.home); }
+    await sleep(500);
+  }
+  throw new Error('The installed app did not start its host within 60 s');
 }
 
 function startHost(stack) {
@@ -296,7 +329,7 @@ function runPlaybook(env) {
 
 const report = { startedAt: new Date().toISOString(), mode: null, runs: [] };
 const pkg = installed();
-report.mode = pkg ? `installed package ${pkg.install}` : `source build ${process.env.ABN_HOST}`;
+report.mode = pkg?.shell ? `installed app ${pkg.shell}` : pkg ? `installed package's host and UI in a test browser ${pkg.install}` : `source build ${process.env.ABN_HOST}`;
 if (!pkg) for (const name of ['ABN_HOST', 'ABN_DIST', 'ABN_RUNTIME_APP']) if (!process.env[name]) { console.error(`${name} is not set`); process.exit(2); }
 const languages = (process.env.ABN_LANGS ?? 'en,ja').split(',').map(item => item.trim()).filter(Boolean);
 let port = Number(process.env.ABN_PORT ?? 9240);
@@ -304,11 +337,16 @@ try {
   for (const language of languages) {
     const fixture = await startFixtureServer(0);
     const stack = { pkg, paths: makeRoot(fixture.port, pkg) };
-    startHost(stack);
-    const info = await hostInfo(stack.paths.home);
-    stack.restart = async () => { kill(stack.host.pid); await sleep(500); startHost(stack); return hostInfo(stack.paths.home); };
+    let browser = null;
+    if (pkg?.shell) {
+      startShell(stack, port);
+      await shellHost(stack);
+    } else {
+      startHost(stack);
+      const info = await hostInfo(stack.paths.home);
+      browser = await openBrowser(info, language, port);
+    }
     const world = await worldServer(stack);
-    const browser = await openBrowser(info, language, port);
     const file = join(out, `abnormal-${language}.json`);
     const run = await runPlaybook({
       PLAYBOOK_CDP: `http://127.0.0.1:${port}`, PLAYBOOK_OUT: file, PLAYBOOK_SHOTS: join(out, language),
@@ -316,10 +354,11 @@ try {
       PLAYBOOK_ONLY: process.env.ABN_ONLY ?? '',
     });
     report.runs.push({ language, root: stack.paths.root, code: run.code, result: run.result });
-    await browser.close();
+    await browser?.close();
     world.server.close();
     fixture.server.close();
     kill(stack.host.pid);
+    if (stack.shell) kill(stack.shell.pid);
     try { cpSync(join(stack.paths.home, 'logs'), join(out, `logs-${language}`), { recursive: true }); } catch { /* no logs */ }
     port += 1;
   }
