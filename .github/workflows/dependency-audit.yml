@@ -3,9 +3,19 @@ name: Dependency audit
 # Advisories are checked when the dependencies change, every day against the
 # latest advisory database, and by the release before an installer is built.
 # A finding is fixed by upgrading, not by ignoring it.
+# A release checks what it ships: npm packages the installer contains (no dev-only build
+# and test tools) and the Rust crates. Pull requests and the daily run check every npm
+# package, dev tools included, so a dev-only finding is still reported and upgraded when a
+# fix exists; it just does not block an installer it is not part of.
 on:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      npm-scope:
+        description: "all: every npm package; shipped: only packages the installer contains"
+        required: false
+        type: string
+        default: all
   schedule:
     - cron: '0 21 * * *'
   pull_request:
@@ -31,7 +41,14 @@ jobs:
         with:
           node-version: '24.22.2'
       - name: npm audit
-        run: npm audit --prefix apps/launcher --audit-level=high
+        env:
+          NPM_SCOPE: ${{ inputs.npm-scope || 'all' }}
+        run: |
+          if [ "$NPM_SCOPE" = shipped ]; then
+            npm audit --prefix apps/launcher --omit=dev --audit-level=high
+          else
+            npm audit --prefix apps/launcher --audit-level=high
+          fi
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ~/.cargo/bin/cargo-audit

@@ -95,6 +95,8 @@ jobs:
 
   audit:
     uses: ./.github/workflows/dependency-audit.yml
+    with:
+      npm-scope: shipped
 
   windows:
     needs: [prepare, audit]
