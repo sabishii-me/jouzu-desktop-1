@@ -4870,6 +4870,66 @@ mod session_tests {
         manager.stop_all();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_message_sent_while_the_runtime_recovers_is_held_and_answered() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager.create_pending(workspace.path().to_str().unwrap(), None, None).unwrap();
+        session.attach_early();
+        session.send("first", "hello").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        let pid = session.runtime_pid().unwrap();
+        std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status().unwrap();
+        wait_until(|| session.status() == Status::Recovering).await;
+        // The session is still there: its message is held, not refused.
+        session.send("during", "again").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().filter(|row| row["kind"] == "assistant").count() == 2)).await;
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_stopped_session_starts_again_for_a_message() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager.create_pending(workspace.path().to_str().unwrap(), None, None).unwrap();
+        session.attach_early();
+        session.send("first", "hello").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        session.stop();
+        assert_eq!(session.status(), Status::Stopped);
+        // Its model stays on screen: nothing is on its way.
+        assert_eq!(session.summary()["model"]["state"], "ready", "{}", session.summary());
+        assert_eq!(session.summary()["model"]["id"], "model");
+        // The same session takes the message and starts a runtime for it.
+        session.send("after-stop", "again").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().filter(|row| row["kind"] == "assistant").count() == 2)).await;
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_pick_on_a_stopped_session_waits_for_its_next_runtime() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let log_path = log.path().to_string_lossy().into_owned();
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_PROMPT_MODEL_LOG", log_path.as_str())]);
+        let session = manager.create_pending(workspace.path().to_str().unwrap(), None, None).unwrap();
+        session.attach_early();
+        wait_status(&session, Status::Idle).await;
+        wait_until(|| session.summary()["models"].as_array().map_or(0, Vec::len) == 2).await;
+        // A pick still on its way when the runtime goes does not stay "resolving".
+        session.request_model("fixture", "other");
+        session.stop();
+        let stopped = session.summary();
+        assert_eq!(stopped["model"]["state"], "ready", "{stopped}");
+        assert_eq!(stopped["model"]["id"], "other", "{stopped}");
+        // A pick made while stopped is shown at once and used by the next runtime.
+        session.select_model("fixture", "other").await.unwrap();
+        session.send("after-stop", "hello").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        assert_eq!(session.summary()["model"]["id"], "other");
+        assert_eq!(std::fs::read_to_string(log.path()).unwrap().trim(), "other");
+        manager.stop_all();
+    }
+
     #[tokio::test]
     async fn a_new_conversation_shows_the_runtimes_last_answer_before_its_own() {
         let (manager, _home, workspace) = manager(50);
@@ -4879,18 +4939,25 @@ mod session_tests {
         wait_until(|| first.summary()["models"].as_array().map_or(0, Vec::len) == 2).await;
         // Before its runtime answers, the next one shows the list and model the
         // runtimes last reported, and the client's pick by its listed name.
+        // It has no runtime yet, so nothing is on its way: it shows that model.
         let next = manager.create_pending(path, None, None).unwrap();
         let summary = next.summary();
-        assert_eq!(summary["model"]["state"], "resolving");
-        assert_eq!(summary["model"]["expected"]["id"], "model", "{summary}");
+        assert_eq!(summary["model"]["state"], "ready", "{summary}");
+        assert_eq!(summary["model"]["id"], "model", "{summary}");
         assert_eq!(summary["models"].as_array().unwrap().len(), 2, "{summary}");
         next.request_model("fixture", "other");
-        assert_eq!(next.summary()["model"]["expected"]["name"], "Fixture Other");
+        assert_eq!(next.summary()["model"]["name"], "Fixture Other");
+        // Once its runtime starts, the same model is what it expects.
+        next.attach_early();
+        let starting = next.summary();
+        if starting["model"]["state"] == "resolving" {
+            assert_eq!(starting["model"]["expected"]["name"], "Fixture Other", "{starting}");
+        }
         // A configuration change forgets what the runtimes said.
         manager.forget_known_models();
         let after = manager.create_pending(path, None, None).unwrap();
         assert!(after.summary()["models"].as_array().unwrap().is_empty());
-        assert!(after.summary()["model"].get("expected").is_none());
+        assert!(after.summary()["model"].get("id").is_none());
         manager.stop_all();
     }
 

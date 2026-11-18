@@ -3879,8 +3879,12 @@ impl Session {
         if total > 20 * 1024 * 1024 {
             return Err(ApiError::bad_request("Images must total 20 MB or less"));
         }
-        match self.status() {
-            Status::Stopped | Status::Error | Status::Cancelled => {
+        // The session owns its messages whatever its runtime does: a stopped
+        // session starts a runtime again for this message, and one whose runtime
+        // is being replaced (recovering) holds it like one that is starting.
+        // Only a session that failed waits for the user's Restart.
+        let resume = match self.status() {
+            Status::Error => {
                 return Err(ApiError::new(
                     axum::http::StatusCode::CONFLICT,
                     "session-stopped",
@@ -3888,16 +3892,9 @@ impl Session {
                     false,
                 ))
             }
-            Status::Recovering => {
-                return Err(ApiError::new(
-                    axum::http::StatusCode::CONFLICT,
-                    "session-recovering",
-                    "The runtime is recovering; retry in a moment",
-                    true,
-                ))
-            }
-            _ => {}
-        }
+            Status::Stopped | Status::Cancelled => true,
+            _ => false,
+        };
         let now = Instant::now();
         let cancelled = {
             let mut tombstones = self
@@ -3968,7 +3965,8 @@ impl Session {
         self.remember_turn(text);
         // Whether the runtime is still being started: the prompt is parked
         // until its handshake ends (`flush_parked_prompt`).
-        let starting = matches!(self.status(), Status::Pending | Status::Starting)
+        let starting = resume
+            || matches!(self.status(), Status::Pending | Status::Starting | Status::Recovering)
             || self.model_state() != "ready";
         // The message starts a run only when none is in progress, whoever
         // started that one. Decided and claimed at once, under the same locks
@@ -4055,7 +4053,7 @@ impl Session {
         );
         self.sync_status();
         self.publish_summary();
-        if matches!(self.status(), Status::Pending) {
+        if resume || matches!(self.status(), Status::Pending) {
             self.set_status(Status::Starting);
             self.start();
             if matches!(self.status(), Status::Cancelled | Status::Error) {
@@ -4399,9 +4397,7 @@ impl Session {
     pub async fn select_model(self: &Arc<Self>, provider: &str, model: &str) -> Result<Value, ApiError> {
         // Before the runtime answered, the choice waits for it like the pick a
         // new conversation was created with.
-        if !self.model_answered.load(Ordering::SeqCst)
-            && matches!(self.status(), Status::Pending | Status::Starting | Status::Recovering)
-        {
+        if !self.model_answered.load(Ordering::SeqCst) || !self.runtime_live() {
             self.request_model(provider, model);
             return Ok(json!({ "provider": provider, "id": model, "pending": true }));
         }
@@ -4496,7 +4492,7 @@ impl Session {
     /// `resolving` until the runtime answers (and has the model the client
     /// asked for, when it offers it), then `ready` or `none`.
     fn model_state(&self) -> &'static str {
-        if self.pick_pending.load(Ordering::SeqCst) {
+        if self.pick_pending.load(Ordering::SeqCst) || !self.model_answered.load(Ordering::SeqCst) {
             "resolving"
         } else if self
             .model
@@ -4505,11 +4501,52 @@ impl Session {
             .is_some()
         {
             "ready"
-        } else if self.model_answered.load(Ordering::SeqCst) {
-            "none"
         } else {
-            "resolving"
+            "none"
         }
+    }
+
+    /// Whether a runtime is working for this session now (starting, recovering
+    /// or up). Only then can anything about the model still be on its way.
+    fn runtime_live(&self) -> bool {
+        !matches!(
+            self.status(),
+            Status::Pending | Status::Stopped | Status::Cancelled | Status::Error
+        )
+    }
+
+    /// The session's runtime is gone (stopped, failed, exited). What it was
+    /// asked and never answered ends with it: the session keeps the model that
+    /// runtime last reported, and a pick it never applied stays on the session
+    /// for the next runtime (`install_runtime`). Nothing waits on it any more.
+    fn runtime_gone(&self) {
+        self.pick_pending.store(false, Ordering::SeqCst);
+        self.model_answered.store(false, Ordering::SeqCst);
+    }
+
+    /// The model a session without a runtime shows: the user's pick waiting for
+    /// the next runtime, else the model its last runtime reported, else the one
+    /// its runtimes' earlier words lead to expect.
+    fn resting_model(&self) -> Option<Value> {
+        let requested = self
+            .requested_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some((provider, id)) = requested {
+            return Some(
+                self.config
+                    .known
+                    .find(&provider, &id)
+                    .unwrap_or_else(|| json!({ "provider": provider, "id": id })),
+            );
+        }
+        let current = self
+            .model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        current.or_else(|| self.expected_model())
     }
 
     /// The session's model as clients see it: the runtime's report and its state.
@@ -4519,6 +4556,16 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        if !self.runtime_live() {
+            // No runtime, so nothing is on its way: the session shows its model.
+            return match self.resting_model() {
+                Some(Value::Object(mut object)) => {
+                    object.insert("state".into(), json!("ready"));
+                    Value::Object(object)
+                }
+                _ => json!({ "state": "resolving" }),
+            };
+        }
         let mut view = match model {
             Some(Value::Object(object)) => Value::Object(object),
             _ => json!({}),
@@ -4586,7 +4633,11 @@ impl Session {
             .requested_model
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((provider.to_string(), id.to_string()));
-        self.pick_pending.store(true, Ordering::SeqCst);
+        // Without a runtime the pick waits on the session; the next runtime
+        // takes it (`install_runtime`).
+        if self.runtime_live() {
+            self.pick_pending.store(true, Ordering::SeqCst);
+        }
         self.publish_summary();
         if self.model_answered.load(Ordering::SeqCst) {
             self.apply_requested_model();
@@ -4679,6 +4730,7 @@ impl Session {
             Status::Stopped
         });
         self.restarts.reset();
+        self.runtime_gone();
         self.cancel_pending("session-stopped");
         let runtime = self
             .runtime
@@ -5168,15 +5220,22 @@ impl Session {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if requested.is_none() {
                     *requested = Some((provider.to_string(), id.to_string()));
-                    self.pick_pending.store(true, Ordering::SeqCst);
                 }
             }
         }
-        // A new runtime has its own model: until it answers, the session's
-        // model is unknown again, not the last runtime's.
+        // The new runtime has its own model and answers for it: until then the
+        // session's model is `resolving` (it keeps showing the one it had), and
+        // a pick waiting on the session goes to this runtime.
         self.model_answered.store(false, Ordering::SeqCst);
+        if self
+            .requested_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            self.pick_pending.store(true, Ordering::SeqCst);
+        }
         self.known_generation.store(self.config.known.generation(), Ordering::SeqCst);
-        self.set_model(None);
         self.set_list(&self.models, Vec::new());
         self.set_list(&self.thinking_levels, Vec::new());
         *self
@@ -5228,6 +5287,7 @@ impl Session {
             "runtime.recovering",
             json!({ "reason": reason, "attempts": count }),
         );
+        self.runtime_gone();
         self.set_status(Status::Recovering);
         let session = self.clone();
         tokio::spawn(async move {
@@ -5303,6 +5363,7 @@ impl Session {
             "recovery": "restart",
         }));
         self.set_status(Status::Error);
+        self.runtime_gone();
         self.queue_paused.store(true, Ordering::SeqCst);
         self.steers_in_flight.store(0, Ordering::SeqCst);
         for item in self
@@ -6370,8 +6431,13 @@ impl SessionManager {
                 // A session in error that nobody shows can still own a live
                 // runtime; it is released like an idle one (#93). Opening it
                 // again starts it afresh.
+                // A stopped one nobody shows holds nothing but its entry: a
+                // client that opens it again gets it from its file.
                 let idle = untouched
-                    || matches!(session.status(), Status::Idle | Status::Error)
+                    || matches!(
+                        session.status(),
+                        Status::Idle | Status::Error | Status::Stopped | Status::Cancelled
+                    )
                         && session.subscriber_count() == 0
                         && !held.contains(id)
                         && session.last_activity().elapsed() >= limits.idle;
