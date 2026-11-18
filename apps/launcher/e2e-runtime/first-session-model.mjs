@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { hostAccess } from './host-access.mjs';
 
 // Regression check for #99: the first new session after the host starts shows a
 // model. Its model is the one its runtime reports (the host keeps no default of
@@ -12,7 +13,7 @@ if (!hostHome || !workspace) {
   console.error('JOUZU_E2E_HOST_HOME or JOUZU_E2E_WORKSPACE is not set; skipping the first session model check.');
   process.exit(2);
 }
-const host = JSON.parse(readFileSync(join(hostHome, 'host.json'), 'utf8'));
+const host = hostAccess(hostHome);
 const base = `http://127.0.0.1:${host.port}`;
 const headers = { authorization: `Bearer ${host.token}`, 'content-type': 'application/json' };
 const call = async (path, body) => {

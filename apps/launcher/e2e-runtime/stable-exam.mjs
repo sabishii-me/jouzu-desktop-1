@@ -49,11 +49,24 @@ async function startHost(root, extraEnv) {
   const env = { ...process.env, ...extraEnv };
   delete env.PLAYBOOK_SHISA_API_KEY;
   delete env.PLAYBOOK_OPENROUTER_API_KEY;
-  const child = spawn(hostExe, ['--dist', dist, '--home', root, '--runtime-home', join(root, 'data'), '--install', root], { env, stdio: 'ignore', windowsHide: true });
+  const child = spawn(hostExe, ['--dist', dist, '--home', root, '--runtime-home', join(root, 'data'), '--install', root], { env, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
   children.push(child);
-  for (let attempt = 0; attempt < 60 && !existsSync(join(root, 'host.json')); attempt += 1) await new Promise(r => setTimeout(r, 500));
-  if (!existsSync(join(root, 'host.json'))) throw new Error('The host did not start');
-  return JSON.parse(readFileSync(join(root, 'host.json'), 'utf8'));
+  // The host gives its port and API token to its starter on its first output
+  // line, and writes the token to no file (#130).
+  return await new Promise((done, fail) => {
+    const timer = setTimeout(() => fail(new Error('The host did not start')), 30_000);
+    let text = '';
+    child.stdout.on('data', chunk => {
+      text += chunk;
+      const end = text.indexOf('\n');
+      if (end < 0) return;
+      clearTimeout(timer);
+      child.stdout.removeAllListeners('data');
+      child.stdout.resume();
+      try { done(JSON.parse(text.slice(0, end))); } catch (error) { fail(error); }
+    });
+    child.on('exit', code => { clearTimeout(timer); fail(new Error(`The host exited (${code}) before it was ready`)); });
+  });
 }
 
 async function openBrowser(host, port) {

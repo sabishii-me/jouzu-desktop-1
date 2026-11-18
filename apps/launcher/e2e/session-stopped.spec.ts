@@ -33,17 +33,24 @@ test.beforeEach(async () => {
   host = spawn(hostBin, [
     "--dist", dist, "--home", home, "--runtime-home", join(scratch, "runtime"),
     "--runtime", process.execPath, "--runtime-arg", fixture,
-  ], { env: { ...process.env, HOME: scratch, USERPROFILE: scratch }, stdio: "ignore" });
-  const deadline = Date.now() + 20_000;
-  while (Date.now() < deadline) {
-    try {
-      const info = JSON.parse(readFileSync(join(home, "host.json"), "utf8"));
-      base = `http://127.0.0.1:${info.port}`;
-      token = info.token;
-      break;
-    } catch { await new Promise(done => setTimeout(done, 100)); }
-  }
-  expect(token, "the host wrote host.json").not.toBe("");
+  ], { env: { ...process.env, HOME: scratch, USERPROFILE: scratch }, stdio: ["ignore", "pipe", "ignore"] });
+  // The host gives its port and API token on its first output line (#130).
+  const ready = await new Promise<{ port: number; token: string }>((done, fail) => {
+    let text = "";
+    const timer = setTimeout(() => fail(new Error("the host did not start")), 20_000);
+    host!.stdout!.on("data", chunk => {
+      text += chunk;
+      const end = text.indexOf("\n");
+      if (end < 0) return;
+      clearTimeout(timer);
+      host!.stdout!.removeAllListeners("data");
+      host!.stdout!.resume();
+      done(JSON.parse(text.slice(0, end)));
+    });
+  });
+  base = `http://127.0.0.1:${ready.port}`;
+  token = ready.token;
+  expect(token, "the host gave its token").not.toBe("");
 });
 
 test.afterEach(() => {
