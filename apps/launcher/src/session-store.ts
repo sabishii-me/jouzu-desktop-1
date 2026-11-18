@@ -785,6 +785,9 @@ export class SessionStore {
       this.update({ textguard: { ...this.state.textguard, alert: notice.text } });
     } else if (notice.kind === "flow-hold") {
       this.update({ flowHold: { text: notice.text, paused: notice.paused } });
+    } else if (notice.kind === "flow-paused") {
+      // Nothing waits on the person: what caused the pause (a failed reply, their
+      // own Stop) is already shown where it happened, and the next message resumes.
     } else {
       this.update({ notice: { id: ++this.noticeSeq, text: notice.text, level: notice.level } });
     }
