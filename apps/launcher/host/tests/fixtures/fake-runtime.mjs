@@ -345,10 +345,18 @@ function run(text, images) {
 
 // Like the runtime: the models it registered, the one it uses (none when
 // FAKE_RUNTIME_NO_MODEL is set: nothing is configured) and the level.
-const fixtureModels = [
+const defaultModels = [
   { name: "fixture-model", provider: "fixture", id: "model" },
   { name: "Fixture Other", provider: "fixture", id: "other" },
 ];
+// FAKE_RUNTIME_MODELS_FILE: the configured models, read at start and again when
+// a session is opened (like the runtime, which builds its model runtime anew).
+const readModels = () => {
+  const file = process.env.FAKE_RUNTIME_MODELS_FILE;
+  if (!file || !existsSync(file)) return defaultModels;
+  try { return JSON.parse(readFileSync(file, "utf8")); } catch { return defaultModels; }
+};
+let fixtureModels = readModels();
 let currentModel = process.env.FAKE_RUNTIME_NO_MODEL ? null : fixtureModels[0];
 let currentLevel = "off";
 
@@ -422,6 +430,12 @@ lines.on("line", line => {
         failure(value.id, "switch_session", refusal);
         break;
       }
+      if (process.env.FAKE_RUNTIME_MODELS_FILE) {
+        // Opening a session reads the configuration again; a file with no model
+        // recorded starts on the runtime's first model.
+        fixtureModels = readModels();
+        currentModel = fixtureModels[0] ?? null;
+      }
       // Like the runtime: a saved conversation resumes on the model it last used.
       try {
         const changes = readFileSync(String(value.sessionPath), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.type === "model_change");
@@ -431,6 +445,8 @@ lines.on("line", line => {
       response(value.id, "switch_session", { cancelled: false });
       break;
     case "prompt":
+      // FAKE_RUNTIME_PROMPT_MODEL_LOG: which model each prompt arrived under.
+      if (process.env.FAKE_RUNTIME_PROMPT_MODEL_LOG) appendFileSync(process.env.FAKE_RUNTIME_PROMPT_MODEL_LOG, `${currentModel?.id ?? "none"}\n`);
       // Refused (if a run is going) only once its input handlers are done.
       prompt(value.id, String(value.message ?? ""), value.images);
       break;

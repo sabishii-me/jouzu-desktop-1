@@ -23,6 +23,8 @@ use std::{
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
+use crate::known_models::KnownModels;
+
 use super::{process, RuntimeEvent, RuntimeSupervisor, SpawnSpec};
 
 /// How long a warm runtime may take to answer its first request.
@@ -171,6 +173,9 @@ pub struct WarmPool {
     ready: Notify,
     /// Told on every change of the pool, for sessions waiting their turn to start.
     moved: Notify,
+    /// Where a warm runtime's answers about models are kept, so a new session
+    /// shows them before its own runtime has answered.
+    known: std::sync::OnceLock<Arc<KnownModels>>,
 }
 
 impl WarmPool {
@@ -220,7 +225,13 @@ impl WarmPool {
             changed: Box::new(changed),
             ready: Notify::new(),
             moved: Notify::new(),
+            known: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Keep each warm runtime's answers about models in `known`.
+    pub fn keep_models_in(&self, known: Arc<KnownModels>) {
+        let _ = self.known.set(known);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -383,6 +394,8 @@ impl WarmPool {
 
         // Ready once it answers a request: Node is up and the extensions loaded.
         let pool = self.clone();
+        // Answers about models count only for the configuration it started with.
+        let known = self.known.get().map(|known| (known.clone(), known.generation()));
         tokio::spawn(async move {
             let result = runtime
                 .request(
@@ -391,7 +404,24 @@ impl WarmPool {
                 )
                 .await;
             match result {
-                Ok(_) => {
+                Ok(state) => {
+                    if let Some((known, configured)) = known {
+                        // A blank runtime's model is what a new conversation
+                        // starts on; its list is what every runtime offers.
+                        known.remember_start_model(configured, state.get("model"));
+                        let runtime = runtime.clone();
+                        tokio::spawn(async move {
+                            let listed = runtime
+                                .request(
+                                    json!({ "id": format!("warm-models-{generation}"), "type": "get_available_models" }),
+                                    Duration::from_secs(30),
+                                )
+                                .await;
+                            if let Some(models) = listed.ok().as_ref().and_then(|answer| answer.get("models")).and_then(Value::as_array) {
+                                known.remember_list(configured, models);
+                            }
+                        });
+                    }
                     {
                         let mut inner = pool.lock();
                         let Some(slot) = inner.slots.iter_mut().find(|slot| slot.generation == generation) else {

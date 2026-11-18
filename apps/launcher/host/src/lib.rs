@@ -18,6 +18,7 @@ pub mod control;
 mod environment;
 pub mod events;
 mod files;
+pub mod known_models;
 pub mod runtime;
 pub mod sessions_repair;
 pub mod session;
@@ -624,11 +625,12 @@ async fn create_session(
     Json(request): Json<CreateRequest>,
 ) -> Result<Response, ApiError> {
     let client_id = request.client_id.clone();
-    let session = if request.session_path.is_none() {
+    let new_conversation = request.session_path.is_none();
+    let session = if new_conversation {
         state.sessions.create_pending(
             &request.workspace_path,
-            request.session_path,
-            request.key,
+            request.session_path.clone(),
+            request.key.clone(),
         )?
     } else {
         state
@@ -640,6 +642,13 @@ async fn create_session(
         .filter(|value| !value.trim().is_empty())
     {
         state.sessions.hold(client_id, &session.id);
+    }
+    // A new conversation on the client's last pick: relayed to the runtime as
+    // soon as its list offers it, before anything is sent.
+    if let (true, Some(pick)) = (new_conversation, request.model.as_ref()) {
+        if session.untouched_new() {
+            session.request_model(&pick.provider, &pick.id);
+        }
     }
     // The runtime starts now: the session's model is the one it reports.
     session.attach_early();
@@ -1058,6 +1067,10 @@ async fn config_cancel(State(state): State<AppState>, AxumPath(id): AxumPath<Str
 }
 
 pub fn recycle_warm_runtime(sessions: &SessionManager) {
+    // What runtimes said about models held for the old configuration; open
+    // sessions' runtimes read the new one.
+    sessions.forget_known_models();
+    sessions.reload_configuration();
     if let Some(pool) = sessions.warm_runtime() {
         pool.recycle();
     }
@@ -3936,8 +3949,8 @@ mod session_tests {
         assert_eq!(session.status(), Status::Error);
     }
 
-    /// A saved conversation opened while its runtime is not up: nothing can be
-    /// sent before the runtime reports the session's model.
+    /// A saved conversation opened while its runtime is not up: a message sent
+    /// now waits for the runtime to report the session's model.
     async fn failing_session(env: &[(&str, &str)]) -> (Arc<crate::session::Session>, Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir, String) {
         let (manager, home, workspace) = manager_with_env(50, env);
         let header = json!({ "type": "session", "version": 3, "id": "fails", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
@@ -3947,7 +3960,7 @@ mod session_tests {
         let session = manager
             .create(workspace.path().to_str().unwrap(), Some(path.clone()), None)
             .unwrap();
-        assert_eq!(session.send("waiting", "hello").unwrap_err().code, "no-model");
+        session.send("waiting", "hello").unwrap();
         (session, manager, home, workspace, path)
     }
 
@@ -4730,20 +4743,129 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn nothing_is_sent_or_chosen_before_the_runtime_reports_a_model() {
+    async fn a_message_sent_before_the_runtime_reports_a_model_waits_for_it() {
         let (manager, _home, workspace) = manager(50);
         let path = workspace.path().to_str().unwrap();
-        // No runtime has answered for it: the host holds no model and no pick.
+        // No runtime has answered for it: the host holds no model of its own.
         let pending = manager.create_pending(path, None, None).unwrap();
         assert_eq!(pending.summary()["model"], json!({ "state": "resolving" }));
-        let refused = pending.send("first", "hello").unwrap_err();
-        assert_eq!(refused.code, "no-model");
-        assert!(refused.retryable);
-        let refused = pending.select_model("fixture", "other").await.unwrap_err();
-        assert_eq!(refused.code, "model-resolving");
+        // Sending is never refused for a model still on its way: the message waits.
+        pending.send("first", "hello").unwrap();
+        // A pick made now is the client's choice, handed over once the runtime lists it.
+        let picked = pending.select_model("fixture", "other").await.unwrap();
+        assert_eq!(picked["pending"], true);
         let refused = pending.select_thinking("low").await.unwrap_err();
         assert_eq!(refused.code, "model-resolving");
-        assert_eq!(pending.summary()["model"], json!({ "state": "resolving" }));
+        assert_eq!(pending.summary()["model"]["state"], "resolving");
+    }
+
+    #[tokio::test]
+    async fn a_new_conversation_sends_its_first_message_on_the_picked_model() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let log_path = log.path().to_string_lossy().into_owned();
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_PROMPT_MODEL_LOG", log_path.as_str())]);
+        let path = workspace.path().to_str().unwrap();
+        // The client's last pick comes with the new conversation; the message is
+        // sent at once, before the runtime has answered anything.
+        let session = manager.create_pending(path, None, None).unwrap();
+        session.request_model("fixture", "other");
+        session.attach_early();
+        session.send("first", "hello").unwrap();
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant")) && session.status() == Status::Idle).await;
+        assert_eq!(session.summary()["model"]["id"], "other");
+        // The runtime received the prompt on the picked model, never its own first.
+        assert_eq!(std::fs::read_to_string(log.path()).unwrap().trim(), "other");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_pick_the_runtime_does_not_list_leaves_its_own_model() {
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().to_str().unwrap();
+        let session = manager.create_pending(path, None, None).unwrap();
+        session.request_model("gone", "removed");
+        session.attach_early();
+        session.send("first", "hello").unwrap();
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant")) && session.status() == Status::Idle).await;
+        assert_eq!(session.summary()["model"]["id"], "model");
+        assert_eq!(session.summary()["model"]["state"], "ready");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_message_to_a_runtime_without_a_model_fails_where_it_was_sent() {
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_NO_MODEL", "1")]);
+        let path = workspace.path().to_str().unwrap();
+        let session = manager.create_pending(path, None, None).unwrap();
+        session.attach_early();
+        session.send("first", "hello").unwrap();
+        wait_until(|| session.summary()["failedTurn"]["error"]["code"] == "no-model").await;
+        let summary = session.summary();
+        assert!(summary["activeTurn"].is_null(), "{summary}");
+        assert_eq!(summary["model"]["state"], "none");
+        assert!(summary["failure"].is_null(), "only the message failed: {summary}");
+    }
+
+    #[tokio::test]
+    async fn a_configuration_change_reaches_open_sessions() {
+        let models = tempfile::NamedTempFile::new().unwrap();
+        let write = |list: Value| std::fs::write(models.path(), list.to_string()).unwrap();
+        write(json!([
+            { "name": "fixture-model", "provider": "fixture", "id": "model" },
+            { "name": "Fixture Other", "provider": "fixture", "id": "other" },
+        ]));
+        let file = models.path().to_string_lossy().into_owned();
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_MODELS_FILE", file.as_str())]);
+        let path = workspace.path().to_str().unwrap();
+        let session = manager.create_pending(path, None, None).unwrap();
+        session.attach_early();
+        wait_status(&session, Status::Idle).await;
+        wait_until(|| session.summary()["models"].as_array().map_or(0, Vec::len) == 2).await;
+        session.select_model("fixture", "other").await.unwrap();
+        // Settings changed: a model added, a limit edited.
+        write(json!([
+            { "name": "fixture-model", "provider": "fixture", "id": "model" },
+            { "name": "Fixture Other", "provider": "fixture", "id": "other", "contextWindow": 1000 },
+            { "name": "Added", "provider": "fixture", "id": "added" },
+        ]));
+        recycle_warm_runtime(&manager);
+        wait_until(|| session.summary()["models"].as_array().map_or(0, Vec::len) == 3).await;
+        wait_status(&session, Status::Idle).await;
+        let summary = session.summary();
+        assert_eq!(summary["models"][1]["contextWindow"], 1000, "{summary}");
+        // The new conversation keeps the model it showed.
+        assert_eq!(summary["model"]["id"], "other", "{summary}");
+        assert_eq!(summary["model"]["state"], "ready", "{summary}");
+        session.send("after", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_new_conversation_shows_the_runtimes_last_answer_before_its_own() {
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().to_str().unwrap();
+        let first = manager.create(path, None, None).unwrap();
+        wait_status(&first, Status::Idle).await;
+        wait_until(|| first.summary()["models"].as_array().map_or(0, Vec::len) == 2).await;
+        // Before its runtime answers, the next one shows the list and model the
+        // runtimes last reported, and the client's pick by its listed name.
+        let next = manager.create_pending(path, None, None).unwrap();
+        let summary = next.summary();
+        assert_eq!(summary["model"]["state"], "resolving");
+        assert_eq!(summary["model"]["expected"]["id"], "model", "{summary}");
+        assert_eq!(summary["models"].as_array().unwrap().len(), 2, "{summary}");
+        next.request_model("fixture", "other");
+        assert_eq!(next.summary()["model"]["expected"]["name"], "Fixture Other");
+        // A configuration change forgets what the runtimes said.
+        manager.forget_known_models();
+        let after = manager.create_pending(path, None, None).unwrap();
+        assert!(after.summary()["models"].as_array().unwrap().is_empty());
+        assert!(after.summary()["model"].get("expected").is_none());
+        manager.stop_all();
     }
 
     #[tokio::test]
@@ -4832,6 +4954,11 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        // Without a warm runtime: the latest list a runtime answered.
+        wait_until(|| session.summary()["models"].as_array().map_or(0, Vec::len) == 2).await;
+        let known = call(app.clone(), request(Method::GET, "/v1/models").body(Body::empty()).unwrap()).await;
+        assert_eq!(known.0, StatusCode::OK, "{}", known.2);
+        manager.forget_known_models();
         let none = call(app.clone(), request(Method::GET, "/v1/models").body(Body::empty()).unwrap()).await;
         assert_eq!(none.0, StatusCode::SERVICE_UNAVAILABLE, "{}", none.2);
         let pool = manager.enable_warm_runtime().expect("warm pool");

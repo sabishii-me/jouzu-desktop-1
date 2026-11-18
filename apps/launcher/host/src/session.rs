@@ -79,6 +79,7 @@ use tokio::sync::broadcast;
 use crate::awake::AwakeInstant;
 use crate::log;
 use crate::runtime::adapter::pi::{self, DeltaKind, Record as PiRecord};
+use crate::known_models::{is_model, KnownModels};
 use crate::runtime::{same_place, RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec, WarmPool};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -152,6 +153,8 @@ pub struct SessionConfig {
     pub events: Option<Arc<crate::events::EventHub>>,
     /// The runtime started ahead of need, shared by every session.
     pub warm: Arc<std::sync::OnceLock<Arc<WarmPool>>>,
+    /// The runtimes' latest answers about models (`known_models`).
+    pub known: Arc<KnownModels>,
 }
 
 impl SessionConfig {
@@ -729,6 +732,21 @@ pub struct Session {
     models: Mutex<Vec<Value>>,
     /// The runtime refused to list its models: its words, until a list arrives.
     model_list_error: Mutex<Option<String>>,
+    /// The model the client asked a new conversation to use (its last pick),
+    /// not yet handed to the runtime. It is the client's choice, relayed: the
+    /// runtime gets it with `set_model` once its own list offers it.
+    requested_model: Mutex<Option<(String, String)>>,
+    /// A requested model is on its way to the runtime: the model stays
+    /// `resolving`, so nothing is sent on the model it replaces.
+    pick_pending: AtomicBool,
+    /// The configuration changed since this session's runtime read it: it
+    /// re-reads it (`switch_session` to its own file) once it is idle.
+    reload_due: AtomicBool,
+    /// That re-read is under way: its answers refresh the model lists.
+    reloading: AtomicBool,
+    /// The configuration generation the current runtime started under: its
+    /// answers about models are kept only while that is still current.
+    known_generation: AtomicU64,
     /// The runtime's `get_available_thinking_levels`, as it answered.
     thinking_levels: Mutex<Vec<Value>>,
     /// The reasoning level the runtime reports.
@@ -1020,6 +1038,85 @@ impl Session {
         }
         self.sync_status();
         self.publish_summary();
+        self.reload_if_due();
+    }
+
+    /// The configuration changed (a catalog refresh, a key, a provider, a model
+    /// limit). The runtime read it when it opened this session and keeps that
+    /// copy; opening the session again (`switch_session` to its own file)
+    /// makes it read the configuration anew, models included. Done at once
+    /// when the session is idle, else when its run ends.
+    pub fn reload_configuration(self: &Arc<Self>) {
+        self.reload_due.store(true, Ordering::SeqCst);
+        self.reload_if_due();
+    }
+
+    fn reload_if_due(self: &Arc<Self>) {
+        if !self.reload_due.load(Ordering::SeqCst)
+            || self.status() != Status::Idle
+            || self.run_id().is_some()
+            || !self.queue_guard().is_empty()
+            || !matches!(
+                *self.handshake.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                Handshake::Ready
+            )
+        {
+            return;
+        }
+        let Some(path) = self
+            .session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        if self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+        {
+            return;
+        }
+        self.reload_due.store(false, Ordering::SeqCst);
+        log(&self.home, "info", "session.reload_configuration", json!({ "session": self.id }));
+        // A new conversation nothing was said in may have no model recorded in
+        // its file yet: it keeps the model it shows, if the new list offers it.
+        if self.untouched() {
+            let current = self
+                .model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(model) = current {
+                if let (Some(provider), Some(id)) = (
+                    model.get("provider").and_then(Value::as_str),
+                    model.get("id").and_then(Value::as_str),
+                ) {
+                    *self
+                        .requested_model
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((provider.to_string(), id.to_string()));
+                    self.pick_pending.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        self.reloading.store(true, Ordering::SeqCst);
+        self.known_generation
+            .store(self.config.known.generation(), Ordering::SeqCst);
+        // A message sent meanwhile waits for the handshake, as at start.
+        self.set_status(Status::Starting);
+        *self
+            .handshake
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Handshake::Switch;
+        let id = self.request_id();
+        if let Err(error) =
+            self.write_command(pi::command::with_id(pi::command::switch_session(&path), &id))
+        {
+            self.fail(error.code, &error.message, error.retryable);
+        }
     }
 
     fn clear_runtime_queue(&self) {
@@ -1967,11 +2064,20 @@ impl Session {
                 // The runtime's own answer, whatever it is: its model (or none)
                 // and level. The lists come from the same runtime.
                 let first = !self.model_answered.swap(true, Ordering::SeqCst);
+                if first && self.fresh.load(Ordering::SeqCst) {
+                    // A new conversation's runtime is blank: the model it starts
+                    // on is what the next new conversation will see first.
+                    self.config.known.remember_start_model(
+                        self.known_generation.load(Ordering::SeqCst),
+                        state.model.as_ref(),
+                    );
+                }
                 let changed = self.set_model(state.model.clone());
                 if let Some(level) = state.thinking_level.clone() {
                     self.set_thinking_level(Some(level));
                 }
-                if first || changed {
+                let reloaded = self.reloading.swap(false, Ordering::SeqCst);
+                if first || changed || reloaded {
                     self.request_model_lists();
                 }
                 // What waited for a model can go now.
@@ -2013,7 +2119,7 @@ impl Session {
             match reply {
                 // A refused level leaves the runtime's own; ask which one that is.
                 pi::Reply::SetThinkingLevel => self.request_state(),
-                pi::Reply::Prompt => self.prompt_refused(response_id, message),
+                pi::Reply::Prompt => self.turn_refused(response_id, "prompt-refused", message),
                 pi::Reply::Abort => self.stop_refused(message),
                 pi::Reply::AvailableModels => {
                     *self
@@ -2021,7 +2127,17 @@ impl Session {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message.to_string());
                     self.publish_summary();
+                    // No list to check a requested model against: the session
+                    // stays on the runtime's own.
+                    self.requested_model
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    self.pick_settled();
                 }
+                // A requested model the runtime refused: the session keeps the
+                // runtime's own (a client's own pick answers that client).
+                pi::Reply::SetModel => self.pick_settled(),
                 _ => {}
             }
             return;
@@ -2033,6 +2149,7 @@ impl Session {
                     self.set_model(Some(model.clone()));
                 }
                 self.request_model_lists();
+                self.pick_settled();
             }
             pi::Reply::AvailableModels => {
                 let models = value
@@ -2044,7 +2161,11 @@ impl Session {
                     .model_list_error
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                self.config
+                    .known
+                    .remember_list(self.known_generation.load(Ordering::SeqCst), &models);
                 self.set_list(&self.models, models);
+                self.apply_requested_model();
             }
             pi::Reply::AvailableThinkingLevels => {
                 let levels = value
@@ -2134,6 +2255,8 @@ impl Session {
         self.set_status(self.run_status());
         self.start_queued_turn();
         self.sync_status();
+        // A configuration change that came while it started: read it now.
+        self.reload_if_due();
     }
 
     /// A prompt the runtime consumed without starting a run (a slash command, or
@@ -2148,7 +2271,7 @@ impl Session {
     /// text, and the messages waiting behind it wait for Continue instead of
     /// being refused one by one. A slash command's refusal is that command's
     /// answer (`session.command_done`), never a failed message.
-    fn prompt_refused(self: &Arc<Self>, client_message_id: &str, message: &str) {
+    fn turn_refused(self: &Arc<Self>, client_message_id: &str, code: &str, message: &str) {
         // One lock decides and takes the run, so a Stop in between cannot
         // leave a failed message that is never published.
         let turn = {
@@ -2175,7 +2298,7 @@ impl Session {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(json!({
                 "clientMessageId": client_message_id,
                 "text": text,
-                "error": { "code": "prompt-refused", "text": message },
+                "error": { "code": code, "text": message },
             }));
             if !self.queue_guard().is_empty() {
                 self.queue_paused.store(true, Ordering::SeqCst);
@@ -2184,7 +2307,7 @@ impl Session {
         if let Some(turn) = turn {
             self.publish(
                 "turn.end",
-                json!({ "turnId": turn, "clientMessageId": client_message_id, "reason": "prompt-refused", "message": message }),
+                json!({ "turnId": turn, "clientMessageId": client_message_id, "reason": code, "message": message }),
             );
         }
         self.run_finished();
@@ -3812,7 +3935,8 @@ impl Session {
                 "waiting": waiting,
             }));
         }
-        // Only a session whose runtime reports a model can send.
+        // Refused only when the runtime reported no model; a model still
+        // resolving holds the message until it is ready.
         self.model_for_turn()?;
         let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
         let message_id = format!("m-{counter}");
@@ -3844,7 +3968,8 @@ impl Session {
         self.remember_turn(text);
         // Whether the runtime is still being started: the prompt is parked
         // until its handshake ends (`flush_parked_prompt`).
-        let starting = matches!(self.status(), Status::Pending | Status::Starting);
+        let starting = matches!(self.status(), Status::Pending | Status::Starting)
+            || self.model_state() != "ready";
         // The message starts a run only when none is in progress, whoever
         // started that one. Decided and claimed at once, under the same locks
         // a run's end takes, so a message never waits behind a run that ended.
@@ -3948,7 +4073,7 @@ impl Session {
         // handshake writes it; a handshake that ended since `starting` was read
         // has already looked, so it is written here (at most once either way).
         let mut waiting = false;
-        if !matches!(self.status(), Status::Starting | Status::Recovering) {
+        if !matches!(self.status(), Status::Starting | Status::Recovering) && self.model_state() == "ready" {
             match self.write_prompt(&message_id) {
                 // A run the runtime started took its place: the message waits in the queue.
                 Ok(written) => waiting = !written && self.run_id().as_deref() != Some(message_id.as_str()),
@@ -4029,17 +4154,18 @@ impl Session {
         Ok(json!({ "status": "tombstoned" }))
     }
 
-    /// A turn reaches the runtime only when the runtime reports a model; the
-    /// refusal is typed, and whatever waits stays where it is.
+    /// A turn is refused only when the runtime reported that it has no model.
+    /// While the model is `resolving` the message is accepted and waits: it
+    /// reaches the runtime once the model is `ready` (`flush_parked_prompt`).
     fn model_for_turn(&self) -> Result<(), ApiError> {
         match self.model_state() {
-            "ready" => Ok(()),
-            state => Err(ApiError::new(
+            "none" => Err(ApiError::new(
                 axum::http::StatusCode::CONFLICT,
                 "no-model",
                 "The session has no model",
-                state == "resolving",
+                false,
             )),
+            _ => Ok(()),
         }
     }
 
@@ -4270,8 +4396,21 @@ impl Session {
 
     /// Change this session's model: the runtime's `set_model`, nothing else.
     /// A refusal is this command's result only; the session keeps its model.
-    pub async fn select_model(&self, provider: &str, model: &str) -> Result<Value, ApiError> {
+    pub async fn select_model(self: &Arc<Self>, provider: &str, model: &str) -> Result<Value, ApiError> {
+        // Before the runtime answered, the choice waits for it like the pick a
+        // new conversation was created with.
+        if !self.model_answered.load(Ordering::SeqCst)
+            && matches!(self.status(), Status::Pending | Status::Starting | Status::Recovering)
+        {
+            self.request_model(provider, model);
+            return Ok(json!({ "provider": provider, "id": model, "pending": true }));
+        }
         self.model_command_ready()?;
+        // A newer choice replaces a pick still on its way.
+        self.requested_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         let selected = self
             .request(
                 pi::command::set_model(provider, model),
@@ -4354,9 +4493,12 @@ impl Session {
         }
     }
 
-    /// `resolving` until the runtime answers, then `ready` or `none`.
+    /// `resolving` until the runtime answers (and has the model the client
+    /// asked for, when it offers it), then `ready` or `none`.
     fn model_state(&self) -> &'static str {
-        if self
+        if self.pick_pending.load(Ordering::SeqCst) {
+            "resolving"
+        } else if self
             .model
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4381,8 +4523,136 @@ impl Session {
             Some(Value::Object(object)) => Value::Object(object),
             _ => json!({}),
         };
-        view["state"] = json!(self.model_state());
+        let state = self.model_state();
+        view["state"] = json!(state);
+        if state == "resolving" {
+            if let Some(expected) = self.expected_model() {
+                view["expected"] = expected;
+            }
+        }
         view
+    }
+
+    /// While the runtime has not answered: the model it is expected to report,
+    /// from the runtime's own earlier words. The pick the client asked for when
+    /// the runtimes list it; for a new conversation, the model a blank runtime
+    /// last started on; for a saved one, the model its last reply used. Only
+    /// shown; nothing is decided by it.
+    fn expected_model(&self) -> Option<Value> {
+        let known = &self.config.known;
+        let requested = self
+            .requested_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some((provider, id)) = requested {
+            if let Some(model) = known.find(&provider, &id) {
+                return Some(model);
+            }
+            // Kept across a configuration re-read: the model it already had.
+            let current = self.model.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+            if let Some(model) = current.filter(|model| is_model(model, &provider, &id)) {
+                return Some(model);
+            }
+        }
+        if self.fresh.load(Ordering::SeqCst) {
+            return known.start_model();
+        }
+        let history = self.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        history.iter().rev().find_map(|row| {
+            let id = row.get("model").and_then(Value::as_str)?;
+            let provider = row.get("provider").and_then(Value::as_str)?;
+            Some(known.find(provider, id).unwrap_or_else(|| json!({ "provider": provider, "id": id })))
+        })
+    }
+
+    /// The session's runtime's list once it answered; until then the latest
+    /// list any runtime answered (every runtime reads the same configuration).
+    fn models_view(&self) -> Vec<Value> {
+        let own = self.models.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        if own.is_empty() && !self.model_answered.load(Ordering::SeqCst) {
+            return self.config.known.list();
+        }
+        own
+    }
+
+    /// A new conversation should use the client's last pick. It goes to the
+    /// runtime with `set_model` as soon as the runtime's own list offers it;
+    /// until then the model is `resolving`, so no message goes out on the model
+    /// it replaces. A pick the runtime does not list is dropped: the session
+    /// keeps the runtime's model.
+    pub fn request_model(self: &Arc<Self>, provider: &str, id: &str) {
+        *self
+            .requested_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((provider.to_string(), id.to_string()));
+        self.pick_pending.store(true, Ordering::SeqCst);
+        self.publish_summary();
+        if self.model_answered.load(Ordering::SeqCst) {
+            self.apply_requested_model();
+        }
+    }
+
+    /// Hand the requested model to the runtime, once its list has arrived.
+    fn apply_requested_model(self: &Arc<Self>) {
+        // During a configuration re-read, only lists answered after it count.
+        if !self.pick_pending.load(Ordering::SeqCst)
+            || !self.model_answered.load(Ordering::SeqCst)
+            || self.reloading.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let Some((provider, id)) = self
+            .requested_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let listed = self
+            .models
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|model| is_model(model, &provider, &id));
+        let current = self
+            .model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|model| is_model(model, &provider, &id));
+        if !listed || current {
+            self.pick_settled();
+            return;
+        }
+        let request = self.request_id();
+        if self
+            .write_command(pi::command::with_id(pi::command::set_model(&provider, &id), &request))
+            .is_err()
+        {
+            self.pick_settled();
+        }
+    }
+
+    /// The requested model was applied, refused or not offered: the session's
+    /// model is the runtime's answer now, and what waited for it can go.
+    fn pick_settled(self: &Arc<Self>) {
+        if !self.pick_pending.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.requested_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.publish_summary();
+        // While the handshake runs, its end sends what waited.
+        if matches!(self.status(), Status::Starting | Status::Recovering) {
+            return;
+        }
+        self.flush_parked_prompt();
+        self.sync_status();
+        self.start_queued_turn();
     }
 
     /// Change this session's reasoning level. The runtime clamps it to the
@@ -4608,11 +4878,7 @@ impl Session {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
             "model": self.model_view(),
-            "models": self
-                .models
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
+            "models": self.models_view(),
             "thinkingLevels": self
                 .thinking_levels
                 .lock()
@@ -4695,6 +4961,11 @@ impl Session {
             model_answered: AtomicBool::new(false),
             models: Mutex::new(Vec::new()),
             model_list_error: Mutex::new(None),
+            requested_model: Mutex::new(None),
+            pick_pending: AtomicBool::new(false),
+            reload_due: AtomicBool::new(false),
+            reloading: AtomicBool::new(false),
+            known_generation: AtomicU64::new(0),
             thinking_levels: Mutex::new(Vec::new()),
             first_output: Mutex::new(FirstOutput::default()),
             warm_attach: Mutex::new(None),
@@ -4717,6 +4988,11 @@ impl Session {
         log(&self.home, "info", "session.attach_early", json!({ "session": self.id }));
         self.set_status(Status::Starting);
         self.start();
+    }
+
+    /// A new conversation nothing was said in yet.
+    pub fn untouched_new(&self) -> bool {
+        self.untouched()
     }
 
     /// Nothing was ever said in it: a new conversation the user left before
@@ -4876,6 +5152,7 @@ impl Session {
         // A new runtime has its own model: until it answers, the session's
         // model is unknown again, not the last runtime's.
         self.model_answered.store(false, Ordering::SeqCst);
+        self.known_generation.store(self.config.known.generation(), Ordering::SeqCst);
         self.set_model(None);
         self.set_list(&self.models, Vec::new());
         self.set_list(&self.thinking_levels, Vec::new());
@@ -5127,14 +5404,26 @@ impl Session {
 
     /// Write the prompt parked while the runtime started.
     fn flush_parked_prompt(self: &Arc<Self>) {
-        let Some(id) = self
+        let Some((id, client_message_id)) = self
             .run_guard()
             .as_ref()
             .filter(|run| run.phase == RunPhase::Starting)
-            .map(|run| run.id.clone())
+            .map(|run| (run.id.clone(), run.client_message_id.clone()))
         else {
             return;
         };
+        match self.model_state() {
+            // The model is still on its way: it is sent once it is settled.
+            "resolving" => return,
+            // The runtime has no model: the message fails where it was sent.
+            "none" => {
+                if let Some(client_message_id) = client_message_id {
+                    self.turn_refused(&client_message_id, "no-model", "The session has no model");
+                }
+                return;
+            }
+            _ => {}
+        }
         if let Err(error) = self.write_prompt(&id) {
             self.fail(error.code, &error.message, error.retryable);
         }
@@ -5404,6 +5693,7 @@ impl SessionManager {
                 replay_limit,
                 events,
                 warm: Arc::new(std::sync::OnceLock::new()),
+                known: Arc::new(KnownModels::new()),
             });
         }
         Self {
@@ -5458,6 +5748,7 @@ impl SessionManager {
                 replay_limit: managed.replay_limit,
                 events: managed.events.clone(),
                 warm: Arc::new(std::sync::OnceLock::new()),
+                known: Arc::new(KnownModels::new()),
             }
         });
         if found {
@@ -6604,6 +6895,7 @@ impl SessionManager {
                 },
             )
         });
+        pool.keep_models_in(config.known.clone());
         pool.fill();
         log(&config.home, "info", "runtime.warm_start", pool.status());
         // The app is starting and its loading screen waits for this runtime.
@@ -6633,12 +6925,41 @@ impl SessionManager {
         }
     }
 
-    /// The models the warm runtime registered (`get_available_models`).
-    /// `None` while it is not ready.
+    /// A configuration change: the runtimes' earlier answers about models no
+    /// longer hold.
+    pub fn forget_known_models(&self) {
+        if let Some(config) = self.config.get() {
+            config.known.forget();
+        }
+    }
+
+    /// A configuration change: every open session's runtime reads it again
+    /// (idle ones now, busy ones when their run ends).
+    pub fn reload_configuration(&self) {
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for session in sessions {
+            session.reload_configuration();
+        }
+    }
+
+    /// The models the runtimes registered (`get_available_models`): the warm
+    /// runtime's answer when one is ready, else the latest answer any runtime
+    /// gave since the configuration last changed. `None` while there is neither.
     pub async fn runtime_models(&self) -> Option<Result<Value, ApiError>> {
-        // Only the warm runtime: every settings change restarts it, so its list
-        // is the current one. A session's runtime may predate the change.
-        let runtime = self.warm_runtime().and_then(|pool| pool.ready_runtime())?;
+        // Only the warm runtime is asked: every settings change restarts it, so
+        // its list is the current one. A session's runtime may predate the change.
+        let known = self.config.get().map(|config| config.known.clone());
+        let Some(runtime) = self.warm_runtime().and_then(|pool| pool.ready_runtime()) else {
+            let models = known.map(|known| known.list()).unwrap_or_default();
+            return (!models.is_empty()).then(|| Ok(json!({ "models": models })));
+        };
+        let configured = known.as_ref().map(|known| known.generation());
         let id = format!("models-{}", random_id());
         let answer = runtime
             .request(
@@ -6646,6 +6967,11 @@ impl SessionManager {
                 Duration::from_secs(10),
             )
             .await;
+        if let (Some(known), Some(configured), Ok(answer)) = (&known, configured, &answer) {
+            if let Some(models) = answer.get("models").and_then(Value::as_array) {
+                known.remember_list(configured, models);
+            }
+        }
         Some(answer.map_err(|error| {
             let message = match error {
                 RequestError::Timeout => "The runtime did not answer".to_string(),
@@ -6726,6 +7052,16 @@ pub struct CreateRequest {
     /// The client opening the session; it holds the session (see `hold`).
     #[serde(rename = "clientId", default)]
     pub client_id: Option<String>,
+    /// A new conversation only: the model the client wants it on (its last
+    /// pick). Handed to the runtime once its list offers it (`request_model`).
+    #[serde(default)]
+    pub model: Option<ModelPick>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelPick {
+    pub provider: String,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -6957,6 +7293,7 @@ mod environment_tests {
             replay_limit: DEFAULT_REPLAY_LIMIT,
             events: None,
             warm: Arc::new(std::sync::OnceLock::new()),
+            known: Arc::new(KnownModels::new()),
         }
     }
 
