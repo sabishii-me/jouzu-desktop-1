@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { HostClient } from "./api/host-client";
-import { configFailure, configPending, configureAppView, currentAppView, receiveAppViewForTest, runConfig, setAppViewForTest, type AppView } from "./app-view";
+import { configFailure, configPending, configureAppView, currentAppView, parseAppView, receiveAppViewForTest, runConfig, setAppViewForTest, type AppView } from "./app-view";
 
 const settings = { schemaVersion: 1, profile: "core", account: { signedIn: false }, credentials: [], customProviders: [], providers: [] };
 const snapshot = (revision: number, config: Partial<AppView["config"]> = {}, value: unknown = settings) => ({
@@ -12,6 +12,11 @@ const result = (operationId: string, ok: boolean, finishedAt = "2026-11-18T00:00
   ({ operationId, ok, code, params: {}, text: ok ? null : "failed", finishedAt });
 
 describe("app view", () => {
+  it("reads which providers refused their stored sign-in, and nothing else", () => {
+    const view = parseAppView({ revision: 1, config: {}, settings: null, providerAuth: { shisa: { refusedAt: "t", text: "401 Unauthorized" }, broken: "x" } });
+    expect(view.providerAuth).toEqual({ shisa: { refusedAt: "t", text: "401 Unauthorized" } });
+    expect(parseAppView({ revision: 1, config: {}, settings: null }).providerAuth).toEqual({});
+  });
   it("keeps only the newest snapshot", () => {
     setAppViewForTest(null);
     receiveAppViewForTest(snapshot(3));
