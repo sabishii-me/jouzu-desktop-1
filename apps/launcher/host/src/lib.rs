@@ -3934,7 +3934,13 @@ mod session_tests {
             .iter()
             .filter(|row| row["kind"] == "user")
             .count();
-        assert_eq!(users, 2);
+        // Not in the transcript yet: the runtime has not used them.
+        assert_eq!(users, 0, "{}", session.history(50, None));
+        // Neither is left without a state: each is a waiting message the
+        // extension holds (the runtime gives no reason, so none is shown).
+        let summary = session.summary();
+        let states: Vec<&str> = summary["queue"].as_array().unwrap().iter().filter_map(|item| item["state"].as_str()).collect();
+        assert_eq!(states, ["held", "held"], "{summary}");
     }
 
     #[cfg(windows)]

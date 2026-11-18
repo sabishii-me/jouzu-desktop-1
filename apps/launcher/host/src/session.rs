@@ -2270,7 +2270,39 @@ impl Session {
     /// input its Flow control retained). No agent events will follow, so the turn
     /// ends here instead of waiting for `agent_settled`.
     fn end_turn_without_run(self: &Arc<Self>, client_message_id: &str) {
+        // A message (not a command) the runtime took without a run: an
+        // extension holds it (Flow, until its gate opens) and delivers it
+        // later itself. It stays the user's waiting message, held, exactly as
+        // when the same answer comes to a queued message (its row joins the
+        // transcript when the runtime uses it); it is never left without a
+        // state. The runtime gives no reason (runtime G7), so none is made up.
+        let held = self
+            .run_guard()
+            .as_ref()
+            .filter(|run| run.client_message_id.as_deref() == Some(client_message_id) && !run.phase.started())
+            .and_then(|run| run.prompt.clone().map(|prompt| (run.id.clone(), prompt)))
+            .filter(|(_, prompt)| {
+                !prompt
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim_start()
+                    .starts_with('/')
+            });
+        // Its row leaves the transcript before the turn ends: the next waiting
+        // message may start a run (and add its own row) as this one ends.
+        let held = held.map(|(turn, prompt)| {
+            let row = self.take_user_row(&turn);
+            (turn, prompt, row)
+        });
         self.end_turn(client_message_id, json!({ "status": "handled" }));
+        if let Some((turn, prompt, row)) = held {
+            self.queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_front(Queued { turn, prompt, row, steered: None, no_steer: true, held: true, prompted: false });
+            self.publish_summary();
+        }
     }
 
     /// The runtime refused a prompt. A message gets no reply: it becomes the
