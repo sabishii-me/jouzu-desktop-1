@@ -64,6 +64,19 @@ struct Slot {
     target: Arc<Mutex<Option<mpsc::Sender<RuntimeEvent>>>>,
     started_at: Instant,
     ready_ms: Option<u64>,
+    /// The runtime's answer to `get_state` once it is ready: its own blank
+    /// session (file and model), which a new conversation takes over as is.
+    state: Option<Value>,
+}
+
+/// A warm runtime handed to a session.
+pub struct Taken {
+    pub runtime: Arc<RuntimeSupervisor>,
+    /// Whether it was warmed for the session's folder.
+    pub matched: bool,
+    pub attaching: Attaching,
+    /// Its `get_state` answer, when it was ready: the blank session it opened.
+    pub state: Option<Value>,
 }
 
 struct Inner {
@@ -346,6 +359,7 @@ impl WarmPool {
                 target: target.clone(),
                 started_at: Instant::now(),
                 ready_ms: None,
+                state: None,
             });
         }
         self.notify();
@@ -431,6 +445,7 @@ impl WarmPool {
                         // then dies would otherwise be restarted forever. A session
                         // taking one, or a client asking again, resets them.
                         slot.ready_ms = Some(slot.started_at.elapsed().as_millis() as u64);
+                        slot.state = Some(state.clone());
                         inner.converged = true;
                     }
                     pool.ready.notify_waiters();
@@ -494,13 +509,15 @@ impl WarmPool {
     /// over too, since the session waits for less than it would for a new one.
     ///
     /// A runtime warmed for another folder is still handed over: the switch
-    /// reloads the extensions, but the Node start is saved. The second value
-    /// says whether it was warmed for `workspace`.
+    /// reloads the extensions, but the Node start is saved. A new conversation
+    /// takes over the runtime's own blank session, which belongs to the folder
+    /// the runtime started in, so it asks for `same_folder_only`.
     pub fn take(
         self: &Arc<Self>,
         events: mpsc::Sender<RuntimeEvent>,
         workspace: &Path,
-    ) -> Option<(Arc<RuntimeSupervisor>, bool, Attaching)> {
+        same_folder_only: bool,
+    ) -> Option<Taken> {
         let slot = {
             let mut inner = self.lock();
             let matches = |slot: &Slot| {
@@ -515,7 +532,7 @@ impl WarmPool {
                 .iter()
                 .position(|slot| slot.ready_ms.is_some() && matches(slot))
                 .or_else(|| inner.slots.iter().position(|slot| matches(slot)))
-                .or_else(|| inner.next())?;
+                .or_else(|| if same_folder_only { None } else { inner.next() })?;
             let slot = inner.slots.remove(index);
             inner.taken += 1;
             inner.attaching += 1;
@@ -534,7 +551,12 @@ impl WarmPool {
             .workspace
             .as_deref()
             .is_some_and(|warm| same_folder(warm, workspace));
-        Some((slot.runtime, matched, Attaching(Some(self.clone()))))
+        Some(Taken {
+            runtime: slot.runtime,
+            matched,
+            attaching: Attaching(Some(self.clone())),
+            state: slot.state,
+        })
     }
 
     /// `workspace` is where the user works now: it becomes the most recent

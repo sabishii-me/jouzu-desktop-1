@@ -739,6 +739,9 @@ pub struct Session {
     /// A requested model is on its way to the runtime: the model stays
     /// `resolving`, so nothing is sent on the model it replaces.
     pick_pending: AtomicBool,
+    /// The runtime being installed opened this session's file itself (a new
+    /// conversation took over its blank session): the handshake does not switch.
+    runtime_owns_file: AtomicBool,
     /// The configuration changed since this session's runtime read it: it
     /// re-reads it (`switch_session` to its own file) once it is idle.
     reload_due: AtomicBool,
@@ -1911,11 +1914,15 @@ impl Session {
     }
 
     fn start_handshake(&self) {
-        let existing = self
-            .session_path
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        // A runtime whose own session this is has it open already.
+        let existing = if self.runtime_owns_file.swap(false, Ordering::SeqCst) {
+            None
+        } else {
+            self.session_path
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        };
         match existing {
             Some(path) => {
                 // How much history the runtime loads: a long session takes long to attach.
@@ -5015,6 +5022,7 @@ impl Session {
             model_list_error: Mutex::new(None),
             requested_model: Mutex::new(None),
             pick_pending: AtomicBool::new(false),
+            runtime_owns_file: AtomicBool::new(false),
             reload_due: AtomicBool::new(false),
             reloading: AtomicBool::new(false),
             known_generation: AtomicU64::new(0),
@@ -5105,18 +5113,23 @@ impl Session {
             return false;
         }
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
-        // A warm runtime is switched to this session's file by the handshake, so
-        // only a session with a file can take one.
+        // A session with a file takes any warm runtime: the handshake switches
+        // it to that file. A new conversation without one takes over the blank
+        // session a runtime warmed for its folder opened by itself, as it is:
+        // no switch, no second file.
         let has_file = self
             .session_path
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some();
-        if let (true, Some(pool)) = (has_file, self.config.warm.get()) {
+        if let Some(pool) = self.config.warm.get() {
             let before = pool.status();
-            if let Some((runtime, matched, attaching)) =
-                pool.take(event_tx.clone(), Path::new(&self.runtime_cwd()))
+            if let Some(crate::runtime::warm::Taken { runtime, matched, attaching, state }) =
+                pool.take(event_tx.clone(), Path::new(&self.runtime_cwd()), !has_file)
             {
+                if !has_file {
+                    self.adopt_runtime_session(state.as_ref());
+                }
                 *self
                     .warm_attach
                     .lock()
@@ -5193,6 +5206,36 @@ impl Session {
                 false
             }
         }
+    }
+
+    /// A new conversation takes over the blank session its runtime opened at
+    /// start (the runtime's `get_state`): that file is the conversation's from
+    /// now on, and clients learn it at once. A runtime still starting reports
+    /// it in the handshake instead.
+    fn adopt_runtime_session(&self, state: Option<&Value>) {
+        let Some(path) = state
+            .and_then(|state| state.get("sessionFile"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+        else {
+            return;
+        };
+        *self
+            .session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.to_string());
+        self.runtime_owns_file.store(true, Ordering::SeqCst);
+        self.publish(
+            "session.attached",
+            json!({
+                "sessionPath": path,
+                "title": self
+                    .title
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            }),
+        );
     }
 
     fn install_runtime(
@@ -6894,27 +6937,9 @@ impl SessionManager {
         // handshake. The index and navigation can then show it before the first
         // reply, including when the turn is stopped during starting.
         let fresh = session_path.is_none();
-        let session_path = match session_path {
-            Some(path) => Some(path),
-            None if matches!(status, Status::Pending) => {
-                let directory = self.runtime_home.join("state").join("sessions");
-                std::fs::create_dir_all(&directory).ok();
-                let file = directory.join(format!("{}.jsonl", random_id()));
-                let header = json!({
-                    "type": "session",
-                    "version": 3,
-                    "id": random_id(),
-                    "timestamp": Session::now_iso(),
-                    "cwd": self.folder_text(&workspace),
-                });
-                if std::fs::write(&file, format!("{header}\n")).is_ok() {
-                    Some(file.to_string_lossy().into_owned())
-                } else {
-                    None
-                }
-            }
-            None => None,
-        };
+        // A new conversation's file is the runtime's own: the blank session a
+        // runtime opens at start, taken over when the conversation gets its
+        // runtime (a warm one at once). The host writes no file of its own.
         let id = match &session_path {
             Some(path) => session_id_for_path(path),
             None => format!("h-{}", random_id()),

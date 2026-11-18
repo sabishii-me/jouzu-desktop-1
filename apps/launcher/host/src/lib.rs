@@ -5023,6 +5023,30 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_new_session_takes_over_its_warm_runtimes_own_session() {
+        // Every switch is refused: a new conversation must not need one.
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_SWITCH_ERROR", "switch refused")]);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let folder = workspace.path().to_str().unwrap();
+        let _aim = manager.create_pending(folder, None, None).unwrap();
+        let status = pool.wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(status["state"], "ready", "{status}");
+        let sessions = manager.runtime_home().join("state").join("sessions");
+        let before: Vec<std::path::PathBuf> = std::fs::read_dir(&sessions).unwrap().filter_map(Result::ok).map(|entry| entry.path()).collect();
+        let session = manager.create_pending(folder, None, None).unwrap();
+        session.attach_early();
+        // Its file is known the moment it takes the runtime, and it is the
+        // runtime's own blank session: no file of the host's.
+        let path = session.info()["sessionPath"].as_str().expect("path at once").to_string();
+        assert!(before.contains(&std::path::PathBuf::from(&path)), "{path} not in {before:?}");
+        session.send("first", "hello").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        assert!(session.summary()["failure"].is_null(), "{}", session.summary());
+        manager.stop_all();
+    }
+
+    #[tokio::test]
     async fn a_new_session_starts_its_runtime_at_once_without_a_warm_one() {
         let (manager, _home, workspace) = manager(50);
         let session = manager
@@ -5151,16 +5175,23 @@ mod session_tests {
     async fn a_new_session_never_used_leaves_no_file() {
         let (manager, _home, workspace) = manager(50);
         let folder = workspace.path().to_str().unwrap();
+        // A new session's file is its runtime's own blank session.
         let left = manager.create_pending(folder, None, None).unwrap();
+        left.attach_early();
+        wait_until(|| left.session_path.lock().unwrap().is_some()).await;
         let left_file = left.session_path.lock().unwrap().clone().expect("a new session has a file");
         let kept = manager.create_pending(folder, None, None).unwrap();
+        kept.attach_early();
+        wait_until(|| kept.session_path.lock().unwrap().is_some()).await;
         let kept_file = kept.session_path.lock().unwrap().clone().expect("a new session has a file");
+        wait_status(&left, Status::Idle).await;
+        wait_status(&kept, Status::Idle).await;
         assert!(std::path::Path::new(&left_file).exists());
         let _stream = manager.connect_client("window");
         manager.hold("window", &kept.id);
         manager.reap_idle(IdleLimits::all(Duration::ZERO));
         assert!(std::path::Path::new(&kept_file).exists(), "shown by a client: kept");
-        assert_eq!(left.status(), Status::Cancelled);
+        assert!(matches!(left.status(), Status::Cancelled | Status::Stopped), "{:?}", left.status());
         assert!(!std::path::Path::new(&left_file).exists());
         // A file that holds a conversation is never removed, whatever the host thinks.
         std::fs::OpenOptions::new()
@@ -5735,7 +5766,7 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn a_new_session_in_a_folder_keeps_the_spelling_its_sessions_use() {
+    async fn a_folder_is_named_with_the_spelling_its_sessions_use() {
         let (manager, _home, workspace) = manager(50);
         let folder = std::fs::canonicalize(workspace.path()).unwrap();
         // An older session spells the folder differently: on Windows the verbatim
@@ -5757,15 +5788,6 @@ mod session_tests {
         )
         .unwrap();
         assert_eq!(manager.folder_text(&folder), spelled);
-        let session = manager
-            .create_pending(workspace.path().to_str().unwrap(), None, None)
-            .unwrap();
-        let path = session.info()["sessionPath"].as_str().unwrap().to_string();
-        let header: Value = serde_json::from_str(
-            std::fs::read_to_string(&path).unwrap().lines().next().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(header["cwd"], spelled.as_str());
     }
 
     #[tokio::test]

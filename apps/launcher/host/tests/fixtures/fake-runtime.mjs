@@ -1,8 +1,23 @@
 // Fake pi RPC runtime for host tests. It speaks the real wire shapes:
 // {id,type:"response",...}, extension_ui_request, and agent/message events.
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import readline from "node:readline";
+
+// Like the runtime: it opens a blank session of its own at start, in its home,
+// for the folder it runs in, and reports it (get_state) until switched away.
+let sessionFile = null;
+if (process.env.JOUZU_HOME) {
+  try {
+    const directory = join(process.env.JOUZU_HOME, "state", "sessions");
+    mkdirSync(directory, { recursive: true });
+    const id = randomUUID();
+    sessionFile = join(directory, `${new Date().toISOString().replace(/[:.]/gu, "-")}_${id}.jsonl`);
+    writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd: process.cwd() })}\n`);
+  } catch { sessionFile = null; }
+}
 
 const delay = Number(process.env.FAKE_RUNTIME_DELAY_MS ?? 15);
 const startDelay = Number(process.env.FAKE_RUNTIME_START_DELAY_MS ?? 0);
@@ -388,7 +403,7 @@ lines.on("line", line => {
       response(value.id, "get_messages", { messages });
       break;
     case "get_state":
-      response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: currentModel, thinkingLevel: currentLevel, sessionFile: null });
+      response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: currentModel, thinkingLevel: currentLevel, sessionFile });
       selfRunWhen("ready");
       break;
     case "get_available_models":
@@ -442,6 +457,7 @@ lines.on("line", line => {
         const last = changes.at(-1);
         if (last) currentModel = { name: last.modelId, provider: last.provider, id: last.modelId };
       } catch {}
+      sessionFile = String(value.sessionPath);
       response(value.id, "switch_session", { cancelled: false });
       break;
     case "prompt":
