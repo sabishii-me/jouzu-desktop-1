@@ -6659,8 +6659,10 @@ impl SessionManager {
                 let mut cwd = None;
                 let mut title = None;
                 for line in std::io::BufRead::lines(reader) {
-                    let line = line.ok()?;
-                    let value: Value = serde_json::from_str(&line).ok()?;
+                    // A line cut off (the app or the computer stopped while it was
+                    // written) loses that line only, never the session (#150).
+                    let Ok(line) = line else { break };
+                    let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
                     if value.get("type").and_then(Value::as_str) == Some("session") {
                         cwd = value
                             .get("cwd")

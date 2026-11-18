@@ -4182,6 +4182,21 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_saved_session_whose_last_line_was_cut_off_is_still_listed() {
+        let (manager, _home, workspace) = manager(50);
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let cwd = workspace.path().to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            directory.join("cut.jsonl"),
+            format!("{{\"type\":\"session\",\"cwd\":\"{cwd}\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"cut of"),
+        )
+        .unwrap();
+        let listed = manager.persisted(None, true);
+        assert!(listed.iter().any(|entry| entry["sessionPath"].as_str().is_some_and(|path| path.ends_with("cut.jsonl"))), "{listed:?}");
+    }
+
+    #[tokio::test]
     async fn persisted_list_is_cached_until_refresh() {
         let (manager, _home, workspace) = manager(50);
         let directory = manager.runtime_home().join("state").join("sessions");
