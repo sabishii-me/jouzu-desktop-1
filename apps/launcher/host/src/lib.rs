@@ -4844,6 +4844,32 @@ mod session_tests {
         manager.stop_all();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restarted_runtime_keeps_the_sessions_model() {
+        let models = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(models.path(), json!([
+            { "name": "fixture-model", "provider": "fixture", "id": "model" },
+            { "name": "Fixture Other", "provider": "fixture", "id": "other" },
+        ]).to_string()).unwrap();
+        let file = models.path().to_string_lossy().into_owned();
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_MODELS_FILE", file.as_str())]);
+        let session = manager.create_pending(workspace.path().to_str().unwrap(), None, None).unwrap();
+        session.attach_early();
+        wait_status(&session, Status::Idle).await;
+        wait_until(|| session.summary()["models"].as_array().map_or(0, Vec::len) == 2).await;
+        session.select_model("fixture", "other").await.unwrap();
+        let pid = session.runtime_pid().unwrap();
+        std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status().unwrap();
+        // The host restarts the runtime; the new one starts on its own first
+        // model, and the session's model is handed back to it.
+        wait_until(|| session.runtime_pid().is_some_and(|now| now != pid)).await;
+        wait_until(|| session.summary()["model"]["state"] == "ready" && session.status() == Status::Idle).await;
+        assert_eq!(session.summary()["model"]["id"], "other", "{}", session.summary());
+        manager.stop_all();
+    }
+
     #[tokio::test]
     async fn a_new_conversation_shows_the_runtimes_last_answer_before_its_own() {
         let (manager, _home, workspace) = manager(50);

@@ -5149,6 +5149,29 @@ impl Session {
         mut events: tokio::sync::mpsc::Receiver<RuntimeEvent>,
     ) {
         let generation = self.runtime_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // A runtime the host restarts for this session (recovery) must not
+        // change the session's model: the model it had is handed to the new
+        // runtime like a pick, once that runtime lists it.
+        let previous = self
+            .model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(model) = previous {
+            if let (Some(provider), Some(id)) = (
+                model.get("provider").and_then(Value::as_str),
+                model.get("id").and_then(Value::as_str),
+            ) {
+                let mut requested = self
+                    .requested_model
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if requested.is_none() {
+                    *requested = Some((provider.to_string(), id.to_string()));
+                    self.pick_pending.store(true, Ordering::SeqCst);
+                }
+            }
+        }
         // A new runtime has its own model: until it answers, the session's
         // model is unknown again, not the last runtime's.
         self.model_answered.store(false, Ordering::SeqCst);
@@ -5591,7 +5614,13 @@ pub struct SessionManager {
     /// left open does not keep a runtime alive for every session it visited.
     holders: Mutex<HashMap<String, Holder>>,
     persisted_cache: Mutex<Option<Vec<Value>>>,
+    /// Configuration changes so far: only the latest one's re-read runs.
+    reload_epoch: Arc<AtomicU64>,
 }
+
+/// How long after a configuration change open sessions wait before they
+/// re-read it, so a run of changes is read once.
+const RELOAD_SETTLE: Duration = Duration::from_millis(800);
 
 struct ManagedRuntime {
     root: PathBuf,
@@ -5706,6 +5735,7 @@ impl SessionManager {
             clients: Mutex::new(HashMap::new()),
             holders: Mutex::new(HashMap::new()),
             persisted_cache: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -6934,8 +6964,12 @@ impl SessionManager {
     }
 
     /// A configuration change: every open session's runtime reads it again
-    /// (idle ones now, busy ones when their run ends).
+    /// (idle ones now, busy ones when their run ends). Changes in a row are
+    /// read once, after the last one, and one session at a time: runtimes
+    /// re-reading their profile together race for its lock (#94).
     pub fn reload_configuration(&self) {
+        let epoch = self.reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let latest = self.reload_epoch.clone();
         let sessions: Vec<Arc<Session>> = self
             .sessions
             .lock()
@@ -6943,9 +6977,26 @@ impl SessionManager {
             .values()
             .cloned()
             .collect();
-        for session in sessions {
-            session.reload_configuration();
-        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            for session in sessions {
+                session.reload_configuration();
+            }
+            return;
+        };
+        handle.spawn(async move {
+            tokio::time::sleep(RELOAD_SETTLE).await;
+            for session in sessions {
+                if latest.load(Ordering::SeqCst) != epoch {
+                    // A newer change reads everything again.
+                    return;
+                }
+                session.reload_configuration();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while session.status() == Status::Starting && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        });
     }
 
     /// The models the runtimes registered (`get_available_models`): the warm
