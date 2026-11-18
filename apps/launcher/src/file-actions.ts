@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { copyText } from "./secure-context";
+import { InputError } from "./input-error";
 
 /**
  * File actions for paths that appear in the transcript (0057). Revealing is a
@@ -36,7 +37,8 @@ export async function revealPath(path: string, workspace?: string): Promise<void
   try {
     await invoke("reveal_path", workspace ? { path, workspace } : { path });
   } catch (error) {
-    throw new Error(revealMessage(failureReason(error)));
+    const reason = failureReason(error);
+    throw new InputError(`reveal-${reason.replace(/^reveal-/u, "")}`, revealMessage(reason));
   } finally {
     pending.delete(path);
   }

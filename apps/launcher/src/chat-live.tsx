@@ -4,7 +4,7 @@ import { ChatMarkdown } from "./chat-markdown";
 import type { ActiveTurn } from "./chat-types";
 import { Button } from "./components/ui/button";
 import { DetailsPopover } from "./control-result";
-import { useChatText } from "./chat-text";
+import { fill, useChatText, type ChatText } from "./chat-text";
 
 type RecoveryAction = { label: string; run: () => void; disabled?: boolean };
 
@@ -14,31 +14,31 @@ const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms
  * The status line's words for a running turn, as the host reports it: which step,
  * what it is doing, and for how long when the wait is the point.
  */
-export function turnLabel(turn: ActiveTurn | null | undefined, now: number): string {
-  if (!turn) return "Working…";
-  if (turn.phase === "starting") return "Starting session…";
-  if (turn.phase === "cancelling") return "Stopping…";
+export function turnLabel(turn: ActiveTurn | null | undefined, now: number, t: ChatText): string {
+  if (!turn) return t.working;
+  if (turn.phase === "starting") return t.startingSession;
+  if (turn.phase === "cancelling") return t.stopping;
   const step = turn.step;
-  if (!step) return "Working…";
+  if (!step) return t.working;
   // The status line already shows the turn's own clock; a second one is only worth showing
   // once this state started later than the turn did.
   const ownClock = step.since !== undefined && (turn.startedAt === undefined || step.since - turn.startedAt >= 1000);
   const waited = ownClock ? ` · ${clock(Math.max(0, now - step.since!))}` : "";
   switch (step.state) {
-    case "waiting_model": return `Waiting for model${waited}`;
-    case "thinking": return "Thinking";
-    case "writing": return "Writing";
-    case "calling_tool": return "Preparing tool call";
+    case "waiting_model": return `${t.waitingModel}${waited}`;
+    case "thinking": return t.thinking;
+    case "writing": return t.writing;
+    case "calling_tool": return t.preparingTool;
     case "tools": {
       const names = [...new Set(step.tools.map(tool => tool.name))];
-      return names.length ? `Running ${names.join(", ")}${waited}` : "Tools done";
+      return names.length ? `${fill(t.runningTools, { names: names.join(", ") })}${waited}` : t.toolsDone;
     }
     case "retrying": {
       const attempt = step.retry?.attempt !== undefined ? ` ${step.retry.attempt}${step.retry.maxAttempts !== undefined ? `/${step.retry.maxAttempts}` : ""}` : "";
-      return `Model request failed, retrying${attempt}${step.retry?.error ? ` (${step.retry.error})` : ""}`;
+      return `${t.retryingModel}${attempt}${step.retry?.error ? ` (${step.retry.error})` : ""}`;
     }
-    case "compacting": return `Compacting context${waited}`;
-    default: return "Working…";
+    case "compacting": return `${t.compactingContext}${waited}`;
+    default: return t.working;
   }
 }
 
@@ -122,7 +122,7 @@ export function AgentAction({ thinking, label, running, elapsed, settled, failur
   return <div className="px-1">
     <button type="button" className="flex h-8 w-full min-w-0 items-center gap-2 rounded-md px-1 text-left text-[11px] text-muted-foreground hover:bg-muted/40" aria-expanded={open} onClick={() => setOpen(value => !value)}>
       <Brain className="size-3.5 shrink-0" aria-hidden="true" />
-      <span className="shrink-0 font-medium text-foreground">Reasoning</span>
+      <span className="shrink-0 font-medium text-foreground">{t.reasoning}</span>
       <span className="min-w-0 flex-1 truncate">{last}</span>
       <ChevronDown className={`size-3.5 shrink-0 transition-transform ${open ? "rotate-180" : ""}`} aria-hidden="true" />
     </button>

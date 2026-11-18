@@ -9,6 +9,7 @@ import { copyText } from "./secure-context";
 import { useOptionalApi } from "./api/context";
 import type { JouzuApi } from "./api/jouzu-api";
 import type { HostAttachmentRef } from "./chat-projection";
+import { fill, chatTexts, useChatText, type ChatText } from "./chat-text";
 
 /** The native reader's cap for a workspace file. */
 export const MAX_LOCAL_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -59,21 +60,21 @@ export type ImageSourceClassification =
   | { type: "local"; path: string; name: string }
   | { type: "card"; reason: ImageCardReason; name: string; path?: string; bytes?: number; detail?: string };
 
-const REASON_TEXT: Record<ImageCardReason, string> = {
-  "outside-workspace": "Outside the workspace",
-  "not-found": "File not found",
-  "too-large": "Too large to show",
-  "not-an-image": "Preview not supported",
-  unreadable: "Unreadable",
-  "not-a-file": "Not a file",
-  "unsupported-mime": "Preview not supported",
-  "workspace-unavailable": "Workspace unavailable",
-  "no-source": "No image source",
-  "invalid-source": "Image source is not valid",
-};
+const REASON_TEXT = (t: ChatText): Record<ImageCardReason, string> => ({
+  "outside-workspace": t.outsideWorkspace,
+  "not-found": t.fileNotFound,
+  "too-large": t.tooLargeToShow,
+  "not-an-image": t.previewUnsupported,
+  unreadable: t.unreadable,
+  "not-a-file": t.notAFile,
+  "unsupported-mime": t.previewUnsupported,
+  "workspace-unavailable": t.workspaceUnavailable,
+  "no-source": t.noImageSource,
+  "invalid-source": t.invalidImageSource,
+});
 
-export function imageReasonText(reason: ImageCardReason): string {
-  return REASON_TEXT[reason];
+export function imageReasonText(reason: ImageCardReason, t: ChatText): string {
+  return REASON_TEXT(t)[reason];
 }
 
 export function formatBytes(bytes: number): string {
@@ -218,20 +219,20 @@ export function classifyImageSource(
 }
 
 export function imageCardReason(reason: string | undefined): ImageCardReason {
-  return reason && reason in REASON_TEXT ? reason as ImageCardReason : "unreadable";
+  return reason && reason in REASON_TEXT(chatTexts.en) ? reason as ImageCardReason : "unreadable";
 }
 
-export function normalizeImageError(value: unknown): LocalImageError {
+export function normalizeImageError(value: unknown, t: ChatText): LocalImageError {
   if (value && typeof value === "object") {
     const record = value as Record<string, unknown>;
     return {
       reason: typeof record.reason === "string" ? record.reason : "unreadable",
-      message: typeof record.message === "string" ? record.message : "The image could not be read.",
+      message: typeof record.message === "string" ? record.message : t.imageUnreadable,
       bytes: typeof record.bytes === "number" ? record.bytes : undefined,
     };
   }
   if (typeof value === "string") return { reason: "unreadable", message: value };
-  return { reason: "unreadable", message: "The image could not be read." };
+  return { reason: "unreadable", message: t.imageUnreadable };
 }
 
 const cache = new Map<string, LocalImagePayload>();
@@ -300,12 +301,14 @@ export function clearImageCache(): void {
 }
 
 function RevealButton({ path }: { path: string }) {
-  return <Button variant="ghost" className={CARD_ACTION} title="Show in folder" aria-label="Reveal" onClick={() => {
+  const t = useChatText();
+  return <Button variant="ghost" className={CARD_ACTION} title={t.showInFolder} aria-label={t.reveal} onClick={() => {
     void invoke("reveal_path", { path }).catch(() => {});
-  }}><FolderOpen className="size-3" />Reveal</Button>;
+  }}><FolderOpen className="size-3" />{t.reveal}</Button>;
 }
 
 function CopyPathButton({ path }: { path: string }) {
+  const t = useChatText();
   const [copied, setCopied] = useState(false);
   return <Button variant="ghost" className={CARD_ACTION} onClick={async () => {
     try {
@@ -315,12 +318,13 @@ function CopyPathButton({ path }: { path: string }) {
     } catch {
       setCopied(false);
     }
-  }}>{copied ? <Check className="size-3" /> : <Copy className="size-3" />}{copied ? "Copied" : "Copy path"}</Button>;
+  }}>{copied ? <Check className="size-3" /> : <Copy className="size-3" />}{copied ? t.copied : t.copyPath}</Button>;
 }
 
 /** Exported so the card states can be rendered directly in a static test. */
 export function ImageFallbackCard({ reason, name, path, bytes, detail }: { reason: ImageCardReason; name: string; path?: string; bytes?: number; detail?: string }) {
-  const label = imageReasonText(reason);
+  const t = useChatText();
+  const label = imageReasonText(reason, t);
   const size = reason === "too-large" ? formatBytes(bytes ?? 0) : "";
   return <figure role="group" aria-label={`${name}: ${label}`} className="my-2 overflow-hidden rounded-lg border border-border bg-muted/30 text-left">
     <div className="flex items-start gap-2 px-3 py-2">
@@ -339,7 +343,8 @@ export function ImageFallbackCard({ reason, name, path, bytes, detail }: { reaso
 }
 
 function RemoteImageCard({ url, host, alt, openable }: { url: string; host: string; alt: string; openable: boolean }) {
-  return <figure role="group" aria-label={`Remote image on ${host}`} className="my-2 overflow-hidden rounded-lg border border-border bg-muted/30 text-left">
+  const t = useChatText();
+  return <figure role="group" aria-label={fill(t.remoteImageOn, { host })} className="my-2 overflow-hidden rounded-lg border border-border bg-muted/30 text-left">
     <div className="flex items-start gap-2 px-3 py-2">
       <ImageOff className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
       <div className="min-w-0 flex-1">
@@ -348,18 +353,19 @@ function RemoteImageCard({ url, host, alt, openable }: { url: string; host: stri
       </div>
     </div>
     {openable && <div className="flex justify-end border-t border-border/60 px-2 py-1">
-      <Button variant="ghost" className={CARD_ACTION} onClick={() => { void invoke("open_external_url", { url }).catch(() => openUrl(url).catch(() => {})); }}><ExternalLink className="size-3" />Open</Button>
+      <Button variant="ghost" className={CARD_ACTION} onClick={() => { void invoke("open_external_url", { url }).catch(() => openUrl(url).catch(() => {})); }}><ExternalLink className="size-3" />{t.open}</Button>
     </div>}
   </figure>;
 }
 
 function InlineImage({ src, alt, caption }: { src: string; alt: string; caption: boolean }) {
+  const t = useChatText();
   const [broken, setBroken] = useState(false);
-  if (broken) return <ImageFallbackCard reason="unreadable" name={alt || "Image"} />;
+  if (broken) return <ImageFallbackCard reason="unreadable" name={alt || t.image} />;
   return <figure className="my-2 space-y-1">
     <img
       src={src}
-      alt={alt || "Image"}
+      alt={alt || t.image}
       className="max-h-80 max-w-full rounded-lg border border-border bg-background object-contain"
       onError={() => setBroken(true)}
     />
@@ -370,6 +376,7 @@ function InlineImage({ src, alt, caption }: { src: string; alt: string; caption:
 type LocalState = { status: "loading" } | { status: "ready"; payload: LocalImagePayload } | { status: "failed"; error: LocalImageError };
 
 function LocalImage({ workspace, path, name, alt, caption }: { workspace: string; path: string; name: string; alt: string; caption: boolean }) {
+  const t = useChatText();
   const [state, setState] = useState<LocalState>(() => {
     const cached = readCached(workspace, path);
     return cached ? { status: "ready", payload: cached } : { status: "loading" };
@@ -385,7 +392,7 @@ function LocalImage({ workspace, path, name, alt, caption }: { workspace: string
     void requestLocalImage(workspace, path).then(payload => {
       if (!cancelled) setState({ status: "ready", payload });
     }, (error: unknown) => {
-      if (!cancelled) setState({ status: "failed", error: normalizeImageError(error) });
+      if (!cancelled) setState({ status: "failed", error: normalizeImageError(error, t) });
     });
     return () => { cancelled = true; };
   }, [workspace, path]);
@@ -398,7 +405,7 @@ function LocalImage({ workspace, path, name, alt, caption }: { workspace: string
     return <ImageFallbackCard reason={reason} name={name} path={path} bytes={error.bytes} detail={reason === "not-an-image" ? error.message : undefined} />;
   }
   return <div role="status" className="my-2 flex items-center gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
-    <JouzuLoader className="jouzu-loader-sm" />Loading image…
+    <JouzuLoader className="jouzu-loader-sm" />{t.loadingImage}
   </div>;
 }
 
@@ -413,7 +420,7 @@ export function requestHostAttachment(api: JouzuApi, ref: HostAttachmentRef): Pr
   const pending = hostInflight.get(key);
   if (pending) return pending;
   const load = api.sessions.attachment;
-  if (!load) return Promise.reject(new Error("This client cannot read message images."));
+  if (!load) return Promise.reject(new Error("this client has no session attachment reader"));
   const request = load(ref.sessionId, ref.id).then(payload => {
     hostInflight.delete(key);
     hostCache.delete(key);
@@ -440,6 +447,7 @@ type HostState = { status: "loading" } | { status: "ready"; src: string } | { st
  * the same transcript after switching sessions or restarting (#119).
  */
 export function HostAttachmentImage({ attachment, alt = "" }: { attachment: HostAttachmentRef; alt?: string }) {
+  const t = useChatText();
   const api = useOptionalApi();
   const key = `${attachment.sessionId}\u0000${attachment.id}`;
   const [state, setState] = useState<HostState>(() => {
@@ -460,9 +468,9 @@ export function HostAttachmentImage({ attachment, alt = "" }: { attachment: Host
     return () => { cancelled = true; };
   }, [api, key]);
   if (state.status === "ready") return <MessageImage kind="block" source={state.src} alt={alt} />;
-  if (state.status === "failed") return <ImageFallbackCard reason="unreadable" name={alt || "Image"} />;
+  if (state.status === "failed") return <ImageFallbackCard reason="unreadable" name={alt || t.image} />;
   return <div role="status" className="my-2 flex items-center gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
-    <JouzuLoader className="jouzu-loader-sm" />Loading image…
+    <JouzuLoader className="jouzu-loader-sm" />{t.loadingImage}
   </div>;
 }
 

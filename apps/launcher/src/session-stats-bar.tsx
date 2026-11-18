@@ -1,6 +1,7 @@
 import { CircleGauge, Database, Gauge } from "lucide-react";
 import type { SessionStats, SessionTiming } from "./chat-types";
 import { StatCard, StatPopover, StatRow } from "./components/stat-popover";
+import { fill, useChatText } from "./chat-text";
 
 function compact(value: number) {
   if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(1).replace(/\.0$/, "")}B`;
@@ -20,6 +21,7 @@ function formatDuration(ms: number) {
 }
 /** Whole-session counters and their DSH-style detail cards; no wall-clock session timer. */
 export function SessionStatsBar({ stats, timing, firstOutputMs }: { stats?: SessionStats; timing?: SessionTiming; firstOutputMs?: number | null }) {
+  const t = useChatText();
   if (!stats) return null;
   const tokens = stats.tokens ?? {};
   const total = Number.isFinite(tokens.total) ? tokens.total! : (tokens.input ?? 0) + (tokens.output ?? 0) + (tokens.cacheRead ?? 0) + (tokens.cacheWrite ?? 0);
@@ -30,26 +32,26 @@ export function SessionStatsBar({ stats, timing, firstOutputMs }: { stats?: Sess
   const percent = stats.contextUsage?.percent;
   const speed = timing && timing.modelMs > 0 ? timing.outputTokens / (timing.modelMs / 1000) : null;
   if (!total && !modelMs && percent == null) return null;
-  return <div aria-label="Session usage" className="mx-auto flex max-w-3xl flex-wrap items-center gap-x-2 gap-y-1 px-2 py-1.5 text-[11px] text-muted-foreground">
+  return <div aria-label={t.sessionUsage} className="mx-auto flex max-w-3xl flex-wrap items-center gap-x-2 gap-y-1 px-2 py-1.5 text-[11px] text-muted-foreground">
     {modelMs > 0 && <StatPopover label={<><Gauge className="size-3.5" aria-hidden="true" />{speed !== null && speed > 0 ? `${compact(speed)} tok/s` : formatDuration(modelMs)}</>}>
-      <StatCard title="Session stats">
-        <StatRow label="Model time" value={formatDuration(timing?.modelMs ?? 0)} />
-        <StatRow label="Tool time" value={formatDuration(timing?.toolMs ?? 0)} />
-        <StatRow label="First token avg (TTFT)" value={firstOutputMs != null ? formatDuration(firstOutputMs) : "—"} />
-        <StatRow label="Output speed (TPS)" value={speed !== null ? `${compact(speed)} tok/s` : "—"} />
+      <StatCard title={t.sessionStats}>
+        <StatRow label={t.modelTime} value={formatDuration(timing?.modelMs ?? 0)} />
+        <StatRow label={t.toolTime} value={formatDuration(timing?.toolMs ?? 0)} />
+        <StatRow label={t.firstTokenAvg} value={firstOutputMs != null ? formatDuration(firstOutputMs) : "—"} />
+        <StatRow label={t.outputSpeed} value={speed !== null ? `${compact(speed)} tok/s` : "—"} />
       </StatCard>
     </StatPopover>}
-    {!!total && <StatPopover label={<><Database className="size-3.5" aria-hidden="true" />{compact(total)} tok{cached !== null ? ` · ${cached}% cached` : ""}</>}>
-      <StatCard title="Token usage" value={`${exact(total)} tok`}>
-        {cached !== null && <StatRow label="Cache hit" value={`${cached}%`} />}
-        <StatRow label="Uncached input" value={`${exact(tokens.input ?? 0)} tok`} />
-        <StatRow label="Cache read" value={`${exact(tokens.cacheRead ?? 0)} tok`} />
-        {!!tokens.cacheWrite && <StatRow label="Cache write" value={`${exact(tokens.cacheWrite)} tok`} />}
-        <StatRow label="Output" value={`${exact(tokens.output ?? 0)} tok`} />
+    {!!total && <StatPopover label={<><Database className="size-3.5" aria-hidden="true" />{compact(total)} tok{cached !== null ? ` · ${fill(t.percentCached, { n: cached })}` : ""}</>}>
+      <StatCard title={t.tokenUsage} value={`${exact(total)} tok`}>
+        {cached !== null && <StatRow label={t.cacheHit} value={`${cached}%`} />}
+        <StatRow label={t.uncachedInput} value={`${exact(tokens.input ?? 0)} tok`} />
+        <StatRow label={t.cacheRead} value={`${exact(tokens.cacheRead ?? 0)} tok`} />
+        {!!tokens.cacheWrite && <StatRow label={t.cacheWrite} value={`${exact(tokens.cacheWrite)} tok`} />}
+        <StatRow label={t.output} value={`${exact(tokens.output ?? 0)} tok`} />
       </StatCard>
     </StatPopover>}
     {percent != null && <StatPopover align="right" label={<><CircleGauge className="size-3.5" aria-hidden="true" />{Math.round(percent)}%</>}>
-      <StatCard title="Context used" value={`~${compact(stats.contextUsage?.tokens ?? 0)} / ${compact(stats.contextUsage?.contextWindow ?? 0)}`}>
+      <StatCard title={t.contextUsed} value={`~${compact(stats.contextUsage?.tokens ?? 0)} / ${compact(stats.contextUsage?.contextWindow ?? 0)}`}>
         <div className="pt-2"><div className="h-1.5 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary" style={{ width: `${Math.max(0, Math.min(100, percent))}%` }} /></div></div>
       </StatCard>
     </StatPopover>}

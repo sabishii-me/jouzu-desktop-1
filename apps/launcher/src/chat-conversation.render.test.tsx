@@ -2,6 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { ChatConversation } from "./chat-conversation";
 import { turnLabel } from "./chat-live";
+import { chatTexts } from "./chat-text";
 import type { TurnStep } from "./chat-types";
 import { emptyProjection, type ChatProjection } from "./chat-projection";
 
@@ -41,22 +42,22 @@ describe("the turn status line", () => {
   const now = Date.parse("2026-11-14T00:01:00Z");
   const since = Date.parse("2026-11-14T00:00:19Z");
   it("says the model has not answered yet, and for how long", () => {
-    expect(turnLabel(turn({ n: 1, state: "waiting_model", since, tools: [] }), now)).toBe("Waiting for model · 0:41");
-    expect(turnLabel(turn({ n: 6, state: "waiting_model", since, tools: [] }), now)).toBe("Waiting for model · 0:41");
+    expect(turnLabel(turn({ n: 1, state: "waiting_model", since, tools: [] }), now, chatTexts.en)).toBe("Waiting for model · 0:41");
+    expect(turnLabel(turn({ n: 6, state: "waiting_model", since, tools: [] }), now, chatTexts.en)).toBe("Waiting for model · 0:41");
   });
   it("does not repeat the turn's own clock when the state began with the turn", () => {
-    expect(turnLabel({ ...turn({ n: 1, state: "waiting_model", since, tools: [] }), startedAt: since }, now)).toBe("Waiting for model");
-    expect(turnLabel({ ...turn({ n: 2, state: "waiting_model", since, tools: [] }), startedAt: since - 5000 }, now)).toBe("Waiting for model · 0:41");
+    expect(turnLabel({ ...turn({ n: 1, state: "waiting_model", since, tools: [] }), startedAt: since }, now, chatTexts.en)).toBe("Waiting for model");
+    expect(turnLabel({ ...turn({ n: 2, state: "waiting_model", since, tools: [] }), startedAt: since - 5000 }, now, chatTexts.en)).toBe("Waiting for model · 0:41");
   });
   it("names the tools at work", () => {
-    expect(turnLabel(turn({ n: 2, state: "tools", since, tools: [{ id: "a", name: "write" }, { id: "b", name: "write" }] }), now)).toBe("Running write · 0:41");
+    expect(turnLabel(turn({ n: 2, state: "tools", since, tools: [{ id: "a", name: "write" }, { id: "b", name: "write" }] }), now, chatTexts.en)).toBe("Running write · 0:41");
   });
   it("says a failed model request is being retried", () => {
-    expect(turnLabel(turn({ n: 1, state: "retrying", tools: [], retry: { attempt: 2, maxAttempts: 3, error: "overloaded" } }), now)).toBe("Model request failed, retrying 2/3 (overloaded)");
+    expect(turnLabel(turn({ n: 1, state: "retrying", tools: [], retry: { attempt: 2, maxAttempts: 3, error: "overloaded" } }), now, chatTexts.en)).toBe("Model request failed, retrying 2/3 (overloaded)");
   });
   it("keeps the session's own phase first", () => {
-    expect(turnLabel(turn(undefined, "starting"), now)).toBe("Starting session…");
-    expect(turnLabel(turn({ n: 1, state: "writing", tools: [] }, "cancelling"), now)).toBe("Stopping…");
+    expect(turnLabel(turn(undefined, "starting"), now, chatTexts.en)).toBe("Starting session…");
+    expect(turnLabel(turn({ n: 1, state: "writing", tools: [] }, "cancelling"), now, chatTexts.en)).toBe("Stopping…");
   });
 });
 

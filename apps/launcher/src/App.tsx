@@ -614,7 +614,7 @@ export function App() {
   // Only a first run asks: no saved language settings yet. A file Jouzu cannot read is not a first run.
   if (needsSetup && setup?.language?.status === "absent") return languageSetupScreen;
   if (needsSetup) return modelSetupScreen;
-  return <main aria-busy={busy || undefined} className="flex h-screen w-full flex-col overflow-hidden">
+  return <ChatTextProvider value={chatTexts[locale]}><main aria-busy={busy || undefined} className="flex h-screen w-full flex-col overflow-hidden">
     <span role="status" aria-live="polite" className="sr-only">{busy || notice ? (operation === "preparing" ? t.preparing : operation === "launching" ? t.launching : operation === "choosing" ? t.choosing : operation === "saving" ? t.saving : notice ? t[notice] : null) : state && !state.ready ? t.repair : ""}</span>
     <header data-tauri-drag-region className="flex items-center justify-between border-b border-border px-4 py-2">
       <div className="absolute left-0 right-0 top-0 h-3" data-tauri-drag-region />
@@ -750,7 +750,7 @@ export function App() {
         entryWarm?.state === "starting" && entryWarm.since !== null ? t.warming.replace("{s}", String(Math.max(0, Math.round((bootNow - entryWarm.since) / 1000)))) : t.connecting,
         entryWarm?.state === "failed" ? { message: t.warmingFailed, detail: entryWarm.error ?? "", onRetry: () => retryEntryWarm.current() } : undefined,
       )}
-    {activePath && <div className="flex min-h-0 flex-1"><ChatTextProvider value={chatTexts[locale]}>
+    {activePath && <div className="flex min-h-0 flex-1">
       <ChatWorkspace
         path={activePath}
         revision={sessionRevision}
@@ -777,12 +777,12 @@ export function App() {
         updateAvailable={!!(updater.version || jouzuUpdater.version)}
         updateBusy={updater.busy || jouzuUpdater.busy}
       />
-    </ChatTextProvider></div>}
+    </div>}
     {!activePath && <LauncherPage title={t.heading} description={t.intro}>
       {error?.place === "folders" && <div className="mx-auto w-full max-w-xl px-6 pt-6">{errorNotice("folders")}</div>}
       <div className="flex min-h-0 flex-1 items-center justify-center gap-2 p-6"><Button onClick={() => void chooseFolder()} disabled={!state || busy}><Plus />{t.addFolder}</Button><Button variant="outline" onClick={() => setSettingsOpen(true)}>{t.settings}</Button></div>
     </LauncherPage>}
-    </main>;
+    </main></ChatTextProvider>;
 }
 
 

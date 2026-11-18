@@ -4,6 +4,7 @@ import { ImageViewer } from "./components/image-viewer";
 import { Button } from "./components/ui/button";
 import { FilePreview } from "./file-preview";
 import type { TurnArtifact, TurnSummaryData } from "./turn-summary";
+import { useChatText } from "./chat-text";
 
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"]);
 const CODE_EXTENSIONS = new Set(["ts", "tsx", "js", "jsx", "rs", "py", "go", "java", "c", "h", "cpp", "css", "html", "json", "toml", "yaml", "yml", "sh", "ps1"]);
@@ -28,23 +29,24 @@ function fileIcon(extension: string) {
  * a type icon, the name and the format; opening one previews it.
  */
 export function TurnSummary({ data, workspace, onOpenArtifacts }: { data: TurnSummaryData; workspace?: string; onOpenArtifacts?: () => void }) {
+  const t = useChatText();
   const [open, setOpen] = useState<TurnArtifact | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   if (!data.artifacts.length && !data.files.length) return null;
-  return <section aria-label="Turn summary" className="mt-3 rounded-xl border border-border bg-muted/30 p-3">
+  return <section aria-label={t.turnSummary} className="mt-3 rounded-xl border border-border bg-muted/30 p-3">
     <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
       {data.artifacts.length > 0 && <span className="flex items-center gap-1.5"><ImageIcon className="size-3.5" aria-hidden="true" />{data.artifacts.length} image{data.artifacts.length === 1 ? "" : "s"}</span>}
       {data.files.length > 0 && <span className="flex items-center gap-1.5"><PencilLine className="size-3.5" aria-hidden="true" />{data.files.length} file{data.files.length === 1 ? "" : "s"} edited</span>}
-      {data.artifacts.length > 0 && onOpenArtifacts && <Button variant="ghost" className="ml-auto h-6 px-2 text-[11px]" onClick={onOpenArtifacts}>View in artifacts</Button>}
+      {data.artifacts.length > 0 && onOpenArtifacts && <Button variant="ghost" className="ml-auto h-6 px-2 text-[11px]" onClick={onOpenArtifacts}>{t.viewInArtifacts}</Button>}
     </div>
     {data.artifacts.length > 0 && <div className="mt-2 flex flex-wrap gap-2">
       {data.artifacts.map(artifact => artifact.data
-        ? <button key={artifact.id} type="button" className="overflow-hidden rounded-md border border-border" title={artifact.prompt ?? artifact.path ?? "Generated image"} aria-label={artifact.prompt ?? "Generated image"} onClick={() => setOpen(artifact)}>
-          <img src={`data:${artifact.mime};base64,${artifact.data}`} alt={artifact.prompt ?? "Generated image"} className="size-20 object-cover" />
+        ? <button key={artifact.id} type="button" className="overflow-hidden rounded-md border border-border" title={artifact.prompt ?? artifact.path ?? t.generatedImage} aria-label={artifact.prompt ?? t.generatedImage} onClick={() => setOpen(artifact)}>
+          <img src={`data:${artifact.mime};base64,${artifact.data}`} alt={artifact.prompt ?? t.generatedImage} className="size-20 object-cover" />
         </button>
         : <span key={artifact.id} className="max-w-48 truncate rounded-md border border-border px-2 py-1 font-mono text-[10px] text-muted-foreground">{artifact.path ?? "image"}</span>)}
     </div>}
-    {data.files.length > 0 && <ul aria-label="Edited files" className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+    {data.files.length > 0 && <ul aria-label={t.editedFiles} className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
       {data.files.map(file => {
         const name = file.split(/[\\/]/u).pop() ?? file;
         const extension = fileExtension(name);
@@ -61,7 +63,7 @@ export function TurnSummary({ data, workspace, onOpenArtifacts }: { data: TurnSu
         </li>;
       })}
     </ul>}
-    {open && <ImageViewer src={`data:${open.mime};base64,${open.data}`} alt={open.prompt ?? ""} title={open.path?.split(/[\\/]/u).pop() ?? "Image"} onClose={() => setOpen(null)} />}
+    {open && <ImageViewer src={`data:${open.mime};base64,${open.data}`} alt={open.prompt ?? ""} title={open.path?.split(/[\\/]/u).pop() ?? t.image} onClose={() => setOpen(null)} />}
     {preview && <FilePreview path={preview} workspace={workspace} onClose={() => setPreview(null)} />}
   </section>;
 }
