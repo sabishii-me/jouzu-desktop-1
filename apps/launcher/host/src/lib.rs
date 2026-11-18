@@ -5006,6 +5006,27 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_saved_conversation_that_names_no_model_shows_the_runtimes_start_model_at_rest() {
+        let (manager, _home, workspace) = manager(50);
+        // A runtime has answered which model it starts with.
+        let first = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        wait_status(&first, Status::Idle).await;
+        // Written by an older version: no model change, no reply with a model.
+        let header = json!({ "type": "session", "version": 1, "id": "old", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let user = json!({ "type": "message", "message": { "role": "user", "content": "hi" } });
+        let file = workspace.path().join("old.jsonl");
+        std::fs::write(&file, format!("{header}\n{user}\n")).unwrap();
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+        // Nothing is on its way without a runtime: never a spinner.
+        let model = &session.info()["model"];
+        assert_eq!(model["state"], "ready", "{model}");
+        assert_eq!(model["id"], first.info()["model"]["id"], "{model}");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
     async fn a_saved_conversation_keeps_the_model_it_used() {
         let (manager, _home, workspace) = manager(50);
         let header = json!({ "type": "session", "version": 3, "id": "saved-model", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });

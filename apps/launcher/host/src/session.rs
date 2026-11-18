@@ -4655,7 +4655,9 @@ impl Session {
             .clone();
         if !self.runtime_live() {
             // No runtime, so nothing is on its way: the session shows its model.
-            return match self.resting_model() {
+            // A saved file that names none (written by an older version) gets the
+            // model a runtime starts it with, as the runtimes last answered.
+            return match self.resting_model().or_else(|| self.config.known.start_model()) {
                 Some(Value::Object(mut object)) => {
                     object.insert("state".into(), json!("ready"));
                     Value::Object(object)
