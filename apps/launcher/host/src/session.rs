@@ -68,6 +68,33 @@ fn saved_messages(path: &Path) -> std::io::Result<Vec<Value>> {
     Ok(messages)
 }
 
+/// The model a saved conversation last used, as its file records it: the last
+/// model change or assistant reply. Only shown until a runtime reports.
+fn saved_last_model(path: &Path) -> Option<Value> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut last = None;
+    for line in std::io::BufRead::lines(reader) {
+        let Ok(line) = line else { break };
+        if !line.contains("\"model_change\"") && !line.contains("\"assistant\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+        let pick = match value.get("type").and_then(Value::as_str) {
+            Some("model_change") => value.get("provider").zip(value.get("modelId")),
+            Some("message") => value
+                .get("message")
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+                .and_then(|message| message.get("provider").zip(message.get("model"))),
+            _ => None,
+        };
+        if let Some((Value::String(provider), Value::String(id))) = pick {
+            last = Some(json!({ "provider": provider, "id": id }));
+        }
+    }
+    last
+}
+
 fn is_scratch_workspace(path: &str) -> bool {
     path.split(|character| character == '\\' || character == '/')
         .any(|part| part.starts_with("jouzu-warm-"))
@@ -746,6 +773,8 @@ pub struct Session {
     /// warm pool and the folder's earlier sessions spell it (`folder_text`), so
     /// it takes that folder's warm runtime and its file records the same text.
     start_folder: Mutex<Option<String>>,
+    /// The model a saved conversation's file says it last used.
+    saved_model: Mutex<Option<Value>>,
     /// The configuration changed since this session's runtime read it: it
     /// re-reads it (`switch_session` to its own file) once it is idle.
     reload_due: AtomicBool,
@@ -1981,28 +2010,6 @@ impl Session {
 
     /// A slash command was answered: every reply it had is published. Tell
     /// clients, so state its replies settle (a Flow hold) can be settled.
-    /// Flow let go of what it held (`/flow clear` or `/flow off` succeeded):
-    /// it says it released the held request and delivers nothing more. Messages
-    /// the host kept as held go back to the user (Continue or Discard), never
-    /// left held with nobody to deliver them.
-    fn return_held_messages(&self) {
-        let mut returned = false;
-        for item in self
-            .queued_turns
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter_mut()
-            .filter(|item| item.held)
-        {
-            item.held = false;
-            returned = true;
-        }
-        if returned {
-            self.queue_paused.store(true, Ordering::SeqCst);
-            self.publish_summary();
-        }
-    }
-
     fn command_answered(&self, id: &str) -> Option<Value> {
         let done = {
             let mut commands = self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2021,16 +2028,7 @@ impl Session {
             if let Some(error) = value.get("error").filter(|_| value.get("success") == Some(&Value::Bool(false))) {
                 done["error"] = error.clone();
             }
-            let released = value.get("success") == Some(&Value::Bool(true))
-                && done
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .is_some_and(|text| text == "/flow clear" || text == "/flow off");
             self.publish("session.command_done", done);
-            if released {
-                self.return_held_messages();
-            }
         }
         if response_id == FLOW_RELEASE_ID {
             log(
@@ -2436,6 +2434,10 @@ impl Session {
         let Some(path) = self.saved_path() else { return };
         let started = Instant::now();
         let Ok(messages) = saved_messages(Path::new(&path)) else { return };
+        *self
+            .saved_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = saved_last_model(Path::new(&path));
         let count = messages.len();
         self.import_history(&Value::Array(messages));
         // Last changed when the file was, as the saved-session list says.
@@ -4680,11 +4682,19 @@ impl Session {
             return known.start_model();
         }
         let history = self.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        history.iter().rev().find_map(|row| {
-            let id = row.get("model").and_then(Value::as_str)?;
-            let provider = row.get("provider").and_then(Value::as_str)?;
-            Some(known.find(provider, id).unwrap_or_else(|| json!({ "provider": provider, "id": id })))
-        })
+        history
+            .iter()
+            .rev()
+            .find_map(|row| {
+                let id = row.get("model").and_then(Value::as_str)?;
+                let provider = row.get("provider").and_then(Value::as_str)?;
+                Some((provider.to_string(), id.to_string()))
+            })
+            .or_else(|| {
+                let saved = self.saved_model.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()?;
+                Some((saved.get("provider")?.as_str()?.to_string(), saved.get("id")?.as_str()?.to_string()))
+            })
+            .map(|(provider, id)| known.find(&provider, &id).unwrap_or_else(|| json!({ "provider": provider, "id": id })))
     }
 
     /// The session's runtime's list once it answered; until then the latest
@@ -5091,6 +5101,7 @@ impl Session {
             pick_pending: AtomicBool::new(false),
             runtime_owns_file: AtomicBool::new(false),
             start_folder: Mutex::new(None),
+            saved_model: Mutex::new(None),
             reload_due: AtomicBool::new(false),
             reloading: AtomicBool::new(false),
             known_generation: AtomicU64::new(0),
@@ -7039,6 +7050,15 @@ impl SessionManager {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             sessions.insert(session.id.clone(), session.clone());
+        }
+        if !matches!(status, Status::Starting) {
+            if let Some(path) = session.saved_path() {
+                // Not opened yet: its model is still on screen from its file.
+                *session
+                    .saved_model
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = saved_last_model(Path::new(&path));
+            }
         }
         if matches!(status, Status::Starting) {
             // A saved conversation is readable the moment it is opened: its
