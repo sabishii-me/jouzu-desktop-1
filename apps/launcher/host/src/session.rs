@@ -742,6 +742,10 @@ pub struct Session {
     /// The runtime being installed opened this session's file itself (a new
     /// conversation took over its blank session): the handshake does not switch.
     runtime_owns_file: AtomicBool,
+    /// How a new conversation's folder is spelled for its runtime: the way the
+    /// warm pool and the folder's earlier sessions spell it (`folder_text`), so
+    /// it takes that folder's warm runtime and its file records the same text.
+    start_folder: Mutex<Option<String>>,
     /// The configuration changed since this session's runtime read it: it
     /// re-reads it (`switch_session` to its own file) once it is idle.
     reload_due: AtomicBool,
@@ -1977,6 +1981,28 @@ impl Session {
 
     /// A slash command was answered: every reply it had is published. Tell
     /// clients, so state its replies settle (a Flow hold) can be settled.
+    /// Flow let go of what it held (`/flow clear` or `/flow off` succeeded):
+    /// it says it released the held request and delivers nothing more. Messages
+    /// the host kept as held go back to the user (Continue or Discard), never
+    /// left held with nobody to deliver them.
+    fn return_held_messages(&self) {
+        let mut returned = false;
+        for item in self
+            .queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter_mut()
+            .filter(|item| item.held)
+        {
+            item.held = false;
+            returned = true;
+        }
+        if returned {
+            self.queue_paused.store(true, Ordering::SeqCst);
+            self.publish_summary();
+        }
+    }
+
     fn command_answered(&self, id: &str) -> Option<Value> {
         let done = {
             let mut commands = self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1995,7 +2021,16 @@ impl Session {
             if let Some(error) = value.get("error").filter(|_| value.get("success") == Some(&Value::Bool(false))) {
                 done["error"] = error.clone();
             }
+            let released = value.get("success") == Some(&Value::Bool(true))
+                && done
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .is_some_and(|text| text == "/flow clear" || text == "/flow off");
             self.publish("session.command_done", done);
+            if released {
+                self.return_held_messages();
+            }
         }
         if response_id == FLOW_RELEASE_ID {
             log(
@@ -5055,6 +5090,7 @@ impl Session {
             requested_model: Mutex::new(None),
             pick_pending: AtomicBool::new(false),
             runtime_owns_file: AtomicBool::new(false),
+            start_folder: Mutex::new(None),
             reload_due: AtomicBool::new(false),
             reloading: AtomicBool::new(false),
             known_generation: AtomicU64::new(0),
@@ -5125,6 +5161,12 @@ impl Session {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
             .and_then(|path| session_header_cwd(&path))
+            .or_else(|| {
+                self.start_folder
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            })
             .unwrap_or_else(|| canonical_path(&self.workspace_path))
     }
 
@@ -6985,6 +7027,12 @@ impl SessionManager {
             &config,
         );
         session.fresh.store(fresh, Ordering::SeqCst);
+        if fresh {
+            *session
+                .start_folder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(self.folder_text(&workspace));
+        }
         {
             let mut sessions = self
                 .sessions

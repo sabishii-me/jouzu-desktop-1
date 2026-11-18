@@ -3941,6 +3941,10 @@ mod session_tests {
         let summary = session.summary();
         let states: Vec<&str> = summary["queue"].as_array().unwrap().iter().filter_map(|item| item["state"].as_str()).collect();
         assert_eq!(states, ["held", "held"], "{summary}");
+        // The person releases Flow's hold: Flow delivers nothing more, so the
+        // messages come back to the person (Continue or Discard).
+        session.send("release", "/flow clear").unwrap();
+        wait_until(|| session.summary()["queue"].as_array().is_some_and(|queue| queue.iter().all(|item| item["state"] == "returned"))).await;
     }
 
     #[cfg(windows)]
