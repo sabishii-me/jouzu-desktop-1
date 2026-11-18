@@ -3,6 +3,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { Composer } from "./composer";
 import { AgentAction } from "./chat-live";
+import { ChatConversation } from "./chat-conversation";
+import { emptyProjection, type ChatMessage } from "./chat-projection";
 import { ResultMark } from "./control-result";
 import { ChatTextProvider, chatTexts, explain, failureText } from "./chat-text";
 import { ApiError } from "./api/jouzu-api";
@@ -68,10 +70,36 @@ describe("a failure is shown on the thing that failed", () => {
     expect(html).not.toContain("Request history is full");
   });
 
-  it("a failed reply offers the recovery the runtime's text points to, on the reply", () => {
-    const html = renderToStaticMarkup(<AgentAction thinking="" label="" running={false} settled="failed" failure={{ details: "image rejected", action: { label: "Remove images", run: noop } }} />);
-    expect(html).toContain("Failed");
-    expect(html).toContain("Remove images");
+  const failedReply = (code: string, running = false, extra: ChatMessage[] = []) => {
+    const messages: ChatMessage[] = [
+      { role: "user", content: [{ type: "text", text: "hello" }], turn: 1 },
+      { role: "assistant", content: [], turn: 1, stopReason: "error", errorMessage: "401 Unauthorized: raw provider words", errorCode: code },
+      ...extra,
+    ];
+    return renderToStaticMarkup(<ChatTextProvider value={chatTexts.ja}><ChatConversation projection={{ ...emptyProjection(), messages, running }} replyAction={{ label: chatTexts.ja.signIn, run: noop }} /></ChatTextProvider>);
+  };
+
+  it("a failed reply says once, on the reply, why it failed and what recovers it (#151, #152)", () => {
+    const html = failedReply("auth");
+    expect(html.match(/data-reply-failed/gu)).toHaveLength(1);
+    expect(html).toContain(chatTexts.ja.replyAuth);
+    expect(html).toContain(`>${chatTexts.ja.signIn}</button>`);
+    // The provider's own words are behind Details only.
+    expect(html).not.toContain("raw provider words");
+  });
+
+  it("a request the runtime is still retrying is not shown as a failed reply", () => {
+    expect(failedReply("rate-limit", true)).not.toContain("data-reply-failed");
+  });
+
+  it("only the latest failed reply offers its recovery", () => {
+    const html = failedReply("auth", false, [{ role: "user", content: [{ type: "text", text: "again" }], turn: 2 }, { role: "assistant", content: [{ type: "text", text: "ok" }], turn: 2, stopReason: "stop" }]);
+    expect(html.match(/data-reply-failed/gu)).toHaveLength(1);
+    expect(html).not.toContain(`>${chatTexts.ja.signIn}</button>`);
+  });
+
+  it("the status line never shows a failed reply a second time", () => {
+    expect(workspaceSource).not.toMatch(/settled=\{[^}]*failed/u);
   });
 
   it("the runtime's notice is one line, never a list", () => {
@@ -91,10 +119,9 @@ describe("a failure is shown on the thing that failed", () => {
 
   it("an idle status line keeps its row, so a failure appearing moves nothing", () => {
     const idle = renderToStaticMarkup(<AgentAction thinking="" label="" running={false} />);
-    const failed = renderToStaticMarkup(<AgentAction thinking="" label="" running={false} settled="failed" />);
+    const stopped = renderToStaticMarkup(<AgentAction thinking="" label="" running={false} settled="interrupted" />);
     expect(idle).toContain("h-8");
-    expect(failed).toContain("h-8");
-    expect(failed).toContain('role="alert"');
+    expect(stopped).toContain("h-8");
   });
 
   it("a message that got no reply offers Retry beside the recovery its text points to", () => {

@@ -53,7 +53,7 @@ describe("the turn status line", () => {
     expect(turnLabel(turn({ n: 2, state: "tools", since, tools: [{ id: "a", name: "write" }, { id: "b", name: "write" }] }), now, chatTexts.en)).toBe("Running write · 0:41");
   });
   it("says a failed model request is being retried", () => {
-    expect(turnLabel(turn({ n: 1, state: "retrying", tools: [], retry: { attempt: 2, maxAttempts: 3, error: "overloaded" } }), now, chatTexts.en)).toBe("Model request failed, retrying 2/3 (overloaded)");
+    expect(turnLabel(turn({ n: 1, state: "retrying", tools: [], retry: { attempt: 2, maxAttempts: 3, error: "529 overloaded", code: "unavailable" } }), now, chatTexts.en)).toBe("Model request failed, retrying 2/3 (The provider did not answer)");
   });
   it("keeps the session's own phase first", () => {
     expect(turnLabel(turn(undefined, "starting"), now, chatTexts.en)).toBe("Starting session…");
