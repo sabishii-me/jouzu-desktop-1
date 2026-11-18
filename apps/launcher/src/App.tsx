@@ -147,6 +147,18 @@ export function App() {
   const errorNotice = (place: "settings" | "folders") => error?.place === place
     ? <NoticeRow alert={{ id: `app-${place}`, level: "error", text: error.text, details: error.details, actions: [], dismiss: () => setError(null) }} />
     : null;
+  /**
+   * Settings-wide failures (an action outside any card, or settings that could
+   * not be read) in the given frame. The frame is laid over the page, so the
+   * failure appearing or clearing never moves what is under it (ui-layer §1, §8).
+   */
+  const settingsNotices = (frame: string) => {
+    // Settings that could not be read come first: every card waits for them,
+    // and what failed because of it is not reported beside it. One at a time.
+    const notice = (!setup && configFailure(appView, ["status"]) ? configNotice("status") : null)
+      ?? (error?.place === "settings" ? errorNotice("settings") : null);
+    return notice ? <div className={`absolute z-10 rounded-lg bg-background shadow-lg ${frame}`}>{notice}</div> : null;
+  };
   const [operation, setOperation] = useState<"choosing" | "launching" | "preparing" | "saving" | null>(null);
   const [version, setVersion] = useState<string | null>(null);
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
@@ -582,10 +594,9 @@ export function App() {
     {firstRunControls}
     {onboardingBanner(t.setupConnect, undefined, 0.55, false, true)}
     <div className="flex min-h-0 flex-1 justify-center overflow-auto px-6 py-8">
-      <div data-slot="page-body" className="onboarding-card m-auto w-full max-w-2xl rounded-2xl border border-border bg-card/70 p-6 shadow-[0_28px_70px_-40px_rgba(0,0,0,0.95)] backdrop-blur-sm sm:p-8">
+      <div data-slot="page-body" className="onboarding-card relative m-auto w-full max-w-2xl rounded-2xl border border-border bg-card/70 p-6 shadow-[0_28px_70px_-40px_rgba(0,0,0,0.95)] backdrop-blur-sm sm:p-8">
+        {settingsNotices("inset-x-6 top-6 sm:inset-x-8 sm:top-8")}
         <p className="mb-6 text-sm leading-relaxed text-muted-foreground">{t.setupHint}</p>
-        {error?.place === "settings" && <div className="mb-4">{errorNotice("settings")}</div>}
-        {!setup && configFailure(appView, ["status"]) && <div className="mb-4">{configNotice("status")}</div>}
         {providerContent}
       </div>
     </div>
@@ -604,9 +615,8 @@ export function App() {
         {/* The dialog must stay open on an outside click and must not let the view behind it be used. A non-modal dialog keeps the background interactive, so shield it. */}
         {settingsOpen && <div aria-hidden="true" data-settings-shield className="fixed inset-0 z-40" onPointerDown={event => event.preventDefault()} onWheel={event => event.preventDefault()} />}
         <DialogContent showCloseButton={false} onInteractOutside={event => event.preventDefault()} onPointerDownOutside={event => event.preventDefault()} className="flex h-[min(560px,85dvh)] max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden rounded-2xl border-border p-0 sm:max-w-3xl">
-          {error?.place === "settings" && <div className="border-b border-border p-2">{errorNotice("settings")}</div>}
-          {/* The settings could not be read: every card below waits for them. */}
-          {!setup && configFailure(appView, ["status"]) && <div className="border-b border-border p-2">{configNotice("status")}</div>}
+          {/* Over the top of the panel, beside the tabs, so showing or clearing it never moves them (#147). */}
+          {settingsNotices("right-3 top-3 left-[calc(9rem+0.75rem)] sm:left-[calc(12rem+0.75rem)]")}
           <DialogDescription className="sr-only">{t.preferences}</DialogDescription>
           <Tabs value={settingsTab} onValueChange={setSettingsTab} orientation="vertical" className="min-h-0 flex-1 gap-0">
             <aside className="w-36 shrink-0 border-r border-border bg-muted/60 p-3 sm:w-48">
