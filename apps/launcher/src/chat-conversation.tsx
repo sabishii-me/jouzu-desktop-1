@@ -1,12 +1,12 @@
 import { memo, useEffect, useRef, useState, type ReactNode } from "react";
-import { ArrowDown } from "lucide-react";
+import { AlertTriangle, ArrowDown } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { ChatMarkdown } from "./chat-markdown";
 import { HostAttachmentImage, MessageImage } from "./message-image";
 import { WorkspaceContext } from "./workspace-context";
 import { turnAt, type ChatMessage, type ChatProjection } from "./chat-projection";
 import type { OutboxItem } from "./chat-types";
-import { fill, codeText, useChatText, type ChatText } from "./chat-text";
+import { fill, codeText, replyReason, useChatText, type ChatText } from "./chat-text";
 import { DetailsPopover, type ControlResult } from "./control-result";
 import { ToolRenderer } from "./tool-renderers";
 import { ActivityStrip, isRichTool, type ActivityItem } from "./tool-renderers/tool-chip";
@@ -141,7 +141,7 @@ function OutboxRow({ item, onRetry, onDiscard }: { item: OutboxItem; onRetry?: (
 /** The session's history beyond what is loaded: earlier pages read on request (#20). */
 export interface EarlierHistory { more: boolean; loading: boolean; load: () => void }
 
-function ChatConversationView({ projection, reasoningLive = false, workspace, busy = false, pendingUser = "", outbox = [], onRetrySend, onDiscardSend, onFork, forkResult, history, onOpenArtifacts, changedFiles = [] }: { projection: ChatProjection; reasoningLive?: boolean; workspace?: string; busy?: boolean; pendingUser?: string; outbox?: readonly OutboxItem[]; onRetrySend?: (clientMessageId: string) => void; onDiscardSend?: (clientMessageId: string) => void; onFork?: (prompt: string, turn: number) => void; forkResult?: { turn: number; result: ControlResult } | null; history?: EarlierHistory; onOpenArtifacts?: () => void; changedFiles?: readonly string[] }) {
+function ChatConversationView({ projection, reasoningLive = false, workspace, busy = false, pendingUser = "", outbox = [], onRetrySend, onDiscardSend, onFork, forkResult, history, onOpenArtifacts, changedFiles = [], replyAction }: { projection: ChatProjection; reasoningLive?: boolean; workspace?: string; busy?: boolean; pendingUser?: string; outbox?: readonly OutboxItem[]; onRetrySend?: (clientMessageId: string) => void; onDiscardSend?: (clientMessageId: string) => void; onFork?: (prompt: string, turn: number) => void; forkResult?: { turn: number; result: ControlResult } | null; history?: EarlierHistory; onOpenArtifacts?: () => void; changedFiles?: readonly string[]; /** What recovers the latest failed reply (Retry, Sign in, Remove images…), when anything does. */ replyAction?: { label: string; run: () => void; disabled?: boolean } }) {
   const t = useChatText();
   const scroll = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -242,7 +242,19 @@ function ChatConversationView({ projection, reasoningLive = false, workspace, bu
       const turnEnd = !nextMessage || nextMessage.role === "user";
       // The reply's own failure, on the reply: the model's words stay behind it.
       // Stop is the user's own choice, not an error; the status line says t.interrupted.
-      if (last.message.errorMessage && last.message.stopReason !== "aborted") rows.push(<details key={`error-${key(last.index)}`} data-reply-failed className="text-xs text-destructive"><summary className="cursor-pointer select-none">{t.replyFailed}</summary><pre className="mt-1 select-text whitespace-pre-wrap break-words font-mono text-[10px] text-muted-foreground">{last.message.errorMessage}</pre></details>);
+      // A turn still running is not over: the runtime may be retrying a failed
+      // request, and only its last attempt is the reply's outcome.
+      const ended = !(projection.running && !nextMessage);
+      if (ended && last.message.errorMessage && last.message.stopReason !== "aborted") {
+        // The latest reply is the one that can be recovered; earlier ones are just marked.
+        const action = !nextMessage ? replyAction : undefined;
+        rows.push(<div key={`error-${key(last.index)}`} role="alert" data-reply-failed data-reply-error={last.message.errorCode ?? "other"} className="flex min-h-8 items-center gap-2 text-xs text-destructive">
+          <AlertTriangle className="size-3.5 shrink-0" aria-hidden="true" />
+          <span className="min-w-0 flex-1">{replyReason(t, last.message.errorCode)}</span>
+          <DetailsPopover details={last.message.errorMessage} />
+          {action && <Button type="button" variant="outline" className="h-6 shrink-0 px-2 text-[10px]" disabled={action.disabled} onClick={action.run}>{action.label}</Button>}
+        </div>);
+      }
       if (turnEnd && !projection.running && !busy && !last.message.content.some(block => block.type === "toolCall") && last.message.stopReason !== "toolUse") {
         // The workspace diff belongs to the latest turn only (#79); earlier turns list
         // what their own tool calls show.

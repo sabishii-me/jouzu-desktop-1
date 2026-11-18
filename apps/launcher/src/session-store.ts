@@ -154,7 +154,7 @@ function stepOf(value: unknown): TurnStep | undefined {
     state,
     since: time(step.since),
     tools,
-    ...(retry ? { retry: { attempt: typeof retry.attempt === "number" ? retry.attempt : undefined, maxAttempts: typeof retry.maxAttempts === "number" ? retry.maxAttempts : undefined, error: text(retry.error) } } : {}),
+    ...(retry ? { retry: { attempt: typeof retry.attempt === "number" ? retry.attempt : undefined, maxAttempts: typeof retry.maxAttempts === "number" ? retry.maxAttempts : undefined, error: text(retry.error), code: text(retry.code) } } : {}),
   };
 }
 
@@ -906,6 +906,7 @@ export class SessionStore {
             content: blocks.length ? blocks : message.content,
             ...(text(data.stopReason) ? { stopReason: text(data.stopReason) } : {}),
             ...(text(data.errorMessage) ? { errorMessage: text(data.errorMessage) } : {}),
+            ...(text(data.errorCode) ? { errorCode: text(data.errorCode) } : {}),
             ...(text(data.model) ? { model: text(data.model) } : {}),
             ...(text(data.provider) ? { provider: text(data.provider) } : {}),
             ...(record(data.usage) ? { usage: data.usage as ChatMessage["usage"] } : {}),

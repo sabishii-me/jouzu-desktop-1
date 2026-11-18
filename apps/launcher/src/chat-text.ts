@@ -34,6 +34,14 @@ const en = {
   sending: "Sending…",
   noReply: "No reply",
   replyFailed: "This reply stopped with an error",
+  replyAuth: "The provider refused the key or sign-in",
+  replyQuota: "The provider account is out of credit or quota",
+  replyRateLimit: "The provider is limiting requests right now",
+  replyModelUnavailable: "The provider does not offer this model",
+  replyImage: "The model refused an image in this conversation",
+  replyUnavailable: "The provider did not answer",
+  replyOther: "The reply stopped with an error",
+  signIn: "Sign in",
   failed: "Failed",
   interrupted: "Interrupted",
   historyFailed: "The conversation could not be loaded.",
@@ -443,6 +451,14 @@ const ja: ChatText = {
   sending: "送信中…",
   noReply: "応答なし",
   replyFailed: "この応答はエラーで止まりました",
+  replyAuth: "プロバイダーがキーまたはサインインを拒否しました",
+  replyQuota: "プロバイダーのアカウントのクレジットまたは利用枠が足りません",
+  replyRateLimit: "プロバイダーが現在リクエストを制限しています",
+  replyModelUnavailable: "プロバイダーはこのモデルを提供していません",
+  replyImage: "モデルがこの会話の画像を拒否しました",
+  replyUnavailable: "プロバイダーから応答がありません",
+  replyOther: "応答がエラーで止まりました",
+  signIn: "サインイン",
   failed: "失敗",
   interrupted: "中断",
   historyFailed: "会話を読み込めませんでした。",
@@ -847,6 +863,14 @@ const hans: ChatText = {
   sending: "发送中…",
   noReply: "没有回复",
   replyFailed: "此回复因错误而停止",
+  replyAuth: "服务商拒绝了密钥或登录",
+  replyQuota: "服务商账户的额度或配额不足",
+  replyRateLimit: "服务商目前在限制请求",
+  replyModelUnavailable: "服务商不提供这个模型",
+  replyImage: "模型拒绝了此对话中的图片",
+  replyUnavailable: "服务商没有响应",
+  replyOther: "回复因错误而停止",
+  signIn: "登录",
   failed: "失败",
   interrupted: "已中断",
   historyFailed: "无法加载对话。",
@@ -1251,6 +1275,14 @@ const hant: ChatText = {
   sending: "傳送中…",
   noReply: "沒有回覆",
   replyFailed: "此回覆因錯誤而停止",
+  replyAuth: "服務商拒絕了金鑰或登入",
+  replyQuota: "服務商帳戶的額度或配額不足",
+  replyRateLimit: "服務商目前正在限制請求",
+  replyModelUnavailable: "服務商不提供這個模型",
+  replyImage: "模型拒絕了此對話中的圖片",
+  replyUnavailable: "服務商沒有回應",
+  replyOther: "回覆因錯誤而停止",
+  signIn: "登入",
   failed: "失敗",
   interrupted: "已中斷",
   historyFailed: "無法載入對話。",
@@ -1722,4 +1754,18 @@ export function explain(t: ChatText, error: unknown, failed: string): Explained 
   }
   if (error instanceof TypeError && /fetch|network/iu.test(error.message)) return { text: t.codeNetwork, details };
   return { text: failed, details };
+}
+
+const REPLY_REASONS: Record<string, TextKey> = {
+  auth: "replyAuth",
+  quota: "replyQuota",
+  "rate-limit": "replyRateLimit",
+  "model-unavailable": "replyModelUnavailable",
+  image: "replyImage",
+  unavailable: "replyUnavailable",
+};
+
+/** The short reason for a failed reply, from the code the host gives it. */
+export function replyReason(t: ChatText, code: string | undefined): string {
+  return t[REPLY_REASONS[code ?? ""] ?? "replyOther"];
 }

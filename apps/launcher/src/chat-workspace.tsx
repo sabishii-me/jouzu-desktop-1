@@ -20,7 +20,7 @@ import type { ChatSnapshot, PendingPrompt, SessionTiming } from "./chat-types";
 import { eventRouter } from "./event-router";
 import { fitsSendBudget, readImageAttachment, removeSubmittedImages, validateImageSelection, type ImageAttachment } from "./chat-attachments";
 import { normalizeVideoUrl, videoMarker } from "./video-url";
-import { emptyProjection, prependHistory, savedPageProjection, type ChatProjection, type FlowReportRecord } from "./chat-projection";
+import { emptyProjection, prependHistory, savedPageProjection, type ChatMessage, type ChatProjection, type FlowReportRecord } from "./chat-projection";
 import { clearDraft, draftKey, readDraft, writeDraft } from "./drafts";
 import { describeError, isCapacityError, isFlowHistoryError, isImageRefused } from "./runtime-errors";
 import { NoticeRow, SteerQueue } from "./session-alerts-view";
@@ -1415,10 +1415,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const streamingBlock = turnStep?.state === "thinking" ? activeMessage?.content.at(-1) : undefined;
   const liveThinking = streamingBlock?.type === "thinking" ? streamingBlock.thinking ?? "" : "";
   const lastMessage = conversationProjection.messages.at(-1);
+  // A failed reply says so on the reply; the status line only says a turn was stopped.
   const settled = !conversationProjection.running
-    ? lastMessage?.role === "assistant" && lastMessage.stopReason === "error" ? "failed" as const
-      : lastMessage?.role === "toolResult" || (lastMessage?.role === "assistant" && (lastMessage.stopReason === "aborted" || lastMessage.stopReason === "toolUse")) ? "interrupted" as const
-        : undefined
+    && (lastMessage?.role === "toolResult" || (lastMessage?.role === "assistant" && (lastMessage.stopReason === "aborted" || lastMessage.stopReason === "toolUse")))
+    ? "interrupted" as const
     : undefined;
   const outputReferences = useMemo(
     () => collectOutputReferences(conversationProjection.messages, artifactsSessionId),
@@ -1463,7 +1463,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const flowHold = showingAttached ? snapshot.flowHold : null;
   const failedTurn = showingAttached ? snapshot.failedTurn : null;
   const queued = showingAttached ? snapshot.queue ?? [] : [];
-  const replyError = !conversationProjection.running && lastMessage?.role === "assistant" && lastMessage.stopReason === "error" ? lastMessage.errorMessage ?? null : null;
   /**
    * Until the runtime reports these as structure (refused image: jouzu#54/#74;
    * Flow history: its Flow state; provider codes: runtime G6), their only sign is
@@ -1477,7 +1476,29 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (raw && isImageRefused(raw)) return { label: t.removeImages, run: () => void repairSessionImages(), disabled: commandBusy };
     return undefined;
   }
-  const replyRecovery = recoveryFor(replyError);
+  /**
+   * What recovers the latest failed reply, by the kind of failure the host names.
+   * Retry sends the person's message again, as they would by hand: the runtime
+   * has no command to rerun a failed reply (runtime request G12). A message with
+   * images is not sent again without them, so it gets no Retry.
+   */
+  function replyActionFor(message: ChatMessage | undefined): { label: string; run: () => void; disabled?: boolean } | undefined {
+    if (!message || message.role !== "assistant" || message.stopReason !== "error") return undefined;
+    const own = recoveryFor(message.errorMessage);
+    if (own && !isImageRefused(message.errorMessage)) return own;
+    switch (message.errorCode) {
+      case "image": return { label: t.removeImages, run: () => void repairSessionImages(), disabled: commandBusy };
+      case "auth": return { label: t.signIn, run: onSettings };
+      case "quota": return { label: t.settings, run: onSettings };
+      case "model-unavailable": return undefined;
+    }
+    const asked = [...conversationProjection.messages].reverse().find(item => item.role === "user");
+    if (!asked || asked.content.some(block => block.type === "image")) return undefined;
+    const words = asked.content.filter(block => block.type === "text").map(block => block.text ?? "").join("\n").trim();
+    if (!words) return undefined;
+    return { label: t.retry, run: () => { void connection.current?.send(words).catch(() => {}); }, disabled: commandBusy };
+  }
+  const replyAction = replyActionFor(lastMessage);
   // The one thing that ever takes the composer's place: the session cannot go on.
   const sessionFailure = showingAttached && snapshot.status === "error" ? snapshot.failure ?? { code: "", text: "" } : null;
   const blocked = sessionFailure
@@ -1626,12 +1647,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">{t.openingSession}</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
           {showingAttached && snapshot.historyError && <div className="absolute inset-x-0 top-2 z-10 mx-auto w-[min(48rem,calc(100%-2rem))]"><NoticeRow alert={{ id: "history", level: "error", text: t.historyFailed, details: snapshot.historyError, actions: [{ label: t.retry, run: () => void connection.current?.retryHistory() }] }} /></div>}
-          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onRetrySend={id => void connection.current?.retry(id)?.catch(() => {})} onDiscardSend={id => connection.current?.discard(id)} forkResult={forkResult} onFork={(prompt, turn) => void forkTurn(prompt, turn)} history={earlierHistory} onOpenArtifacts={openArtifactsPanel} changedFiles={showingAttached && turnChanged && normalizedPath(turnChanged.session) === normalizedPath(snapshot.sessionFile ?? "") ? turnChanged.files : []} />
+          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onRetrySend={id => void connection.current?.retry(id)?.catch(() => {})} onDiscardSend={id => connection.current?.discard(id)} forkResult={forkResult} onFork={(prompt, turn) => void forkTurn(prompt, turn)} history={earlierHistory} onOpenArtifacts={openArtifactsPanel} replyAction={showingAttached ? replyAction : undefined} changedFiles={showingAttached && turnChanged && normalizedPath(turnChanged.session) === normalizedPath(snapshot.sessionFile ?? "") ? turnChanged.files : []} />
         </div>
         <div className="relative">
           <div className="mx-auto w-full max-w-3xl">
             {banners}
-            <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now, t)} running={conversationProjection.running} elapsed={elapsed} settled={settled} failure={settled === "failed" ? { details: replyError ?? undefined, action: replyRecovery } : undefined} noReply={noReply} hold={hold} notice={runtimeNotice} />
+            <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now, t)} running={conversationProjection.running} elapsed={elapsed} settled={settled} noReply={noReply} hold={hold} notice={runtimeNotice} />
           </div>
           {promptNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{promptNode}</div>}
           <Composer autoFocus={composerFocus} blocked={blocked} results={controlResults} connected={snapshot.connected || !!activePreview} pending={elsewhere ? locked : snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={elsewhere || (opening && !activePreview)} starting={!elsewhere && composerStarting} unavailable={!!sessionError} running={!elsewhere && composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={elsewhere ? [] : snapshot.models ?? []} model={elsewhere ? undefined : snapshot.model} modelState={elsewhere ? "ready" : snapshot.modelState ?? "resolving"} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={elsewhere ? undefined : snapshot.thinkingLevel} thinkingLevels={elsewhere ? [] : snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
