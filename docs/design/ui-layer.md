@@ -71,6 +71,12 @@ ever appears in the composer's place, and only one at a time.
   "Reconnecting…" and the composer is dimmed. The session keeps running in the
   host and the window catches up on reconnect. This is not a session error.
 - The sidebar row shows whether a session is running or has ended; nothing else.
+- The session on screen is a host session. Opening a saved session from the
+  sidebar opens it in the host at once (no runtime until a message needs one);
+  its saved transcript may fill the screen meanwhile, but the composer never
+  shows another session's model, run or Stop. A session the host stopped stays
+  on screen as it is: its model shows, Send works, and the host starts it again
+  for the message. The UI does not reopen sessions on its own.
 
 ## 6. Settings
 
@@ -111,6 +117,7 @@ else comes from host snapshots.
 - The four model copies (catalog list fetched once, per-session list, stored
   preference, the Settings list) and the one-second wait for a default model.
 - Inferring busy state locally.
+- Reopening a stopped session from the UI (`reopenBoundSession` on `stopped`).
 - The local steer queue.
 - Partial queuing of configuration operations and handling of `409`.
 - The notice list in `session-alerts` built from about 14 inputs, and the code

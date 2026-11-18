@@ -60,6 +60,11 @@ describes no screens; what a person sees is in the UI document.
   and has not answered; it can no longer be edited or removed), `held` (an
   extension took it and delivers it itself), `returned` (after Stop).
 - A message leaves the queue only after the runtime confirms it used it.
+- The session owns its messages whatever its runtime does. While the runtime is
+  starting or being replaced after it exited (`recovering`), a message is
+  accepted and waits for it. A stopped session starts a runtime again for the
+  next message (the same session, no reopening by the client). Only a failed
+  session refuses (`session-stopped`) until the user restarts it.
 - Open question: confirm that a message sent while a Flow run is streaming is
   delivered as a steer under these rules.
 
@@ -77,6 +82,12 @@ describes no screens; what a person sees is in the UI document.
   runtimes started before the change are not taken.
 - A session's model state is `resolving` (the runtime has not answered, or the
   client's pick is on its way), `ready` or `none` (the runtime reports none).
+  `resolving` belongs to a runtime: it exists only while one works for the
+  session. When that runtime ends (stopped, failed, exited) what it was asked
+  ends with it: the session keeps the model its last runtime reported, a pick
+  it never applied stays on the session, and the state is `ready` with that
+  pick or model. A session without a runtime is never `resolving` while it has
+  a model to show. The next runtime gets the pick (or that model).
 - Send is refused (`no-model`) only when the state is `none`. While it is
   `resolving` the message is accepted and waits; it reaches the runtime once the
   model is `ready`, or fails with `no-model` at that message. A new session can
@@ -93,7 +104,8 @@ describes no screens; what a person sees is in the UI document.
 - A new session starts its runtime when it is created (a warm one when ready).
 - A model change the runtime makes on its own (a slash command) is not reported
   in RPC mode; the host does not work around that (runtime G3). A new runtime for
-  the session (recovery) makes the model `resolving` again until it answers.
+  the session (recovery) makes the model `resolving` again until it answers; the
+  session keeps showing its model meanwhile and hands it to the new runtime.
   Queued and retried turns wait for `ready` like a send.
 - After a configuration operation the host recycles the warm runtime and every
   open session's runtime opens its own file again (`switch_session`), which
