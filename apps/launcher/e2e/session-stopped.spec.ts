@@ -152,8 +152,13 @@ test("a saved session opened from the sidebar shows its own model and sends on i
   await composer.fill("beta message");
   await page.getByRole("button", { name: /^send$/i }).first().click();
   await expect(conversation.getByText("beta message")).toHaveCount(2, { timeout: 15_000 });
-  // Back to alpha (stopped): its own model, never beta's.
+  // Back to alpha (stopped): its own model, never beta's, and no spinner while it opens.
   await page.getByText("alpha message").first().click();
+  for (let sample = 0; sample < 40; sample += 1) {
+    expect(await model.textContent()).not.toContain("Fixture Other");
+    expect(await model.locator(".animate-spin").count()).toBe(0);
+    await page.waitForTimeout(10);
+  }
   await expect(model).toContainText("fixture-model", { timeout: 5_000 });
   await expect(model).not.toContainText("Fixture Other");
   // A pick on it, then the host stops it again: the message goes out on the pick.

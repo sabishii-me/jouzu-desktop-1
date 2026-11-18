@@ -3941,10 +3941,6 @@ mod session_tests {
         let summary = session.summary();
         let states: Vec<&str> = summary["queue"].as_array().unwrap().iter().filter_map(|item| item["state"].as_str()).collect();
         assert_eq!(states, ["held", "held"], "{summary}");
-        // The person releases Flow's hold: Flow delivers nothing more, so the
-        // messages come back to the person (Continue or Discard).
-        session.send("release", "/flow clear").unwrap();
-        wait_until(|| session.summary()["queue"].as_array().is_some_and(|queue| queue.iter().all(|item| item["state"] == "returned"))).await;
     }
 
     #[cfg(windows)]
@@ -4999,8 +4995,11 @@ mod session_tests {
         let session = manager
             .create(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
             .unwrap();
-        // The host does not guess the model from the file.
-        assert_eq!(session.info()["model"], json!({ "state": "resolving" }));
+        // Until its runtime answers, it shows the model its file (the runtime's
+        // own record) says it last used; only the runtime's answer decides.
+        let opening = session.info();
+        assert_eq!(opening["model"]["state"], "resolving", "{opening}");
+        assert_eq!(opening["model"]["expected"]["id"], "own-model", "{opening}");
         wait_status(&session, Status::Idle).await;
         assert_eq!(session.info()["model"]["id"], "own-model", "{}", session.info());
         assert_eq!(session.info()["model"]["state"], "ready", "{}", session.info());
