@@ -55,10 +55,12 @@ function ModelMenu({ open, onOpenChange, models, model, state, onSelect, thinkin
   const visible = models.filter(item => `${item.provider} ${item.name} ${item.id}`.toLowerCase().includes(query.toLowerCase()));
   const providers = [...new Set(visible.map(item => item.provider))];
   return <div ref={root} className="relative flex items-center">
-    {/* The button is the model's state: loading, the model, or the way to get one. */}
-    <Button type="button" variant="ghost" className="h-8 gap-1 px-2 text-xs" aria-label="Model" aria-expanded={open} disabled={state === "resolving"} onClick={() => { if (state === "none" && !models.length) { onSetup?.(); return; } const next = !open; onOpenChange(next); if (next) setQuery(""); }}>
-      {state === "resolving" ? <Loader2 className="size-4 shrink-0 animate-spin" aria-hidden="true" /> : <Cpu className="size-4 shrink-0" aria-hidden="true" />}
-      <span className="max-w-40 truncate">{state === "ready" ? model : state === "none" ? (models.length ? "Select model" : "Set up a model") : ""}</span>
+    {/* The button is the model: the session's, or while its runtime has not answered the
+        one it is expected to report (the runtime's earlier answer). It spins only when
+        nothing is known yet, and it leads to setup when the runtime has no model. */}
+    <Button type="button" variant="ghost" className="h-8 gap-1 px-2 text-xs" aria-label="Model" aria-expanded={open} disabled={state === "resolving" && !models.length} onClick={() => { if (state === "none" && !models.length) { onSetup?.(); return; } const next = !open; onOpenChange(next); if (next) setQuery(""); }}>
+      {state === "resolving" && !model ? <Loader2 className="size-4 shrink-0 animate-spin" aria-hidden="true" /> : <Cpu className="size-4 shrink-0" aria-hidden="true" />}
+      <span className="max-w-40 truncate">{state === "none" ? (models.length ? "Select model" : "Set up a model") : model ?? ""}</span>
       <ChevronDown className="size-3 shrink-0" aria-hidden="true" />
     </Button>
     <ResultMark result={result} />
@@ -225,7 +227,9 @@ export function Composer({ hero = false, autoFocus = false, textguard, blocked, 
   const [modelOpen, setModelOpen] = useState(false);
   // Nothing is sent without the runtime's model; the model button next to
   // Send shows why (loading, or the way to set one up).
-  const noModel = modelState !== "ready";
+  // Only a runtime that reported no model stops Send; a model still on its way does not
+  // (the host holds the message until it is ready).
+  const noModel = modelState === "none";
   const submit = () => { if ((connected || opening) && !noModel && !unavailable && !readingImages && (draft.trim() || videos.length) && (running || starting || !pending)) onSend(); };
   const compactDisabled = !connected || pending || settling || opening || unavailable || running;
   const exportDisabled = !connected || pending || settling || opening || unavailable;

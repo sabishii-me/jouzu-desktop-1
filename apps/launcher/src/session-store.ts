@@ -28,6 +28,23 @@ import {
 } from "./chat-types";
 import { newId } from "./secure-context";
 
+/**
+ * The host's latest model list and the model a new session is expected to show:
+ * what the host last relayed from the runtimes. A new session shows it from the
+ * first frame, before the host has even answered its creation; the host's own
+ * snapshot replaces it at once.
+ */
+const lastKnown: { models: ChatModel[]; startModel?: string } = { models: [] };
+export const knownModels = {
+  get models(): ChatModel[] { return lastKnown.models; },
+  /** The remembered pick when the runtimes list it, else the model a new session last started on. */
+  get model(): string | undefined {
+    const preferred = readModelPreference();
+    const picked = preferred && lastKnown.models.find(model => model.provider === preferred.provider && model.id === preferred.id);
+    return picked?.name ?? lastKnown.startModel;
+  },
+};
+
 export interface SessionPort {
   readonly id: string;
   /** The saved file the host opened this session on, when it has one. */
@@ -236,9 +253,6 @@ export class SessionStore {
   private seen = 0;
   private routerUnsubscribe?: () => void;
   private disposed = false;
-  /** The last model the person picked (UI memory), applied once per session. */
-  private preferred = readModelPreference();
-  private preferenceTried = false;
   private api?: JouzuApi;
   private noticeSeq = 0;
   /** The last reply of each open Flow command that releases a hold, by command id. */
@@ -251,7 +265,7 @@ export class SessionStore {
     readonly session: SessionPort,
     private readonly onDispose?: () => void,
     api?: JouzuApi,
-    /** A new conversation (not a saved one): the remembered model applies to it. */
+    /** A new conversation (not a saved one). */
     private readonly fresh = false,
   ) {
     this.api = api;
@@ -513,8 +527,7 @@ export class SessionStore {
   async selectModel(provider: string, id: string): Promise<void> {
     if (!this.api) return;
     await this.api.models.select(this.session.id, provider, id);
-    this.preferred = { provider, id };
-    writeModelPreference(this.preferred);
+    writeModelPreference({ provider, id });
   }
 
   /** Change the reasoning level; the runtime reports the level it set. */
@@ -681,23 +694,6 @@ export class SessionStore {
     for (const listener of this.listeners) listener(this.state);
   }
 
-  /**
-   * Remembering the last picked model is the UI's own convenience (the
-   * runtime does not restore it in RPC mode yet). A new conversation whose
-   * runtime is ready on another model switches to it once, when its own list
-   * offers it; a refusal leaves the runtime's model.
-   */
-  private applyPreferredModel(): void {
-    const preferred = this.preferred;
-    // Only a new conversation: a saved one keeps the model the runtime restored.
-    if (!preferred || !this.fresh || !this.api || this.preferenceTried) return;
-    if (this.state.modelState !== "ready" || !this.state.models?.length) return;
-    this.preferenceTried = true;
-    if (this.state.modelProvider === preferred.provider && this.state.modelId === preferred.id) return;
-    if (!this.state.models.some(model => model.provider === preferred.provider && model.id === preferred.id)) return;
-    void this.selectModel(preferred.provider, preferred.id).catch(() => {});
-  }
-
   private addPrompt(prompt: PendingPrompt | null): void {
     if (!prompt) return;
     const prompts = this.state.prompts ?? [];
@@ -740,12 +736,18 @@ export class SessionStore {
     // The session's model, its list and levels are the runtime's, as the host relays them.
     const selected = record(data.model);
     const modelState = selected ? modelStateOf(selected.state) : this.state.modelState;
-    const ready = modelState === "ready" && selected;
-    const provider = ready ? text(selected.provider) : undefined;
-    const id = ready ? text(selected.id) : undefined;
+    // While resolving, the model the host expects the runtime to report (its earlier
+    // answer) is shown; the session's own answer replaces it.
+    const shown = modelState === "ready" ? selected : modelState === "resolving" ? record(selected?.expected) : undefined;
+    const provider = shown ? text(shown.provider) : undefined;
+    const id = shown ? text(shown.id) : undefined;
+    const label = provider && id ? text(shown?.name) ?? id : undefined;
+    const models = Array.isArray(data.models) ? data.models.map(modelOf).filter((model): model is ChatModel => !!model) : undefined;
+    if (models?.length) lastKnown.models = models;
+    if (this.fresh && modelState === "ready" && label) lastKnown.startModel = label;
     this.update({
-      ...(selected ? { modelState, model: provider && id ? text(selected.name) ?? id : undefined, modelProvider: provider, modelId: id } : {}),
-      ...(Array.isArray(data.models) ? { models: data.models.map(modelOf).filter((model): model is ChatModel => !!model) } : {}),
+      ...(selected ? { modelState, model: label, modelProvider: provider, modelId: id } : {}),
+      ...(models ? { models } : {}),
       ...(Array.isArray(data.thinkingLevels) ? { thinkingLevels: data.thinkingLevels.filter((level): level is string => typeof level === "string") } : {}),
       sessionId: text(data.sessionId) ?? this.state.sessionId,
       sessionFile: text(data.sessionPath) ?? this.state.sessionFile,
@@ -761,7 +763,6 @@ export class SessionStore {
       ...("statuses" in data ? { statuses: statusesOf(data.statuses) } : {}),
     });
     if ("activeTurn" in data) this.applyTurn(activeTurnOf(data.activeTurn));
-    this.applyPreferredModel();
   }
 
   private applyNotice(message: string, level: unknown, command?: CommandRef, extension = false): void {

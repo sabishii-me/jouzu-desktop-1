@@ -15,7 +15,7 @@ import { collectOutputReferences } from "./artifact-references";
 import { PanelStart } from "./panel-start";
 import { FilesPanel } from "./files-panel";
 import { ToolReviewDialog } from "./tool-review-dialog";
-import { SessionStore as ChatConnection, chatPool } from "./session-store";
+import { SessionStore as ChatConnection, chatPool, knownModels } from "./session-store";
 import type { ChatSnapshot, PendingPrompt, SessionTiming } from "./chat-types";
 import { eventRouter } from "./event-router";
 import { fitsSendBudget, readImageAttachment, removeSubmittedImages, validateImageSelection, type ImageAttachment } from "./chat-attachments";
@@ -715,10 +715,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!ready || !await ensureSelectedSession(ready)) { settle("send", { ok: false, text: t.sendOpening }); return; }
       const client = connection.current;
       if (!client || sendCancelRef.current) return;
-      // A conversation opened by this send (a preview) has a runtime only now:
-      // until it reports a model nothing is sent, and the user is told so.
-      if (client.snapshot.modelState !== "ready") {
-        settle("send", { ok: false, text: client.snapshot.modelState === "none" ? t.sendNoModel : t.sendLoadingModel });
+      // A runtime that reported no model cannot take it; a model still on its way
+      // can (the host holds the message until the model is ready).
+      if (client.snapshot.modelState === "none") {
+        settle("send", { ok: false, text: t.sendNoModel });
         return;
       }
       const receipt = client.send(value, submitted.map(item => item.image));
@@ -806,8 +806,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       pending: false,
       connectionError: null,
       // The new session's model is its own runtime's, reported once it answers.
+      // Until then the runtimes' last answer is shown, as the host will show it.
       modelState: "resolving",
-      models: [],
+      model: knownModels.model,
+      models: knownModels.models,
       thinkingLevels: [],
     });
     previewRequest.current += 1;
