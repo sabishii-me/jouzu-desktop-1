@@ -147,7 +147,9 @@ function sourceInstall(root) {
 /** The installed app as a person starts it; the host is its child. */
 function startShell(stack, port) {
   const { pkg, paths } = stack;
-  for (const dir of ['localappdata', 'appdata']) mkdirSync(join(paths.root, dir), { recursive: true });
+  // USERPROFILE is the exam root too, and WebView2 opens no debugging port when that
+  // profile has no AppData\Local, so give it the folders a real profile has.
+  for (const dir of ['localappdata', 'appdata', join('AppData', 'Local'), join('AppData', 'Roaming')]) mkdirSync(join(paths.root, dir), { recursive: true });
   const env = cleanEnv(paths.root, { WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}` });
   const child = spawn(pkg.shell, [], { env, cwd: paths.workspace, stdio: 'ignore', detached: false });
   children.add(child);
