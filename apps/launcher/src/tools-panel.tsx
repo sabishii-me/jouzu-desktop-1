@@ -4,7 +4,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./com
 import { Label } from "./components/ui/label";
 import { Switch } from "./components/ui/switch";
 import { ErrorLine } from "./session-alerts-view";
-import { fill, useChatText } from "./chat-text";
+import { explain, fill, useChatText } from "./chat-text";
 
 interface ImageSettings {
   enabled: boolean;
@@ -75,7 +75,7 @@ export function ToolsPanel() {
   const [tools, setTools] = useState<ToolsSettings | null>(null);
   const [providers, setProviders] = useState<ImageProvider[] | null>(null);
   const [models, setModels] = useState<ImageModel[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
 
   async function refreshModels(provider: string, currentModel: string, currentSize: string, base?: ToolsSettings, known?: ImageModel[] | null) {
@@ -93,7 +93,7 @@ export function ToolsPanel() {
         setTools(saved);
       }
     } catch (failure) {
-      setError(String(failure));
+      setError(failure);
       setModels([]);
     } finally {
       setBusy(false);
@@ -109,7 +109,7 @@ export function ToolsPanel() {
         try {
           list = readProviders((await api.tools.providers()).providers);
         } catch (failure) {
-          setError(String(failure));
+          setError(failure);
         }
         setProviders(list);
         // Only a provider that can generate images now is offered. The saved
@@ -118,7 +118,7 @@ export function ToolsPanel() {
         const chosen = usable.find(provider => provider.id === value.image.provider) ?? usable[0];
         if (chosen) await refreshModels(chosen.id, chosen.id === value.image.provider ? value.image.model : "", value.image.size, value, chosen.models);
       } catch (failure) {
-        setError(String(failure));
+        setError(failure);
       }
     })();
   }, []);
@@ -131,13 +131,13 @@ export function ToolsPanel() {
       const saved = await api.tools.save({ ...tools.image, ...patch }) as unknown as ToolsSettings;
       setTools(saved);
     } catch (failure) {
-      setError(String(failure));
+      setError(failure);
     } finally {
       setBusy(false);
     }
   }
 
-  if (!tools) return <p className="text-sm text-muted-foreground">{error ?? t.loadingTools}</p>;
+  if (!tools) return <p className="text-sm text-muted-foreground">{error ? explain(t, error, t.toolsChangeFailed).text : t.loadingTools}</p>;
   const image = tools.image;
   const sizes = models.find(model => model.id === image.model)?.sizes ?? SIZES;
   const usable = (providers ?? []).filter(provider => provider.available);
@@ -189,7 +189,7 @@ export function ToolsPanel() {
       {unusable.length > 0 && <ul aria-label={t.unavailableImageProviders} className="space-y-1 text-xs text-muted-foreground">
         {unusable.map(provider => <li key={provider.id}>{provider.label}: {provider.reason || t.notAvailable}</li>)}
       </ul>}
-      {error && <ErrorLine raw={error} failed={t.toolsChangeFailed} onDismiss={() => setError(null)} />}
+      {error != null && <ErrorLine raw={error} failed={t.toolsChangeFailed} onDismiss={() => setError(null)} />}
       <div className="border-t border-border pt-3 text-xs text-muted-foreground">
         {fill(t.reviewedCalls, { names: tools.reviewTools.join(", ") })}
       </div>

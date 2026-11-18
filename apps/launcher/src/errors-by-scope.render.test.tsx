@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { Composer } from "./composer";
 import { AgentAction } from "./chat-live";
+import { ErrorLine } from "./session-alerts-view";
 import { ChatConversation } from "./chat-conversation";
 import { emptyProjection, type ChatMessage } from "./chat-projection";
 import { ResultMark } from "./control-result";
@@ -100,6 +101,13 @@ describe("a failure is shown on the thing that failed", () => {
 
   it("the status line never shows a failed reply a second time", () => {
     expect(workspaceSource).not.toMatch(/settled=\{[^}]*failed/u);
+  });
+
+  it("an error line says what its code means, never guessing a refused image from its words (#157)", () => {
+    const html = renderToStaticMarkup(<ChatTextProvider value={chatTexts.ja}><ErrorLine raw={new ApiError("tools-unavailable" as never, "The image tool is not installed yet", true, 503)} failed={chatTexts.ja.toolsChangeFailed} /></ChatTextProvider>);
+    expect(html).toContain(chatTexts.ja.codeToolsUnavailable);
+    expect(html).not.toContain(chatTexts.ja.replyImage);
+    expect(html).not.toContain("rejected a request because of an image");
   });
 
   it("the runtime's notice is one line, never a list", () => {

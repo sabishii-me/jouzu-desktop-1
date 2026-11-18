@@ -93,7 +93,7 @@ const en = {
   codePromptResolved: "This request was already answered.",
   codePromptExpired: "This request expired before it was answered.",
   codeNoModel: "This session has no model.",
-  codeModelUnavailable: "The runtime does not offer that model.",
+  codeModelUnavailable: "The runtime does not offer that model.", codeToolsUnavailable: "The image tool is not installed yet.",
   codeMessageHeld: "Flow control is holding this message.",
   codeNetwork: "Cannot reach Jouzu. Check that the app is still running.",
   // The main window, its panels and the Tools page.
@@ -506,7 +506,7 @@ const ja: ChatText = {
   codePromptResolved: "このリクエストはすでに回答済みです。",
   codePromptExpired: "このリクエストは回答前に期限切れになりました。",
   codeNoModel: "このセッションにはモデルがありません。",
-  codeModelUnavailable: "ランタイムはそのモデルを提供していません。",
+  codeModelUnavailable: "ランタイムはそのモデルを提供していません。", codeToolsUnavailable: "画像ツールはまだインストールされていません。",
   codeMessageHeld: "Flow コントロールがこのメッセージを保留しています。",
   codeNetwork: "Jouzu に接続できません。アプリが動作しているか確認してください。",
   // The main window, its panels and the Tools page.
@@ -918,7 +918,7 @@ const hans: ChatText = {
   codePromptResolved: "此请求已被回答。",
   codePromptExpired: "此请求在回答前已过期。",
   codeNoModel: "此会话没有模型。",
-  codeModelUnavailable: "运行环境不提供该模型。",
+  codeModelUnavailable: "运行环境不提供该模型。", codeToolsUnavailable: "图像工具尚未安装。",
   codeMessageHeld: "Flow 控制正在暂扣此消息。",
   codeNetwork: "无法连接 Jouzu。请确认应用仍在运行。",
   // The main window, its panels and the Tools page.
@@ -1330,7 +1330,7 @@ const hant: ChatText = {
   codePromptResolved: "此請求已被回答。",
   codePromptExpired: "此請求在回答前已過期。",
   codeNoModel: "此工作階段沒有模型。",
-  codeModelUnavailable: "執行環境不提供該模型。",
+  codeModelUnavailable: "執行環境不提供該模型。", codeToolsUnavailable: "圖像工具尚未安裝。",
   codeMessageHeld: "Flow 控制正在暫扣此訊息。",
   codeNetwork: "無法連線到 Jouzu。請確認應用程式仍在執行。",
   // The main window, its panels and the Tools page.
@@ -1687,6 +1687,7 @@ const CODES: Partial<Record<string, TextKey>> = {
   "prompt-expired": "codePromptExpired",
   "no-model": "codeNoModel",
   "model-unavailable": "codeModelUnavailable",
+  "tools-unavailable": "codeToolsUnavailable",
   "message-held": "codeMessageHeld",
   // Refused by the interface itself before sending (input-error.ts).
   "image-count": "inputImageCount",
