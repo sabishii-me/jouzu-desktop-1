@@ -55,13 +55,21 @@ const providerRequests = async () => (await fetch(fixture + "/__fault").then(res
 const control = (path, body) => post(world, path, body);
 
 // ---- Words the person sees, per interface language (from src/chat-text.ts, src/i18n.ts) ----
-const words = {
+const allWords = {
   en: { newSession: "New session", retry: "Retry", settings: "Settings", restart: "Restart session", continue: "Continue", discard: "Discard" },
   ja: { newSession: "新しいセッション", retry: "再試行", settings: "設定", restart: "セッションを再起動", continue: "続ける", discard: "破棄" },
   "zh-Hans": { newSession: "新会话", retry: "重试", settings: "设置", restart: "重启会话", continue: "继续", discard: "丢弃" },
   "zh-Hant": { newSession: "新工作階段", retry: "重試", settings: "設定", restart: "重新啟動工作階段", continue: "繼續", discard: "捨棄" },
-}[lang];
-const newSession = () => page.getByRole("button", { name: words.newSession, exact: true }).first();
+};
+const words = allWords[lang];
+const english = allWords.en;
+/**
+ * A control's accessible name: the interface language's word, or the English one while that
+ * control is not localized yet (the English-only words are reported by the i18n judgement of
+ * the problems shown, not by failing to find the control).
+ */
+const named = key => new RegExp(`^(${words[key]}|${english[key]})$`);
+const newSession = () => page.getByRole("button", { name: named("newSession") }).first();
 const textbox = () => page.getByRole("textbox", { name: /message/i }).first();
 const sendButton = () => page.locator('[aria-label="Message composer"] button[type="submit"]').first();
 const stopButton = () => page.locator('[aria-label="Message composer"]').getByRole("button", { name: /^(stop|停止)$/i }).first();
@@ -146,12 +154,16 @@ async function freshSession() {
   await textbox().waitFor({ timeout: 10_000 });
 }
 let current = null;
+/** What the person sent: a problem line may quote it, and a quote is not the app's own words. */
+const sent = [];
+const ownWords = text => sent.reduce((rest, item) => rest.split(item).join(" "), text).replace(/\s+/g, " ").trim();
 /**
  * Type and press Send. Send must be usable when the person has typed (the host holds a
  * message until the session is ready); if it is not, the case fails with how long the
  * person was kept waiting, unless the session shows it has ended (then Send is not offered).
  */
 async function typeAndSend(text, { wait = 20_000 } = {}) {
+  sent.push(text);
   await textbox().fill(text);
   const typed = now();
   // One render for the typed text to reach the button; a wait longer than that is the app's.
@@ -175,6 +187,7 @@ async function typeAndSend(text, { wait = 20_000 } = {}) {
  * conversation (a mutation observer, so the test's polling adds nothing).
  */
 async function sendTimed(text) {
+  sent.push(text);
   await textbox().fill(text);
   await page.evaluate(prompt => {
     window.__ownMessage = new Promise(resolve => {
@@ -250,9 +263,10 @@ function judgeShown(c, list, { scope, before, after }) {
   if (list.filter(item => item.blocked).length > 1) c.fail("more than one session-level error");
   if (list.some(item => item.floating)) c.fail("shown as a floating message");
   for (const item of list) {
-    if (!item.text) c.fail(`a problem has no words (${item.scope})`);
-    if (technical.test(item.text)) c.fail(`raw technical text in the main sentence: "${item.text}"`);
-    if (lang !== "en" && englishPhrase.test(item.text)) c.fail(`not in the interface language (${lang}): "${item.text}"`);
+    const words = ownWords(item.text);
+    if (!words) c.fail(`a problem has no words (${item.scope})`);
+    if (technical.test(words)) c.fail(`raw technical text in the main sentence: "${words}"`);
+    if (lang !== "en" && englishPhrase.test(words)) c.fail(`not in the interface language (${lang}): "${words}"`);
   }
   if (before && after) judgeLayout(c, before, after);
 }
@@ -270,7 +284,7 @@ async function judgeNoEndlessWait(c, settleMs = 3_000) {
 }
 /** After the cause is gone: the next message (or Retry when offered) gets its reply. */
 async function judgeRecovers(c, { preferRetry = false } = {}) {
-  const retry = page.getByRole("button", { name: words.retry, exact: true }).last();
+  const retry = page.getByRole("button", { name: named("retry") }).last();
   const offered = await retry.isVisible().catch(() => false);
   c.note(`Retry offered: ${offered}`);
   await idle(15_000);
@@ -405,7 +419,7 @@ add("Stop with a message waiting in the queue", "The waiting message is kept (Co
   const queued = page.getByRole("region", { name: "Queued messages" });
   const kept = text.includes(waitingText) || await queued.getByText(waitingText).count() > 0;
   if (!kept) c.fail("the waiting message is gone");
-  const resume = queued.getByRole("button", { name: words.continue, exact: true });
+  const resume = queued.getByRole("button", { name: named("continue") });
   if (await resume.count()) { await resume.click(); await idle(30_000); }
   const times = await conversation().getByText(waitingText, { exact: true }).count();
   if (times > 1) c.fail(`the waiting message is shown ${times} times`);
@@ -464,7 +478,7 @@ add("Runtime keeps crashing", "A runtime that dies again and again ends in one r
   if (!shown) c.fail("20 s of crashes and nothing shown");
   else judgeShown(c, await problems(), { scope: ["composer", "reply"], before, after: await layout() });
   await judgeNoEndlessWait(c, 5_000);
-  const way = page.getByRole("button", { name: words.restart, exact: true });
+  const way = page.getByRole("button", { name: named("restart") });
   if (await way.isVisible().catch(() => false)) { await way.click(); await sleep(3_000); }
   await judgeRecovers(c);
 }, { langs: ["en", "ja"] });
@@ -522,6 +536,7 @@ add("Very long message (300 KB)", "A huge paste is either sent whole or refused 
   await chatSession();
   const before = await layout();
   const big = `${"lorem ipsum dolor sit amet ".repeat(11_000)} What is 6 × 7? Reply with only the number.`;
+  sent.push(big);
   await textbox().fill(big);
   const start = now();
   await sendButton().click({ timeout: 5_000 }).catch(() => c.fail("Send not available for a long message"));
@@ -597,7 +612,7 @@ add("A file that is not an image, named .png", "A broken attachment is refused a
 
 // ---- Settings and files ----
 async function openSettings(tab) {
-  await page.getByRole("button", { name: words.settings, exact: true }).first().click();
+  await page.getByRole("button", { name: named("settings") }).first().click();
   const dialog = page.getByRole("dialog").first();
   if (tab) await dialog.getByRole("tab", { name: tab }).click();
   return dialog;
@@ -652,6 +667,7 @@ add("Settings file cannot be written", "When a setting cannot be saved, that car
 }, { langs: ["en", "ja"] });
 
 add("Missing tools.json", "A data folder without tools settings opens the Tools page normally.", async c => {
+  await freshSession();
   await control("/file", { path: "data/agent/tools.json", remove: true });
   const dialog = await openSettings(/^(tools|ツール|工具)$/i);
   await sleep(2_000);
@@ -722,7 +738,7 @@ function tinyPng() {
 }
 
 // ---- Run ----
-await page.getByRole("button", { name: words.newSession, exact: true }).first().waitFor({ timeout: 60_000 }).catch(error => result.errors.push(`the app never became usable: ${error.message}`));
+await newSession().waitFor({ timeout: 60_000 }).catch(error => result.errors.push(`the app never became usable: ${error.message}`));
 for (const item of cases) {
   if (!item.langs.includes(lang)) continue;
   if (only && !item.name.toLowerCase().includes(only.toLowerCase())) continue;
