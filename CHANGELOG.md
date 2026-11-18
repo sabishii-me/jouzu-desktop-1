@@ -1,7 +1,27 @@
 # Changelog
 
-## 1.1.3-rc.3 - unreleased
+## 1.1.3-rc.3 - 2026-11-18
 
+Third release candidate for 1.1.3, on the QA channel.
+
+- Errors are shown where they happened and no longer pile up above the composer. A session
+  that ended with an error takes the composer's place with the reason and the one action that
+  recovers it; a message that was not sent is marked on that message with Retry and Discard; a
+  reply that failed is shown at the end of the conversation; a model, Stop or command that did
+  not take effect is marked at its own control. None of these moves the layout, and all of
+  their text is in English, Japanese and Chinese (Simplified and Traditional), with the
+  runtime's original words behind Details. Desktop no longer limits a message to 32 KiB; what
+  fits is up to the runtime and the model (#62). The chat no longer shifts sideways on a
+  horizontal swipe (#113).
+- The model menu shows exactly the models the session's runtime offers, so every listed model
+  can be selected, and an empty list on a cold start is gone. Until the runtime has reported
+  its model, Send waits and the model button shows that it is loading; with no model set up it
+  offers Settings. A new session uses the model picked last when its runtime offers it.
+- A message sent while the runtime is running a turn on its own (for example a Flow step) is
+  queued and handed to that turn instead of being refused, and that turn is shown and can be
+  stopped.
+- The workspace menu on the new-session screen stays inside the window and scrolls on its own
+  (#114).
 - Settings actions run one after another instead of failing with "Another configuration
   operation is running": the host queues every configuration change (keys, sign-in, catalog
   refresh, default model, language, profile, environment variables) and each card waits only for
