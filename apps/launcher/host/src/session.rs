@@ -6031,6 +6031,13 @@ impl SessionManager {
         &self.runtime_home
     }
 
+    /// The directory of the runtime app this host starts (the folder of its
+    /// `bootstrap.mjs`), for tools that load the runtime's own packages.
+    pub fn runtime_app(&self) -> Option<PathBuf> {
+        let script = PathBuf::from(self.config()?.spec.args.first()?);
+        (script.file_name()? == "bootstrap.mjs").then(|| script.parent().map(Path::to_path_buf)).flatten()
+    }
+
     pub fn node_executable(&self) -> Option<PathBuf> {
         self.config()
             .map(|config| config.spec.program.clone())

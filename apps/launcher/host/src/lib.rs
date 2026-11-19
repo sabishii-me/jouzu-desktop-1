@@ -1580,10 +1580,16 @@ async fn run_image_cli(state: &AppState, args: &[&str]) -> Result<Value, ApiErro
         .args(args)
         .env("JOUZU_HOME", &home)
         .env("PI_CODING_AGENT_DIR", home.join("agent"))
+        .env_remove("JOUZU_RUNTIME_APP")
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_PATH")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // The tool loads the runtime's packages from the app this host starts; the
+    // data home (which may be a custom JOUZU_HOME) does not locate it.
+    if let Some(app) = state.sessions.runtime_app() {
+        command.env("JOUZU_RUNTIME_APP", app);
+    }
     #[cfg(windows)]
     {
         command.creation_flags(0x0800_0000);
@@ -5430,6 +5436,9 @@ mod session_tests {
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .expect("the installed runtime is used");
         assert_eq!(manager.node_executable(), Some(node));
+        // Tools that load the runtime's packages find them in this app, not
+        // next to the data home.
+        assert_eq!(manager.runtime_app(), Some(app.clone()));
         let pool = manager.warm_runtime().expect("the warm pool started with the runtime");
         let status = pool.wait_settled(Duration::from_secs(10)).await;
         assert_eq!(status["state"], "ready", "{status}");
