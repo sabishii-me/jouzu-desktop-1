@@ -31,6 +31,8 @@ import { startFixtureServer } from './fixture-server.mjs';
 //   ABN_LANGS    interface languages to run, comma separated (default en,ja)
 //   ABN_ONLY     run only the cases whose names contain this text (several: separate with |)
 //   ABN_OUT      report folder (default ./abnormal-exam-<time>)
+//   ABN_PLAYBOOK the playbook in e2e/ to run in this world (default abnormal-playbook.mjs;
+//                ui-states.mjs records every screen and state for a UI audit, no pass/fail)
 const here = import.meta.dirname;
 const launcher = resolve(here, '..');
 const out = resolve(process.env.ABN_OUT ?? `abnormal-exam-${new Date().toISOString().replace(/[:.]/g, '-')}`);
@@ -346,7 +348,7 @@ async function openBrowser(info, language, port) {
 
 function runPlaybook(env) {
   return new Promise(resolvePromise => {
-    const child = spawn(process.execPath, [join(launcher, 'e2e', 'abnormal-playbook.mjs')], { cwd: launcher, env: { ...process.env, ...env }, stdio: ['ignore', 'ignore', 'inherit'] });
+    const child = spawn(process.execPath, [join(launcher, 'e2e', process.env.ABN_PLAYBOOK ?? 'abnormal-playbook.mjs')], { cwd: launcher, env: { ...process.env, ...env }, stdio: ['ignore', 'ignore', 'inherit'] });
     child.on('exit', code => {
       let result = null;
       try { result = JSON.parse(readFileSync(env.PLAYBOOK_OUT, 'utf8')); } catch { /* none */ }
