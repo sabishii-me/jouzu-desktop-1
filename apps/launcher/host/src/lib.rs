@@ -3093,6 +3093,10 @@ mod session_tests {
         let session = manager
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
+        // A window shows it: a runtime that dies under a session nobody uses
+        // is replaced only when it is used again (see the unix test).
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &session.id);
         wait_status(&session, Status::Idle).await;
         let previous = session.runtime_pid().expect("runtime pid");
         kill_tree(previous);
@@ -3954,7 +3958,6 @@ mod session_tests {
         assert_eq!(states, ["held", "held"], "{summary}");
     }
 
-    #[cfg(windows)]
     #[tokio::test]
     async fn repeated_crashes_end_in_error() {
         let (manager, _home, workspace) =
@@ -3962,6 +3965,9 @@ mod session_tests {
         let session = manager
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
+        // A window shows it (a session nobody uses waits for its next message).
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &session.id);
         wait_until(|| session.status() == Status::Error).await;
         assert_eq!(session.status(), Status::Error);
     }

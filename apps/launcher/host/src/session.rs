@@ -5721,13 +5721,16 @@ impl Session {
                 // will answer, and none of their effects can be assumed.
                 self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
                 // A runtime is started for a session someone uses. One that dies
-                // while its session waits for nobody (idle, nothing queued, no
-                // client shows or follows it) is not replaced now: the session
-                // stops, and starts a runtime again for its next message or when
-                // it is opened. Replacing every such runtime at once competes
-                // with the one session the user is in (all of a machine's
-                // runtimes can go down together).
+                // after it came up (it answered) while its session waits for
+                // nobody (idle, nothing queued, no client shows or follows it) is
+                // not replaced now: the session stops, and starts a runtime again
+                // for its next message or when it is opened. Replacing every such
+                // runtime at once competes with the one session the user is in
+                // (all of a machine's runtimes can go down together). A runtime
+                // that dies before it answered is a failed start: recovery runs,
+                // and a start that keeps failing ends the session in error.
                 if self.status() == Status::Idle
+                    && self.model_answered.load(Ordering::SeqCst)
                     && self.run().is_none()
                     && self.queue_guard().is_empty()
                     && self.viewers.load(Ordering::SeqCst) == 0
