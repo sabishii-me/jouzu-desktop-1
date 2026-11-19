@@ -497,10 +497,13 @@ add("Runtime keeps crashing", "A runtime that dies again and again ends in one r
   const loop = control("/runtime/kill-loop", { ms: 20_000 });
   await sleep(500);
   const start = await typeAndSend(prompt).catch(() => now());
-  await loop;
-  const shown = await firstProblem(start, 20_000);
+  // Watch while the crashes go on: the loop answers only when it ends, about 20 s later.
+  const [shown] = await Promise.all([firstProblem(start, 25_000), loop]);
   if (!shown) c.fail("20 s of crashes and nothing shown");
-  else judgeShown(c, await problems(), { scope: ["composer", "reply"], before, after: await layout() });
+  else {
+    c.metric("crashShownMs", shown.ms);
+    judgeShown(c, await problems(), { scope: ["composer", "reply"], before, after: await layout() });
+  }
   await judgeNoEndlessWait(c, 5_000);
   const way = page.getByRole("button", { name: named("restart") });
   if (await way.isVisible().catch(() => false)) { await way.click(); await sleep(3_000); }
