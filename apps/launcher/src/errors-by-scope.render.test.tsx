@@ -101,6 +101,10 @@ describe("a failure is shown on the thing that failed", () => {
     expect(html).not.toContain(`>${chatTexts.ja.signIn}</button>`);
   });
 
+  it("a session that cannot go on shows that one cause, not also its message's No reply", () => {
+    expect(workspaceSource).toMatch(/const noReply = failedTurn && [^?]*!blocked \?/u);
+  });
+
   it("the status line never shows a failed reply a second time", () => {
     expect(workspaceSource).not.toMatch(/settled=\{[^}]*failed/u);
   });

@@ -1511,7 +1511,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       ? { text: t.openFailed, details: sessionError, action: selectedSession ? { label: t.retry, run: () => { setSessionError(null); startSwitch(selectedSession); } } : undefined }
       : null;
   const heroBlocked = startError ? { text: startError.text ?? t.newSessionFailed, details: startError.details, action: { label: t.retry, run: () => { setStartError(null); void startNewSession(); } } } : null;
-  const noReply = failedTurn && !conversationProjection.running ? {
+  // While the session itself cannot go on, that is the one cause shown; its message that got no
+  // reply comes back with Retry once the session is restarted (the host carries it over).
+  const noReply = failedTurn && !conversationProjection.running && !blocked ? {
     text: failedTurn.text,
     details: failedTurn.error?.text || undefined,
     onRetry: () => changeQueue(client => client.queue("retry"), "send"),
