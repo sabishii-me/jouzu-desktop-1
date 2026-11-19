@@ -6999,6 +6999,10 @@ impl SessionManager {
         let key = key.unwrap_or_else(|| {
             session_path.clone().unwrap_or_else(|| format!("new-{}", random_id()))
         });
+        // What only the host knew about the conversation's last message (it got
+        // no reply) is not in the file; a session that replaces an ended one
+        // for the same conversation keeps it.
+        let mut carried_failure = None;
         {
             let mut sessions = self
                 .sessions
@@ -7063,6 +7067,11 @@ impl SessionManager {
                 }
                 // A session in error can still own a live runtime; one that
                 // leaves the table without a stop keeps it until the host exits.
+                carried_failure = existing
+                    .failed_turn
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 existing.stop();
                 sessions.remove(&existing.id);
             }
@@ -7107,6 +7116,12 @@ impl SessionManager {
             &config,
         );
         session.fresh.store(fresh, Ordering::SeqCst);
+        if let Some(failure) = carried_failure {
+            *session
+                .failed_turn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(failure);
+        }
         if fresh {
             *session
                 .start_folder

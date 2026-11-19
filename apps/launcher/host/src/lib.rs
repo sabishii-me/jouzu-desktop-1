@@ -4026,6 +4026,34 @@ mod session_tests {
         manager.stop_all();
     }
 
+    /// Restart after a crash opens the conversation again as a new session. The
+    /// message that got no reply is only known to the host, so the new session
+    /// keeps it, with its Retry, instead of showing it as if nothing happened.
+    #[tokio::test]
+    async fn a_restarted_conversation_keeps_the_message_that_got_no_reply() {
+        let (manager, _home, workspace) = manager_with_env(50, &[("FAKE_RUNTIME_CRASH_ON_PROMPT", "1")]);
+        let header = json!({ "type": "session", "version": 3, "id": "crashes", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let file = workspace.path().join("crashes.jsonl");
+        std::fs::write(&file, format!("{header}\n")).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), Some(path.clone()), None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("lost", "hello").unwrap();
+        wait_until(|| !session.summary()["failedTurn"].is_null()).await;
+        let failed = session.summary()["failedTurn"].clone();
+        assert_eq!(failed["clientMessageId"], "lost", "{failed}");
+        // What Restart session does after the host gave up: open the file again.
+        session.stop();
+        let again = manager
+            .create(workspace.path().to_str().unwrap(), Some(path), None)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&again, &session));
+        assert_eq!(again.summary()["failedTurn"], failed, "{}", again.summary());
+        manager.stop_all();
+    }
+
     #[tokio::test]
     async fn a_runtime_that_keeps_dying_while_starting_fails_the_session() {
         let (session, manager, _home, _workspace, _path) =
