@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.1.4-rc.1 - 2026-11-19
+
+First release candidate for 1.1.4, on the QA channel. It replaces 1.1.3-rc.3, which did not
+pass its evaluation (#160).
+
+- A new session can send at once. Its model shows right away, from what the runtimes last
+  reported; a message sent while the model is still resolving is held and sent on the right
+  model, and the model picked last is applied before the first message (#99, #143). A model
+  refresh or a key or provider change now reaches sessions that are already open (#144).
+- A session keeps its messages, its model and a message that got no reply when its runtime
+  exits or restarts. Send stays usable meanwhile (#154). A runtime that dies under a session
+  nobody has open is started again only when that session is used, so the session in use is
+  back within seconds when every runtime goes down together.
+- Each problem is shown once, where it happened. A failed reply says why on the reply, in the
+  interface language, with what recovers it and Retry (#151, #152). A session whose runtime
+  cannot recover shows one error with Restart session (#156). Nothing moves when an error
+  appears (#147, #153). A session that cannot open at start says why instead of loading
+  forever (#166).
+- Provider errors are read from their codes, including the Shisa.AI router's plan, balance and
+  capacity codes. A refused Shisa.AI sign-in shows on its card.
+- Settings that cannot be saved are reported on the provider's form, with the file and the
+  system's code under Details (#155). The main window and the Tools page follow the interface
+  language (#100), and the Tools page says why an image provider is unavailable (#157). The
+  Tools page also works with a custom data home (#163).
+- Saved sessions whose last line was cut off, or that were written by an older version, are
+  listed and open with their history (#150, #164).
+- When the downloaded runtime is incomplete, setup downloads it again instead of failing on a
+  missing npm.
+- The host's API token is no longer written to a file (#130).
+- Acceptance measures a new session from the New session click, with Send usable at once, and
+  the #99 limits are restored (#148).
+
 ## 1.1.3-rc.3 - 2026-11-18
 
 Third release candidate for 1.1.3, on the QA channel.
