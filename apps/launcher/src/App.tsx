@@ -4,7 +4,7 @@ import { ArtifactsPanel } from "./artifacts-panel";
 import { LauncherPage } from "./components/launcher-page";
 import { ProviderPicker } from "./components/ui/provider-picker";
 import { recoveryText } from "./recovery-text";
-import { describeError, explainError } from "./runtime-errors";
+import { describeError } from "./runtime-errors";
 import { NoticeRow } from "./session-alerts-view";
 import { UpdatePreview } from "./update-preview";
 import { GitBashSection, useGitBash } from "./git-bash-section";
@@ -18,7 +18,6 @@ import { Label } from "./components/ui/label";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ARTIFACT_FIELDS, ARTIFACT_LANGUAGES, RESPONSE_LANGUAGES, artifactPolicyFor, artifactPreset, catalogChangeSummary, type ArtifactLanguage } from "./control-state";
 import { cancelConfig, configFailure, configPending, currentAppView, enqueueConfig, heldCatalog as heldCatalogOf, runConfig, useAppView, useAppViewFailure, type ConfigKind, type ConfigResult } from "./app-view";
-import { ApiError } from "./api/jouzu-api";
 import { eventRouter } from "./event-router";
 import { useApi } from "./api/context";
 import type { WarmView } from "./warm-runtime";
@@ -41,8 +40,8 @@ import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from ".
 import { Button } from "./components/ui/button";
 import { JouzuLoader } from "./components/ui/jouzu-loader";
 import { Progress } from "./components/ui/progress";
-import { catalogReview, messages, locales, resolveLocale, type Locale } from "./i18n";
-import { ChatTextProvider, chatTexts } from "./chat-text";
+import { catalogReview, configFailureText, messages, locales, resolveLocale, type Locale } from "./i18n";
+import { ChatTextProvider, chatTexts, explain } from "./chat-text";
 import { type Workspace } from "./history";
 import { parseDiagnostics, type Diagnostics } from "./diagnostics";
 import { copyText } from "./secure-context";
@@ -105,18 +104,20 @@ export function App() {
     setRefused(current => ({ ...current, [kind]: undefined }));
     try { return (await runConfig(kind, body)).ok; }
     catch (failure) {
-      // The host's own reason for refusing the request (a field it does not accept).
-      const text = failure instanceof ApiError ? failure.message : explainError(failure, t.error).text;
+      // The host's own reason for refusing the request (a field it does not accept): the original text.
+      const text = failure instanceof Error ? failure.message : String(failure);
       setRefused(current => ({ ...current, [kind]: { operationId: `refused-${Date.now()}`, ok: false, code: "config-invalid", params: {}, text, finishedAt: new Date().toISOString() } }));
       return false;
     }
   }
   /** The failure of a card's own operations, shown on that card only. */
   const configNotice = (...kinds: ConfigKind[]) => {
-    const local = kinds.map(kind => refused[kind]).filter((item): item is ConfigResult => !!item);
-    const failure = [configFailure(appView, kinds), ...local].filter((item): item is ConfigResult => !!item && item.operationId !== dismissed).sort((a, b) => b.finishedAt.localeCompare(a.finishedAt))[0];
+    const failure = kinds
+      .flatMap(kind => [configFailure(appView, [kind]), refused[kind]].filter((item): item is ConfigResult => !!item && item.operationId !== dismissed).map(result => ({ kind, result })))
+      .sort((a, b) => b.result.finishedAt.localeCompare(a.result.finishedAt))[0];
     if (!failure) return null;
-    return <NoticeRow alert={{ id: `config-${failure.operationId}`, level: "error", text: failure.text ?? t.error, actions: [], dismiss: () => setDismissed(failure.operationId) }} />;
+    const { kind, result } = failure;
+    return <NoticeRow alert={{ id: `config-${result.operationId}`, level: "error", text: configFailureText(t, kind, result.code), details: result.text ?? undefined, actions: [], dismiss: () => setDismissed(result.operationId) }} />;
   };
   /**
    * A card's failure laid over the top of that card (its title), so it appearing
@@ -146,7 +147,7 @@ export function App() {
   // window (and the setup page), folder actions with the folder list. Never a
   // floating banner; the technical text stays behind Details.
   const [error, setError] = useState<{ place: "settings" | "folders"; text: string; details?: string } | null>(null);
-  const fail = (place: "settings" | "folders", failure: unknown) => setError({ place, ...explainError(failure, t.error) });
+  const fail = (place: "settings" | "folders", failure: unknown) => setError({ place, ...explain(chatTexts[locale], failure, t.error) });
   // Failures nobody can act on (a window button, a copy, an event subscription) go to the log only.
   const quiet = (failure: unknown) => console.warn("[jouzu]", describeError(failure));
   // A settings snapshot this window cannot read is a settings failure, shown there.
