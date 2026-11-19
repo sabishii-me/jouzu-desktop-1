@@ -9,6 +9,23 @@ const root = process.argv[1]?.endsWith("control.mjs") ? process.argv[2] : proces
 const appRoot = process.argv[1]?.endsWith('control.mjs') ? (process.argv[3] || join(root, 'app')) : (process.argv[2] || join(root, 'app'));
 const load = name => import(pathToFileURL(join(appRoot, 'node_modules/jouzu/dist', `${name}.js`)));
 let action = "status";
+// What the runtime's settings manager recorded instead of throwing: one entry
+// per settings file, with the error it met there.
+class SettingsFailure extends Error {
+  constructor(failures) { super('Settings not saved'); this.failures = failures; }
+}
+// What the system refused (its code and call) on a file is a local fact the
+// person can act on, so it is relayed with the file. Any other error text may
+// carry upstream input or credentials and is not; of a settings file that
+// failed otherwise, only the file and the kind of error are named.
+const fileFact = (error, path) => {
+  const file = typeof error?.path === 'string' ? error.path : path;
+  if (typeof error?.code === 'string' && typeof error?.syscall === 'string') return `${file ? `${file}: ` : ''}${error.code} (${error.syscall})`;
+  return typeof file === 'string' ? `${file}: ${error?.name ?? 'Error'}` : null;
+};
+const localCause = error => error instanceof SettingsFailure
+  ? error.failures.map(({ error: each, path }) => fileFact(each, path)).filter(Boolean).join('\n') || null
+  : fileFact(error);
 // Remote revocation is advisory: a saved sign-out still clears local credentials.
 let signOutRevocation;
 // A held catalog revision is a decision, not an error, and "nothing to refresh"
@@ -205,12 +222,15 @@ try {
     // does not know would be saved while the runtime starts on another model.
     const name = value => typeof value === 'string' && value.length > 0 && value.length <= 256 && ![...value].some(c => c.charCodeAt(0) < 32);
     if (!name(request.provider) || !name(request.model) || !runtime.getModel(request.provider, request.model)) throw new Error('Unknown model');
-    // The settings manager records a failed write instead of throwing it; a
-    // save it could not write is this operation's failure, not a success.
-    settings.drainErrors();
+    // The settings manager records a failed read or write instead of throwing
+    // it, and skips the save of a file it could not read. Either is this
+    // operation's failure, not a success held only in the manager's memory.
+    const unread = settings.drainErrors();
+    if (unread.length) throw new SettingsFailure(unread);
     settings.setDefaultModelAndProvider(request.provider, request.model);
     await settings.flush();
-    if (settings.drainErrors().length) throw new Error('Default model not saved');
+    const unwritten = settings.drainErrors();
+    if (unwritten.length) throw new SettingsFailure(unwritten);
   } else if (request.action !== 'status') throw new Error('Unsupported operation');
   if (request.action === "custom-provider") await runtime.refresh({ allowNetwork: false });
   const { ModelConfig } = await pi('model-config');
@@ -250,7 +270,7 @@ try {
     artifactPolicy: pick(resolveArtifactPolicy(savedSettings?.artifactPolicy ? { config: savedSettings.artifactPolicy } : {})),
   };
   console.log(JSON.stringify({ schemaVersion: 1, ...(catalog ? { catalog } : {}), language, profile: readProfileChoice(profilePath)?.profile ?? null, account, customProviders, providers: runtime.getProviders().map(p => ({ id: p.id, name: p.id === 'openai-codex' ? 'Codex' : (p.name ?? p.id), oauth: !!p.auth?.oauth, oauthName: p.auth?.oauth?.name, apiKey: !!p.auth?.apiKey })), credentials, defaultProvider: settings.getDefaultProvider(), defaultModel: settings.getDefaultModel() }));
-} catch {
+} catch (error) {
   // Do not relay raw upstream errors: they can contain credentials or server input.
   const messages = {
     status: 'Could not read Jouzu configuration. No settings were changed.',
@@ -267,7 +287,9 @@ try {
     language: 'Could not save the language settings. The Jouzu language file may be unreadable or changed elsewhere; nothing was overwritten.',
     'shisa-logout': 'Shisa.AI sign-out could not be fully confirmed. Refresh its state and check the Shisa.AI dashboard.',
   };
-  console.log(JSON.stringify({ error: messages[action] ?? 'Unsupported configuration operation.' }));
+  const message = messages[action] ?? 'Unsupported configuration operation.';
+  const cause = localCause(error);
+  console.log(JSON.stringify({ error: cause ? `${message}\n${cause}` : message }));
   process.exitCode = 1;
 }
 

@@ -212,6 +212,10 @@ struct Operation {
     id: String,
     kind: &'static Kind,
     payload: Payload,
+    /// The provider the operation is for (its key, sign-in, removal, default
+    /// model or custom connection); its result names it, so a client shows
+    /// the result at that provider only.
+    provider: Option<String>,
     queued_at: String,
 }
 
@@ -236,12 +240,13 @@ impl Outcome {
         Self { ok: true, code: None, text: None }
     }
 
-    fn render(&self, operation_id: &str, params: Value) -> Value {
+    fn render(&self, operation_id: &str, params: Value, provider: Option<&str>) -> Value {
         json!({
             "operationId": operation_id,
             "ok": self.ok,
             "code": self.code,
             "params": params,
+            "provider": provider,
             "text": self.text,
             "finishedAt": now(),
         })
@@ -432,7 +437,11 @@ impl ControlManager {
                     true,
                 ));
             }
-            queue.queued.push_back(Operation { id: id.clone(), kind, payload, queued_at: now() });
+            let provider = match &payload {
+                Payload::Adapter(fields) => fields.get("provider").and_then(Value::as_str).map(str::to_string),
+                Payload::Environment(_) => None,
+            };
+            queue.queued.push_back(Operation { id: id.clone(), kind, payload, provider, queued_at: now() });
             // How many operations run before this one.
             let position = queue.queued.len() - 1 + usize::from(queue.running.is_some());
             let start = !queue.draining;
@@ -464,7 +473,7 @@ impl ControlManager {
             return false;
         };
         let operation = queue.queued.remove(index).expect("index is in range");
-        let result = Outcome { ok: false, code: Some("config-cancelled"), text: None }.render(&operation.id, json!({}));
+        let result = Outcome { ok: false, code: Some("config-cancelled"), text: None }.render(&operation.id, json!({}), operation.provider.as_deref());
         queue.last.insert(operation.kind.name, result);
         self.publish(&mut queue);
         true
@@ -491,10 +500,7 @@ impl ControlManager {
             };
             let id = operation.id.clone();
             let kind = operation.kind;
-            let operation_payload_provider = match &operation.payload {
-                Payload::Adapter(payload) => payload.get("provider").and_then(Value::as_str).map(str::to_string),
-                Payload::Environment(_) => None,
-            };
+            let operation_payload_provider = operation.provider.clone();
             // Each operation runs in a task of its own: a panic in it ends that
             // operation with a result, never the queue.
             let manager = self.clone();
@@ -537,9 +543,9 @@ impl ControlManager {
                 queue.settings = Some(settings);
             }
             if let Some(read) = done.read_failure {
-                queue.last.insert("status", read.render(&id, json!({})));
+                queue.last.insert("status", read.render(&id, json!({}), None));
             }
-            queue.last.insert(kind.name, done.outcome.render(&id, done.params));
+            queue.last.insert(kind.name, done.outcome.render(&id, done.params, operation_payload_provider.as_deref()));
             self.publish(&mut queue);
         }
     }

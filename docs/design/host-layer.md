@@ -138,7 +138,12 @@ describes no screens; what a person sees is in the UI document.
 - `AppView.settings` is the control program's answer: read when the host starts
   and returned by every operation. What belongs to one operation (a catalog
   refresh's outcome, a held revision) is in that operation's
-  `lastResult[kind].params`, not in the settings. A sign-in waiting for the person shows its
+  `lastResult[kind].params`, not in the settings. An operation for one
+  provider (its key, sign-in, removal, default model or custom connection)
+  names it in `lastResult[kind].provider`, so its result is shown at that
+  provider only; the others carry `null`. A failure's `text` is the control
+  program's sentence and, when the system refused a file, that file and the
+  system's code; no other error text is relayed. A sign-in waiting for the person shows its
   page and code on `config.running.device`.
 - After an operation that changed configuration the host recycles its warm
   runtime and open sessions re-read the configuration (section 4), so new and
