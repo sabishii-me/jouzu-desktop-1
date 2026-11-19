@@ -73,6 +73,7 @@ pub fn code(text: &str) -> &'static str {
             "enotfound",
             "fetch failed",
             "network",
+            "connection error",
             "socket hang up",
         ])
     {
@@ -95,6 +96,7 @@ mod tests {
         assert_eq!(code("400 Invalid image: the image could not be decoded"), "image");
         assert_eq!(code("503 Service Unavailable"), "unavailable");
         assert_eq!(code("fetch failed"), "unavailable");
+        assert_eq!(code("Connection error."), "unavailable");
         assert_eq!(code("Something odd happened"), "other");
         // A number inside a longer one is not a status.
         assert_eq!(code("request 14010 failed"), "other");
