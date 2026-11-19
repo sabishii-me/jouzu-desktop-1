@@ -205,8 +205,12 @@ try {
     // does not know would be saved while the runtime starts on another model.
     const name = value => typeof value === 'string' && value.length > 0 && value.length <= 256 && ![...value].some(c => c.charCodeAt(0) < 32);
     if (!name(request.provider) || !name(request.model) || !runtime.getModel(request.provider, request.model)) throw new Error('Unknown model');
+    // The settings manager records a failed write instead of throwing it; a
+    // save it could not write is this operation's failure, not a success.
+    settings.drainErrors();
     settings.setDefaultModelAndProvider(request.provider, request.model);
     await settings.flush();
+    if (settings.drainErrors().length) throw new Error('Default model not saved');
   } else if (request.action !== 'status') throw new Error('Unsupported operation');
   if (request.action === "custom-provider") await runtime.refresh({ allowNetwork: false });
   const { ModelConfig } = await pi('model-config');
