@@ -199,6 +199,28 @@ async fn a_failure_is_recorded_on_its_kind_only() {
     assert_eq!(view["settings"]["last"], "language");
 }
 
+/// A result names the provider its operation was for, so a client shows it
+/// at that provider only (ui-layer §8); a cancelled one too. Operations that
+/// are for no provider name none.
+#[tokio::test]
+async fn a_result_names_the_provider_it_was_for() {
+    let root = tempfile::tempdir().unwrap();
+    let Some(control) = fake_service(root.path()) else { return };
+    control.enqueue("provider-key", &json!({ "provider": "a", "token": "fail" })).unwrap();
+    control.enqueue("default-model", &json!({ "provider": "b", "model": "m" })).unwrap();
+    control.enqueue("provider-key", &json!({ "provider": "c", "token": "sleep:300" })).unwrap();
+    let doomed = control.enqueue("provider-remove", &json!({ "provider": "d" })).unwrap();
+    control.enqueue("language", &json!({ "uiLocale": "ja" })).unwrap();
+    assert!(control.cancel(doomed["operationId"].as_str().unwrap()));
+    let view = settled(&control).await;
+    let last = &view["config"]["lastResult"];
+    assert_eq!(last["provider-key"]["provider"], "c", "{view}");
+    assert_eq!(last["default-model"]["provider"], "b", "{view}");
+    assert_eq!(last["provider-remove"]["code"], "config-cancelled", "{view}");
+    assert_eq!(last["provider-remove"]["provider"], "d", "{view}");
+    assert!(last["language"]["provider"].is_null(), "{view}");
+}
+
 #[tokio::test]
 async fn a_queued_operation_can_be_cancelled_and_the_rest_continue() {
     let root = tempfile::tempdir().unwrap();
