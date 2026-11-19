@@ -202,7 +202,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [forkResult, setForkResult] = useState<{ turn: number; result: ControlResult } | null>(null);
   // A new session that could not start while nothing else is on screen: the
   // start page's composer says so, with Retry.
-  const [startError, setStartError] = useState<{ details?: string } | null>(null);
+  const [startError, setStartError] = useState<{ text?: string; details?: string } | null>(null);
   // Sidebar actions (pin, rename, archive, copy) report in the sidebar.
   const [sidebarNote, setSidebarNote] = useState<{ text: string; details?: string } | null>(null);
   const sidebarOpen = useRef(true);
@@ -386,7 +386,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       } catch (error) {
         if (disposed) return;
         settled = true;
-        setSnapshot(current => ({ ...current, error: describeError(error) }));
+        // The entry session could not be opened (for example the runtime is
+        // missing): loading ends and the start page says why, with its Retry.
+        const explained = explain(t, error, t.newSessionFailed);
+        setHero(true);
+        setStartError({ text: explained.text, details: explained.details });
         if (choosing) setEntryOpening(false);
       }
     })();
@@ -444,9 +448,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // A connection that failed (a lease refused with an error) has nothing left to
   // wait for: loading ends so the chat shows the error and its retry (issue #87).
   useEffect(() => {
-    const failed = !snapshot.connected && !!snapshot.connectionError;
+    const failed = !snapshot.connected && (!!snapshot.connectionError || !!startError);
     onBootChange?.(!chatUnavailable && !failed && (!snapshot.connected || entryOpening || (!entryExisting && warmBlocks(warm))), warm, retryWarm);
-  }, [snapshot.connected, snapshot.connectionError, onBootChange, chatUnavailable, warm, entryOpening, entryExisting]);
+  }, [snapshot.connected, snapshot.connectionError, startError, onBootChange, chatUnavailable, warm, entryOpening, entryExisting]);
   useEffect(() => {
     const target = entryTarget.current;
     if (!entryAttaching || !target) return;
@@ -834,7 +838,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         // Shown where it was asked for: the start page's composer, or the sidebar's
         // New session when the previous session is back on screen.
         if (previousFile) tellWhereAsked(explain(t, error, t.newSessionFailed));
-        else setStartError({ details: explain(t, error, t.newSessionFailed).details });
+        else { const explained = explain(t, error, t.newSessionFailed); setStartError({ text: explained.text, details: explained.details }); }
       } finally {
         switchingRef.current = false;
         switchingTarget.current = null;
@@ -1506,7 +1510,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     : sessionError
       ? { text: t.openFailed, details: sessionError, action: selectedSession ? { label: t.retry, run: () => { setSessionError(null); startSwitch(selectedSession); } } : undefined }
       : null;
-  const heroBlocked = startError ? { text: t.newSessionFailed, details: startError.details, action: { label: t.retry, run: () => { setStartError(null); void startNewSession(); } } } : null;
+  const heroBlocked = startError ? { text: startError.text ?? t.newSessionFailed, details: startError.details, action: { label: t.retry, run: () => { setStartError(null); void startNewSession(); } } } : null;
   const noReply = failedTurn && !conversationProjection.running ? {
     text: failedTurn.text,
     details: failedTurn.error?.text || undefined,

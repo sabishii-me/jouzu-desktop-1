@@ -85,6 +85,7 @@ const en = {
   heldByFlow: "Held by Flow",
   // Host error codes.
   codeRuntimeUnavailable: "The runtime is not available right now.",
+  codeRuntimeMissing: "Jouzu's runtime files are missing. Repair the installation in Settings to continue.",
   codeRuntimeTimeout: "The runtime did not respond in time.",
   codeSessionNotFound: "This session is no longer open.",
   codeSessionStopped: "This session has stopped.",
@@ -505,6 +506,7 @@ const ja: ChatText = {
   queueNext: "Jouzu は次のステップでこれを読みます。",
   heldByFlow: "Flow が保留中",
   codeRuntimeUnavailable: "ランタイムは現在利用できません。",
+  codeRuntimeMissing: "Jouzu のランタイムファイルがありません。設定からインストールを修復してください。",
   codeRuntimeTimeout: "ランタイムが時間内に応答しませんでした。",
   codeSessionNotFound: "このセッションはもう開いていません。",
   codeSessionStopped: "このセッションは停止しています。",
@@ -924,6 +926,7 @@ const hans: ChatText = {
   queueNext: "Jouzu 会在下一步读取这些消息。",
   heldByFlow: "Flow 暂扣中",
   codeRuntimeUnavailable: "运行环境暂时不可用。",
+  codeRuntimeMissing: "Jouzu 的运行环境文件缺失。请在设置中修复安装后继续。",
   codeRuntimeTimeout: "运行环境未在规定时间内响应。",
   codeSessionNotFound: "此会话已关闭。",
   codeSessionStopped: "此会话已停止。",
@@ -1343,6 +1346,7 @@ const hant: ChatText = {
   queueNext: "Jouzu 會在下一步讀取這些訊息。",
   heldByFlow: "Flow 暫扣中",
   codeRuntimeUnavailable: "執行環境暫時無法使用。",
+  codeRuntimeMissing: "Jouzu 的執行環境檔案遺失。請在設定中修復安裝後繼續。",
   codeRuntimeTimeout: "執行環境未在時限內回應。",
   codeSessionNotFound: "此工作階段已關閉。",
   codeSessionStopped: "此工作階段已停止。",
@@ -1705,6 +1709,7 @@ type TextKey = keyof ChatText;
 /** Host error codes with a sentence of their own. */
 const CODES: Partial<Record<string, TextKey>> = {
   "runtime-unavailable": "codeRuntimeUnavailable",
+  "runtime-missing": "codeRuntimeMissing",
   "runtime-timeout": "codeRuntimeTimeout",
   "session-not-found": "codeSessionNotFound",
   "session-stopped": "codeSessionStopped",
