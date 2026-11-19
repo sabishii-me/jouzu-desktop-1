@@ -1,9 +1,8 @@
 import { useState } from "react";
 import { Pencil, X } from "lucide-react";
 import { Button } from "./components/ui/button";
-import { explainError } from "./runtime-errors";
 import type { QueuedMessage } from "./chat-types";
-import { fill, useChatText } from "./chat-text";
+import { explain, fill, useChatText } from "./chat-text";
 import { ResultMark, type ControlResult } from "./control-result";
 
 export type AlertLevel = "error" | "warning" | "info";
@@ -80,6 +79,7 @@ export function SteerQueue({ items, onEdit, onRemove, onContinue, onDiscard, res
  */
 export function ErrorLine({ raw, failed, onDismiss, onRetry }: { raw: unknown; failed: string; onDismiss?: () => void; onRetry?: () => void }) {
   const t = useChatText();
-  const { text, details } = explainError(raw, failed);
+  // Said from the error's code, in the interface language; never guessed from its words (#157).
+  const { text, details } = explain(t, raw, failed);
   return <NoticeRow alert={{ id: "error", level: "error", text, details, actions: onRetry ? [{ label: t.retry, run: onRetry }] : [], dismiss: onDismiss }} />;
 }

@@ -15,12 +15,12 @@ import { collectOutputReferences } from "./artifact-references";
 import { PanelStart } from "./panel-start";
 import { FilesPanel } from "./files-panel";
 import { ToolReviewDialog } from "./tool-review-dialog";
-import { SessionStore as ChatConnection, chatPool } from "./session-store";
+import { SessionStore as ChatConnection, chatPool, knownModels } from "./session-store";
 import type { ChatSnapshot, PendingPrompt, SessionTiming } from "./chat-types";
 import { eventRouter } from "./event-router";
 import { fitsSendBudget, readImageAttachment, removeSubmittedImages, validateImageSelection, type ImageAttachment } from "./chat-attachments";
 import { normalizeVideoUrl, videoMarker } from "./video-url";
-import { emptyProjection, prependHistory, savedPageProjection, type ChatProjection, type FlowReportRecord } from "./chat-projection";
+import { emptyProjection, prependHistory, savedPageProjection, type ChatMessage, type ChatProjection, type FlowReportRecord } from "./chat-projection";
 import { clearDraft, draftKey, readDraft, writeDraft } from "./drafts";
 import { describeError, isCapacityError, isFlowHistoryError, isImageRefused } from "./runtime-errors";
 import { NoticeRow, SteerQueue } from "./session-alerts-view";
@@ -202,7 +202,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [forkResult, setForkResult] = useState<{ turn: number; result: ControlResult } | null>(null);
   // A new session that could not start while nothing else is on screen: the
   // start page's composer says so, with Retry.
-  const [startError, setStartError] = useState<{ details?: string } | null>(null);
+  const [startError, setStartError] = useState<{ text?: string; details?: string } | null>(null);
   // Sidebar actions (pin, rename, archive, copy) report in the sidebar.
   const [sidebarNote, setSidebarNote] = useState<{ text: string; details?: string } | null>(null);
   const sidebarOpen = useRef(true);
@@ -386,7 +386,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       } catch (error) {
         if (disposed) return;
         settled = true;
-        setSnapshot(current => ({ ...current, error: describeError(error) }));
+        // The entry session could not be opened (for example the runtime is
+        // missing): loading ends and the start page says why, with its Retry.
+        const explained = explain(t, error, t.newSessionFailed);
+        setHero(true);
+        setStartError({ text: explained.text, details: explained.details });
         if (choosing) setEntryOpening(false);
       }
     })();
@@ -444,9 +448,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // A connection that failed (a lease refused with an error) has nothing left to
   // wait for: loading ends so the chat shows the error and its retry (issue #87).
   useEffect(() => {
-    const failed = !snapshot.connected && !!snapshot.connectionError;
+    const failed = !snapshot.connected && (!!snapshot.connectionError || !!startError);
     onBootChange?.(!chatUnavailable && !failed && (!snapshot.connected || entryOpening || (!entryExisting && warmBlocks(warm))), warm, retryWarm);
-  }, [snapshot.connected, snapshot.connectionError, onBootChange, chatUnavailable, warm, entryOpening, entryExisting]);
+  }, [snapshot.connected, snapshot.connectionError, startError, onBootChange, chatUnavailable, warm, entryOpening, entryExisting]);
   useEffect(() => {
     const target = entryTarget.current;
     if (!entryAttaching || !target) return;
@@ -680,10 +684,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     while (Date.now() < end && !sendCancelRef.current) {
       const current = connection.current;
       if (current?.snapshot.connected) return current;
-      if (current && current.snapshot.status === "stopped" && !switchingRef.current) {
-        if (!await reopenBoundSession()) return null;
-        continue;
-      }
       if (current?.snapshot.connectionError && !current.snapshot.connected && !switchingRef.current) return null;
       await new Promise(resolve => setTimeout(resolve, 25));
     }
@@ -716,10 +716,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!ready || !await ensureSelectedSession(ready)) { settle("send", { ok: false, text: t.sendOpening }); return; }
       const client = connection.current;
       if (!client || sendCancelRef.current) return;
-      // A conversation opened by this send (a preview) has a runtime only now:
-      // until it reports a model nothing is sent, and the user is told so.
-      if (client.snapshot.modelState !== "ready") {
-        settle("send", { ok: false, text: client.snapshot.modelState === "none" ? t.sendNoModel : t.sendLoadingModel });
+      // A runtime that reported no model cannot take it; a model still on its way
+      // can (the host holds the message until the model is ready).
+      if (client.snapshot.modelState === "none") {
+        settle("send", { ok: false, text: t.sendNoModel });
         return;
       }
       const receipt = client.send(value, submitted.map(item => item.image));
@@ -807,8 +807,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       pending: false,
       connectionError: null,
       // The new session's model is its own runtime's, reported once it answers.
+      // Until then the runtimes' last answer is shown, as the host will show it.
       modelState: "resolving",
-      models: [],
+      model: knownModels.model,
+      models: knownModels.models,
       thinkingLevels: [],
     });
     previewRequest.current += 1;
@@ -836,7 +838,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         // Shown where it was asked for: the start page's composer, or the sidebar's
         // New session when the previous session is back on screen.
         if (previousFile) tellWhereAsked(explain(t, error, t.newSessionFailed));
-        else setStartError({ details: explain(t, error, t.newSessionFailed).details });
+        else { const explained = explain(t, error, t.newSessionFailed); setStartError({ text: explained.text, details: explained.details }); }
       } finally {
         switchingRef.current = false;
         switchingTarget.current = null;
@@ -1060,17 +1062,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     try { return await promise; }
     finally { if (switchPromise.current === current) switchPromise.current = null; }
   }
-  // Reopen automatically once per stopped connection. A failure is reported and
-  // left to the user's next send, so a runtime that cannot start is not retried
-  // in a loop.
-  const reopenTried = useRef<ChatConnection | null>(null);
-  useEffect(() => {
-    const stale = connection.current;
-    if (!stale || snapshot.connected || snapshot.status !== "stopped" || switching) return;
-    if (reopenTried.current === stale) return;
-    reopenTried.current = stale;
-    void reopenBoundSession();
-  }, [snapshot.connected, snapshot.status, switching]);
   function loadPreview(sessionPath: string) {
     const request = ++previewRequest.current;
     const cached = projectionCache.current.get(normalizedPath(sessionPath));
@@ -1173,7 +1164,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       startSwitch(sessionPath);
       return;
     }
+    // The session shown is the session the composer works on: the host opens it
+    // now (no runtime until a message needs one), so its model, its state and
+    // where Send goes are its own. Its saved transcript fills the screen meanwhile.
     loadPreview(sessionPath);
+    if (switchingRef.current) queuedSwitch.current = sessionPath;
+    else startSwitch(sessionPath);
   }
   async function forkTurn(prompt: string, turn: number) {
     const client = connection.current;
@@ -1257,6 +1253,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!map.has(key)) map.set(key, { id: key, path: session.workspace, name: workspaceLabel(session.workspace, t), sessions: [] });
       map.get(key)!.sessions.push(session);
     }
+    // Most recent first, by the time each row shows: the list merges saved and
+    // live sessions and arrives in no order of its own.
+    for (const group of map.values()) group.sessions.sort((left, right) => right.updated - left.updated);
     let result = [...map.values()];
     if (search.trim()) {
       const query = search.trim().toLowerCase();
@@ -1412,15 +1411,18 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       ? { more: activePreview.before !== null, loading: !!activePreview.loading, load: loadEarlierPreview }
       : undefined;
   const activeMessage = conversationProjection.activeMessage === null ? undefined : conversationProjection.messages[conversationProjection.activeMessage];
+  // While the host opens the session on screen, the bound store is still the
+  // previous session: nothing of it (model, run, Stop) is shown for this one.
+  const elsewhere = !hero && !!selectedSession && selectedKey !== activeSession;
   // The host says when the step is reasoning; the words are the step's reasoning block being written.
   const turnStep = conversationProjection.running ? snapshot.activeTurn?.step : undefined;
   const streamingBlock = turnStep?.state === "thinking" ? activeMessage?.content.at(-1) : undefined;
   const liveThinking = streamingBlock?.type === "thinking" ? streamingBlock.thinking ?? "" : "";
   const lastMessage = conversationProjection.messages.at(-1);
+  // A failed reply says so on the reply; the status line only says a turn was stopped.
   const settled = !conversationProjection.running
-    ? lastMessage?.role === "assistant" && lastMessage.stopReason === "error" ? "failed" as const
-      : lastMessage?.role === "toolResult" || (lastMessage?.role === "assistant" && (lastMessage.stopReason === "aborted" || lastMessage.stopReason === "toolUse")) ? "interrupted" as const
-        : undefined
+    && (lastMessage?.role === "toolResult" || (lastMessage?.role === "assistant" && (lastMessage.stopReason === "aborted" || lastMessage.stopReason === "toolUse")))
+    ? "interrupted" as const
     : undefined;
   const outputReferences = useMemo(
     () => collectOutputReferences(conversationProjection.messages, artifactsSessionId),
@@ -1465,7 +1467,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const flowHold = showingAttached ? snapshot.flowHold : null;
   const failedTurn = showingAttached ? snapshot.failedTurn : null;
   const queued = showingAttached ? snapshot.queue ?? [] : [];
-  const replyError = !conversationProjection.running && lastMessage?.role === "assistant" && lastMessage.stopReason === "error" ? lastMessage.errorMessage ?? null : null;
   /**
    * Until the runtime reports these as structure (refused image: jouzu#54/#74;
    * Flow history: its Flow state; provider codes: runtime G6), their only sign is
@@ -1479,7 +1480,29 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (raw && isImageRefused(raw)) return { label: t.removeImages, run: () => void repairSessionImages(), disabled: commandBusy };
     return undefined;
   }
-  const replyRecovery = recoveryFor(replyError);
+  /**
+   * What recovers the latest failed reply, by the kind of failure the host names.
+   * Retry sends the person's message again, as they would by hand: the runtime
+   * has no command to rerun a failed reply (runtime request G12). A message with
+   * images is not sent again without them, so it gets no Retry.
+   */
+  function replyActionFor(message: ChatMessage | undefined): { label: string; run: () => void; disabled?: boolean } | undefined {
+    if (!message || message.role !== "assistant" || message.stopReason !== "error") return undefined;
+    const own = recoveryFor(message.errorMessage);
+    if (own && !isImageRefused(message.errorMessage)) return own;
+    switch (message.errorCode) {
+      case "image": return { label: t.removeImages, run: () => void repairSessionImages(), disabled: commandBusy };
+      case "auth": return { label: t.signIn, run: onSettings };
+      case "quota": return { label: t.settings, run: onSettings };
+      case "model-unavailable": return undefined;
+    }
+    const asked = [...conversationProjection.messages].reverse().find(item => item.role === "user");
+    if (!asked || asked.content.some(block => block.type === "image")) return undefined;
+    const words = asked.content.filter(block => block.type === "text").map(block => block.text ?? "").join("\n").trim();
+    if (!words) return undefined;
+    return { label: t.retry, run: () => { void connection.current?.send(words).catch(() => {}); }, disabled: commandBusy };
+  }
+  const replyAction = replyActionFor(lastMessage);
   // The one thing that ever takes the composer's place: the session cannot go on.
   const sessionFailure = showingAttached && snapshot.status === "error" ? snapshot.failure ?? { code: "", text: "" } : null;
   const blocked = sessionFailure
@@ -1487,8 +1510,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     : sessionError
       ? { text: t.openFailed, details: sessionError, action: selectedSession ? { label: t.retry, run: () => { setSessionError(null); startSwitch(selectedSession); } } : undefined }
       : null;
-  const heroBlocked = startError ? { text: t.newSessionFailed, details: startError.details, action: { label: t.retry, run: () => { setStartError(null); void startNewSession(); } } } : null;
-  const noReply = failedTurn && !conversationProjection.running ? {
+  const heroBlocked = startError ? { text: startError.text ?? t.newSessionFailed, details: startError.details, action: { label: t.retry, run: () => { setStartError(null); void startNewSession(); } } } : null;
+  // While the session itself cannot go on, that is the one cause shown; its message that got no
+  // reply comes back with Retry once the session is restarted (the host carries it over).
+  const noReply = failedTurn && !conversationProjection.running && !blocked ? {
     text: failedTurn.text,
     details: failedTurn.error?.text || undefined,
     onRetry: () => changeQueue(client => client.queue("retry"), "send"),
@@ -1502,9 +1527,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     ...(!results.stop && stopError ? { stop: { ok: false, text: t.stopFailed, details: stopError } } : {}),
     ...(!results.model && modelListError ? { model: { ok: false, text: t.modelsFailed, details: modelListError } } : {}),
   };
-  const hold = flowHold ? {
-    details: flowHold.text,
-    paused: flowHold.paused,
+  // Flow holds a message: its own notice says so, or the host keeps a message
+  // the runtime took without running it (held). Either way the person gets what
+  // lets it go; Flow's words, when it gave any, are behind Details.
+  const heldByFlow = queued.some(item => item.state === "held");
+  const hold = flowHold || heldByFlow ? {
+    details: flowHold?.text ?? "",
+    paused: flowHold?.paused ?? false,
     busy: commandBusy,
     onResume: () => void runFlow("resume"),
     onRelease: () => void runFlow("clear"),
@@ -1624,15 +1653,15 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">{t.openingSession}</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
           {showingAttached && snapshot.historyError && <div className="absolute inset-x-0 top-2 z-10 mx-auto w-[min(48rem,calc(100%-2rem))]"><NoticeRow alert={{ id: "history", level: "error", text: t.historyFailed, details: snapshot.historyError, actions: [{ label: t.retry, run: () => void connection.current?.retryHistory() }] }} /></div>}
-          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onRetrySend={id => void connection.current?.retry(id)?.catch(() => {})} onDiscardSend={id => connection.current?.discard(id)} forkResult={forkResult} onFork={(prompt, turn) => void forkTurn(prompt, turn)} history={earlierHistory} onOpenArtifacts={openArtifactsPanel} changedFiles={showingAttached && turnChanged && normalizedPath(turnChanged.session) === normalizedPath(snapshot.sessionFile ?? "") ? turnChanged.files : []} />
+          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onRetrySend={id => void connection.current?.retry(id)?.catch(() => {})} onDiscardSend={id => connection.current?.discard(id)} forkResult={forkResult} onFork={(prompt, turn) => void forkTurn(prompt, turn)} history={earlierHistory} onOpenArtifacts={openArtifactsPanel} replyAction={showingAttached ? replyAction : undefined} changedFiles={showingAttached && turnChanged && normalizedPath(turnChanged.session) === normalizedPath(snapshot.sessionFile ?? "") ? turnChanged.files : []} />
         </div>
         <div className="relative">
           <div className="mx-auto w-full max-w-3xl">
             {banners}
-            <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now, t)} running={conversationProjection.running} elapsed={elapsed} settled={settled} failure={settled === "failed" ? { details: replyError ?? undefined, action: replyRecovery } : undefined} noReply={noReply} hold={hold} notice={runtimeNotice} />
+            <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now, t)} running={conversationProjection.running} elapsed={elapsed} settled={settled} noReply={noReply} hold={hold} notice={runtimeNotice} />
           </div>
           {promptNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{promptNode}</div>}
-          <Composer autoFocus={composerFocus} blocked={blocked} results={controlResults} connected={snapshot.connected || !!activePreview} pending={snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={snapshot.models ?? []} model={snapshot.model} modelState={snapshot.modelState ?? "resolving"} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
+          <Composer autoFocus={composerFocus} blocked={blocked} results={controlResults} connected={snapshot.connected || !!activePreview} pending={elsewhere ? locked : snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={elsewhere || (opening && !activePreview)} starting={!elsewhere && composerStarting} unavailable={!!sessionError} running={!elsewhere && composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={elsewhere ? [] : snapshot.models ?? []} model={elsewhere ? undefined : snapshot.model} modelState={elsewhere ? "ready" : snapshot.modelState ?? "resolving"} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={elsewhere ? undefined : snapshot.thinkingLevel} thinkingLevels={elsewhere ? [] : snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
         </div>
         <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>

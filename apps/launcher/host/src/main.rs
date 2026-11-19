@@ -217,6 +217,8 @@ async fn main() -> ExitCode {
         let sessions = sessions.clone();
         state.control.on_change(move || jouzu_host::recycle_warm_runtime(&sessions));
     }
+    // Settings show what replies said about each provider's sign-in.
+    state.control.watch_providers(sessions.providers());
     state.control.start();
     // Web access listeners follow the saved scope; addresses can change (DHCP,
     // Tailscale reconnect), so re-check them periodically.

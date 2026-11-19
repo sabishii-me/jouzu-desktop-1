@@ -22,7 +22,10 @@ function formatDuration(ms: number) {
 /** Whole-session counters and their DSH-style detail cards; no wall-clock session timer. */
 export function SessionStatsBar({ stats, timing, firstOutputMs }: { stats?: SessionStats; timing?: SessionTiming; firstOutputMs?: number | null }) {
   const t = useChatText();
-  if (!stats) return null;
+  // The row is always there, empty or not: stats that come and go (a runtime that
+  // restarted has none yet) never move the composer above it (#153).
+  const empty = <div aria-hidden="true" data-session-usage-empty className="h-8" />;
+  if (!stats) return empty;
   const tokens = stats.tokens ?? {};
   const total = Number.isFinite(tokens.total) ? tokens.total! : (tokens.input ?? 0) + (tokens.output ?? 0) + (tokens.cacheRead ?? 0) + (tokens.cacheWrite ?? 0);
   const prompt = (tokens.input ?? 0) + (tokens.cacheRead ?? 0) + (tokens.cacheWrite ?? 0);
@@ -31,8 +34,8 @@ export function SessionStatsBar({ stats, timing, firstOutputMs }: { stats?: Sess
   const modelMs = timing?.modelMs ?? 0;
   const percent = stats.contextUsage?.percent;
   const speed = timing && timing.modelMs > 0 ? timing.outputTokens / (timing.modelMs / 1000) : null;
-  if (!total && !modelMs && percent == null) return null;
-  return <div aria-label={t.sessionUsage} className="mx-auto flex max-w-3xl flex-wrap items-center gap-x-2 gap-y-1 px-2 py-1.5 text-[11px] text-muted-foreground">
+  if (!total && !modelMs && percent == null) return empty;
+  return <div aria-label={t.sessionUsage} className="mx-auto flex min-h-8 max-w-3xl flex-wrap items-center gap-x-2 gap-y-1 px-2 py-1.5 text-[11px] text-muted-foreground">
     {modelMs > 0 && <StatPopover label={<><Gauge className="size-3.5" aria-hidden="true" />{speed !== null && speed > 0 ? `${compact(speed)} tok/s` : formatDuration(modelMs)}</>}>
       <StatCard title={t.sessionStats}>
         <StatRow label={t.modelTime} value={formatDuration(timing?.modelMs ?? 0)} />

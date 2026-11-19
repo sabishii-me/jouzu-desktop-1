@@ -49,7 +49,7 @@ export interface TurnStep {
   state: string;
   since?: number;
   tools: Array<{ id: string; name: string }>;
-  retry?: { attempt?: number; maxAttempts?: number; error?: string };
+  retry?: { attempt?: number; maxAttempts?: number; error?: string; code?: string };
 }
 export interface ActiveTurn {
   turnId: string;

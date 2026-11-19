@@ -600,8 +600,8 @@ async function firstSessionHasModel() {
   await composer().waitFor({ timeout: 10_000 });
   const modelButton = page.getByRole("button", { name: C.model, exact: true }).first();
   const label = async () => (await modelButton.innerText().catch(() => "")).trim();
-  // Empty while the runtime has not answered (a spinner); then a model or a setup offer.
-  const end = now() + 30_000;
+  // Empty while nothing is known yet (a spinner); then a model or a setup offer.
+  const end = now() + 15_000;
   while (now() < end && !await label()) await page.waitForTimeout(100);
   const shown = await label();
   if (shown && !either(C.selectModel, C.setUpModel).test(shown)) {
@@ -671,15 +671,32 @@ try {
   const prompt = "What is 17 × 23? Reply with only the number.";
   const reply = "391";
   const repeat = Math.max(1, Number(process.env.PLAYBOOK_REPEAT ?? 5));
-  const own = [], working = [], readable = [], ended = [];
+  const own = [], working = [], readable = [], ended = [], sendWait = [], newToReply = [];
   let freshOk = true;
   for (let i = 0; i < repeat; i++) {
+    // From New session as the user sees it: nothing between the click and the
+    // reply is left out. Send must be usable as soon as the composer is there
+    // (Sun 11-18: new session to Send usable = 0 s); the wait is measured
+    // without Playwright's own waiting for an enabled button.
+    let clicked = now();
     if (i > 0) {
+      clicked = now();
       await newSession().click();
       await composer().waitFor({ timeout: 10_000 });
     }
-    start = now();
     await composer().fill(prompt);
+    const typed = now();
+    if (i > 0) {
+      // 0 when Send is enabled at the first look; else how long it took.
+      let waited = 0;
+      while (!await send().isEnabled().catch(() => false)) {
+        if (now() - typed > 60_000) { waited = 60_000; break; }
+        await page.waitForTimeout(10);
+        waited = now() - typed;
+      }
+      sendWait.push(waited);
+    }
+    start = now();
     await send().click();
     const ownSeen = waitForConversationText(prompt, 5_000).then(() => now() - start);
     const stopSeen = stop().waitFor({ timeout: 5_000 }).then(() => now() - start, () => null);
@@ -687,6 +704,7 @@ try {
     const stopMs = await stopSeen;
     await waitForConversationText(reply, 60_000);
     readable.push(now() - start);
+    if (i > 0) newToReply.push(now() - clicked);
     // Turn end = Stop gone and Send enabled; no hint string is used.
     await stop().waitFor({ state: "detached", timeout: 30_000 }).catch(() => {});
     await send().waitFor({ timeout: 30_000 });
@@ -695,6 +713,9 @@ try {
     working.push(stopMs ?? readable[readable.length - 1]);
     freshOk &&= (await conversation().innerText()).includes(reply);
   }
+  // 0 ms: a new session is sendable the moment its composer shows.
+  if (sendWait.length) assertRepeatedGate("newSessionSendWait", sendWait, 0);
+  if (newToReply.length) record("newSessionToReply", newToReply);
   assertRepeatedGate("ownMessageVisible", own, 100);
   assertRepeatedGate("workingVisible", working, 100);
   record("warmFirstReadable", readable);

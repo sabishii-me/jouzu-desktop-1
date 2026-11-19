@@ -4,7 +4,7 @@ export type WireObject = Record<string, unknown>;
 /** An image the host keeps for a message in history: fetched by id, never inlined in the row. */
 export interface HostAttachmentRef { sessionId: string; id: string }
 export interface ChatBlock { type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: unknown; data?: string; mimeType?: string; attachment?: HostAttachmentRef; content?: ChatBlock[]; toolCallId?: string; isError?: boolean }
-export interface ChatMessage { role: string; content: ChatBlock[]; turnId?: string; /** The user turn this message belongs to (1 = the first user message), as the host numbers it. */ turn?: number; details?: unknown; timestamp?: number; endedAt?: number; stopReason?: string; errorMessage?: string; toolCallId?: string; toolName?: string; isError?: boolean; provider?: string; model?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number; totalTokens?: number } }
+export interface ChatMessage { role: string; content: ChatBlock[]; turnId?: string; /** The user turn this message belongs to (1 = the first user message), as the host numbers it. */ turn?: number; details?: unknown; timestamp?: number; endedAt?: number; stopReason?: string; errorMessage?: string; /** What kind of failure ended the reply, as the host names it. */ errorCode?: string; toolCallId?: string; toolName?: string; isError?: boolean; provider?: string; model?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number; totalTokens?: number } }
 export interface ToolView { id: string; name: string; args: unknown; phase: "running" | "complete" | "error"; result?: unknown; interrupted?: boolean }
 export interface FlowReportRecord { kind: string; text: string; timestamp?: number }
 export interface ChatProjection {
@@ -133,6 +133,7 @@ export function historyRowsProjection(rows: unknown, sessionId?: string): ChatPr
         ...(typeof row.provider === "string" ? { provider: row.provider } : {}),
         ...(typeof row.stopReason === "string" ? { stopReason: row.stopReason } : {}),
         ...(typeof row.errorMessage === "string" ? { errorMessage: row.errorMessage } : {}),
+        ...(typeof row.errorCode === "string" ? { errorCode: row.errorCode } : {}),
         ...(object(row.usage) ? { usage: row.usage as ChatMessage["usage"] } : {}),
       });
       for (const block of content) if (block.type === "toolCall" && typeof block.id === "string") tools[block.id] = { id: block.id, name: block.name ?? "tool", args: block.arguments, phase: tools[block.id]?.phase ?? "running", result: tools[block.id]?.result };

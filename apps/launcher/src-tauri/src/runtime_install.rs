@@ -201,11 +201,14 @@ fn ensure_node(managed: &Path, progress: Progress) -> Result<PathBuf, String> {
     let node = managed.join("runtime").join("node");
     let executable = node_executable(managed);
     if executable.is_file() {
-        if node_version_ok(managed) {
+        // A Node folder is kept only when it is whole: the right version, and
+        // the npm it ships with (a cleanup can leave node.exe alone; the runtime
+        // could then never be installed again).
+        if node_version_ok(managed) && npm_cli(&executable).is_file() {
             return Ok(executable);
         }
         // A runtime provisioned by an older build keeps its Node; replace it so a
-        // security release is not left behind.
+        // security release is not left behind. An incomplete one is replaced too.
         std::fs::remove_dir_all(&node).map_err(|error| format!("Could not replace the old Node runtime: {error}"))?;
     }
     let name = archive_name();
@@ -253,8 +256,9 @@ fn installer_path(node: &Path, app: &Path) -> Result<std::ffi::OsString, String>
         .map_err(|error| format!("Could not prepare the package installer environment: {error}"))
 }
 
-fn npm_install(node: &Path, app: &Path, progress: Progress) -> Result<(), String> {
-    let npm = if cfg!(windows) {
+/// npm's entry point inside a Node distribution, beside its executable.
+fn npm_cli(node: &Path) -> PathBuf {
+    if cfg!(windows) {
         node.parent()
             .unwrap()
             .join("node_modules")
@@ -271,7 +275,11 @@ fn npm_install(node: &Path, app: &Path, progress: Progress) -> Result<(), String
             .join("npm")
             .join("bin")
             .join("npm-cli.js")
-    };
+    }
+}
+
+fn npm_install(node: &Path, app: &Path, progress: Progress) -> Result<(), String> {
+    let npm = npm_cli(node);
     if !npm.is_file() {
         return Err("The Node package does not carry npm.".into());
     }

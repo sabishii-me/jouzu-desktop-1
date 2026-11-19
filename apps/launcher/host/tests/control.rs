@@ -82,3 +82,34 @@ async fn an_unknown_kind_is_refused_without_queuing() {
     assert!(manager.view()["config"]["queued"].as_array().unwrap().is_empty());
     assert!(!manager.cancel("op-never-started"));
 }
+
+/// A default model the settings file cannot take is a failed save, not a
+/// success that only the adapter's memory holds (#155).
+#[tokio::test]
+async fn a_default_model_that_cannot_be_written_is_a_failed_save() {
+    let Some(app) = app_dir() else { return };
+    let temp = tempfile::tempdir().unwrap();
+    let manager = manager(&app, &temp.path().to_path_buf());
+    let agent = temp.path().join("data").join("agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    let file = agent.join("settings.json");
+    let before = "{\"defaultProvider\":\"anthropic\",\"defaultModel\":\"claude-opus-4-5\"}";
+    std::fs::write(&file, before).unwrap();
+    let mut permissions = std::fs::metadata(&file).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&file, permissions.clone()).unwrap();
+    if std::fs::OpenOptions::new().write(true).open(&file).is_ok() {
+        eprintln!("skipped: this user can write a read-only file");
+        return;
+    }
+
+    manager
+        .enqueue("default-model", &json!({ "provider": "anthropic", "model": "claude-sonnet-4-5" }))
+        .expect("queued");
+    let view = settled(&manager).await;
+
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&file, permissions).unwrap();
+    assert_eq!(view["config"]["lastResult"]["default-model"]["ok"], false, "{view}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+}

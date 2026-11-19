@@ -4,7 +4,7 @@ import { ChatMarkdown } from "./chat-markdown";
 import type { ActiveTurn } from "./chat-types";
 import { Button } from "./components/ui/button";
 import { DetailsPopover } from "./control-result";
-import { fill, useChatText, type ChatText } from "./chat-text";
+import { fill, replyReason, useChatText, type ChatText } from "./chat-text";
 
 type RecoveryAction = { label: string; run: () => void; disabled?: boolean };
 
@@ -35,7 +35,7 @@ export function turnLabel(turn: ActiveTurn | null | undefined, now: number, t: C
     }
     case "retrying": {
       const attempt = step.retry?.attempt !== undefined ? ` ${step.retry.attempt}${step.retry.maxAttempts !== undefined ? `/${step.retry.maxAttempts}` : ""}` : "";
-      return `${t.retryingModel}${attempt}${step.retry?.error ? ` (${step.retry.error})` : ""}`;
+      return `${t.retryingModel}${attempt}${step.retry?.code ? ` (${replyReason(t, step.retry.code)})` : ""}`;
     }
     case "compacting": return `${t.compactingContext}${waited}`;
     default: return t.working;
@@ -48,14 +48,13 @@ export function turnLabel(turn: ActiveTurn | null | undefined, now: number, t: C
  * the message that got no reply, or else the runtime's latest notice: one line,
  * one thing at a time, never a list. Tools stay in the activity strip.
  */
-export function AgentAction({ thinking, label, running, elapsed, settled, failure, noReply, hold, notice }: {
+export function AgentAction({ thinking, label, running, elapsed, settled, noReply, hold, notice }: {
   thinking: string;
   label: string;
   running: boolean;
   elapsed?: string;
-  settled?: "interrupted" | "failed";
-  /** The failed reply's own words, and the one action that recovers when one is known. */
-  failure?: { details?: string; action?: RecoveryAction };
+  /** The latest turn was stopped. A failed reply says so on the reply itself, not here. */
+  settled?: "interrupted";
   /** The last message got no reply: its text, the runtime's reason, and Retry. */
   noReply?: { text: string; details?: string; onRetry: () => void; action?: RecoveryAction } | null;
   /** Flow control is holding the last message: its words behind Details, and what lets it go. */
@@ -84,19 +83,16 @@ export function AgentAction({ thinking, label, running, elapsed, settled, failur
     return <div role="status" data-flow-hold className={`${row} text-amber-700 dark:text-amber-300`}>
       <AlertTriangle className="size-3.5 shrink-0" aria-hidden="true" />
       <span className="min-w-0 flex-1 truncate" title={t.flowHolding}>{t.flowHolding}</span>
-      <DetailsPopover details={hold.details} />
+      {hold.details && <DetailsPopover details={hold.details} />}
       {hold.paused && <Button type="button" variant="outline" className={small} disabled={hold.busy} onClick={hold.onResume}>{t.resume}</Button>}
       <Button type="button" variant="outline" className={small} disabled={hold.busy} onClick={hold.onRelease}>{t.release}</Button>
       <Button type="button" variant="ghost" className={small} disabled={hold.busy} onClick={hold.onOff}>{t.turnOffFlow}</Button>
     </div>;
   }
   if (!running && !text && settled) {
-    const Icon = settled === "failed" ? AlertTriangle : Square;
-    return <div role={settled === "failed" ? "alert" : "status"} aria-live="polite" data-reply-failed={settled === "failed" ? "" : undefined} className={`${row} ${settled === "failed" ? "text-destructive" : "text-muted-foreground"}`}>
-      <Icon className="size-3.5 shrink-0" aria-hidden="true" />
-      <span className="min-w-0 flex-1 font-medium">{settled === "failed" ? t.failed : t.interrupted}</span>
-      {settled === "failed" && failure?.details && <DetailsPopover details={failure.details} />}
-      {settled === "failed" && failure?.action && <Button type="button" variant="outline" className={small} disabled={failure.action.disabled} onClick={failure.action.run}>{failure.action.label}</Button>}
+    return <div role="status" aria-live="polite" className={`${row} text-muted-foreground`}>
+      <Square className="size-3.5 shrink-0" aria-hidden="true" />
+      <span className="min-w-0 flex-1 font-medium">{t.interrupted}</span>
     </div>;
   }
   if (!running && !text && notice) {

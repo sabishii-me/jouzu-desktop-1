@@ -53,8 +53,12 @@ describe("HostClient", () => {
       return response({ sessionId: "h1", status: "starting", cursor: 0 }, 202);
     }) as typeof fetch;
     const client = new HostClient({ baseUrl: "", clientId: "web-test", fetchImpl });
-    await client.attach("C:/w", "C:/s/one.jsonl");
+    await client.attach("C:/w", "C:/s/one.jsonl", { provider: "p", id: "m" });
+    // A saved conversation keeps the model its runtime restores: no pick is sent.
     expect(body).toEqual({ workspacePath: "C:/w", sessionPath: "C:/s/one.jsonl", clientId: "web-test" });
+    // A new conversation carries the last pick for the host to hand to the runtime.
+    await client.attach("C:/w", undefined, { provider: "p", id: "m" });
+    expect(body).toEqual({ workspacePath: "C:/w", sessionPath: null, clientId: "web-test", model: { provider: "p", id: "m" } });
   });
 
   test("uses model and thinking endpoints", async () => {

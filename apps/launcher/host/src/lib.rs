@@ -18,6 +18,9 @@ pub mod control;
 mod environment;
 pub mod events;
 mod files;
+pub mod known_models;
+pub mod provider_answers;
+mod provider_error;
 pub mod runtime;
 pub mod sessions_repair;
 pub mod session;
@@ -628,11 +631,12 @@ async fn create_session(
     Json(request): Json<CreateRequest>,
 ) -> Result<Response, ApiError> {
     let client_id = request.client_id.clone();
-    let session = if request.session_path.is_none() {
+    let new_conversation = request.session_path.is_none();
+    let session = if new_conversation {
         state.sessions.create_pending(
             &request.workspace_path,
-            request.session_path,
-            request.key,
+            request.session_path.clone(),
+            request.key.clone(),
         )?
     } else {
         state
@@ -644,6 +648,13 @@ async fn create_session(
         .filter(|value| !value.trim().is_empty())
     {
         state.sessions.hold(client_id, &session.id);
+    }
+    // A new conversation on the client's last pick: relayed to the runtime as
+    // soon as its list offers it, before anything is sent.
+    if let (true, Some(pick)) = (new_conversation, request.model.as_ref()) {
+        if session.untouched_new() {
+            session.request_model(&pick.provider, &pick.id);
+        }
     }
     // The runtime starts now: the session's model is the one it reports.
     session.attach_early();
@@ -1062,6 +1073,10 @@ async fn config_cancel(State(state): State<AppState>, AxumPath(id): AxumPath<Str
 }
 
 pub fn recycle_warm_runtime(sessions: &SessionManager) {
+    // What runtimes said about models held for the old configuration; open
+    // sessions' runtimes read the new one.
+    sessions.forget_known_models();
+    sessions.reload_configuration();
     if let Some(pool) = sessions.warm_runtime() {
         pool.recycle();
     }
@@ -1565,10 +1580,16 @@ async fn run_image_cli(state: &AppState, args: &[&str]) -> Result<Value, ApiErro
         .args(args)
         .env("JOUZU_HOME", &home)
         .env("PI_CODING_AGENT_DIR", home.join("agent"))
+        .env_remove("JOUZU_RUNTIME_APP")
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_PATH")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // The tool loads the runtime's packages from the app this host starts; the
+    // data home (which may be a custom JOUZU_HOME) does not locate it.
+    if let Some(app) = state.sessions.runtime_app() {
+        command.env("JOUZU_RUNTIME_APP", app);
+    }
     #[cfg(windows)]
     {
         command.creation_flags(0x0800_0000);
@@ -3924,7 +3945,13 @@ mod session_tests {
             .iter()
             .filter(|row| row["kind"] == "user")
             .count();
-        assert_eq!(users, 2);
+        // Not in the transcript yet: the runtime has not used them.
+        assert_eq!(users, 0, "{}", session.history(50, None));
+        // Neither is left without a state: each is a waiting message the
+        // extension holds (the runtime gives no reason, so none is shown).
+        let summary = session.summary();
+        let states: Vec<&str> = summary["queue"].as_array().unwrap().iter().filter_map(|item| item["state"].as_str()).collect();
+        assert_eq!(states, ["held", "held"], "{summary}");
     }
 
     #[cfg(windows)]
@@ -3939,8 +3966,8 @@ mod session_tests {
         assert_eq!(session.status(), Status::Error);
     }
 
-    /// A saved conversation opened while its runtime is not up: nothing can be
-    /// sent before the runtime reports the session's model.
+    /// A saved conversation opened while its runtime is not up: a message sent
+    /// now waits for the runtime to report the session's model.
     async fn failing_session(env: &[(&str, &str)]) -> (Arc<crate::session::Session>, Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir, String) {
         let (manager, home, workspace) = manager_with_env(50, env);
         let header = json!({ "type": "session", "version": 3, "id": "fails", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
@@ -3950,7 +3977,7 @@ mod session_tests {
         let session = manager
             .create(workspace.path().to_str().unwrap(), Some(path.clone()), None)
             .unwrap();
-        assert_eq!(session.send("waiting", "hello").unwrap_err().code, "no-model");
+        session.send("waiting", "hello").unwrap();
         (session, manager, home, workspace, path)
     }
 
@@ -3996,6 +4023,34 @@ mod session_tests {
             .create(_workspace.path().to_str().unwrap(), Some(path), None)
             .unwrap();
         assert!(!Arc::ptr_eq(&again, &session));
+        manager.stop_all();
+    }
+
+    /// Restart after a crash opens the conversation again as a new session. The
+    /// message that got no reply is only known to the host, so the new session
+    /// keeps it, with its Retry, instead of showing it as if nothing happened.
+    #[tokio::test]
+    async fn a_restarted_conversation_keeps_the_message_that_got_no_reply() {
+        let (manager, _home, workspace) = manager_with_env(50, &[("FAKE_RUNTIME_CRASH_ON_PROMPT", "1")]);
+        let header = json!({ "type": "session", "version": 3, "id": "crashes", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let file = workspace.path().join("crashes.jsonl");
+        std::fs::write(&file, format!("{header}\n")).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), Some(path.clone()), None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("lost", "hello").unwrap();
+        wait_until(|| !session.summary()["failedTurn"].is_null()).await;
+        let failed = session.summary()["failedTurn"].clone();
+        assert_eq!(failed["clientMessageId"], "lost", "{failed}");
+        // What Restart session does after the host gave up: open the file again.
+        session.stop();
+        let again = manager
+            .create(workspace.path().to_str().unwrap(), Some(path), None)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&again, &session));
+        assert_eq!(again.summary()["failedTurn"], failed, "{}", again.summary());
         manager.stop_all();
     }
 
@@ -4158,6 +4213,21 @@ mod session_tests {
         .await;
         assert_eq!(send.0, StatusCode::ACCEPTED, "{}", send.2);
         wait_status(&session, Status::Idle).await;
+    }
+
+    #[tokio::test]
+    async fn a_saved_session_whose_last_line_was_cut_off_is_still_listed() {
+        let (manager, _home, workspace) = manager(50);
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let cwd = workspace.path().to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            directory.join("cut.jsonl"),
+            format!("{{\"type\":\"session\",\"cwd\":\"{cwd}\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"cut of"),
+        )
+        .unwrap();
+        let listed = manager.persisted(None, true);
+        assert!(listed.iter().any(|entry| entry["sessionPath"].as_str().is_some_and(|path| path.ends_with("cut.jsonl"))), "{listed:?}");
     }
 
     #[tokio::test]
@@ -4733,20 +4803,222 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn nothing_is_sent_or_chosen_before_the_runtime_reports_a_model() {
+    async fn a_message_sent_before_the_runtime_reports_a_model_waits_for_it() {
         let (manager, _home, workspace) = manager(50);
         let path = workspace.path().to_str().unwrap();
-        // No runtime has answered for it: the host holds no model and no pick.
+        // No runtime has answered for it: the host holds no model of its own.
         let pending = manager.create_pending(path, None, None).unwrap();
         assert_eq!(pending.summary()["model"], json!({ "state": "resolving" }));
-        let refused = pending.send("first", "hello").unwrap_err();
-        assert_eq!(refused.code, "no-model");
-        assert!(refused.retryable);
-        let refused = pending.select_model("fixture", "other").await.unwrap_err();
-        assert_eq!(refused.code, "model-resolving");
+        // Sending is never refused for a model still on its way: the message waits.
+        pending.send("first", "hello").unwrap();
+        // A pick made now is the client's choice, handed over once the runtime lists it.
+        let picked = pending.select_model("fixture", "other").await.unwrap();
+        assert_eq!(picked["pending"], true);
         let refused = pending.select_thinking("low").await.unwrap_err();
         assert_eq!(refused.code, "model-resolving");
-        assert_eq!(pending.summary()["model"], json!({ "state": "resolving" }));
+        assert_eq!(pending.summary()["model"]["state"], "resolving");
+    }
+
+    #[tokio::test]
+    async fn a_new_conversation_sends_its_first_message_on_the_picked_model() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let log_path = log.path().to_string_lossy().into_owned();
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_PROMPT_MODEL_LOG", log_path.as_str())]);
+        let path = workspace.path().to_str().unwrap();
+        // The client's last pick comes with the new conversation; the message is
+        // sent at once, before the runtime has answered anything.
+        let session = manager.create_pending(path, None, None).unwrap();
+        session.request_model("fixture", "other");
+        session.attach_early();
+        session.send("first", "hello").unwrap();
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant")) && session.status() == Status::Idle).await;
+        assert_eq!(session.summary()["model"]["id"], "other");
+        // The runtime received the prompt on the picked model, never its own first.
+        assert_eq!(std::fs::read_to_string(log.path()).unwrap().trim(), "other");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_pick_the_runtime_does_not_list_leaves_its_own_model() {
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().to_str().unwrap();
+        let session = manager.create_pending(path, None, None).unwrap();
+        session.request_model("gone", "removed");
+        session.attach_early();
+        session.send("first", "hello").unwrap();
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant")) && session.status() == Status::Idle).await;
+        assert_eq!(session.summary()["model"]["id"], "model");
+        assert_eq!(session.summary()["model"]["state"], "ready");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_message_to_a_runtime_without_a_model_fails_where_it_was_sent() {
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_NO_MODEL", "1")]);
+        let path = workspace.path().to_str().unwrap();
+        let session = manager.create_pending(path, None, None).unwrap();
+        session.attach_early();
+        session.send("first", "hello").unwrap();
+        wait_until(|| session.summary()["failedTurn"]["error"]["code"] == "no-model").await;
+        let summary = session.summary();
+        assert!(summary["activeTurn"].is_null(), "{summary}");
+        assert_eq!(summary["model"]["state"], "none");
+        assert!(summary["failure"].is_null(), "only the message failed: {summary}");
+    }
+
+    #[tokio::test]
+    async fn a_configuration_change_reaches_open_sessions() {
+        let models = tempfile::NamedTempFile::new().unwrap();
+        let write = |list: Value| std::fs::write(models.path(), list.to_string()).unwrap();
+        write(json!([
+            { "name": "fixture-model", "provider": "fixture", "id": "model" },
+            { "name": "Fixture Other", "provider": "fixture", "id": "other" },
+        ]));
+        let file = models.path().to_string_lossy().into_owned();
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_MODELS_FILE", file.as_str())]);
+        let path = workspace.path().to_str().unwrap();
+        let session = manager.create_pending(path, None, None).unwrap();
+        session.attach_early();
+        wait_status(&session, Status::Idle).await;
+        wait_until(|| session.summary()["models"].as_array().map_or(0, Vec::len) == 2).await;
+        session.select_model("fixture", "other").await.unwrap();
+        // Settings changed: a model added, a limit edited.
+        write(json!([
+            { "name": "fixture-model", "provider": "fixture", "id": "model" },
+            { "name": "Fixture Other", "provider": "fixture", "id": "other", "contextWindow": 1000 },
+            { "name": "Added", "provider": "fixture", "id": "added" },
+        ]));
+        recycle_warm_runtime(&manager);
+        wait_until(|| session.summary()["models"].as_array().map_or(0, Vec::len) == 3).await;
+        wait_status(&session, Status::Idle).await;
+        let summary = session.summary();
+        assert_eq!(summary["models"][1]["contextWindow"], 1000, "{summary}");
+        // The new conversation keeps the model it showed.
+        assert_eq!(summary["model"]["id"], "other", "{summary}");
+        assert_eq!(summary["model"]["state"], "ready", "{summary}");
+        session.send("after", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        manager.stop_all();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restarted_runtime_keeps_the_sessions_model() {
+        let models = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(models.path(), json!([
+            { "name": "fixture-model", "provider": "fixture", "id": "model" },
+            { "name": "Fixture Other", "provider": "fixture", "id": "other" },
+        ]).to_string()).unwrap();
+        let file = models.path().to_string_lossy().into_owned();
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_MODELS_FILE", file.as_str())]);
+        let session = manager.create_pending(workspace.path().to_str().unwrap(), None, None).unwrap();
+        session.attach_early();
+        wait_status(&session, Status::Idle).await;
+        wait_until(|| session.summary()["models"].as_array().map_or(0, Vec::len) == 2).await;
+        session.select_model("fixture", "other").await.unwrap();
+        let pid = session.runtime_pid().unwrap();
+        std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status().unwrap();
+        // The host restarts the runtime; the new one starts on its own first
+        // model, and the session's model is handed back to it.
+        wait_until(|| session.runtime_pid().is_some_and(|now| now != pid)).await;
+        wait_until(|| session.summary()["model"]["state"] == "ready" && session.status() == Status::Idle).await;
+        assert_eq!(session.summary()["model"]["id"], "other", "{}", session.summary());
+        manager.stop_all();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_message_sent_while_the_runtime_recovers_is_held_and_answered() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager.create_pending(workspace.path().to_str().unwrap(), None, None).unwrap();
+        session.attach_early();
+        session.send("first", "hello").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        let pid = session.runtime_pid().unwrap();
+        std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status().unwrap();
+        wait_until(|| session.status() == Status::Recovering).await;
+        // The session is still there: its message is held, not refused.
+        session.send("during", "again").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().filter(|row| row["kind"] == "assistant").count() == 2)).await;
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_stopped_session_starts_again_for_a_message() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager.create_pending(workspace.path().to_str().unwrap(), None, None).unwrap();
+        session.attach_early();
+        session.send("first", "hello").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        session.stop();
+        assert_eq!(session.status(), Status::Stopped);
+        // Its model stays on screen: nothing is on its way.
+        assert_eq!(session.summary()["model"]["state"], "ready", "{}", session.summary());
+        assert_eq!(session.summary()["model"]["id"], "model");
+        // The same session takes the message and starts a runtime for it.
+        session.send("after-stop", "again").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().filter(|row| row["kind"] == "assistant").count() == 2)).await;
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_pick_on_a_stopped_session_waits_for_its_next_runtime() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let log_path = log.path().to_string_lossy().into_owned();
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_PROMPT_MODEL_LOG", log_path.as_str())]);
+        let session = manager.create_pending(workspace.path().to_str().unwrap(), None, None).unwrap();
+        session.attach_early();
+        wait_status(&session, Status::Idle).await;
+        wait_until(|| session.summary()["models"].as_array().map_or(0, Vec::len) == 2).await;
+        // A pick still on its way when the runtime goes does not stay "resolving".
+        session.request_model("fixture", "other");
+        session.stop();
+        let stopped = session.summary();
+        assert_eq!(stopped["model"]["state"], "ready", "{stopped}");
+        assert_eq!(stopped["model"]["id"], "other", "{stopped}");
+        // A pick made while stopped is shown at once and used by the next runtime.
+        session.select_model("fixture", "other").await.unwrap();
+        session.send("after-stop", "hello").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        assert_eq!(session.summary()["model"]["id"], "other");
+        assert_eq!(std::fs::read_to_string(log.path()).unwrap().trim(), "other");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_new_conversation_shows_the_runtimes_last_answer_before_its_own() {
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().to_str().unwrap();
+        let first = manager.create(path, None, None).unwrap();
+        wait_status(&first, Status::Idle).await;
+        wait_until(|| first.summary()["models"].as_array().map_or(0, Vec::len) == 2).await;
+        // Before its runtime answers, the next one shows the list and model the
+        // runtimes last reported, and the client's pick by its listed name.
+        // It has no runtime yet, so nothing is on its way: it shows that model.
+        let next = manager.create_pending(path, None, None).unwrap();
+        let summary = next.summary();
+        assert_eq!(summary["model"]["state"], "ready", "{summary}");
+        assert_eq!(summary["model"]["id"], "model", "{summary}");
+        assert_eq!(summary["models"].as_array().unwrap().len(), 2, "{summary}");
+        next.request_model("fixture", "other");
+        assert_eq!(next.summary()["model"]["name"], "Fixture Other");
+        // Once its runtime starts, the same model is what it expects.
+        next.attach_early();
+        let starting = next.summary();
+        if starting["model"]["state"] == "resolving" {
+            assert_eq!(starting["model"]["expected"]["name"], "Fixture Other", "{starting}");
+        }
+        // A configuration change forgets what the runtimes said.
+        manager.forget_known_models();
+        let after = manager.create_pending(path, None, None).unwrap();
+        assert!(after.summary()["models"].as_array().unwrap().is_empty());
+        assert!(after.summary()["model"].get("id").is_none());
+        manager.stop_all();
     }
 
     #[tokio::test]
@@ -4768,6 +5040,52 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_saved_conversation_that_names_no_model_shows_the_runtimes_start_model_at_rest() {
+        let (manager, _home, workspace) = manager(50);
+        // A runtime has answered which model it starts with.
+        let first = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        wait_status(&first, Status::Idle).await;
+        // Written by an older version: no model change, no reply with a model.
+        let header = json!({ "type": "session", "version": 1, "id": "old", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let user = json!({ "type": "message", "message": { "role": "user", "content": "hi" } });
+        let file = workspace.path().join("old.jsonl");
+        std::fs::write(&file, format!("{header}\n{user}\n")).unwrap();
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+        // Nothing is on its way without a runtime: never a spinner.
+        let model = &session.info()["model"];
+        assert_eq!(model["state"], "ready", "{model}");
+        assert_eq!(model["id"], first.info()["model"]["id"], "{model}");
+        // While its runtime starts, the model it is expected to report is that one too.
+        session.attach_early();
+        let opening = &session.info()["model"];
+        if opening["state"] == "resolving" {
+            assert_eq!(opening["expected"]["id"], first.info()["model"]["id"], "{opening}");
+        }
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_saved_conversation_written_with_plain_text_content_shows_its_history() {
+        let (manager, _home, workspace) = manager(50);
+        let header = json!({ "type": "session", "version": 1, "id": "old", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let user = json!({ "type": "message", "message": { "role": "user", "content": "Session from an older version" } });
+        let reply = json!({ "type": "message", "message": { "role": "assistant", "content": "An answer written by an older version." } });
+        let file = workspace.path().join("old.jsonl");
+        std::fs::write(&file, format!("{header}\n{user}\n{reply}\n")).unwrap();
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+        session.open_saved_history();
+        let rows = session.history(50, None)["messages"].as_array().cloned().unwrap_or_default();
+        let mut texts: Vec<&str> = rows.iter().filter_map(|row| row["text"].as_str()).collect();
+        texts.sort_unstable();
+        assert_eq!(texts, ["An answer written by an older version.", "Session from an older version"], "{rows:?}");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
     async fn a_saved_conversation_keeps_the_model_it_used() {
         let (manager, _home, workspace) = manager(50);
         let header = json!({ "type": "session", "version": 3, "id": "saved-model", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
@@ -4777,8 +5095,11 @@ mod session_tests {
         let session = manager
             .create(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
             .unwrap();
-        // The host does not guess the model from the file.
-        assert_eq!(session.info()["model"], json!({ "state": "resolving" }));
+        // Until its runtime answers, it shows the model its file (the runtime's
+        // own record) says it last used; only the runtime's answer decides.
+        let opening = session.info();
+        assert_eq!(opening["model"]["state"], "resolving", "{opening}");
+        assert_eq!(opening["model"]["expected"]["id"], "own-model", "{opening}");
         wait_status(&session, Status::Idle).await;
         assert_eq!(session.info()["model"]["id"], "own-model", "{}", session.info());
         assert_eq!(session.info()["model"]["state"], "ready", "{}", session.info());
@@ -4811,6 +5132,72 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_new_session_takes_over_its_warm_runtimes_own_session() {
+        // Every switch is refused: a new conversation must not need one.
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_SWITCH_ERROR", "switch refused")]);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let folder = workspace.path().to_str().unwrap();
+        let _aim = manager.create_pending(folder, None, None).unwrap();
+        let status = pool.wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(status["state"], "ready", "{status}");
+        let sessions = manager.runtime_home().join("state").join("sessions");
+        let before: Vec<std::path::PathBuf> = std::fs::read_dir(&sessions).unwrap().filter_map(Result::ok).map(|entry| entry.path()).collect();
+        let session = manager.create_pending(folder, None, None).unwrap();
+        session.attach_early();
+        // Its file is known the moment it takes the runtime, and it is the
+        // runtime's own blank session: no file of the host's.
+        let path = session.info()["sessionPath"].as_str().expect("path at once").to_string();
+        assert!(before.contains(&std::path::PathBuf::from(&path)), "{path} not in {before:?}");
+        session.send("first", "hello").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        assert!(session.summary()["failure"].is_null(), "{}", session.summary());
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_conversation_from_this_run_stays_listed_after_it_leaves_the_table() {
+        let (manager, _home, workspace) = manager(50);
+        // The saved list is read once, before the conversation exists.
+        assert!(manager.persisted(None, false).is_empty());
+        let session = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("m1", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        let path = session.info()["sessionPath"].as_str().expect("path").to_string();
+        // What the runtime saves of the turn.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut file, b"{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n").unwrap();
+        drop(file);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
+        assert!(manager.get(&session.id).is_none(), "released");
+        let listed = manager.persisted(None, false);
+        assert!(
+            listed.iter().any(|entry| entry["sessionPath"].as_str().is_some_and(|value| crate::session::canonical_path(&path) == value)),
+            "{path} missing from {listed:?}"
+        );
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_refused_sign_in_is_kept_for_its_provider_until_a_reply_is_answered() {
+        let refusal = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(refusal.path(), "401 Unauthorized: invalid api key").unwrap();
+        let file = refusal.path().to_string_lossy().to_string();
+        let (manager, _home, workspace) = manager_with_env(50, &[("FAKE_RUNTIME_REPLY_ERROR_FILE", file.as_str())]);
+        let session = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("m1", "hello").unwrap();
+        wait_until(|| session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["errorCode"] == "auth"))).await;
+        assert_eq!(manager.providers().view()["fixture"]["text"], "401 Unauthorized: invalid api key");
+        wait_status(&session, Status::Idle).await;
+        std::fs::write(refusal.path(), "").unwrap();
+        session.send("m2", "again").unwrap();
+        wait_until(|| manager.providers().view().get("fixture").is_none()).await;
+        manager.stop_all();
+    }
+
+    #[tokio::test]
     async fn a_new_session_starts_its_runtime_at_once_without_a_warm_one() {
         let (manager, _home, workspace) = manager(50);
         let session = manager
@@ -4835,6 +5222,11 @@ mod session_tests {
             .create(workspace.path().to_str().unwrap(), None, None)
             .unwrap();
         wait_status(&session, Status::Idle).await;
+        // Without a warm runtime: the latest list a runtime answered.
+        wait_until(|| session.summary()["models"].as_array().map_or(0, Vec::len) == 2).await;
+        let known = call(app.clone(), request(Method::GET, "/v1/models").body(Body::empty()).unwrap()).await;
+        assert_eq!(known.0, StatusCode::OK, "{}", known.2);
+        manager.forget_known_models();
         let none = call(app.clone(), request(Method::GET, "/v1/models").body(Body::empty()).unwrap()).await;
         assert_eq!(none.0, StatusCode::SERVICE_UNAVAILABLE, "{}", none.2);
         let pool = manager.enable_warm_runtime().expect("warm pool");
@@ -4934,16 +5326,23 @@ mod session_tests {
     async fn a_new_session_never_used_leaves_no_file() {
         let (manager, _home, workspace) = manager(50);
         let folder = workspace.path().to_str().unwrap();
+        // A new session's file is its runtime's own blank session.
         let left = manager.create_pending(folder, None, None).unwrap();
+        left.attach_early();
+        wait_until(|| left.session_path.lock().unwrap().is_some()).await;
         let left_file = left.session_path.lock().unwrap().clone().expect("a new session has a file");
         let kept = manager.create_pending(folder, None, None).unwrap();
+        kept.attach_early();
+        wait_until(|| kept.session_path.lock().unwrap().is_some()).await;
         let kept_file = kept.session_path.lock().unwrap().clone().expect("a new session has a file");
+        wait_status(&left, Status::Idle).await;
+        wait_status(&kept, Status::Idle).await;
         assert!(std::path::Path::new(&left_file).exists());
         let _stream = manager.connect_client("window");
         manager.hold("window", &kept.id);
         manager.reap_idle(IdleLimits::all(Duration::ZERO));
         assert!(std::path::Path::new(&kept_file).exists(), "shown by a client: kept");
-        assert_eq!(left.status(), Status::Cancelled);
+        assert!(matches!(left.status(), Status::Cancelled | Status::Stopped), "{:?}", left.status());
         assert!(!std::path::Path::new(&left_file).exists());
         // A file that holds a conversation is never removed, whatever the host thinks.
         std::fs::OpenOptions::new()
@@ -5065,6 +5464,9 @@ mod session_tests {
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .expect("the installed runtime is used");
         assert_eq!(manager.node_executable(), Some(node));
+        // Tools that load the runtime's packages find them in this app, not
+        // next to the data home.
+        assert_eq!(manager.runtime_app(), Some(app.clone()));
         let pool = manager.warm_runtime().expect("the warm pool started with the runtime");
         let status = pool.wait_settled(Duration::from_secs(10)).await;
         assert_eq!(status["state"], "ready", "{status}");
@@ -5132,7 +5534,11 @@ mod session_tests {
         // dropped, never handed to a session; after repeated deaths the pool
         // reports the failure and stops trying.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_ne!(pool.status()["pid"].as_u64(), dead, "{}", pool.status());
+        // On a slow machine the first one can die before it answers: then
+        // there is no pid to compare, only the failure below.
+        if dead.is_some() {
+            assert_ne!(pool.status()["pid"].as_u64(), dead, "{}", pool.status());
+        }
         let deadline = Instant::now() + Duration::from_secs(20);
         while pool.status()["state"] != "failed" && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -5262,7 +5668,13 @@ mod session_tests {
         wait_model_state(&session, "ready").await;
         session.send("in-a", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
-        assert_eq!(pool.folders()[0], a, "opening a session makes its folder the most recent");
+        // Its runtime's own session file names the folder as the runtime spells
+        // it (on Windows without the `\\?\` prefix canonicalize adds): the same place.
+        assert!(
+            crate::runtime::warm::same_place(&pool.folders()[0], &a),
+            "opening a session makes its folder the most recent: {:?}",
+            pool.folders()
+        );
         manager.stop_all();
     }
 
@@ -5518,7 +5930,7 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn a_new_session_in_a_folder_keeps_the_spelling_its_sessions_use() {
+    async fn a_folder_is_named_with_the_spelling_its_sessions_use() {
         let (manager, _home, workspace) = manager(50);
         let folder = std::fs::canonicalize(workspace.path()).unwrap();
         // An older session spells the folder differently: on Windows the verbatim
@@ -5540,15 +5952,6 @@ mod session_tests {
         )
         .unwrap();
         assert_eq!(manager.folder_text(&folder), spelled);
-        let session = manager
-            .create_pending(workspace.path().to_str().unwrap(), None, None)
-            .unwrap();
-        let path = session.info()["sessionPath"].as_str().unwrap().to_string();
-        let header: Value = serde_json::from_str(
-            std::fs::read_to_string(&path).unwrap().lines().next().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(header["cwd"], spelled.as_str());
     }
 
     #[tokio::test]

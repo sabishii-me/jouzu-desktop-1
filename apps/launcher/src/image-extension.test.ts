@@ -194,7 +194,7 @@ describe("generate_image extension", () => {
     const providers = await listProviders(registry({ models: [flux, gemini], available: [] }));
     expect(providers).toEqual([
       { id: "shisa", label: "Shisa.AI", available: true, models: [{ id: "gemini-3.1-flash-lite-image", sizes: ["1K"] }] },
-      { id: "openrouter", label: "OpenRouter", available: false, reason: "No credential for OpenRouter. Add one under Model providers to generate images with it." },
+      { id: "openrouter", label: "OpenRouter", available: false, code: "no-credential", reason: "No credential for OpenRouter. Add one under Model providers to generate images with it." },
     ]);
     const usable = await listProviders(registry({ models: [flux, gemini] }));
     // The runtime's image API takes no size, so its models offer none.
@@ -206,7 +206,7 @@ describe("generate_image extension", () => {
   it("marks Shisa unavailable without a credential, with the reason, instead of hiding it", async () => {
     setCredentialReader(async () => undefined);
     const providers = await listProviders(registry());
-    expect(providers).toEqual([{ id: "shisa", label: "Shisa.AI", available: false, reason: "Sign in to Shisa.AI or set SHISA_API_KEY to generate images." }]);
+    expect(providers).toEqual([{ id: "shisa", label: "Shisa.AI", available: false, code: "no-credential", reason: "Sign in to Shisa.AI or set SHISA_API_KEY to generate images." }]);
   });
 
   it("generates with a runtime provider through the runtime's registry, never its own request", async () => {
@@ -283,26 +283,42 @@ describe("image provider availability", () => {
   it("is unavailable without a credential, and says how to get one", async () => {
     setCredentialReader(async () => undefined);
     const result = await availability(shisa);
-    expect(result).toEqual({ available: false, reason: "Sign in to Shisa.AI or set SHISA_API_KEY to generate images." });
+    expect(result).toEqual({ available: false, code: "no-credential", reason: "Sign in to Shisa.AI or set SHISA_API_KEY to generate images." });
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("says a refused sign-in by its code, for the desktop to word", async () => {
+    setCredentialReader(async () => ({ type: "oauth", access: "expired" }));
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 401, json: async () => ({}) });
+    expect(await availability(shisa)).toEqual({ available: false, code: "sign-in-refused", reason: "Sign in to Shisa.AI again to generate images." });
+  });
+
+  it("reads the router's error code before its status", async () => {
+    setCredentialReader(async () => ({ type: "oauth", access: "t" }));
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 403, json: async () => ({ error: { code: "model_not_in_plan" } }) });
+    expect(await availability(shisa)).toMatchObject({ available: false, code: "not-allowed" });
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 429, json: async () => ({ error: { code: "free_allowance_exhausted" } }) });
+    expect(await availability(shisa)).toMatchObject({ available: false, code: "no-credit" });
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 402, json: async () => ({ error: { code: "insufficient_balance" } }) });
+    expect(await availability(shisa)).toMatchObject({ available: false, code: "no-credit" });
   });
 
   it("is unavailable when the account cannot use image generation", async () => {
     setCredentialReader(async () => ({ type: "oauth", access: "t" }));
     vi.mocked(fetch).mockResolvedValue({ ok: false, status: 403, json: async () => ({ code: 311 }) });
-    expect(await availability(shisa)).toEqual({ available: false, reason: "This account cannot use image generation (shisa/image)." });
+    expect(await availability(shisa)).toEqual({ available: false, code: "not-allowed", reason: "This account cannot use image generation (shisa/image)." });
   });
 
   it("is unavailable when the account lists no image models", async () => {
     setCredentialReader(async () => ({ type: "oauth", access: "t" }));
     vi.mocked(fetch).mockResolvedValue(ok({ models: [] }));
-    expect(await availability(shisa)).toEqual({ available: false, reason: "This account has no image models." });
+    expect(await availability(shisa)).toEqual({ available: false, code: "no-models", reason: "This account has no image models." });
   });
 
   it("is unavailable, not an error, when the provider cannot be reached", async () => {
     setCredentialReader(async () => ({ type: "oauth", access: "t" }));
     vi.mocked(fetch).mockRejectedValue(new TypeError("fetch failed"));
-    expect(await availability(shisa)).toEqual({ available: false, reason: "Shisa.AI could not be reached." });
+    expect(await availability(shisa)).toEqual({ available: false, code: "unreachable", reason: "Shisa.AI could not be reached." });
   });
 
   it("is available with the account's models and their sizes", async () => {

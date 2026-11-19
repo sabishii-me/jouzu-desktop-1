@@ -56,10 +56,12 @@ function ModelMenu({ open, onOpenChange, models, model, state, onSelect, thinkin
   const visible = models.filter(item => `${item.provider} ${item.name} ${item.id}`.toLowerCase().includes(query.toLowerCase()));
   const providers = [...new Set(visible.map(item => item.provider))];
   return <div ref={root} className="relative flex items-center">
-    {/* The button is the model's state: loading, the model, or the way to get one. */}
-    <Button type="button" variant="ghost" className="h-8 gap-1 px-2 text-xs" aria-label={t.model} aria-expanded={open} disabled={state === "resolving"} onClick={() => { if (state === "none" && !models.length) { onSetup?.(); return; } const next = !open; onOpenChange(next); if (next) setQuery(""); }}>
-      {state === "resolving" ? <Loader2 className="size-4 shrink-0 animate-spin" aria-hidden="true" /> : <Cpu className="size-4 shrink-0" aria-hidden="true" />}
-      <span className="max-w-40 truncate">{state === "ready" ? model : state === "none" ? (models.length ? t.selectModel : t.setUpModel) : ""}</span>
+    {/* The button is the model: the session's, or while its runtime has not answered the
+        one it is expected to report (the runtime's earlier answer). It spins only when
+        nothing is known yet, and it leads to setup when the runtime has no model. */}
+    <Button type="button" variant="ghost" className="h-8 gap-1 px-2 text-xs" aria-label={t.model} aria-expanded={open} disabled={state === "resolving" && !models.length} onClick={() => { if (state === "none" && !models.length) { onSetup?.(); return; } const next = !open; onOpenChange(next); if (next) setQuery(""); }}>
+      {state === "resolving" && !model ? <Loader2 className="size-4 shrink-0 animate-spin" aria-hidden="true" /> : <Cpu className="size-4 shrink-0" aria-hidden="true" />}
+      <span className="max-w-40 truncate">{state === "none" ? (models.length ? t.selectModel : t.setUpModel) : model ?? ""}</span>
       <ChevronDown className="size-3 shrink-0" aria-hidden="true" />
     </Button>
     <ResultMark result={result} />
@@ -228,7 +230,9 @@ export function Composer({ hero = false, autoFocus = false, textguard, blocked, 
   const [modelOpen, setModelOpen] = useState(false);
   // Nothing is sent without the runtime's model; the model button next to
   // Send shows why (loading, or the way to set one up).
-  const noModel = modelState !== "ready";
+  // Only a runtime that reported no model stops Send; a model still on its way does not
+  // (the host holds the message until it is ready).
+  const noModel = modelState === "none";
   const submit = () => { if ((connected || opening) && !noModel && !unavailable && !readingImages && (draft.trim() || videos.length) && (running || starting || !pending)) onSend(); };
   const compactDisabled = !connected || pending || settling || opening || unavailable || running;
   const exportDisabled = !connected || pending || settling || opening || unavailable;
@@ -255,21 +259,21 @@ export function Composer({ hero = false, autoFocus = false, textguard, blocked, 
     onAddImages(files);
   };
   const frame = `relative mx-auto flex max-w-3xl flex-col gap-2 border border-border bg-card shadow-[0_8px_30px_rgba(0,0,0,0.12)] ${hero ? "rounded-3xl p-3" : "rounded-2xl p-2.5"}`;
-  if (blocked) {
-    // The same frame and height as the composer it replaces: nothing moves.
-    return <div className={hero ? "px-0 pb-0 pt-0" : "px-3 pb-3 pt-2 sm:px-6"}>
-      <div role="alert" aria-label={t.sessionEnded} data-session-blocked className={frame}>
-        <div className="flex min-h-[6.5rem] items-center gap-2 px-1">
-          <span className="min-w-0 flex-1 break-words text-sm">{blocked.text}</span>
-          {blocked.details && <DetailsPopover details={blocked.details} />}
-          {blocked.action && <Button type="button" className="h-8 shrink-0 px-3" disabled={blocked.action.disabled} onClick={blocked.action.run}>{blocked.action.label}</Button>}
-          <ResultMark result={blocked.result} />
-        </div>
-      </div>
-    </div>;
-  }
+  // The session ended: one line and the button that recovers take the composer's
+  // place, laid over the composer itself (kept, hidden and inert), so they have
+  // exactly its frame and height and nothing moves (#156).
+  const blockedLine = blocked ? <div role="alert" aria-label={t.sessionEnded} data-session-blocked className={`${frame.replace("relative ", "")} absolute inset-0 z-10 justify-center`}>
+    <div className="flex items-center gap-2 px-1">
+      <span className="min-w-0 flex-1 break-words text-sm">{blocked.text}</span>
+      {blocked.details && <DetailsPopover details={blocked.details} />}
+      {blocked.action && <Button type="button" className="h-8 shrink-0 px-3" disabled={blocked.action.disabled} onClick={blocked.action.run}>{blocked.action.label}</Button>}
+      <ResultMark result={blocked.result} />
+    </div>
+  </div> : null;
   return <div className={hero ? "px-0 pb-0 pt-0" : "px-3 pb-3 pt-2 sm:px-6"}>
-    <form aria-label={t.messageComposer} onPaste={pasteFiles} className={`relative mx-auto flex max-w-3xl flex-col gap-2 border border-border bg-card shadow-[0_8px_30px_rgba(0,0,0,0.12)] focus-within:ring-1 focus-within:ring-ring ${hero ? "rounded-3xl p-3" : "rounded-2xl p-2.5"}`} onSubmit={event => { event.preventDefault(); submit(); }}>
+    <div className="relative mx-auto max-w-3xl">
+    {blockedLine}
+    <form aria-label={t.messageComposer} aria-hidden={blocked ? true : undefined} inert={blocked ? true : undefined} onPaste={pasteFiles} className={`relative mx-auto flex max-w-3xl flex-col gap-2 border border-border bg-card shadow-[0_8px_30px_rgba(0,0,0,0.12)] focus-within:ring-1 focus-within:ring-ring ${hero ? "rounded-3xl p-3" : "rounded-2xl p-2.5"} ${blocked ? "invisible" : ""}`} onSubmit={event => { event.preventDefault(); submit(); }}>
       {!!attachments.length && <ul aria-label={t.attachedImages} className="flex flex-wrap gap-2 px-1">{attachments.map(item => <li key={item.id} className="relative max-w-36 rounded-lg border border-border p-1.5"><img src={`data:${item.image.mimeType};base64,${item.image.data}`} alt={fill(t.previewOf, { name: item.name })} className="h-16 w-24 object-contain" /><div className="flex items-center gap-1"><p className="min-w-0 flex-1 truncate text-xs" title={item.name}>{item.name}</p><Button type="button" variant="ghost" className="size-6 p-0" aria-label={fill(t.removeNamed, { name: item.name })} onClick={() => onRemoveImage?.(item.id)}><X className="size-3" /></Button></div></li>)}</ul>}
       {!!videos.length && <ul aria-label={t.attachedVideos} className="flex flex-wrap gap-2 px-1">{videos.map(url => <li key={url} className="flex max-w-full items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs"><Video className="size-3.5 shrink-0" /><span className="min-w-0 flex-1 truncate" title={url}>{url}</span><Button type="button" variant="ghost" className="size-6 p-0" aria-label={fill(t.removeVideo, { url })} onClick={() => onRemoveVideo?.(url)}><X className="size-3" /></Button></li>)}</ul>}
       {videoOpen && <div className="flex items-center gap-2 px-1"><Input aria-label={t.videoUrl} placeholder="https://…/video.mp4" value={videoDraft} onChange={event => setVideoDraft(event.target.value)} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); const error = onAddVideo?.(videoDraft) ?? null; setVideoError(error); if (!error) { setVideoDraft(""); setVideoOpen(false); } } }} /><Button type="button" onClick={() => { const error = onAddVideo?.(videoDraft) ?? null; setVideoError(error); if (!error) { setVideoDraft(""); setVideoOpen(false); } }}>{t.add}</Button></div>}
@@ -304,6 +308,7 @@ export function Composer({ hero = false, autoFocus = false, textguard, blocked, 
         </div>
       </div>
     </form>
+    </div>
   </div>;
 }
 

@@ -1,7 +1,7 @@
 import { test, expect, type Page } from "@playwright/test";
 import { UI_BASE, stubHost, emptyControlState } from "./host-control";
 
-type Provider = { id: string; label: string; available: boolean; reason?: string; models?: { id: string; sizes: string[] }[] };
+type Provider = { id: string; label: string; available: boolean; code?: string; reason?: string; models?: { id: string; sizes: string[] }[] };
 
 const saved = { enabled: true, provider: "shisa", model: "gemini-3-pro-image", size: "1K", maxImages: 3 };
 // What the host answers with no tools.json (#67): a full image section, no provider chosen.
@@ -15,8 +15,8 @@ const usableOpenRouter: Provider = {
   id: "openrouter", label: "OpenRouter", available: true,
   models: [{ id: "black-forest-labs/flux.2-pro", sizes: [] }, { id: "google/gemini-2.5-flash-image", sizes: [] }],
 };
-const noCredentialOpenRouter: Provider = { id: "openrouter", label: "OpenRouter", available: false, reason: "No credential for OpenRouter. Add one under Model providers to generate images with it." };
-const signedOutShisa: Provider = { id: "shisa", label: "Shisa.AI", available: false, reason: "Sign in to Shisa.AI or set SHISA_API_KEY to generate images." };
+const noCredentialOpenRouter: Provider = { id: "openrouter", label: "OpenRouter", available: false, code: "no-credential", reason: "No credential for OpenRouter. Add one under Model providers to generate images with it." };
+const signedOutShisa: Provider = { id: "shisa", label: "Shisa.AI", available: false, code: "no-credential", reason: "Sign in to Shisa.AI or set SHISA_API_KEY to generate images." };
 
 /** Opens Settings → Tools against a host whose image tool reports `providers`. Returns what the page saved. */
 async function openTools(page: Page, image: Record<string, unknown>, providers: Provider[]) {
@@ -76,7 +76,7 @@ test("an unusable image provider is not offered, and says why", async ({ page })
   await expect(provider.locator("option")).toHaveText(["No image provider available"]);
   await expect(dialog.getByLabel("Image model", { exact: true })).toBeDisabled();
   await expect(dialog.getByLabel("Image size", { exact: true })).toBeDisabled();
-  await expect(dialog.getByRole("list", { name: "Unavailable image providers" })).toHaveText("Shisa.AI: Sign in to Shisa.AI or set SHISA_API_KEY to generate images.");
+  await expect(dialog.getByRole("list", { name: "Unavailable image providers" })).toHaveText("Shisa.AI: Not signed in. Add a key or sign in under Model providers.");
   await expect(dialog.getByRole("alert")).toHaveCount(0);
   await expect(dialog.getByText("This tools change did not complete.")).toHaveCount(0);
   expect(models).toEqual([]);
@@ -127,6 +127,6 @@ test("the image provider list includes the runtime's providers and switching kee
 test("a runtime provider without a credential is not offered, and says why", async ({ page }) => {
   const { dialog, errors } = await openTools(page, saved, [usableShisa, noCredentialOpenRouter]);
   await expect(dialog.getByLabel("Image provider", { exact: true }).locator("option")).toHaveText(["Shisa.AI"]);
-  await expect(dialog.getByRole("list", { name: "Unavailable image providers" })).toHaveText("OpenRouter: No credential for OpenRouter. Add one under Model providers to generate images with it.");
+  await expect(dialog.getByRole("list", { name: "Unavailable image providers" })).toHaveText("OpenRouter: Not signed in. Add a key or sign in under Model providers.");
   expect(errors).toEqual([]);
 });
