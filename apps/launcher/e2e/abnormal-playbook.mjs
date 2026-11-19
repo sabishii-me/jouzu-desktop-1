@@ -68,10 +68,14 @@ const control = (path, body) => post(world, path, body);
 
 // ---- Words the person sees, per interface language (from src/chat-text.ts, src/i18n.ts) ----
 const allWords = {
-  en: { newSession: "New session", retry: "Retry", settings: "Settings", restart: "Restart session", continue: "Continue", discard: "Discard" },
-  ja: { newSession: "新しいセッション", retry: "再試行", settings: "設定", restart: "セッションを再起動", continue: "続ける", discard: "破棄" },
-  "zh-Hans": { newSession: "新会话", retry: "重试", settings: "设置", restart: "重启会话", continue: "继续", discard: "丢弃" },
-  "zh-Hant": { newSession: "新工作階段", retry: "重試", settings: "設定", restart: "重新啟動工作階段", continue: "繼續", discard: "捨棄" },
+  en: { newSession: "New session", retry: "Retry", settings: "Settings", restart: "Restart session", continue: "Continue", discard: "Discard",
+    composer: "Message composer", conversation: "Conversation", workspaces: "Workspaces", message: "Message Jouzu", chooseImages: "Choose images", attachedImages: "Attached images", queued: "Queued messages", stop: "Stop" },
+  ja: { newSession: "新しいセッション", retry: "再試行", settings: "設定", restart: "セッションを再起動", continue: "続ける", discard: "破棄",
+    composer: "メッセージ入力", conversation: "会話", workspaces: "ワークスペース", message: "Jouzu へのメッセージ", chooseImages: "画像を選択", attachedImages: "添付画像", queued: "待機中のメッセージ", stop: "停止" },
+  "zh-Hans": { newSession: "新会话", retry: "重试", settings: "设置", restart: "重启会话", continue: "继续", discard: "丢弃",
+    composer: "消息输入框", conversation: "对话", workspaces: "工作区", message: "给 Jouzu 发消息", chooseImages: "选择图片", attachedImages: "已添加的图片", queued: "排队中的消息", stop: "停止" },
+  "zh-Hant": { newSession: "新工作階段", retry: "重試", settings: "設定", restart: "重新啟動工作階段", continue: "繼續", discard: "捨棄",
+    composer: "訊息輸入框", conversation: "對話", workspaces: "工作區", message: "傳訊息給 Jouzu", chooseImages: "選擇圖片", attachedImages: "已加入的圖片", queued: "排隊中的訊息", stop: "停止" },
 };
 const words = allWords[lang];
 const english = allWords.en;
@@ -80,17 +84,21 @@ const english = allWords.en;
  * control is not localized yet (the English-only words are reported by the i18n judgement of
  * the problems shown, not by failing to find the control).
  */
-const named = key => new RegExp(`^(${words[key]}|${english[key]})$`);
+const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const named = key => new RegExp(`^(${escape(words[key])}|${escape(english[key])})$`);
+/** CSS for an element labelled in the interface language or in English (labels localized in 1.1.4, #100). */
+const labelled = key => `:is(${[...new Set([words[key], english[key]])].map(text => `[aria-label="${text}"]`).join(", ")})`;
+const SEL = { composer: labelled("composer"), conversation: labelled("conversation"), workspaces: labelled("workspaces") };
 const newSession = () => page.getByRole("button", { name: named("newSession") }).first();
-const textbox = () => page.getByRole("textbox", { name: /message/i }).first();
-const sendButton = () => page.locator('[aria-label="Message composer"] button[type="submit"]').first();
-const stopButton = () => page.locator('[aria-label="Message composer"]').getByRole("button", { name: /^(stop|停止)$/i }).first();
-const conversation = () => page.getByRole("region", { name: /conversation/i }).first();
+const textbox = () => page.getByRole("textbox", { name: new RegExp(`message|${escape(words.message)}`, "i") }).first();
+const sendButton = () => page.locator(`${SEL.composer} button[type="submit"]`).first();
+const stopButton = () => page.locator(SEL.composer).getByRole("button", { name: named("stop") }).first();
+const conversation = () => page.locator(SEL.conversation).first();
 const conversationText = async () => (await conversation().textContent().catch(() => "")) ?? "";
 
 /** Everything shown as a problem, where it is, and the words of its main sentence. */
 async function problems() {
-  return page.evaluate(() => {
+  return page.evaluate(SEL => {
     const selector = '[role="alert"], [data-result="failed"], [data-reply-failed], [data-send-failed], [data-no-reply], [data-flow-hold], [data-session-blocked], [data-reconnecting]';
     const visible = element => { const rect = element.getBoundingClientRect(); return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== "hidden"; };
     const main = element => {
@@ -102,9 +110,9 @@ async function problems() {
       return copy.innerText ?? copy.textContent ?? "";
     };
     const scope = element => element.closest('[role="dialog"]') ? "settings"
-      : element.closest('[aria-label="Conversation"]') ? "reply"
-      : element.closest('[aria-label="Message composer"]') || element.matches("[data-flow-hold], [data-session-blocked], [data-no-reply]") ? "composer"
-      : element.closest('[aria-label="Workspaces"]') ? "sidebar"
+      : element.closest(SEL.conversation) ? "reply"
+      : element.closest(SEL.composer) || element.matches("[data-flow-hold], [data-session-blocked], [data-no-reply]") ? "composer"
+      : element.closest(SEL.workspaces) ? "sidebar"
       : element.closest("header") || element.matches("[data-reconnecting]") ? "header" : "page";
     const seen = new Set();
     return [...document.querySelectorAll(selector)].filter(visible).filter(element => {
@@ -116,19 +124,19 @@ async function problems() {
       const style = getComputedStyle(element);
       return { text: main(element).trim().replace(/\s+/g, " "), scope: scope(element), floating: style.position === "fixed" && !element.closest('[role="dialog"]'), blocked: element.matches("[data-session-blocked]") };
     });
-  });
+  }, SEL);
 }
 /** Where the parts the person works with are, and whether anything widens the page. */
 async function layout() {
-  return page.evaluate(() => {
+  return page.evaluate(SEL => {
     const box = selector => { const element = document.querySelector(selector); if (!element) return null; const rect = element.getBoundingClientRect(); return [rect.x, rect.y, rect.width, rect.height].map(Math.round); };
     return {
-      composer: box('[aria-label="Message composer"]'),
-      conversation: box('[aria-label="Conversation"]'),
-      sidebar: box('aside[aria-label="Workspaces"]'),
+      composer: box(SEL.composer),
+      conversation: box(SEL.conversation),
+      sidebar: box(`aside${SEL.workspaces}`),
       overflow: Math.max(0, document.documentElement.scrollWidth - innerWidth),
     };
-  });
+  }, SEL);
 }
 /** Busy indicators still on screen: spinners and in-progress lines ("Starting…", "Opening…"). */
 async function waiting() {
@@ -179,9 +187,9 @@ async function typeAndSend(text, { wait = 20_000 } = {}) {
   await textbox().fill(text);
   const typed = now();
   // One render for the typed text to reach the button; a wait longer than that is the app's.
-  const enabled = () => page.waitForFunction(() => !document.querySelector('[aria-label="Message composer"] button[type="submit"]')?.disabled, null, { timeout: 250 }).then(() => true, () => false);
+  const enabled = () => page.waitForFunction(SEL => !document.querySelector(`${SEL.composer} button[type="submit"]`)?.disabled, SEL, { timeout: 250 }).then(() => true, () => false);
   if (!await enabled()) {
-    await page.waitForFunction(() => !document.querySelector('[aria-label="Message composer"] button[type="submit"]')?.disabled, null, { timeout: wait }).catch(() => {});
+    await page.waitForFunction(SEL => !document.querySelector(`${SEL.composer} button[type="submit"]`)?.disabled, SEL, { timeout: wait }).catch(() => {});
     const blockedMs = now() - typed;
     const ended = (await problems()).some(item => item.blocked);
     if (current && !ended) {
@@ -201,10 +209,10 @@ async function typeAndSend(text, { wait = 20_000 } = {}) {
 async function sendTimed(text) {
   sent.push(text);
   await textbox().fill(text);
-  await page.evaluate(prompt => {
+  await page.evaluate(({ prompt, SEL }) => {
     window.__ownMessage = new Promise(resolve => {
-      const button = document.querySelector('[aria-label="Message composer"] button[type="submit"]');
-      const seen = () => [...document.querySelectorAll('[aria-label="Conversation"] *')].some(node => node.childElementCount === 0 && node.textContent === prompt);
+      const button = document.querySelector(`${SEL.composer} button[type="submit"]`);
+      const seen = () => [...document.querySelectorAll(`${SEL.conversation} *`)].some(node => node.childElementCount === 0 && node.textContent === prompt);
       button.addEventListener("click", () => {
         const start = performance.now();
         if (seen()) { resolve(0); return; }
@@ -213,7 +221,7 @@ async function sendTimed(text) {
         setTimeout(() => { observer.disconnect(); resolve(null); }, 10_000);
       }, { once: true, capture: true });
     });
-  }, text);
+  }, { prompt: text, SEL });
   const start = now();
   await sendButton().click({ timeout: 5_000 });
   const own = await page.evaluate(() => window.__ownMessage);
@@ -381,7 +389,7 @@ add("Nothing moves while a reply runs", "The baseline for every layout check her
   await chatSession();
   const before = await layout();
   await typeAndSend("LONG reply to watch the layout");
-  await page.waitForFunction(() => /line 3\b/.test(document.querySelector('[aria-label="Conversation"]')?.textContent ?? ""), null, { timeout: 30_000 }).catch(() => c.fail("the reply never started writing"));
+  await page.waitForFunction(SEL => /line 3\b/.test(document.querySelector(SEL.conversation)?.textContent ?? ""), SEL, { timeout: 30_000 }).catch(() => c.fail("the reply never started writing"));
   const during = await layout();
   judgeLayout(c, before, during);
   await idle(30_000);
@@ -394,7 +402,7 @@ async function stopCase(c, prepare, stage) {
   await prepare();
   const prompt = stage === "streaming" ? "LONG reply to be stopped" : ask().prompt;
   await typeAndSend(prompt);
-  if (stage === "streaming") await page.waitForFunction(() => /line 3\b/.test(document.querySelector('[aria-label="Conversation"]')?.textContent ?? ""), null, { timeout: 30_000 }).catch(() => c.fail("the reply never started writing"));
+  if (stage === "streaming") await page.waitForFunction(SEL => /line 3\b/.test(document.querySelector(SEL.conversation)?.textContent ?? ""), SEL, { timeout: 30_000 }).catch(() => c.fail("the reply never started writing"));
   if (stage === "waiting") await sleep(1_500);
   const start = now();
   await stopButton().click({ timeout: 3_000 }).catch(() => c.fail(`no Stop to press (${stage})`));
@@ -418,7 +426,7 @@ add("Stop while a new session's runtime is still starting", "Stop during a slow 
 add("Stop with a message waiting in the queue", "The waiting message is kept (Continue or Discard), never lost or sent twice.", async c => {
   await freshSession();
   await typeAndSend("LONG reply with a queued message");
-  await page.waitForFunction(() => /line 3\b/.test(document.querySelector('[aria-label="Conversation"]')?.textContent ?? ""), null, { timeout: 30_000 }).catch(() => c.fail("the reply never started writing"));
+  await page.waitForFunction(SEL => /line 3\b/.test(document.querySelector(SEL.conversation)?.textContent ?? ""), SEL, { timeout: 30_000 }).catch(() => c.fail("the reply never started writing"));
   const waitingText = "Queued while writing: say QUEUED.";
   await textbox().fill(waitingText);
   await sendButton().click();
@@ -428,7 +436,7 @@ add("Stop with a message waiting in the queue", "The waiting message is kept (Co
   if (!await idle(10_000)) c.fail("Send did not come back within 10 s");
   c.metric("stopToSendMs", now() - start);
   const text = await conversationText();
-  const queued = page.getByRole("region", { name: "Queued messages" });
+  const queued = page.getByRole("region", { name: named("queued") });
   const kept = text.includes(waitingText) || await queued.getByText(waitingText).count() > 0;
   if (!kept) c.fail("the waiting message is gone");
   const resume = queued.getByRole("button", { name: named("continue") });
@@ -463,7 +471,7 @@ add("Runtime killed while the reply is writing", "The interrupted reply is marke
   await chatSession();
   const before = await layout();
   const start = await typeAndSend("LONG reply that loses its runtime");
-  await page.waitForFunction(() => /line 3\b/.test(document.querySelector('[aria-label="Conversation"]')?.textContent ?? ""), null, { timeout: 30_000 }).catch(() => c.fail("the reply never started writing"));
+  await page.waitForFunction(SEL => /line 3\b/.test(document.querySelector(SEL.conversation)?.textContent ?? ""), SEL, { timeout: 30_000 }).catch(() => c.fail("the reply never started writing"));
   await control("/runtime/kill", { which: "all" });
   const killedAt = now();
   const back = await idle(15_000);
@@ -528,7 +536,7 @@ add("Computer asleep for 30 s during a reply", "After sleep the reply finishes o
   const before = await layout();
   const prompt = "LONG reply across a sleep";
   await typeAndSend(prompt);
-  await page.waitForFunction(() => /line 3\b/.test(document.querySelector('[aria-label="Conversation"]')?.textContent ?? ""), null, { timeout: 30_000 }).catch(() => c.fail("the reply never started writing"));
+  await page.waitForFunction(SEL => /line 3\b/.test(document.querySelector(SEL.conversation)?.textContent ?? ""), SEL, { timeout: 30_000 }).catch(() => c.fail("the reply never started writing"));
   await control("/freeze", { ms: 30_000 });
   const woke = now();
   const back = await idle(40_000);
@@ -574,12 +582,12 @@ add("Long unbroken token in a message", "A pasted path or id thousands of charac
 
 add("Image the model refuses", "A refused image shows once on the reply with a way out; the session does not stay stuck.", async c => {
   await chatSession();
-  const chooser = page.getByLabel("Choose images", { exact: true });
+  const chooser = page.getByLabel(named("chooseImages"));
   if (!await chooser.count()) { c.record.skipped = true; c.note("the model takes no images"); return; }
   const before = await layout();
   await fault({ refuseImages: true });
   await chooser.setInputFiles({ name: "square.png", mimeType: "image/png", buffer: await redSquarePng() });
-  await page.getByRole("list", { name: "Attached images" }).waitFor({ timeout: 10_000 }).catch(() => c.fail("a valid image was not attached"));
+  await page.getByRole("list", { name: named("attachedImages") }).waitFor({ timeout: 10_000 }).catch(() => c.fail("a valid image was not attached"));
   const start = await typeAndSend("What is in this picture?");
   const shown = await firstProblem(start, 30_000);
   if (!shown) c.fail("a refused image showed nothing within 30 s");
@@ -602,14 +610,14 @@ add("Image the model refuses", "A refused image shows once on the reply with a w
 
 add("A file that is not an image, named .png", "A broken attachment is refused at the composer with the text kept, never sent half-way.", async c => {
   await chatSession();
-  const chooser = page.getByLabel("Choose images", { exact: true });
+  const chooser = page.getByLabel(named("chooseImages"));
   if (!await chooser.count()) { c.record.skipped = true; c.note("the model takes no images"); return; }
   const before = await layout();
   await textbox().fill("Look at this file");
   await chooser.setInputFiles({ name: "notes.png", mimeType: "image/png", buffer: Buffer.from("this is not an image") });
   await sleep(1_500);
   const shown = await problems();
-  const attached = await page.getByRole("list", { name: "Attached images" }).isVisible().catch(() => false);
+  const attached = await page.getByRole("list", { name: named("attachedImages") }).isVisible().catch(() => false);
   if (!shown.length && attached) {
     const start = await typeAndSend("Look at this file");
     const later = await firstProblem(start, 20_000);
