@@ -22,6 +22,8 @@ export interface ConfigResult {
   code: string | null;
   params: Record<string, unknown>;
   text: string | null;
+  /** The provider the operation was for; its result belongs to that provider only. */
+  provider?: string | null;
   finishedAt: string;
 }
 export interface AppView {

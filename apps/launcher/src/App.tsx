@@ -107,14 +107,17 @@ export function App() {
     catch (failure) {
       // The host's own reason for refusing the request (a field it does not accept): the original text.
       const text = failure instanceof Error ? failure.message : String(failure);
-      setRefused(current => ({ ...current, [kind]: { operationId: `refused-${Date.now()}`, ok: false, code: "config-invalid", params: {}, text, finishedAt: new Date().toISOString() } }));
+      setRefused(current => ({ ...current, [kind]: { operationId: `refused-${Date.now()}`, ok: false, code: "config-invalid", params: {}, text, provider: typeof body.provider === "string" ? body.provider : null, finishedAt: new Date().toISOString() } }));
       return false;
     }
   }
-  /** The failure of a card's own operations, shown on that card only. */
-  const configNotice = (...kinds: ConfigKind[]) => {
+  /**
+   * The failure of a card's own operations, shown on that card only. A card
+   * that shows one provider at a time (`provider`) shows only that provider's.
+   */
+  const configNotice = (kinds: ConfigKind[], provider?: string) => {
     const failure = kinds
-      .flatMap(kind => [configFailure(appView, [kind]), refused[kind]].filter((item): item is ConfigResult => !!item && item.operationId !== dismissed).map(result => ({ kind, result })))
+      .flatMap(kind => [configFailure(appView, [kind]), refused[kind]].filter((item): item is ConfigResult => !!item && item.operationId !== dismissed && (provider === undefined || !item.provider || item.provider === provider)).map(result => ({ kind, result })))
       .sort((a, b) => b.result.finishedAt.localeCompare(a.result.finishedAt))[0];
     if (!failure) return null;
     const { kind, result } = failure;
@@ -124,8 +127,8 @@ export function App() {
    * A card's failure laid over the top of that card (its title), so it appearing
    * or clearing never moves the card's controls or anything below (#147).
    */
-  const cardNotice = (...kinds: ConfigKind[]) => {
-    const notice = configNotice(...kinds);
+  const cardNotice = (kinds: ConfigKind[], provider?: string) => {
+    const notice = configNotice(kinds, provider);
     return notice ? <div className="absolute inset-x-3 top-3 z-10 rounded-lg bg-background shadow-lg">{notice}</div> : null;
   };
   // Each card waits only for its own operations; nothing else is disabled.
@@ -165,8 +168,8 @@ export function App() {
   const settingsNotices = (frame: string, ...kinds: ConfigKind[]) => {
     // Settings that could not be read come first: every card waits for them,
     // and what failed because of it is not reported beside it. One at a time.
-    const notice = (!setup && configFailure(appView, ["status"]) ? configNotice("status") : null)
-      ?? (kinds.length ? configNotice(...kinds) : null)
+    const notice = (!setup && configFailure(appView, ["status"]) ? configNotice(["status"]) : null)
+      ?? (kinds.length ? configNotice(kinds) : null)
       ?? (error?.place === "settings" ? errorNotice("settings") : null);
     return notice ? <div className={`absolute z-10 rounded-lg bg-background shadow-lg ${frame}`}>{notice}</div> : null;
   };
@@ -518,10 +521,10 @@ export function App() {
   // the Shisa.AI card and must not appear again as a phantom provider row.
   const otherProviders = setup ? [...new Set([...setup.credentials.map(c => c.providerId), ...setup.customProviders.map(c => c.id)])].filter(id => id !== "shisa") : [];
   const providerApiKey = providerInfo?.apiKey !== false;
-  const providerContent = <div className="space-y-4">                  {(inlineProviders || !addingConnection) && <><Card className={inlineProviders ? "gap-3 rounded-none border-0 bg-transparent p-0 shadow-none" : "border-border gap-4 py-5 shadow-none"}><CardHeader className={inlineProviders ? "px-0" : undefined}><CardTitle>Shisa.AI</CardTitle><CardDescription>{device ? t.waitingAuthorization : shisaRefused ? <span className="flex items-center gap-2 text-destructive" data-provider-refused="shisa">{t.shisaRefused}<DetailsPopover details={shisaRefused.text} side="bottom" /></span> : setup?.account.signedIn ? t.shisaConnected : t.shisaHint}</CardDescription></CardHeader><CardContent className={inlineProviders ? "space-y-3 px-0" : "space-y-3"}>{cardNotice("shisa-login", "shisa-logout", "refresh-catalogs")}{!device && setup?.account.revocation === "unconfirmed" && <p role="status" className="text-sm text-muted-foreground">{t.signOutUnconfirmed}</p>}{!device && <div className="flex flex-wrap justify-end gap-2">{setup?.account.signedIn && <Button variant="outline" disabled={shisaBusy || !setup} onClick={() => void refreshModelCatalog(true)}><RefreshCw className={catalogRefreshing ? "animate-spin" : undefined} />{t.refreshModels}</Button>}{shisaRefused && <Button disabled={shisaBusy || !setup} onClick={() => void configure("shisa-login")}>{t.signIn}</Button>}<Button variant={shisaRefused ? "outline" : "default"} disabled={shisaBusy || !setup} onClick={() => void configure(setup?.account.signedIn ? "shisa-logout" : "shisa-login")}>{setup?.account.signedIn ? t.signOut : t.signIn}</Button></div>}{device && <div className="space-y-3"><Input readOnly aria-label={t.loginUrl} value={device.url} onFocus={event => event.target.select()} /><Input readOnly aria-label={t.deviceCode} value={device.code} onFocus={event => event.target.select()} /><p className="text-xs text-muted-foreground">{t.loginHint}</p><div className="flex items-center justify-end gap-2"><Button variant="outline" onClick={() => cancelRunning()}>{t.cancel}</Button><Button onClick={async () => { try { const url = new URL(device.url); if (url.origin !== "https://platform.shisa.ai" || url.pathname !== "/connect" || url.username || url.password) throw new Error(t.loginUrl); await openUrl(url.href); } catch (error) { fail("settings", error); } }}><ArrowUpRight />{t.openBrowser}</Button></div></div>}</CardContent></Card>
+  const providerContent = <div className="space-y-4">                  {(inlineProviders || !addingConnection) && <><Card className={inlineProviders ? "gap-3 rounded-none border-0 bg-transparent p-0 shadow-none" : "border-border gap-4 py-5 shadow-none"}><CardHeader className={inlineProviders ? "px-0" : undefined}><CardTitle>Shisa.AI</CardTitle><CardDescription>{device ? t.waitingAuthorization : shisaRefused ? <span className="flex items-center gap-2 text-destructive" data-provider-refused="shisa">{t.shisaRefused}<DetailsPopover details={shisaRefused.text} side="bottom" /></span> : setup?.account.signedIn ? t.shisaConnected : t.shisaHint}</CardDescription></CardHeader><CardContent className={inlineProviders ? "space-y-3 px-0" : "space-y-3"}>{cardNotice(["shisa-login", "shisa-logout", "refresh-catalogs"])}{!device && setup?.account.revocation === "unconfirmed" && <p role="status" className="text-sm text-muted-foreground">{t.signOutUnconfirmed}</p>}{!device && <div className="flex flex-wrap justify-end gap-2">{setup?.account.signedIn && <Button variant="outline" disabled={shisaBusy || !setup} onClick={() => void refreshModelCatalog(true)}><RefreshCw className={catalogRefreshing ? "animate-spin" : undefined} />{t.refreshModels}</Button>}{shisaRefused && <Button disabled={shisaBusy || !setup} onClick={() => void configure("shisa-login")}>{t.signIn}</Button>}<Button variant={shisaRefused ? "outline" : "default"} disabled={shisaBusy || !setup} onClick={() => void configure(setup?.account.signedIn ? "shisa-logout" : "shisa-login")}>{setup?.account.signedIn ? t.signOut : t.signIn}</Button></div>}{device && <div className="space-y-3"><Input readOnly aria-label={t.loginUrl} value={device.url} onFocus={event => event.target.select()} /><Input readOnly aria-label={t.deviceCode} value={device.code} onFocus={event => event.target.select()} /><p className="text-xs text-muted-foreground">{t.loginHint}</p><div className="flex items-center justify-end gap-2"><Button variant="outline" onClick={() => cancelRunning()}>{t.cancel}</Button><Button onClick={async () => { try { const url = new URL(device.url); if (url.origin !== "https://platform.shisa.ai" || url.pathname !== "/connect" || url.username || url.password) throw new Error(t.loginUrl); await openUrl(url.href); } catch (error) { fail("settings", error); } }}><ArrowUpRight />{t.openBrowser}</Button></div></div>}</CardContent></Card>
                   {!inlineProviders && <>                  <Card className="border-border gap-4 py-5 shadow-none"><CardHeader><CardTitle>{t.connections}</CardTitle></CardHeader><CardContent className="space-y-2">{!!setup && otherProviders.length > 5 && <Input aria-label={t.searchProviders} placeholder={t.searchProviders} value={providerQuery} onChange={event => setProviderQuery(event.target.value)} />}{!addingConnection && setup && otherProviders.filter(id => `${id} ${setup.providers.find(p => p.id === id)?.name ?? ""}`.toLowerCase().includes(providerQuery.toLowerCase())).map(id => ({providerId:id})).map(c => <div key={c.providerId} className="flex items-center gap-2"><Button variant="outline" className="h-auto min-w-0 flex-1 justify-between gap-2 py-3" disabled={connectionBusy} onClick={() => { setProvider(c.providerId); setToken(""); const saved = setup?.customProviders.find(p => p.id === c.providerId); setConnectionMode(saved?.editable ? "custom" : "builtin"); setCustom(saved?.editable ? {provider:saved.id,url:saved.url,model:saved.model,edit:true,imageInput:saved.imageInput ?? false,contextWindow:saved.contextWindow ?? 32768,maxTokens:saved.maxTokens ?? 4096} : {provider:"",url:"",model:"",edit:false,imageInput:false,contextWindow:32768,maxTokens:4096}); setAddingConnection(true); }}><span>{setup.providers.find(p => p.id === c.providerId)?.name ?? c.providerId}</span>{appView?.providerAuth?.[c.providerId] ? <span className="text-xs text-destructive" data-provider-refused={c.providerId}>{t.credentialRefused}</span> : <span className="text-xs text-muted-foreground">{setup.credentials.some(key => key.providerId === c.providerId) ? t.credentialSaved : t.configuredNoKey}</span>}</Button></div>)}<Button variant="outline" disabled={connectionBusy || !setup} onClick={() => { setProviderQuery(""); setProvider(""); setConnectionMode("builtin"); setCustom({provider:"",url:"",model:"",edit:false,imageInput:false,contextWindow:32768,maxTokens:4096}); setAddingConnection(true); }}><Plus />{t.addConnection}</Button></CardContent></Card></>}</>}
                   {(inlineProviders || addingConnection) && <section className={inlineProviders ? "space-y-3 border-t border-border pt-4" : "space-y-4 rounded-xl border border-border bg-card p-5"}><div className="flex items-center justify-between gap-3"><h3 className="text-sm font-semibold">{inlineProviders ? t.connections : custom.edit ? t.editConnection : t.addConnection}</h3>{!inlineProviders && <Button variant="ghost" disabled={connectionBusy} onClick={() => setAddingConnection(false)}>{t.backConnections}</Button>}</div><div className="space-y-4">
-                  {cardNotice("provider-key", "provider-remove", "provider-oauth", "custom-provider", "default-model")}<div className="space-y-2">{!inlineProviders && <Label>{t.service}</Label>}<ProviderPicker value={connectionMode === "custom" ? "__custom__" : provider} disabled={connectionBusy || custom.edit} label={t.service} placeholder={t.chooseService} searchLabel={t.searchProviders} empty={t.noResults} items={[...(setup?.providers ?? []),{id:"__custom__",name:t.customProvider}]} onChange={value => { setToken(""); if(value === "__custom__") {setConnectionMode("custom");setProvider("");} else {setConnectionMode("builtin");setProvider(value);} }}/></div>
+                  {cardNotice(["provider-key", "provider-remove", "provider-oauth", "custom-provider", "default-model"], connectionMode === "custom" ? custom.provider : provider)}<div className="space-y-2">{!inlineProviders && <Label>{t.service}</Label>}<ProviderPicker value={connectionMode === "custom" ? "__custom__" : provider} disabled={connectionBusy || custom.edit} label={t.service} placeholder={t.chooseService} searchLabel={t.searchProviders} empty={t.noResults} items={[...(setup?.providers ?? []),{id:"__custom__",name:t.customProvider}]} onChange={value => { setToken(""); if(value === "__custom__") {setConnectionMode("custom");setProvider("");} else {setConnectionMode("builtin");setProvider(value);} }}/></div>
 
                   {connectionMode === "builtin" && provider &&
                   <div className="space-y-4 border-t border-border pt-4">
@@ -650,7 +653,7 @@ export function App() {
                   
                 </TabsContent>
                 <TabsContent value="tools" className="m-0 space-y-4"><ToolsPanel /></TabsContent>
-                <TabsContent value="environment" className="m-0 space-y-4"><Card className="border-border shadow-none"><CardHeader><CardTitle>{t.environment}</CardTitle><CardDescription>{t.envHint}</CardDescription></CardHeader><CardContent className="space-y-3">{cardNotice("environment")}
+                <TabsContent value="environment" className="m-0 space-y-4"><Card className="border-border shadow-none"><CardHeader><CardTitle>{t.environment}</CardTitle><CardDescription>{t.envHint}</CardDescription></CardHeader><CardContent className="space-y-3">{cardNotice(["environment"])}
                   {envRows.map((row,index) => <div key={index} className="space-y-2 rounded-lg border border-border p-3"><div className="flex items-center gap-2">{editingEnv === index ? <Input aria-label={t.variableName} placeholder={t.variableName} value={row.name} disabled={environmentBusy} onChange={event => setEnvRows(rows => rows.map((r,i) => i === index ? {...r,name:event.target.value} : r))} /> : <span className="min-w-0 flex-1 truncate text-sm font-medium" title={row.name}>{row.name}</span>}<Button variant="ghost" disabled={environmentBusy} onClick={() => setEditingEnv(index)}>{t.editValue}</Button><Switch aria-label={t.enabled} checked={row.enabled} disabled={environmentBusy} onCheckedChange={enabled => setEnvRows(rows => rows.map((r,i) => i === index ? {...r,enabled} : r))} /><Button variant="ghost" disabled={environmentBusy} aria-label={t.deleteEntry} onClick={() => { setEnvRows(rows => rows.filter((_,i) => i !== index)); setEditingEnv(null); }}><X /></Button></div>{editingEnv === index && <Input type="password" autoComplete="off" aria-label={t.variableValue} placeholder={t.variableValue} value={row.value} disabled={environmentBusy} onChange={event => setEnvRows(rows => rows.map((r,i) => i === index ? {...r,value:event.target.value} : r))} />}</div>)}
                   <div className="flex gap-2"><Button variant="outline" disabled={!envLoaded || environmentBusy} onClick={() => { setEditingEnv(envRows.length); setEnvRows(rows => [...rows,{name:"",value:"",enabled:true}]); }}><Plus />{t.addEntry}</Button><Button className="ml-auto" disabled={!envLoaded || environmentBusy} onClick={saveEnvironment}>{t.save}</Button></div>
                 </CardContent></Card></TabsContent>
@@ -660,7 +663,7 @@ export function App() {
                   </CardContent></Card>
                 </TabsContent>
                 <TabsContent value="general" className="m-0 space-y-4">
-                  <Card className="border-border shadow-none">{cardNotice("language", "profile")}<CardHeader><CardTitle>{t.language}</CardTitle><CardDescription>{t.languageHint}</CardDescription></CardHeader><CardContent>
+                  <Card className="border-border shadow-none">{cardNotice(["language", "profile"])}<CardHeader><CardTitle>{t.language}</CardTitle><CardDescription>{t.languageHint}</CardDescription></CardHeader><CardContent>
                     {interfaceLanguageSelect}
                     <div className="mt-6 space-y-4 border-t border-border pt-5">
                       {replyLanguageField}
@@ -744,7 +747,7 @@ export function App() {
             {heldCatalog.reasons.map(reason => <li key={reason}>{reason}</li>)}
           </ul>}
           {heldCatalog && catalogChangeSummary(heldCatalog.changes) && <p className="text-sm">{catalogChangeSummary(heldCatalog.changes)}</p>}
-          {cardNotice("catalog-accept", "catalog-reject")}
+          {cardNotice(["catalog-accept", "catalog-reject"])}
           <div className="flex justify-end gap-2">
             <Button variant="outline" disabled={catalogDeciding} onClick={() => void decideHeldCatalog("reject")}>{review.reject}</Button>
             <Button disabled={catalogDeciding} onClick={() => void decideHeldCatalog("accept")}>{review.accept}</Button>
