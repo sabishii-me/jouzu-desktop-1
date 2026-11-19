@@ -511,7 +511,8 @@ export function App() {
   const providerOauth = connectionMode === "builtin" && provider === "openai-codex";
   const providerSignedIn = !!setup?.credentials.some(item => item.providerId === provider);
   // What the provider said to the latest reply: a stored sign-in it refused is not "connected".
-  const shisaRefused = setup?.account.signedIn ? appView?.providerAuth?.shisa : undefined;
+  // The Shisa.AI sign-in is the credential of every provider marked signIn "shisa".
+  const shisaRefused = setup?.account.signedIn ? setup.providers.filter(item => item.signIn === "shisa").map(item => appView?.providerAuth?.[item.id]).find(Boolean) : undefined;
   // Shisa is an account, not a provider credential. Its saved key is shown by
   // the Shisa.AI card and must not appear again as a phantom provider row.
   const otherProviders = setup ? [...new Set([...setup.credentials.map(c => c.providerId), ...setup.customProviders.map(c => c.id)])].filter(id => id !== "shisa") : [];

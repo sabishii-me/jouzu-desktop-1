@@ -218,6 +218,12 @@ try {
   const { readShisaAccountStatus } = await load('shisa-link/account');
   const account = { ...readShisaAccountStatus(paths), ...(signOutRevocation ? { revocation: signOutRevocation } : {}) };
   const credentials = await auth.list();
+  // Which providers the Shisa.AI sign-in authenticates: those the runtime made
+  // from the Shisa API catalog (its identity binds the catalog source's URL).
+  const { SHISA_API_CATALOG_SOURCE } = await load('catalog-sources');
+  const { catalogRuntimeIdentity, catalogRuntimeProvider } = await load('model-catalog-projection');
+  const shisaBinding = catalogRuntimeProvider('', '', SHISA_API_CATALOG_SOURCE.url).split(':').at(-1);
+  const signIn = id => id === 'shisa' || (catalogRuntimeIdentity(id) && id.split(':').length === 4 && id.split(':').at(-1) === shisaBinding) ? { signIn: 'shisa' } : {};
   // The language a new runtime starts with, resolved the way Jouzu's startup does.
   const { readLocalizationSettings, resolveUiLocale, osLocaleCandidates } = await load('ui-locale');
   const { resolveResponseLanguage, resolveArtifactPolicy } = await load('language-settings');
@@ -230,7 +236,7 @@ try {
     responseLanguage: pick(resolveResponseLanguage({ config: savedSettings?.responseLanguage })),
     artifactPolicy: pick(resolveArtifactPolicy(savedSettings?.artifactPolicy ? { config: savedSettings.artifactPolicy } : {})),
   };
-  console.log(JSON.stringify({ schemaVersion: 1, ...(catalog ? { catalog } : {}), language, profile: readProfileChoice(profilePath)?.profile ?? null, account, customProviders, providers: runtime.getProviders().map(p => ({ id: p.id, name: p.id === 'openai-codex' ? 'Codex' : (p.name ?? p.id), oauth: !!p.auth?.oauth, oauthName: p.auth?.oauth?.name, apiKey: !!p.auth?.apiKey })), credentials, defaultProvider: settings.getDefaultProvider(), defaultModel: settings.getDefaultModel() }));
+  console.log(JSON.stringify({ schemaVersion: 1, ...(catalog ? { catalog } : {}), language, profile: readProfileChoice(profilePath)?.profile ?? null, account, customProviders, providers: runtime.getProviders().map(p => ({ id: p.id, name: p.id === 'openai-codex' ? 'Codex' : (p.name ?? p.id), oauth: !!p.auth?.oauth, oauthName: p.auth?.oauth?.name, apiKey: !!p.auth?.apiKey, ...signIn(p.id) })), credentials, defaultProvider: settings.getDefaultProvider(), defaultModel: settings.getDefaultModel() }));
 } catch {
   // Do not relay raw upstream errors: they can contain credentials or server input.
   const messages = {
