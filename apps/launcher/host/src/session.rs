@@ -715,6 +715,9 @@ pub struct Session {
     fresh: AtomicBool,
     /// A client with a stream showed it: leaving it untouched hands its runtime back.
     shown: AtomicBool,
+    /// Clients that show it now (a client shows one session at a time; one whose
+    /// stream dropped keeps showing it until it opens another).
+    viewers: AtomicUsize,
     first_output_turn: Mutex<Option<String>>,
     first_output: Mutex<FirstOutput>,
     /// Held while this session attaches to a runtime from the warm pool.
@@ -5095,6 +5098,7 @@ impl Session {
             reclaim_waiting: AtomicBool::new(false),
             fresh: AtomicBool::new(false),
             shown: AtomicBool::new(false),
+            viewers: AtomicUsize::new(0),
             queue_paused: AtomicBool::new(false),
             first_output_turn: Mutex::new(None),
             next_message: AtomicU64::new(0),
@@ -5716,6 +5720,28 @@ impl Session {
                 // Commands still open went down with the runtime: none of them
                 // will answer, and none of their effects can be assumed.
                 self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+                // A runtime is started for a session someone uses. One that dies
+                // while its session waits for nobody (idle, nothing queued, no
+                // client shows or follows it) is not replaced now: the session
+                // stops, and starts a runtime again for its next message or when
+                // it is opened. Replacing every such runtime at once competes
+                // with the one session the user is in (all of a machine's
+                // runtimes can go down together).
+                if self.status() == Status::Idle
+                    && self.run().is_none()
+                    && self.queue_guard().is_empty()
+                    && self.viewers.load(Ordering::SeqCst) == 0
+                    && self.subscriber_count() == 0
+                {
+                    log(
+                        &self.home,
+                        "info",
+                        "runtime.not_replaced",
+                        json!({ "session": self.id, "reason": "exited while nobody uses the session" }),
+                    );
+                    self.stop();
+                    return;
+                }
                 if !matches!(self.status(), Status::Stopped) {
                     let status = self.status();
                     let finalize = self.run_reached_runtime()
@@ -6860,16 +6886,19 @@ impl SessionManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_mut(client_id)
         {
-            Some(holder) => {
-                holder.session = Some(session_id.to_string());
-                true
-            }
-            None => false,
+            Some(holder) => Some(holder.session.replace(session_id.to_string())),
+            None => None,
         };
-        if held {
-            if let Some(session) = self.get(session_id) {
-                session.shown.store(true, Ordering::SeqCst);
+        // Only a client with a connected stream holds anything.
+        let Some(before) = held else { return };
+        if let Some(session) = self.get(session_id) {
+            session.shown.store(true, Ordering::SeqCst);
+            if before.as_deref() != Some(session_id) {
+                session.viewers.fetch_add(1, Ordering::SeqCst);
             }
+        }
+        if let Some(left) = before.filter(|before| before != session_id).and_then(|before| self.get(&before)) {
+            let _ = left.viewers.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| count.checked_sub(1));
         }
     }
 

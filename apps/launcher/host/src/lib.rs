@@ -4917,6 +4917,9 @@ mod session_tests {
             manager_with_env(50, &[("FAKE_RUNTIME_MODELS_FILE", file.as_str())]);
         let session = manager.create_pending(workspace.path().to_str().unwrap(), None, None).unwrap();
         session.attach_early();
+        // A window shows it.
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &session.id);
         wait_status(&session, Status::Idle).await;
         wait_until(|| session.summary()["models"].as_array().map_or(0, Vec::len) == 2).await;
         session.select_model("fixture", "other").await.unwrap();
@@ -4936,6 +4939,8 @@ mod session_tests {
         let (manager, _home, workspace) = manager(50);
         let session = manager.create_pending(workspace.path().to_str().unwrap(), None, None).unwrap();
         session.attach_early();
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &session.id);
         session.send("first", "hello").unwrap();
         wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
         let pid = session.runtime_pid().unwrap();
@@ -4944,6 +4949,39 @@ mod session_tests {
         // The session is still there: its message is held, not refused.
         session.send("during", "again").unwrap();
         wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().filter(|row| row["kind"] == "assistant").count() == 2)).await;
+        manager.stop_all();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_runtime_that_dies_under_a_session_nobody_uses_is_not_replaced_until_it_is_used() {
+        let (manager, _home, workspace) = manager(50);
+        let folder = workspace.path().to_str().unwrap();
+        let shown = manager.create_pending(folder, None, None).unwrap();
+        shown.attach_early();
+        let left = manager.create_pending(folder, None, None).unwrap();
+        left.attach_early();
+        let _stream = manager.connect_client("window");
+        // The window showed `left`, then moved to `shown`.
+        manager.hold("window", &left.id);
+        manager.hold("window", &shown.id);
+        for session in [&shown, &left] {
+            session.send(&format!("first-{}", session.id), "hello").unwrap();
+        }
+        for session in [&shown, &left] {
+            wait_until(|| session.status() == Status::Idle && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))).await;
+        }
+        let (shown_pid, left_pid) = (shown.runtime_pid().unwrap(), left.runtime_pid().unwrap());
+        for pid in [shown_pid, left_pid] {
+            std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status().unwrap();
+        }
+        // The session the window shows gets a new runtime at once.
+        wait_until(|| shown.runtime_pid().is_some_and(|now| now != shown_pid) && shown.status() == Status::Idle).await;
+        // The one nobody uses waits for its next message, which it still takes.
+        wait_until(|| left.status() == Status::Stopped).await;
+        assert!(left.runtime_pid().is_none_or(|pid| pid == left_pid), "no new runtime");
+        left.send("again", "again").unwrap();
+        wait_until(|| left.status() == Status::Idle && left.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().filter(|row| row["kind"] == "assistant").count() == 2)).await;
         manager.stop_all();
     }
 

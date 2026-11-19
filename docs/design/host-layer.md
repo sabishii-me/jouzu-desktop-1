@@ -63,7 +63,11 @@ describes no screens; what a person sees is in the UI document.
 - The session owns its messages whatever its runtime does. While the runtime is
   starting or being replaced after it exited (`recovering`), a message is
   accepted and waits for it. A stopped session starts a runtime again for the
-  next message (the same session, no reopening by the client). Only a failed
+  next message (the same session, no reopening by the client). A runtime that
+  exits while its session waits for nobody (idle, nothing queued, no client
+  shows or follows it) is not replaced then: the session stops and starts one
+  for its next message or when it is opened, so runtimes that go down together
+  are not all restarted against the session the user is in. Only a failed
   session refuses (`session-stopped`) until the user restarts it.
 - Open question: confirm that a message sent while a Flow run is streaming is
   delivered as a steer under these rules.
