@@ -37,7 +37,7 @@ test('settings that cannot be read do not move the panel', async ({ page }) => {
   await stubHostControl(page, body => { if (body.action === 'status') throw new Error('control unavailable'); return emptyControlState; });
   await page.route('**/v1/environment', route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ entries: [] }) }));
   const dialog = await openSettings(page);
-  await expectNoShift(dialog, dialog.getByRole('alert').filter({ hasText: 'control unavailable' }));
+  await expectNoShift(dialog, dialog.getByRole('alert').filter({ hasText: "Jouzu's settings could not be read. Nothing was changed." }));
 });
 
 test('a failed action on a card does not move that card or the cards below', async ({ page }) => {
@@ -47,7 +47,7 @@ test('a failed action on a card does not move that card or the cards below', asy
   const add = dialog.getByRole('button', { name: 'Add provider', exact: true });
   const before = [await top(signIn), await top(add)];
   await signIn.click();
-  const alert = dialog.getByRole('alert').filter({ hasText: 'sign-in refused' });
+  const alert = dialog.getByRole('alert').filter({ hasText: 'Sign-in to Shisa.AI did not complete.' });
   await expect(alert).toBeVisible();
   expect([await top(signIn), await top(add)]).toEqual(before);
   await alert.getByRole('button', { name: 'Dismiss', exact: true }).click();
