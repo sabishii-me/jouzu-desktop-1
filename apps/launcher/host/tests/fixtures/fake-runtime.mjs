@@ -1,8 +1,23 @@
 // Fake pi RPC runtime for host tests. It speaks the real wire shapes:
 // {id,type:"response",...}, extension_ui_request, and agent/message events.
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import readline from "node:readline";
+
+// Like the runtime: it opens a blank session of its own at start, in its home,
+// for the folder it runs in, and reports it (get_state) until switched away.
+let sessionFile = null;
+if (process.env.JOUZU_HOME) {
+  try {
+    const directory = join(process.env.JOUZU_HOME, "state", "sessions");
+    mkdirSync(directory, { recursive: true });
+    const id = randomUUID();
+    sessionFile = join(directory, `${new Date().toISOString().replace(/[:.]/gu, "-")}_${id}.jsonl`);
+    writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd: process.cwd() })}\n`);
+  } catch { sessionFile = null; }
+}
 
 const delay = Number(process.env.FAKE_RUNTIME_DELAY_MS ?? 15);
 const startDelay = Number(process.env.FAKE_RUNTIME_START_DELAY_MS ?? 0);
@@ -116,6 +131,15 @@ function tick() {
     });
     current.index += 1;
     timer = setTimeout(tick, delay);
+    return;
+  }
+  // The provider refuses the request with this text while the file holds it.
+  const refusal = process.env.FAKE_RUNTIME_REPLY_ERROR_FILE && existsSync(process.env.FAKE_RUNTIME_REPLY_ERROR_FILE)
+    ? readFileSync(process.env.FAKE_RUNTIME_REPLY_ERROR_FILE, "utf8").trim()
+    : "";
+  if (refusal) {
+    out({ type: "message_end", message: { role: "assistant", content: [], model: "fixture-model", provider: "fixture", stopReason: "error", errorMessage: refusal } });
+    settled(false);
     return;
   }
   out({
@@ -345,10 +369,18 @@ function run(text, images) {
 
 // Like the runtime: the models it registered, the one it uses (none when
 // FAKE_RUNTIME_NO_MODEL is set: nothing is configured) and the level.
-const fixtureModels = [
+const defaultModels = [
   { name: "fixture-model", provider: "fixture", id: "model" },
   { name: "Fixture Other", provider: "fixture", id: "other" },
 ];
+// FAKE_RUNTIME_MODELS_FILE: the configured models, read at start and again when
+// a session is opened (like the runtime, which builds its model runtime anew).
+const readModels = () => {
+  const file = process.env.FAKE_RUNTIME_MODELS_FILE;
+  if (!file || !existsSync(file)) return defaultModels;
+  try { return JSON.parse(readFileSync(file, "utf8")); } catch { return defaultModels; }
+};
+let fixtureModels = readModels();
 let currentModel = process.env.FAKE_RUNTIME_NO_MODEL ? null : fixtureModels[0];
 let currentLevel = "off";
 
@@ -380,7 +412,7 @@ lines.on("line", line => {
       response(value.id, "get_messages", { messages });
       break;
     case "get_state":
-      response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: currentModel, thinkingLevel: currentLevel, sessionFile: null });
+      response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: currentModel, thinkingLevel: currentLevel, sessionFile });
       selfRunWhen("ready");
       break;
     case "get_available_models":
@@ -422,15 +454,24 @@ lines.on("line", line => {
         failure(value.id, "switch_session", refusal);
         break;
       }
+      if (process.env.FAKE_RUNTIME_MODELS_FILE) {
+        // Opening a session reads the configuration again; a file with no model
+        // recorded starts on the runtime's first model.
+        fixtureModels = readModels();
+        currentModel = fixtureModels[0] ?? null;
+      }
       // Like the runtime: a saved conversation resumes on the model it last used.
       try {
         const changes = readFileSync(String(value.sessionPath), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.type === "model_change");
         const last = changes.at(-1);
         if (last) currentModel = { name: last.modelId, provider: last.provider, id: last.modelId };
       } catch {}
+      sessionFile = String(value.sessionPath);
       response(value.id, "switch_session", { cancelled: false });
       break;
     case "prompt":
+      // FAKE_RUNTIME_PROMPT_MODEL_LOG: which model each prompt arrived under.
+      if (process.env.FAKE_RUNTIME_PROMPT_MODEL_LOG) appendFileSync(process.env.FAKE_RUNTIME_PROMPT_MODEL_LOG, `${currentModel?.id ?? "none"}\n`);
       // Refused (if a run is going) only once its input handlers are done.
       prompt(value.id, String(value.message ?? ""), value.images);
       break;

@@ -4,7 +4,7 @@ import { ChatMarkdown } from "./chat-markdown";
 import type { ActiveTurn } from "./chat-types";
 import { Button } from "./components/ui/button";
 import { DetailsPopover } from "./control-result";
-import { useChatText } from "./chat-text";
+import { fill, replyReason, useChatText, type ChatText } from "./chat-text";
 
 type RecoveryAction = { label: string; run: () => void; disabled?: boolean };
 
@@ -14,31 +14,31 @@ const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms
  * The status line's words for a running turn, as the host reports it: which step,
  * what it is doing, and for how long when the wait is the point.
  */
-export function turnLabel(turn: ActiveTurn | null | undefined, now: number): string {
-  if (!turn) return "Working…";
-  if (turn.phase === "starting") return "Starting session…";
-  if (turn.phase === "cancelling") return "Stopping…";
+export function turnLabel(turn: ActiveTurn | null | undefined, now: number, t: ChatText): string {
+  if (!turn) return t.working;
+  if (turn.phase === "starting") return t.startingSession;
+  if (turn.phase === "cancelling") return t.stopping;
   const step = turn.step;
-  if (!step) return "Working…";
+  if (!step) return t.working;
   // The status line already shows the turn's own clock; a second one is only worth showing
   // once this state started later than the turn did.
   const ownClock = step.since !== undefined && (turn.startedAt === undefined || step.since - turn.startedAt >= 1000);
   const waited = ownClock ? ` · ${clock(Math.max(0, now - step.since!))}` : "";
   switch (step.state) {
-    case "waiting_model": return `Waiting for model${waited}`;
-    case "thinking": return "Thinking";
-    case "writing": return "Writing";
-    case "calling_tool": return "Preparing tool call";
+    case "waiting_model": return `${t.waitingModel}${waited}`;
+    case "thinking": return t.thinking;
+    case "writing": return t.writing;
+    case "calling_tool": return t.preparingTool;
     case "tools": {
       const names = [...new Set(step.tools.map(tool => tool.name))];
-      return names.length ? `Running ${names.join(", ")}${waited}` : "Tools done";
+      return names.length ? `${fill(t.runningTools, { names: names.join(", ") })}${waited}` : t.toolsDone;
     }
     case "retrying": {
       const attempt = step.retry?.attempt !== undefined ? ` ${step.retry.attempt}${step.retry.maxAttempts !== undefined ? `/${step.retry.maxAttempts}` : ""}` : "";
-      return `Model request failed, retrying${attempt}${step.retry?.error ? ` (${step.retry.error})` : ""}`;
+      return `${t.retryingModel}${attempt}${step.retry?.code ? ` (${replyReason(t, step.retry.code)})` : ""}`;
     }
-    case "compacting": return `Compacting context${waited}`;
-    default: return "Working…";
+    case "compacting": return `${t.compactingContext}${waited}`;
+    default: return t.working;
   }
 }
 
@@ -48,14 +48,13 @@ export function turnLabel(turn: ActiveTurn | null | undefined, now: number): str
  * the message that got no reply, or else the runtime's latest notice: one line,
  * one thing at a time, never a list. Tools stay in the activity strip.
  */
-export function AgentAction({ thinking, label, running, elapsed, settled, failure, noReply, hold, notice }: {
+export function AgentAction({ thinking, label, running, elapsed, settled, noReply, hold, notice }: {
   thinking: string;
   label: string;
   running: boolean;
   elapsed?: string;
-  settled?: "interrupted" | "failed";
-  /** The failed reply's own words, and the one action that recovers when one is known. */
-  failure?: { details?: string; action?: RecoveryAction };
+  /** The latest turn was stopped. A failed reply says so on the reply itself, not here. */
+  settled?: "interrupted";
   /** The last message got no reply: its text, the runtime's reason, and Retry. */
   noReply?: { text: string; details?: string; onRetry: () => void; action?: RecoveryAction } | null;
   /** Flow control is holding the last message: its words behind Details, and what lets it go. */
@@ -84,19 +83,16 @@ export function AgentAction({ thinking, label, running, elapsed, settled, failur
     return <div role="status" data-flow-hold className={`${row} text-amber-700 dark:text-amber-300`}>
       <AlertTriangle className="size-3.5 shrink-0" aria-hidden="true" />
       <span className="min-w-0 flex-1 truncate" title={t.flowHolding}>{t.flowHolding}</span>
-      <DetailsPopover details={hold.details} />
+      {hold.details && <DetailsPopover details={hold.details} />}
       {hold.paused && <Button type="button" variant="outline" className={small} disabled={hold.busy} onClick={hold.onResume}>{t.resume}</Button>}
       <Button type="button" variant="outline" className={small} disabled={hold.busy} onClick={hold.onRelease}>{t.release}</Button>
       <Button type="button" variant="ghost" className={small} disabled={hold.busy} onClick={hold.onOff}>{t.turnOffFlow}</Button>
     </div>;
   }
   if (!running && !text && settled) {
-    const Icon = settled === "failed" ? AlertTriangle : Square;
-    return <div role={settled === "failed" ? "alert" : "status"} aria-live="polite" data-reply-failed={settled === "failed" ? "" : undefined} className={`${row} ${settled === "failed" ? "text-destructive" : "text-muted-foreground"}`}>
-      <Icon className="size-3.5 shrink-0" aria-hidden="true" />
-      <span className="min-w-0 flex-1 font-medium">{settled === "failed" ? t.failed : t.interrupted}</span>
-      {settled === "failed" && failure?.details && <DetailsPopover details={failure.details} />}
-      {settled === "failed" && failure?.action && <Button type="button" variant="outline" className={small} disabled={failure.action.disabled} onClick={failure.action.run}>{failure.action.label}</Button>}
+    return <div role="status" aria-live="polite" className={`${row} text-muted-foreground`}>
+      <Square className="size-3.5 shrink-0" aria-hidden="true" />
+      <span className="min-w-0 flex-1 font-medium">{t.interrupted}</span>
     </div>;
   }
   if (!running && !text && notice) {
@@ -122,7 +118,7 @@ export function AgentAction({ thinking, label, running, elapsed, settled, failur
   return <div className="px-1">
     <button type="button" className="flex h-8 w-full min-w-0 items-center gap-2 rounded-md px-1 text-left text-[11px] text-muted-foreground hover:bg-muted/40" aria-expanded={open} onClick={() => setOpen(value => !value)}>
       <Brain className="size-3.5 shrink-0" aria-hidden="true" />
-      <span className="shrink-0 font-medium text-foreground">Reasoning</span>
+      <span className="shrink-0 font-medium text-foreground">{t.reasoning}</span>
       <span className="min-w-0 flex-1 truncate">{last}</span>
       <ChevronDown className={`size-3.5 shrink-0 transition-transform ${open ? "rotate-180" : ""}`} aria-hidden="true" />
     </button>

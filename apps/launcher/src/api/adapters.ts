@@ -52,7 +52,7 @@ function unavailableNative(): NativeApi {
 function hostGroups(client: HostClient) {
   const sessions: SessionApi = {
     list: () => client.sessions(),
-    attach: (workspacePath, sessionPath) => client.attach(workspacePath, sessionPath),
+    attach: (workspacePath, sessionPath, model) => client.attach(workspacePath, sessionPath, model),
     view: sessionId => client.view(sessionId),
     snapshot: sessionId => client.snapshot(sessionId),
     history: (sessionId, page) => client.history(sessionId, page),

@@ -1,6 +1,7 @@
 import { createContext, useContext, useId, useState, type ReactNode } from "react";
 import { Check, ChevronDown, Copy } from "lucide-react";
 import { copyText as copyToClipboard } from "../secure-context";
+import { useChatText, type ChatText } from "../chat-text";
 
 /** Chips render the same body without a second header/border. */
 export const ToolDetailContext = createContext(false);
@@ -15,13 +16,13 @@ const DOT: Record<ToolState, string> = {
   idle: "bg-muted-foreground/50",
 };
 
-const STATUS: Record<ToolState, string> = {
-  running: "Running",
-  done: "Completed",
-  error: "Failed",
-  warning: "Warning",
-  idle: "Pending",
-};
+const status = (t: ChatText): Record<ToolState, string> => ({
+  running: t.running,
+  done: t.completed,
+  error: t.failed,
+  warning: t.warning,
+  idle: t.pending,
+});
 
 export function StateDot({ state }: { state: ToolState }) {
   return <span className={`inline-block size-2 shrink-0 rounded-full ${DOT[state]}`} aria-hidden="true" />;
@@ -49,6 +50,7 @@ export function ToolFrame({ title, subtitle, state, defaultOpen, actions, childr
   autoOpen?: boolean;
   statusLabel?: string;
 }) {
+  const t = useChatText();
   const [manual, setManual] = useState<boolean | null>(null);
   const embedded = useContext(ToolDetailContext);
   const expandable = children !== undefined;
@@ -76,7 +78,7 @@ export function ToolFrame({ title, subtitle, state, defaultOpen, actions, childr
             : state === "error" ? "border-destructive/40 text-destructive"
               : state === "warning" ? "border-amber-500/40 text-amber-600"
                 : "border-border text-muted-foreground"
-        }`}>{statusLabel ?? STATUS[state]}</span>
+        }`}>{statusLabel ?? status(t)[state]}</span>
         {expandable && <ChevronDown className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`} aria-hidden="true" />}
       </button>
       {actions && <div className="flex shrink-0 items-center gap-1">{actions}</div>}
@@ -92,6 +94,7 @@ export function ToolSection({ label, copyText, children, maxHeight = "max-h-96" 
   children: ReactNode;
   maxHeight?: string;
 }) {
+  const t = useChatText();
   const [copied, setCopied] = useState(false);
   return <div className="space-y-1">
     <div className="flex items-center justify-between gap-2">
@@ -108,7 +111,7 @@ export function ToolSection({ label, copyText, children, maxHeight = "max-h-96" 
             setCopied(false);
           }
         }}
-      >{copied ? <Check className="size-3" /> : <Copy className="size-3" />}{copied ? "Copied" : "Copy"}</button>}
+      >{copied ? <Check className="size-3" /> : <Copy className="size-3" />}{copied ? t.copied : t.copy}</button>}
     </div>
     <div className={`overflow-auto ${maxHeight}`}>{children}</div>
   </div>;

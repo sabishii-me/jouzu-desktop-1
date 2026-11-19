@@ -1,7 +1,8 @@
 //! Web access (issue #91): who may use the Jouzu web UI besides the desktop window.
 //!
 //! The desktop window keeps talking to the internal loopback listener with the
-//! per-process token from `host.json`; nothing here changes that path. Web access
+//! per-process token the host handed to the desktop when it started (never in a
+//! file, #130); nothing here changes that path. Web access
 //! adds separate listeners on a persistent port, only when the user turns it on:
 //!
 //! * `Off` (default): no extra listener at all.

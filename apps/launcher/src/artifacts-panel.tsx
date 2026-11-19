@@ -9,6 +9,7 @@ import { ImageViewer } from "./components/image-viewer";
 import { ChatMarkdown } from "./chat-markdown";
 import type { OutputReference } from "./artifact-references";
 import { ErrorLine } from "./session-alerts-view";
+import { useChatText, type ChatText } from "./chat-text";
 
 interface ArtifactRecord {
   id: string;
@@ -46,12 +47,12 @@ function referenceRecord(reference: OutputReference): ArtifactRecord {
 const normalizePath = (path?: string) => (path ?? "").replaceAll("\\", "/").replace(/\/+/gu, "/").toLowerCase();
 
 /** A stored file name, unless it is the digest-style name the store gives it. */
-function displayName(item: ArtifactRecord): string {
+function displayName(item: ArtifactRecord, t: ChatText): string {
   if (item.prompt?.trim()) return item.prompt.trim();
   const file = (item.absolutePath ?? item.path ?? "").split(/[\\/]/u).pop() ?? "";
   const stem = file.replace(/\.[^.]+$/u, "");
   if (stem && !/^[0-9a-f]{32,}$/iu.test(stem)) return file;
-  return item.kind === "documents" ? "Text artifact" : `${item.kind ?? "Artifact"} ${item.id.slice(0, 8)}`;
+  return item.kind === "documents" ? t.textArtifact : `${item.kind ?? "Artifact"} ${item.id.slice(0, 8)}`;
 }
 
 function Thumb({ id, alt, onOpen }: { id: string; alt: string; onOpen: () => void }) {
@@ -71,6 +72,7 @@ function Thumb({ id, alt, onOpen }: { id: string; alt: string; onOpen: () => voi
 
 /** Stored artifacts plus the turn's in-place outputs; Save freezes a copy. */
 export function ArtifactsPanel({ sessionId, references = [], workspace, embedded = false }: { sessionId?: string; references?: readonly OutputReference[]; workspace?: string; embedded?: boolean } = {}) {
+  const t = useChatText();
   const api = useApi();
   const [items, setItems] = useState<ArtifactRecord[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -113,7 +115,7 @@ export function ArtifactsPanel({ sessionId, references = [], workspace, embedded
   async function view(item: ArtifactRecord) {
     try {
       const result = await api.artifacts.read(item.id);
-      const title = displayName(item);
+      const title = displayName(item, t);
       if (isImage(item.mimeType ?? result.mimeType)) {
         setViewing({ src: `data:${result.mimeType};base64,${result.data}`, title });
       } else if (isText(item.mimeType ?? result.mimeType)) {
@@ -124,7 +126,7 @@ export function ArtifactsPanel({ sessionId, references = [], workspace, embedded
       } else if (item.absolutePath) {
         await invoke("reveal_path", { path: item.absolutePath });
       } else {
-        setError("This artifact has no preview.");
+        setError(t.noArtifactPreview);
       }
     } catch (failure) {
       setError(String(failure));
@@ -132,7 +134,7 @@ export function ArtifactsPanel({ sessionId, references = [], workspace, embedded
   }
 
   async function remove(item: ArtifactRecord) {
-    const okay = await confirm("Delete this artifact? The file is removed from disk.", { title: "Delete artifact", kind: "warning" });
+    const okay = await confirm("Delete this artifact? The file is removed from disk.", { title: t.deleteArtifact, kind: "warning" });
     if (!okay) return;
     try {
       await api.artifacts.delete(item.id);
@@ -144,32 +146,32 @@ export function ArtifactsPanel({ sessionId, references = [], workspace, embedded
 
   return <Card className={embedded ? "border-0 bg-transparent shadow-none" : "border-border shadow-none"}>
     {!embedded && <CardHeader>
-      <CardTitle>Artifacts</CardTitle>
+      <CardTitle>{t.artifacts}</CardTitle>
       <CardDescription>{sessionId ? "AI outputs for this session. Save freezes a copy into the artifact store; unsaved items stay in the workspace." : "Saved artifacts, newest first."}</CardDescription>
     </CardHeader>}
     <CardContent className={embedded ? "space-y-4 p-0" : "space-y-4"}>
-      {error && <ErrorLine raw={error} failed="This artifacts action did not complete." onDismiss={() => setError(null)} />}
-      {!items && !error && <p className="text-sm text-muted-foreground">Loading artifacts…</p>}
-      {items && !visible.length && <p className="text-sm text-muted-foreground">No AI outputs in this session yet.</p>}
+      {error && <ErrorLine raw={error} failed={t.artifactsActionFailed} onDismiss={() => setError(null)} />}
+      {!items && !error && <p className="text-sm text-muted-foreground">{t.loadingArtifacts}</p>}
+      {items && !visible.length && <p className="text-sm text-muted-foreground">{t.noArtifacts}</p>}
       {items && visible.length > 0 && <>
         <p className="text-xs text-muted-foreground">{visible.length} artifact{visible.length === 1 ? "" : "s"}</p>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
           {visible.map(item => <div key={item.id} className="space-y-2">
             {isImage(item.mimeType) && !item.reference
-              ? <Thumb id={item.id} alt={displayName(item)} onOpen={() => void view(item)} />
-              : <button type="button" className="flex aspect-square w-full items-center justify-center rounded-md border border-border bg-muted/40" onClick={() => { if (!item.reference) void view(item); }} title={displayName(item)}><FileText className="size-7 text-muted-foreground" /></button>}
-            <p className="line-clamp-2 text-[11px] text-muted-foreground" title={displayName(item)}>{displayName(item)}</p>
+              ? <Thumb id={item.id} alt={displayName(item, t)} onOpen={() => void view(item)} />
+              : <button type="button" className="flex aspect-square w-full items-center justify-center rounded-md border border-border bg-muted/40" onClick={() => { if (!item.reference) void view(item); }} title={displayName(item, t)}><FileText className="size-7 text-muted-foreground" /></button>}
+            <p className="line-clamp-2 text-[11px] text-muted-foreground" title={displayName(item, t)}>{displayName(item, t)}</p>
             <p className="truncate text-[10px] text-muted-foreground">{item.reference ? "Not saved · workspace reference" : [item.source?.model, item.dimensions?.width && item.dimensions?.height ? `${item.dimensions.width}×${item.dimensions.height}` : "", item.createdAt ? new Date(item.createdAt).toLocaleString() : ""].filter(Boolean).join(" · ")}</p>
             <div className="flex flex-wrap gap-1">
               {item.reference
                 ? <>
                     {workspace && <Button variant="outline" className="h-7 gap-1 px-2 text-[11px]" disabled={saving === item.path} onClick={() => { const reference = references.find(value => normalizePath(value.path) === normalizePath(item.path)); if (reference) void save(reference); }}><FileText className="size-3" />{saving === item.path ? "Saving…" : "Save"}</Button>}
-                    <Button variant="ghost" className="h-7 gap-1 px-2 text-[11px]" onClick={() => { void invoke("reveal_path", { path: item.absolutePath }).catch(() => {}); }}><FolderOpen className="size-3" />Reveal</Button>
+                    <Button variant="ghost" className="h-7 gap-1 px-2 text-[11px]" onClick={() => { void invoke("reveal_path", { path: item.absolutePath }).catch(() => {}); }}><FolderOpen className="size-3" />{t.reveal}</Button>
                   </>
                 : <>
-                    <Button variant="ghost" className="h-7 gap-1 px-2 text-[11px]" onClick={() => void view(item)}><Eye className="size-3" />Open</Button>
-                    {item.absolutePath && <Button variant="ghost" className="h-7 gap-1 px-2 text-[11px]" onClick={() => { void invoke("reveal_path", { path: item.absolutePath }).catch(() => {}); }}><FolderOpen className="size-3" />Reveal</Button>}
-                    <Button variant="ghost" className="h-7 gap-1 px-2 text-[11px] text-destructive" onClick={() => void remove(item)}><Trash2 className="size-3" />Delete</Button>
+                    <Button variant="ghost" className="h-7 gap-1 px-2 text-[11px]" onClick={() => void view(item)}><Eye className="size-3" />{t.open}</Button>
+                    {item.absolutePath && <Button variant="ghost" className="h-7 gap-1 px-2 text-[11px]" onClick={() => { void invoke("reveal_path", { path: item.absolutePath }).catch(() => {}); }}><FolderOpen className="size-3" />{t.reveal}</Button>}
+                    <Button variant="ghost" className="h-7 gap-1 px-2 text-[11px] text-destructive" onClick={() => void remove(item)}><Trash2 className="size-3" />{t.delete}</Button>
                   </>}
             </div>
           </div>)}
@@ -181,7 +183,7 @@ export function ArtifactsPanel({ sessionId, references = [], workspace, embedded
       <div className="flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl">
         <div className="flex items-center justify-between border-b border-border px-4 py-2">
           <h3 className="min-w-0 truncate text-sm font-semibold">{viewingText.title}</h3>
-          <Button variant="ghost" className="h-7 px-2 text-xs" onClick={() => setViewingText(null)}>Close</Button>
+          <Button variant="ghost" className="h-7 px-2 text-xs" onClick={() => setViewingText(null)}>{t.close}</Button>
         </div>
         {viewingText.markdown
           ? <div className="min-h-0 flex-1 overflow-auto p-4 text-sm"><ChatMarkdown text={viewingText.text} /></div>

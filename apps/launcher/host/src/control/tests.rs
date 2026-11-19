@@ -121,7 +121,7 @@ if (request.action === 'shisa-login') {{
   process.stderr.write(JSON.stringify({{ type: 'device', url: 'https://platform.shisa.ai/connect', code: 'ABCD' }}) + '\n');
   await new Promise(() => setInterval(() => {{}}, 1000));
 }}
-const settings = {{ schemaVersion: 1, last: request.action, key: process.env.SHISA_API_KEY ?? null }};
+const settings = {{ schemaVersion: 1, last: request.action, key: process.env.SHISA_API_KEY ?? null, account: {{ signedIn: true, providers: ['shisa', 'catalog:ai.shisa.api-router:Shisa%20AI:57024af9495fc6b0'] }}, providers: [{{ id: 'openai', name: 'OpenAI' }}] }};
 if (request.action === 'refresh-catalogs') settings.catalog = {{ status: 'quarantined', sources: [], held: {{ revision: 'r1' }} }};
 console.log(JSON.stringify(settings));
 "#
@@ -197,6 +197,28 @@ async fn a_failure_is_recorded_on_its_kind_only() {
     assert_eq!(last["provider-key"]["text"], "Could not save the provider key.");
     assert_eq!(last["language"]["ok"], true);
     assert_eq!(view["settings"]["last"], "language");
+}
+
+/// A result names the provider its operation was for, so a client shows it
+/// at that provider only (ui-layer §8); a cancelled one too. Operations that
+/// are for no provider name none.
+#[tokio::test]
+async fn a_result_names_the_provider_it_was_for() {
+    let root = tempfile::tempdir().unwrap();
+    let Some(control) = fake_service(root.path()) else { return };
+    control.enqueue("provider-key", &json!({ "provider": "a", "token": "fail" })).unwrap();
+    control.enqueue("default-model", &json!({ "provider": "b", "model": "m" })).unwrap();
+    control.enqueue("provider-key", &json!({ "provider": "c", "token": "sleep:300" })).unwrap();
+    let doomed = control.enqueue("provider-remove", &json!({ "provider": "d" })).unwrap();
+    control.enqueue("language", &json!({ "uiLocale": "ja" })).unwrap();
+    assert!(control.cancel(doomed["operationId"].as_str().unwrap()));
+    let view = settled(&control).await;
+    let last = &view["config"]["lastResult"];
+    assert_eq!(last["provider-key"]["provider"], "c", "{view}");
+    assert_eq!(last["default-model"]["provider"], "b", "{view}");
+    assert_eq!(last["provider-remove"]["code"], "config-cancelled", "{view}");
+    assert_eq!(last["provider-remove"]["provider"], "d", "{view}");
+    assert!(last["language"]["provider"].is_null(), "{view}");
 }
 
 #[tokio::test]
@@ -293,4 +315,22 @@ async fn a_panic_after_an_operation_does_not_stop_the_queue() {
     let view = settled(&control).await;
     assert_eq!(view["config"]["lastResult"]["language"]["ok"], true, "{view}");
     assert_eq!(view["config"]["lastResult"]["status"]["ok"], true, "{view}");
+}
+
+/// Signing in to Shisa.AI again replaces what earlier replies said about every
+/// provider the sign-in authenticates, and nothing about the others.
+#[tokio::test]
+async fn a_new_shisa_sign_in_clears_the_refusals_of_its_providers() {
+    let root = tempfile::tempdir().unwrap();
+    let Some(control) = fake_service(root.path()) else { return };
+    let answers = Arc::new(crate::provider_answers::ProviderAnswers::new());
+    control.watch_providers(answers.clone());
+    let shisa = "catalog:ai.shisa.api-router:Shisa%20AI:57024af9495fc6b0";
+    answers.reply(shisa, Some("401 Unauthorized"), "t1");
+    answers.reply("openai", Some("401 Unauthorized"), "t1");
+    control.enqueue("shisa-logout", &json!({})).unwrap();
+    let view = settled(&control).await;
+    assert_eq!(view["config"]["lastResult"]["shisa-logout"]["ok"], true, "{view}");
+    assert!(answers.view().get(shisa).is_none(), "{}", answers.view());
+    assert!(answers.view().get("openai").is_some(), "{}", answers.view());
 }

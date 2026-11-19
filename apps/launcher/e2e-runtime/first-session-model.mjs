@@ -1,9 +1,11 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { hostAccess } from './host-access.mjs';
 
 // Regression check for #99: the first new session after the host starts shows a
-// model. Its model is the one its runtime reports (the host keeps no default of
-// its own), so the session goes from "resolving" to "ready" without anything sent.
+// model and takes a message at once. Its model is the one its runtime reports;
+// until the runtime answers, the host shows the runtimes' earlier answer, and a
+// message sent meanwhile waits for the model instead of being refused.
 // Against a host JUST started on a throwaway home (JOUZU_E2E_HOST_HOME: the host's
 // --home, with a usable default model). Never touches the user's data folder.
 const hostHome = process.env.JOUZU_E2E_HOST_HOME;
@@ -12,7 +14,7 @@ if (!hostHome || !workspace) {
   console.error('JOUZU_E2E_HOST_HOME or JOUZU_E2E_WORKSPACE is not set; skipping the first session model check.');
   process.exit(2);
 }
-const host = JSON.parse(readFileSync(join(hostHome, 'host.json'), 'utf8'));
+const host = hostAccess(hostHome);
 const base = `http://127.0.0.1:${host.port}`;
 const headers = { authorization: `Bearer ${host.token}`, 'content-type': 'application/json' };
 const call = async (path, body) => {
@@ -26,8 +28,13 @@ const check = (name, ok, detail) => { results.push({ name, ok: !!ok, detail }); 
 
 const created = await call('/v1/sessions', { workspacePath: workspace });
 const atCreate = created.model?.state ?? 'none';
+// Sent the moment the session exists: accepted, never refused for a model on its way.
+const sent = await fetch(`${base}/v1/sessions/${created.sessionId}/messages`, {
+  method: 'POST', headers, body: JSON.stringify({ clientMessageId: `first-${Date.now()}`, text: 'Reply with only the word ok.' }),
+});
+check('a message sent at once is accepted', sent.ok, `status ${sent.status}`);
 let model = created.model ?? {};
-for (let attempt = 0; attempt < 120 && model.state === 'resolving'; attempt += 1) {
+for (let attempt = 0; attempt < 20 && model.state === 'resolving'; attempt += 1) {
   await new Promise(resolve => setTimeout(resolve, 250));
   model = (await call(`/v1/sessions/${created.sessionId}`)).model ?? {};
 }

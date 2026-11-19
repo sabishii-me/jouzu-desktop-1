@@ -85,6 +85,5 @@ export function explainError(error: unknown, failed: string): Explained {
   if (error instanceof TypeError && /fetch|network/iu.test(error.message)) return { text: "Cannot reach Jouzu. Check that the app is still running.", details };
   if (isCapacityError(raw)) return { text: CAPACITY_MESSAGE, details };
   if (isFlowHistoryError(raw)) return { text: "Flow request history is full. Clear it before sending again.", details };
-  if (isImageRefused(raw)) return { text: "The model rejected a request because of an image in this conversation.", details };
   return { text: sentence(failed), details };
 }

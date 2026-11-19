@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { SessionStore, type SessionPort } from "./session-store";
+import { knownModels, SessionStore, type SessionPort } from "./session-store";
 import type { ApiEvent, HistoryPage } from "./api/jouzu-api";
 
 function fakeSession(): SessionPort & { emit: (event: ApiEvent) => void; sent: unknown[]; stopped: boolean } {
@@ -544,7 +544,7 @@ describe("SessionStore", () => {
     expect(cancelled).toEqual(["c-2"]);
   });
 
-  it("switches a new session to the remembered model once, when its runtime offers it", async () => {
+  it("shows the model the host expects while resolving and never switches models on its own", async () => {
     const stored = new Map<string, string>([["jouzu.chat.model", JSON.stringify({ provider: "p", id: "remembered" })]]);
     vi.stubGlobal("localStorage", {
       getItem: (key: string) => stored.get(key) ?? null,
@@ -555,32 +555,22 @@ describe("SessionStore", () => {
       const selected: string[] = [];
       const api = { models: { select: async (_session: string, provider: string, id: string) => { selected.push(`${provider}/${id}`); } } };
       const feed = (target: SessionStore, value: ApiEvent) => (target as unknown as { handle: (event: ApiEvent) => void }).handle(value);
-      const ready = (models: Array<{ provider: string; id: string }>) => ({ model: { provider: "p", id: "runtime-pick", name: "Runtime pick", state: "ready" }, models: models.map(model => ({ ...model, name: model.id })) });
-      // Not offered by this runtime: the runtime's model stays, the memory is kept.
-      // The host gives a new conversation its file at creation too.
-      const first = { ...fakeSession(), sessionPath: "/new-1.jsonl" };
-      const store = SessionStore.attach(first, undefined, api as never, true);
-      feed(store, event(1, "session.updated", ready([{ provider: "p", id: "runtime-pick" }])));
-      expect(selected).toEqual([]);
-      expect(stored.get("jouzu.chat.model")).toContain("remembered");
-      // Offered: switched to once, while resolving nothing is asked.
-      const second = { ...fakeSession(), sessionPath: "/new-2.jsonl" };
-      const next = SessionStore.attach(second, undefined, api as never, true);
-      feed(next, event(1, "session.updated", { model: { state: "resolving" }, models: [] }));
-      expect(selected).toEqual([]);
-      feed(next, event(2, "session.updated", ready([{ provider: "p", id: "runtime-pick" }, { provider: "p", id: "remembered" }])));
-      feed(next, event(3, "session.updated", ready([{ provider: "p", id: "runtime-pick" }, { provider: "p", id: "remembered" }])));
+      const listed = [{ provider: "p", id: "runtime-pick", name: "Runtime pick" }, { provider: "p", id: "remembered", name: "Remembered" }];
+      const store = SessionStore.attach({ ...fakeSession(), sessionPath: "/new-1.jsonl" }, undefined, api as never, true);
+      // Before the runtime answers: the host's expected model and the runtimes' last list.
+      feed(store, event(1, "session.updated", { model: { state: "resolving", expected: listed[1] }, models: listed }));
+      expect(store.snapshot.modelState).toBe("resolving");
+      expect(store.snapshot.model).toBe("Remembered");
+      expect(store.snapshot.models).toHaveLength(2);
+      // The next new session shows them from its first frame.
+      expect(knownModels.models).toHaveLength(2);
+      expect(knownModels.model).toBe("Remembered");
+      // The pick is the host's to hand over (at creation): the store asks nothing.
+      feed(store, event(2, "session.updated", { model: { ...listed[1], state: "ready" }, models: listed }));
       await Promise.resolve();
-      expect(selected).toEqual(["p/remembered"]);
-      // A saved conversation keeps the model its runtime restored.
-      const saved = { ...fakeSession(), sessionPath: "/saved.jsonl" };
-      const third = SessionStore.attach(saved, undefined, api as never);
-      feed(third, event(1, "session.updated", ready([{ provider: "p", id: "runtime-pick" }, { provider: "p", id: "remembered" }])));
-      await Promise.resolve();
-      expect(selected).toEqual(["p/remembered"]);
+      expect(selected).toEqual([]);
+      expect(store.snapshot.model).toBe("Remembered");
       store.dispose();
-      next.dispose();
-      third.dispose();
     } finally {
       vi.unstubAllGlobals();
     }

@@ -7,6 +7,7 @@
  */
 import type { ApiEvent, HistoryPage, JouzuApi, OutgoingMessage, Receipt, SessionHandle } from "./jouzu-api";
 import { newId } from "../secure-context";
+import { readModelPreference } from "../chat-types";
 
 let clientSequence = 0;
 
@@ -32,7 +33,8 @@ export class HostChatSession {
   /** Attach to a saved session, or create a pending one when no path is given. */
   static async open(api: JouzuApi, workspacePath: string, sessionPath?: string): Promise<HostChatSession> {
     const clientId = newClientId();
-    const handle = await api.sessions.attach(workspacePath, sessionPath);
+    // A new conversation starts on the last picked model when the runtime offers it.
+    const handle = await api.sessions.attach(workspacePath, sessionPath, sessionPath ? undefined : readModelPreference());
     return new HostChatSession(api, handle.sessionId, clientId, handle);
   }
 

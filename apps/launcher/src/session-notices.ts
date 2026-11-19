@@ -13,6 +13,8 @@ export type SessionNotice =
   | { kind: "textguard-mode"; mode: TextGuardMode; text: string }
   | { kind: "textguard-alert"; text: string; withheld: boolean }
   | { kind: "flow-hold"; text: string; paused: boolean }
+  /** Flow paused only its automated turns; the person's next message resumes them. Nothing waits on the person. */
+  | { kind: "flow-paused"; text: string }
   | { kind: "toast"; text: string; level: "info" | "warning" | "error" };
 
 const level = (value: unknown): "info" | "warning" | "error" => value === "error" || value === "warning" ? value : "info";
@@ -31,6 +33,8 @@ const TEXTGUARD_MODE: Array<[RegExp, TextGuardMode]> = [
   [/^TextGuard is off for this session\b/u, "off"],
 ];
 
+const NEXT_MESSAGE_RESUMES = /\bresumes? on your next message\b|\bor your next message\b/iu;
+const HELD = /\bholding\b|\bis held\b|\bare held\b|withheld request|needs a decision/iu;
 const FLOW_HOLD = /\bholding\b|\bpaused\b|needs a decision|reconciliation|withheld request/iu;
 
 export function classifyNotice(message: string, notifyLevel?: unknown): SessionNotice {
@@ -44,6 +48,13 @@ export function classifyNotice(message: string, notifyLevel?: unknown): SessionN
     return { kind: "textguard-alert", text: withoutCommandAdvice(text, "textguard"), withheld: !/^TextGuard flagged\b/u.test(text) };
   }
   if (/^TextGuard\b/u.test(text)) return { kind: "toast", text: withoutCommandAdvice(text, "textguard") || text, level: level(notifyLevel) };
+  // "Paused after a provider failure / an interrupt / reopening. Automated work
+  // resumes on your next message": the person's own messages are not held, so
+  // this is not a hold to act on (#151). Text matching until Flow reports its
+  // state with structure (runtime request G11).
+  if (/\/flow\b/u.test(text) && NEXT_MESSAGE_RESUMES.test(text) && !HELD.test(text)) {
+    return { kind: "flow-paused", text: withoutCommandAdvice(text, "flow") };
+  }
   if (/\/flow\b/u.test(text) && FLOW_HOLD.test(text) && !/\bnot paused\b/iu.test(text)) {
     return { kind: "flow-hold", text: withoutCommandAdvice(text, "flow") || "Flow control is holding your message.", paused: /paused/iu.test(text) };
   }

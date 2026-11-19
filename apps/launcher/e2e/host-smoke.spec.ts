@@ -2,7 +2,8 @@ import { test, expect } from "@playwright/test";
 
 /**
  * Product-level smoke against a REAL host: real dist, real control adapter, real Node,
- * real runtime home. Set JOUZU_HOST_URL and JOUZU_HOST_TOKEN from the host's host.json.
+ * real runtime home. Set JOUZU_HOST_URL and JOUZU_HOST_TOKEN from the ready line the host printed
+ * when it started (the token is in no file, #130).
  *
  * Not part of the default suite: without a host there is nothing to talk to, and a stub
  * would defeat the purpose.

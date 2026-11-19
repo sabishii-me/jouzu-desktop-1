@@ -212,6 +212,10 @@ struct Operation {
     id: String,
     kind: &'static Kind,
     payload: Payload,
+    /// The provider the operation is for (its key, sign-in, removal, default
+    /// model or custom connection); its result names it, so a client shows
+    /// the result at that provider only.
+    provider: Option<String>,
     queued_at: String,
 }
 
@@ -236,12 +240,13 @@ impl Outcome {
         Self { ok: true, code: None, text: None }
     }
 
-    fn render(&self, operation_id: &str, params: Value) -> Value {
+    fn render(&self, operation_id: &str, params: Value, provider: Option<&str>) -> Value {
         json!({
             "operationId": operation_id,
             "ok": self.ok,
             "code": self.code,
             "params": params,
+            "provider": provider,
             "text": self.text,
             "finishedAt": now(),
         })
@@ -249,6 +254,15 @@ impl Outcome {
 }
 
 /// What a finished operation leaves behind.
+/// The providers whose credential is the Shisa.AI sign-in, as the settings'
+/// account lists them.
+fn shisa_providers(settings: Option<&Value>) -> Vec<String> {
+    let mut ids = vec!["shisa".to_string()];
+    let listed = settings.and_then(|settings| settings.pointer("/account/providers")).and_then(Value::as_array);
+    ids.extend(listed.into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
+    ids
+}
+
 struct Done {
     /// Configuration changed: new runtimes must start with it.
     changed: bool,
@@ -284,6 +298,8 @@ pub struct ControlManager {
     /// Runs after an operation that changed configuration (the host recycles its
     /// warm runtime, so a new session starts with the new configuration).
     after_change: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// What replies said about each provider's sign-in, shown with the settings.
+    providers: OnceLock<Arc<crate::provider_answers::ProviderAnswers>>,
 }
 
 impl ControlManager {
@@ -308,6 +324,7 @@ impl ControlManager {
             queue: Mutex::new(Queue::default()),
             hub: events,
             after_change: OnceLock::new(),
+            providers: OnceLock::new(),
         })
     }
 
@@ -316,6 +333,22 @@ impl ControlManager {
     pub(crate) fn with_script(mut self, script: &str) -> Self {
         self.context.script = script.to_string();
         self
+    }
+
+    /// Set once by the host when it starts: `AppView.providerAuth` follows it.
+    pub fn watch_providers(self: &Arc<Self>, providers: Arc<crate::provider_answers::ProviderAnswers>) {
+        let manager = Arc::downgrade(self);
+        providers.on_change(move || {
+            if let Some(manager) = manager.upgrade() {
+                let mut queue = manager.lock();
+                manager.publish(&mut queue);
+            }
+        });
+        let _ = self.providers.set(providers);
+    }
+
+    fn provider_view(&self) -> Value {
+        self.providers.get().map_or_else(|| json!({}), |providers| providers.view())
     }
 
     /// Set once by the host when it starts.
@@ -341,10 +374,10 @@ impl ControlManager {
     /// The configuration part of `AppView`: what runs, what waits, the last result
     /// of each kind, and the current settings.
     pub fn view(&self) -> Value {
-        Self::render(&self.lock())
+        Self::render(&self.lock(), self.provider_view())
     }
 
-    fn render(queue: &Queue) -> Value {
+    fn render(queue: &Queue, providers: Value) -> Value {
         let running = queue.running.as_ref().map(|running| {
             let mut value = json!({
                 "operationId": running.id,
@@ -377,13 +410,15 @@ impl ControlManager {
             "revision": queue.revision,
             "config": { "running": running, "queued": queued, "lastResult": queue.last },
             "settings": queue.settings,
+            // Providers whose latest reply refused the stored key or sign-in.
+            "providerAuth": providers,
         })
     }
 
     fn publish(&self, queue: &mut Queue) {
         queue.revision += 1;
         if let Some(hub) = &self.hub {
-            hub.publish_control("app.updated", Self::render(queue));
+            hub.publish_control("app.updated", Self::render(queue, self.provider_view()));
         }
     }
 
@@ -402,7 +437,11 @@ impl ControlManager {
                     true,
                 ));
             }
-            queue.queued.push_back(Operation { id: id.clone(), kind, payload, queued_at: now() });
+            let provider = match &payload {
+                Payload::Adapter(fields) => fields.get("provider").and_then(Value::as_str).map(str::to_string),
+                Payload::Environment(_) => None,
+            };
+            queue.queued.push_back(Operation { id: id.clone(), kind, payload, provider, queued_at: now() });
             // How many operations run before this one.
             let position = queue.queued.len() - 1 + usize::from(queue.running.is_some());
             let start = !queue.draining;
@@ -434,7 +473,7 @@ impl ControlManager {
             return false;
         };
         let operation = queue.queued.remove(index).expect("index is in range");
-        let result = Outcome { ok: false, code: Some("config-cancelled"), text: None }.render(&operation.id, json!({}));
+        let result = Outcome { ok: false, code: Some("config-cancelled"), text: None }.render(&operation.id, json!({}), operation.provider.as_deref());
         queue.last.insert(operation.kind.name, result);
         self.publish(&mut queue);
         true
@@ -461,6 +500,7 @@ impl ControlManager {
             };
             let id = operation.id.clone();
             let kind = operation.kind;
+            let operation_payload_provider = operation.provider.clone();
             // Each operation runs in a task of its own: a panic in it ends that
             // operation with a result, never the queue.
             let manager = self.clone();
@@ -480,15 +520,32 @@ impl ControlManager {
                     }
                 }
             }
+            // A new sign-in, key or removal replaces what earlier replies said.
+            if done.outcome.ok {
+                if let Some(providers) = self.providers.get() {
+                    match (kind.name, &operation_payload_provider) {
+                        // The sign-in is the credential of every provider the
+                        // account lists (the Shisa API catalog's).
+                        ("shisa-login" | "shisa-logout", _) => {
+                            let known = done.settings.clone().or_else(|| self.lock().settings.clone());
+                            for id in shisa_providers(known.as_ref()) {
+                                providers.forget(&id);
+                            }
+                        }
+                        ("provider-oauth" | "provider-key" | "provider-remove", Some(provider)) => providers.forget(provider),
+                        _ => {}
+                    }
+                }
+            }
             let mut queue = self.lock();
             queue.running = None;
             if let Some(settings) = done.settings {
                 queue.settings = Some(settings);
             }
             if let Some(read) = done.read_failure {
-                queue.last.insert("status", read.render(&id, json!({})));
+                queue.last.insert("status", read.render(&id, json!({}), None));
             }
-            queue.last.insert(kind.name, done.outcome.render(&id, done.params));
+            queue.last.insert(kind.name, done.outcome.render(&id, done.params, operation_payload_provider.as_deref()));
             self.publish(&mut queue);
         }
     }

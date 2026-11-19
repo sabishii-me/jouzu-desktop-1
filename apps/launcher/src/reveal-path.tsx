@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { Check, Copy, FolderOpen } from "lucide-react";
 import { Button } from "./components/ui/button";
-import { copyPath, revealMessage, revealPath } from "./file-actions";
+import { copyPath, revealPath } from "./file-actions";
 import { useWorkspaceRoot } from "./workspace-context";
+import { explain, fill, useChatText } from "./chat-text";
 
 /**
  * One reveal affordance for a path that appears in the transcript (0057): the
@@ -10,6 +11,7 @@ import { useWorkspaceRoot } from "./workspace-context";
  * even when reveal fails.
  */
 export function RevealPath({ path, compact = false, label }: { path: string; compact?: boolean; label?: string }) {
+  const t = useChatText();
   const workspace = useWorkspaceRoot();
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -20,7 +22,7 @@ export function RevealPath({ path, compact = false, label }: { path: string; com
       await revealPath(path, workspace);
       setError(null);
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : revealMessage(undefined));
+      setError(explain(t, failure, t.revealFailed).text);
     }
   }
 
@@ -33,11 +35,11 @@ export function RevealPath({ path, compact = false, label }: { path: string; com
     <Button
       variant={compact ? "ghost" : "outline"}
       className={compact ? "h-7 gap-1 px-2 text-[11px]" : "h-8 gap-1 px-2 text-xs"}
-      title={`Reveal ${name}`}
-      aria-label={label ?? "Reveal"}
+      title={fill(t.revealNamed, { name })}
+      aria-label={label ?? t.reveal}
       onClick={() => void reveal()}
-    ><FolderOpen className="size-3" />{label ?? "Reveal"}</Button>
-    <Button variant="ghost" className={compact ? "h-7 gap-1 px-2 text-[11px]" : "h-8 gap-1 px-2 text-xs"} title="Copy path" onClick={() => void copy()}>{copied ? <Check className="size-3" /> : <Copy className="size-3" />}{copied ? "Copied" : "Copy path"}</Button>
+    ><FolderOpen className="size-3" />{label ?? t.reveal}</Button>
+    <Button variant="ghost" className={compact ? "h-7 gap-1 px-2 text-[11px]" : "h-8 gap-1 px-2 text-xs"} title={t.copyPath} onClick={() => void copy()}>{copied ? <Check className="size-3" /> : <Copy className="size-3" />}{copied ? t.copied : t.copyPath}</Button>
     {error && <span role="alert" className="text-[11px] text-destructive">{error}.</span>}
   </span>;
 }

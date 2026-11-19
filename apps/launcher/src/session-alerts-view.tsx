@@ -1,9 +1,8 @@
 import { useState } from "react";
 import { Pencil, X } from "lucide-react";
 import { Button } from "./components/ui/button";
-import { explainError } from "./runtime-errors";
 import type { QueuedMessage } from "./chat-types";
-import { fill, useChatText } from "./chat-text";
+import { explain, fill, useChatText } from "./chat-text";
 import { ResultMark, type ControlResult } from "./control-result";
 
 export type AlertLevel = "error" | "warning" | "info";
@@ -50,7 +49,7 @@ export function SteerQueue({ items, onEdit, onRemove, onContinue, onDiscard, res
   const t = useChatText();
   if (!items.length) return null;
   const paused = items.some(item => item.state === "returned");
-  return <section aria-label="Queued messages" className="mb-1 rounded-lg border border-border bg-muted/40 px-3 py-2 text-[11px]">
+  return <section aria-label={t.queuedMessages} className="mb-1 rounded-lg border border-border bg-muted/40 px-3 py-2 text-[11px]">
     <div className="flex flex-wrap items-center gap-2">
       <span className="min-w-0 flex-1 text-muted-foreground">{paused ? fill(t.queueReturned, { n: items.length }) : t.queueNext}</span>
       <ResultMark result={result} />
@@ -66,8 +65,8 @@ export function SteerQueue({ items, onEdit, onRemove, onContinue, onDiscard, res
           : item.state === "delivering"
           ? null
           : <>
-            <Button variant="ghost" className="size-6 p-0" aria-label="Edit queued message" title="Edit" onClick={() => onEdit(item.clientMessageId)}><Pencil className="size-3" /></Button>
-            <Button variant="ghost" className="size-6 p-0" aria-label="Remove queued message" title="Remove" onClick={() => onRemove(item.clientMessageId)}><X className="size-3" /></Button>
+            <Button variant="ghost" className="size-6 p-0" aria-label={t.editQueued} title={t.edit} onClick={() => onEdit(item.clientMessageId)}><Pencil className="size-3" /></Button>
+            <Button variant="ghost" className="size-6 p-0" aria-label={t.removeQueued} title={t.remove} onClick={() => onRemove(item.clientMessageId)}><X className="size-3" /></Button>
           </>}
       </li>)}
     </ol>
@@ -79,6 +78,8 @@ export function SteerQueue({ items, onEdit, onRemove, onContinue, onDiscard, res
  * did not happen in plain words, the raw text behind Details.
  */
 export function ErrorLine({ raw, failed, onDismiss, onRetry }: { raw: unknown; failed: string; onDismiss?: () => void; onRetry?: () => void }) {
-  const { text, details } = explainError(raw, failed);
-  return <NoticeRow alert={{ id: "error", level: "error", text, details, actions: onRetry ? [{ label: "Retry", run: onRetry }] : [], dismiss: onDismiss }} />;
+  const t = useChatText();
+  // Said from the error's code, in the interface language; never guessed from its words (#157).
+  const { text, details } = explain(t, raw, failed);
+  return <NoticeRow alert={{ id: "error", level: "error", text, details, actions: onRetry ? [{ label: t.retry, run: onRetry }] : [], dismiss: onDismiss }} />;
 }

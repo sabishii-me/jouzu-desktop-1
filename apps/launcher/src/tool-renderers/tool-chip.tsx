@@ -7,6 +7,7 @@ import type { ToolView } from "../chat-projection";
 import { ChatMarkdown } from "../chat-markdown";
 import { ToolRenderer } from "./index";
 import { ToolDetailContext, type ToolState } from "./tool-frame";
+import { useChatText } from "../chat-text";
 
 export type ActivityItem =
   | { kind: "tool"; tool: ToolView }
@@ -58,11 +59,12 @@ function itemLabel(item: ActivityItem) {
 /** Thinking and tool calls share one 32 px activity strip; only the expanded
  * item takes vertical space. */
 export function ActivityStrip({ items }: { items: ActivityItem[] }) {
+  const t = useChatText();
   const [openId, setOpenId] = useState<string | null>(null);
   const detailId = useId();
   const open = openId ? items.find(item => itemKey(item) === openId) : undefined;
   return <div className="my-1.5 space-y-1.5">
-    <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Activity">
+    <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label={t.activity}>
       {items.map(item => {
         const state = item.kind === "thinking" ? (item.streaming ? "running" : "done") : toolState(item.tool);
         const Icon = item.kind === "thinking" ? Brain : ICONS[item.tool.name] ?? Wrench;
@@ -89,8 +91,8 @@ export function ActivityStrip({ items }: { items: ActivityItem[] }) {
     </div>
     {open && <div id={detailId} className="rounded-lg border border-border bg-background/60">
       <div className="flex items-center justify-between border-b border-border px-2 py-1">
-        <span className="truncate text-[11px] font-medium">{open.kind === "thinking" ? "Thinking" : open.tool.name}</span>
-        <button type="button" className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground" aria-label="Close activity details" onClick={() => setOpenId(null)}><X className="size-3" /></button>
+        <span className="truncate text-[11px] font-medium">{open.kind === "thinking" ? t.thinking : open.tool.name}</span>
+        <button type="button" className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground" aria-label={t.closeActivity} onClick={() => setOpenId(null)}><X className="size-3" /></button>
       </div>
       <div className="p-2 text-xs">
         {open.kind === "thinking"

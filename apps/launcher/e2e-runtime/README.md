@@ -56,6 +56,7 @@ uses it. Results are written to `language-settings-result.json`.
 
 ```powershell
 $env:JOUZU_E2E_HOST_HOME = '<home of a host started on a throwaway data folder>'
+$env:JOUZU_E2E_HOST_TOKEN = '<token from the first line that host printed>'
 node e2e-runtime/entry-restart.mjs
 ```
 
@@ -69,6 +70,7 @@ entry session was opened. Results are written to `entry-restart-result.json`.
 
 ```powershell
 $env:JOUZU_E2E_HOST_HOME = '<home of a host started on a throwaway data folder>'
+$env:JOUZU_E2E_HOST_TOKEN = '<token from the first line that host printed>'
 $env:JOUZU_E2E_WS_A = '<workspace A>'; $env:JOUZU_E2E_WS_B = '<workspace B>'
 node e2e-runtime/turn-files-session.mjs
 ```
@@ -81,6 +83,7 @@ list the file and B's must not (#79). Results are written to `turn-files-session
 
 ```powershell
 $env:JOUZU_E2E_HOST_HOME = '<home of a host started on a throwaway data folder>'
+$env:JOUZU_E2E_HOST_TOKEN = '<token from the first line that host printed>'
 node e2e-runtime/model-list-fresh.mjs
 ```
 
@@ -92,6 +95,7 @@ be gone), with no restart (#84). Results are written to `model-list-fresh-result
 
 ```powershell
 $env:JOUZU_E2E_HOST_HOME = '<home of a host JUST started on a throwaway data folder>'
+$env:JOUZU_E2E_HOST_TOKEN = '<token from the first line that host printed>'
 $env:JOUZU_E2E_WORKSPACE = '<workspace folder>'
 node e2e-runtime/first-session-model.mjs
 ```
@@ -103,6 +107,7 @@ sent (#99). Results are written to `first-session-model-result.json`.
 
 ```powershell
 $env:JOUZU_E2E_HOST_HOME = '<home of a host started on a throwaway data folder>'
+$env:JOUZU_E2E_HOST_TOKEN = '<token from the first line that host printed>'
 $env:JOUZU_E2E_WORKSPACE = '<workspace folder, added as a workspace>'
 node e2e-runtime/rejected-image.mjs
 ```

@@ -23,6 +23,8 @@ use std::{
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
+use crate::known_models::KnownModels;
+
 use super::{process, RuntimeEvent, RuntimeSupervisor, SpawnSpec};
 
 /// How long a warm runtime may take to answer its first request.
@@ -62,6 +64,19 @@ struct Slot {
     target: Arc<Mutex<Option<mpsc::Sender<RuntimeEvent>>>>,
     started_at: Instant,
     ready_ms: Option<u64>,
+    /// The runtime's answer to `get_state` once it is ready: its own blank
+    /// session (file and model), which a new conversation takes over as is.
+    state: Option<Value>,
+}
+
+/// A warm runtime handed to a session.
+pub struct Taken {
+    pub runtime: Arc<RuntimeSupervisor>,
+    /// Whether it was warmed for the session's folder.
+    pub matched: bool,
+    pub attaching: Attaching,
+    /// Its `get_state` answer, when it was ready: the blank session it opened.
+    pub state: Option<Value>,
 }
 
 struct Inner {
@@ -171,6 +186,9 @@ pub struct WarmPool {
     ready: Notify,
     /// Told on every change of the pool, for sessions waiting their turn to start.
     moved: Notify,
+    /// Where a warm runtime's answers about models are kept, so a new session
+    /// shows them before its own runtime has answered.
+    known: std::sync::OnceLock<Arc<KnownModels>>,
 }
 
 impl WarmPool {
@@ -220,7 +238,13 @@ impl WarmPool {
             changed: Box::new(changed),
             ready: Notify::new(),
             moved: Notify::new(),
+            known: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Keep each warm runtime's answers about models in `known`.
+    pub fn keep_models_in(&self, known: Arc<KnownModels>) {
+        let _ = self.known.set(known);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -335,6 +359,7 @@ impl WarmPool {
                 target: target.clone(),
                 started_at: Instant::now(),
                 ready_ms: None,
+                state: None,
             });
         }
         self.notify();
@@ -383,6 +408,8 @@ impl WarmPool {
 
         // Ready once it answers a request: Node is up and the extensions loaded.
         let pool = self.clone();
+        // Answers about models count only for the configuration it started with.
+        let known = self.known.get().map(|known| (known.clone(), known.generation()));
         tokio::spawn(async move {
             let result = runtime
                 .request(
@@ -391,7 +418,24 @@ impl WarmPool {
                 )
                 .await;
             match result {
-                Ok(_) => {
+                Ok(state) => {
+                    if let Some((known, configured)) = known {
+                        // A blank runtime's model is what a new conversation
+                        // starts on; its list is what every runtime offers.
+                        known.remember_start_model(configured, state.get("model"));
+                        let runtime = runtime.clone();
+                        tokio::spawn(async move {
+                            let listed = runtime
+                                .request(
+                                    json!({ "id": format!("warm-models-{generation}"), "type": "get_available_models" }),
+                                    Duration::from_secs(30),
+                                )
+                                .await;
+                            if let Some(models) = listed.ok().as_ref().and_then(|answer| answer.get("models")).and_then(Value::as_array) {
+                                known.remember_list(configured, models);
+                            }
+                        });
+                    }
                     {
                         let mut inner = pool.lock();
                         let Some(slot) = inner.slots.iter_mut().find(|slot| slot.generation == generation) else {
@@ -401,6 +445,7 @@ impl WarmPool {
                         // then dies would otherwise be restarted forever. A session
                         // taking one, or a client asking again, resets them.
                         slot.ready_ms = Some(slot.started_at.elapsed().as_millis() as u64);
+                        slot.state = Some(state.clone());
                         inner.converged = true;
                     }
                     pool.ready.notify_waiters();
@@ -464,13 +509,15 @@ impl WarmPool {
     /// over too, since the session waits for less than it would for a new one.
     ///
     /// A runtime warmed for another folder is still handed over: the switch
-    /// reloads the extensions, but the Node start is saved. The second value
-    /// says whether it was warmed for `workspace`.
+    /// reloads the extensions, but the Node start is saved. A new conversation
+    /// takes over the runtime's own blank session, which belongs to the folder
+    /// the runtime started in, so it asks for `same_folder_only`.
     pub fn take(
         self: &Arc<Self>,
         events: mpsc::Sender<RuntimeEvent>,
         workspace: &Path,
-    ) -> Option<(Arc<RuntimeSupervisor>, bool, Attaching)> {
+        same_folder_only: bool,
+    ) -> Option<Taken> {
         let slot = {
             let mut inner = self.lock();
             let matches = |slot: &Slot| {
@@ -485,7 +532,7 @@ impl WarmPool {
                 .iter()
                 .position(|slot| slot.ready_ms.is_some() && matches(slot))
                 .or_else(|| inner.slots.iter().position(|slot| matches(slot)))
-                .or_else(|| inner.next())?;
+                .or_else(|| if same_folder_only { None } else { inner.next() })?;
             let slot = inner.slots.remove(index);
             inner.taken += 1;
             inner.attaching += 1;
@@ -504,7 +551,12 @@ impl WarmPool {
             .workspace
             .as_deref()
             .is_some_and(|warm| same_folder(warm, workspace));
-        Some((slot.runtime, matched, Attaching(Some(self.clone()))))
+        Some(Taken {
+            runtime: slot.runtime,
+            matched,
+            attaching: Attaching(Some(self.clone())),
+            state: slot.state,
+        })
     }
 
     /// `workspace` is where the user works now: it becomes the most recent

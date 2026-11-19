@@ -71,7 +71,9 @@ export async function stubHost(
         result = { operationId, ok: false, code: text === "cancelled" ? "config-cancelled" : "config-failed", params: {}, text };
       }
       view.config.running = null;
-      view.config.lastResult[kind] = { ...result, finishedAt: new Date().toISOString() };
+      // The provider the operation was for, as the host records it with the result.
+      const provider = typeof body.provider === "string" ? body.provider : null;
+      view.config.lastResult[kind] = { ...result, provider, finishedAt: new Date().toISOString() };
       publish();
     });
     return { operationId, position };

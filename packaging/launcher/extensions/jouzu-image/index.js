@@ -73,13 +73,16 @@ export async function settings() {
 /**
  * Load a module from the runtime's installation. Node resolves bare imports
  * relative to this extension file, which is outside the app's node_modules, so
- * the runtime package is resolved from the app directory instead.
+ * the runtime package is resolved from the app directory instead: the running
+ * runtime's own (its bootstrap script), or, for the CLI below, the one the
+ * desktop host starts (JOUZU_RUNTIME_APP). The data home says nothing about
+ * where the app is: a custom JOUZU_HOME can be anywhere.
  */
 async function runtimeModule(relative) {
   const roots = [];
   const bootstrap = process.argv[1];
   if (typeof bootstrap === "string" && /bootstrap\.mjs$/.test(bootstrap)) roots.push(dirname(bootstrap));
-  roots.push(join(home(), "..", "app"));
+  if (process.env.JOUZU_RUNTIME_APP) roots.push(process.env.JOUZU_RUNTIME_APP);
   for (const root of roots) {
     const file = join(root, "node_modules", relative);
     if (existsSync(file)) return import(pathToFileURL(file).href);
@@ -139,7 +142,7 @@ export async function listProviders(registry) {
     .map(async provider => ({ id: provider.id, label: provider.label ?? provider.id, ...(await availability(provider)) })));
   const fromRuntime = runtime.map(provider => provider.available
     ? { ...provider, models: listRuntimeModels(registry, provider.id) }
-    : { ...provider, reason: `No credential for ${provider.label}. Add one under Model providers to generate images with it.` });
+    : { ...provider, code: "no-credential", reason: `No credential for ${provider.label}. Add one under Model providers to generate images with it.` });
   return [...own, ...fromRuntime];
 }
 
@@ -147,7 +150,7 @@ export async function token(providerId) {
   const credential = await credentialReader(providerId);
   const value = credential?.access ?? credential?.key ?? credential?.apiKey;
   if (typeof value !== "string" || !value.trim()) {
-    throw new Error(OWN_PROVIDERS[providerId]?.signInHint ?? `No credential for ${providerId}.`);
+    throw Object.assign(new Error(OWN_PROVIDERS[providerId]?.signInHint ?? `No credential for ${providerId}.`), { code: "no-credential" });
   }
   return { token: value.trim(), type: credential?.type ?? "unknown" };
 }
@@ -155,22 +158,23 @@ export async function token(providerId) {
 /**
  * Whether an own adapter can generate images for this user right now: it has a
  * credential by the runtime's rules and the account lists at least one image
- * model. The Tools page offers only providers that can; the others carry the
- * reason they cannot.
+ * model. The Tools page offers only providers that can; the others carry why
+ * not as a code the desktop words in its language, and the original text.
  */
 export async function availability(provider) {
+  const unavailable = error => ({ available: false, code: typeof error?.code === "string" ? error.code : "other", reason: String(error?.message ?? error) });
   let value;
   try {
     value = (await token(provider.id)).token;
   } catch (error) {
-    return { available: false, reason: String(error?.message ?? error) };
+    return unavailable(error);
   }
   try {
     const models = await provider.listModels(value);
-    if (!models.length) return { available: false, reason: "This account has no image models." };
+    if (!models.length) return { available: false, code: "no-models", reason: "This account has no image models." };
     return { available: true, models: models.map(id => ({ id, sizes: provider.sizes?.(id) ?? SIZES })) };
   } catch (error) {
-    return { available: false, reason: String(error?.message ?? error) };
+    return unavailable(error);
   }
 }
 

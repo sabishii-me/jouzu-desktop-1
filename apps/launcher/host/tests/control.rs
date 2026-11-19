@@ -82,3 +82,63 @@ async fn an_unknown_kind_is_refused_without_queuing() {
     assert!(manager.view()["config"]["queued"].as_array().unwrap().is_empty());
     assert!(!manager.cancel("op-never-started"));
 }
+
+/// A default model the settings file cannot take is a failed save, not a
+/// success that only the adapter's memory holds (#155).
+#[tokio::test]
+async fn a_default_model_that_cannot_be_written_is_a_failed_save() {
+    let Some(app) = app_dir() else { return };
+    let temp = tempfile::tempdir().unwrap();
+    let manager = manager(&app, &temp.path().to_path_buf());
+    let agent = temp.path().join("data").join("agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    let file = agent.join("settings.json");
+    let before = "{\"defaultProvider\":\"anthropic\",\"defaultModel\":\"claude-opus-4-5\"}";
+    std::fs::write(&file, before).unwrap();
+    let mut permissions = std::fs::metadata(&file).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&file, permissions.clone()).unwrap();
+    if std::fs::OpenOptions::new().write(true).open(&file).is_ok() {
+        eprintln!("skipped: this user can write a read-only file");
+        return;
+    }
+
+    manager
+        .enqueue("default-model", &json!({ "provider": "anthropic", "model": "claude-sonnet-4-5" }))
+        .expect("queued");
+    let view = settled(&manager).await;
+
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&file, permissions).unwrap();
+    let result = &view["config"]["lastResult"]["default-model"];
+    assert_eq!(result["ok"], false, "{view}");
+    // Details carry what the file system said, with the file it said it about.
+    let text = result["text"].as_str().unwrap_or_default();
+    assert!(text.contains("settings.json") && (text.contains("EACCES") || text.contains("EPERM")), "{view}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+}
+
+/// A settings file the runtime cannot read is not written over: the runtime
+/// skips the save, and the adapter reports that as the failure it is, naming the
+/// file, instead of answering the model it holds only in memory (#155).
+#[tokio::test]
+async fn a_default_model_over_an_unreadable_settings_file_is_a_failed_save() {
+    let Some(app) = app_dir() else { return };
+    let temp = tempfile::tempdir().unwrap();
+    let manager = manager(&app, &temp.path().to_path_buf());
+    let agent = temp.path().join("data").join("agent");
+    // A directory where the file belongs: unreadable as a file for every user.
+    std::fs::create_dir_all(agent.join("settings.json")).unwrap();
+
+    manager
+        .enqueue("default-model", &json!({ "provider": "anthropic", "model": "claude-sonnet-4-5" }))
+        .expect("queued");
+    let view = settled(&manager).await;
+
+    let result = &view["config"]["lastResult"]["default-model"];
+    assert_eq!(result["ok"], false, "{view}");
+    assert_eq!(result["provider"], "anthropic", "{view}");
+    let text = result["text"].as_str().unwrap_or_default();
+    assert!(text.contains("settings.json") && text.contains("EISDIR"), "{view}");
+    assert!(agent.join("settings.json").is_dir());
+}

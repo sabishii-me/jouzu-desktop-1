@@ -19,6 +19,15 @@ describe("classifyNotice", () => {
     expect(classifyNotice("Flow control paused after an admission failure. Pending work is held. Run /flow for details, /flow clear to release the hold, or /flow reset to reset delivery.")).toMatchObject({ kind: "flow-hold", paused: true, text: "Flow control paused after an admission failure. Pending work is held." });
   });
 
+  it("does not read a pause that the next message resumes as a hold (#151)", () => {
+    expect(classifyNotice("Flow control paused after provider request failed: 401 Unauthorized. Automated work resumes on your next message. Run /flow for details.")).toEqual({ kind: "flow-paused", text: "Flow control paused after provider request failed: 401 Unauthorized. Automated work resumes on your next message." });
+    expect(classifyNotice("Flow control paused after an interrupt. Automated work resumes on your next message. Run /flow for details.")).toMatchObject({ kind: "flow-paused" });
+    expect(classifyNotice("Flow control is paused after reopening this session. Inspect with /flow; resume automation with /flow resume or your next message.")).toMatchObject({ kind: "flow-paused" });
+    // Held work still needs a control.
+    expect(classifyNotice("Flow control paused after an admission failure. Pending work is held. Run /flow for details, /flow clear to release the hold, or /flow reset to reset delivery.")).toMatchObject({ kind: "flow-hold" });
+    expect(classifyNotice("Flow control is holding automated work: recovery needs a decision. Run /flow for the control that releases it.")).toMatchObject({ kind: "flow-hold" });
+  });
+
   it("keeps command replies as toasts", () => {
     expect(classifyNotice("Flow clear completed. No active reservation was found; continue with a new message.")).toMatchObject({ kind: "toast", level: "info" });
     expect(classifyNotice("Automated turns are not paused for this session.")).toMatchObject({ kind: "toast" });

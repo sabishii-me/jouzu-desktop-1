@@ -22,6 +22,8 @@ export interface ConfigResult {
   code: string | null;
   params: Record<string, unknown>;
   text: string | null;
+  /** The provider the operation was for; its result belongs to that provider only. */
+  provider?: string | null;
   finishedAt: string;
 }
 export interface AppView {
@@ -29,6 +31,8 @@ export interface AppView {
   config: { running: ConfigRunning | null; queued: ConfigQueued[]; lastResult: Partial<Record<ConfigKind, ConfigResult>> };
   /** `null` until the host has read the settings once. */
   settings: ControlState | null;
+  /** Providers whose latest reply refused the stored key or sign-in, with the provider's words. */
+  providerAuth?: Record<string, { refusedAt: string; text: string }>;
 }
 
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
@@ -45,7 +49,13 @@ export function parseAppView(value: unknown): AppView & { settingsError: Error |
   let settingsError: Error | null = null;
   try { settings = value.settings == null ? null : parseControlState(value.settings); }
   catch (error) { settingsError = error instanceof Error ? error : new Error(String(error)); }
-  return { revision: value.revision, config: { running, queued, lastResult }, settings, settingsError };
+  const providerAuth: AppView["providerAuth"] = {};
+  if (record(value.providerAuth)) {
+    for (const [id, entry] of Object.entries(value.providerAuth)) {
+      if (record(entry) && typeof entry.text === "string") providerAuth[id] = { refusedAt: typeof entry.refusedAt === "string" ? entry.refusedAt : "", text: entry.text };
+    }
+  }
+  return { revision: value.revision, config: { running, queued, lastResult }, settings, settingsError, providerAuth };
 }
 
 type Listener = () => void;

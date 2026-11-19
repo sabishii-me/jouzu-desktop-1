@@ -15,16 +15,16 @@ import { collectOutputReferences } from "./artifact-references";
 import { PanelStart } from "./panel-start";
 import { FilesPanel } from "./files-panel";
 import { ToolReviewDialog } from "./tool-review-dialog";
-import { SessionStore as ChatConnection, chatPool } from "./session-store";
+import { SessionStore as ChatConnection, chatPool, knownModels } from "./session-store";
 import type { ChatSnapshot, PendingPrompt, SessionTiming } from "./chat-types";
 import { eventRouter } from "./event-router";
 import { fitsSendBudget, readImageAttachment, removeSubmittedImages, validateImageSelection, type ImageAttachment } from "./chat-attachments";
 import { normalizeVideoUrl, videoMarker } from "./video-url";
-import { emptyProjection, prependHistory, savedPageProjection, type ChatProjection, type FlowReportRecord } from "./chat-projection";
+import { emptyProjection, prependHistory, savedPageProjection, type ChatMessage, type ChatProjection, type FlowReportRecord } from "./chat-projection";
 import { clearDraft, draftKey, readDraft, writeDraft } from "./drafts";
 import { describeError, isCapacityError, isFlowHistoryError, isImageRefused } from "./runtime-errors";
 import { NoticeRow, SteerQueue } from "./session-alerts-view";
-import { explain, failureText, useChatText } from "./chat-text";
+import { fill, explain, failureText, useChatText, type ChatText } from "./chat-text";
 import type { ControlResult, SessionControl } from "./control-result";
 import { BackgroundMenu, deriveFlow, deriveSubagents, FlowMenu, latestFlowError, SubagentMenu } from "./tool-renderers";
 import { SessionStatsBar } from "./session-stats-bar";
@@ -74,7 +74,7 @@ export interface ChatWorkspaceProps {
   updateBusy?: boolean;
 }
 const lastSegment = (path: string) => path.replaceAll("\\", "/").split("/").filter(Boolean).at(-1) ?? path;
-const workspaceLabel = (path: string) => lastSegment(path) === "default-workspace" ? "Default workspace" : lastSegment(path);
+const workspaceLabel = (path: string, t: ChatText) => lastSegment(path) === "default-workspace" ? t.defaultWorkspace : lastSegment(path);
 /** Saved reports first, then ones that arrived live and are not saved yet. */
 const mergeReports = (saved: FlowReportRecord[], live: FlowReportRecord[]) => [...saved, ...live.filter(report => !saved.some(known => known.text === report.text))].slice(-30);
 const isDefaultWorkspace = (path: string) => lastSegment(path) === "default-workspace";
@@ -118,6 +118,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [warm, retryWarm] = useWarmRuntime(api.runtime, path);
   const chatUnavailable = !api.capabilities.features.includes("chat");
   const t = useChatText();
+  const paneTabLabel = (tab: string) => tab === "artifacts" ? t.artifacts : tab === "start" ? t.startTab : tab === "files" ? t.files : tab;
   const [snapshot, setSnapshot] = useState<ChatSnapshot>({ projection: emptyProjection(), connected: false, pending: false, connectionError: null, models: [], thinkingLevels: [] });
   // The page's one event stream dropped and is being reopened (ui-layer §5).
   const reconnecting = useSyncExternalStore(listener => eventRouter.onStatus(listener), () => eventRouter.reconnecting);
@@ -201,7 +202,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [forkResult, setForkResult] = useState<{ turn: number; result: ControlResult } | null>(null);
   // A new session that could not start while nothing else is on screen: the
   // start page's composer says so, with Retry.
-  const [startError, setStartError] = useState<{ details?: string } | null>(null);
+  const [startError, setStartError] = useState<{ text?: string; details?: string } | null>(null);
   // Sidebar actions (pin, rename, archive, copy) report in the sidebar.
   const [sidebarNote, setSidebarNote] = useState<{ text: string; details?: string } | null>(null);
   const sidebarOpen = useRef(true);
@@ -288,13 +289,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   function addVideoUrl(input: string): string | null {
     try {
       const url = normalizeVideoUrl(input);
-      if (videoRef.current.includes(url)) return "This video URL is already attached.";
+      if (videoRef.current.includes(url)) return t.videoAttached;
       const next = [...videoRef.current, url];
       videoRef.current = next;
       setVideoUrls(next);
       return null;
     } catch (error) {
-      return String(error instanceof Error ? error.message : error);
+      return explain(t, error, t.attachFailed).text;
     }
   }
   function removeVideoUrl(url: string) {
@@ -385,7 +386,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       } catch (error) {
         if (disposed) return;
         settled = true;
-        setSnapshot(current => ({ ...current, error: describeError(error) }));
+        // The entry session could not be opened (for example the runtime is
+        // missing): loading ends and the start page says why, with its Retry.
+        const explained = explain(t, error, t.newSessionFailed);
+        setHero(true);
+        setStartError({ text: explained.text, details: explained.details });
         if (choosing) setEntryOpening(false);
       }
     })();
@@ -443,9 +448,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // A connection that failed (a lease refused with an error) has nothing left to
   // wait for: loading ends so the chat shows the error and its retry (issue #87).
   useEffect(() => {
-    const failed = !snapshot.connected && !!snapshot.connectionError;
+    const failed = !snapshot.connected && (!!snapshot.connectionError || !!startError);
     onBootChange?.(!chatUnavailable && !failed && (!snapshot.connected || entryOpening || (!entryExisting && warmBlocks(warm))), warm, retryWarm);
-  }, [snapshot.connected, snapshot.connectionError, onBootChange, chatUnavailable, warm, entryOpening, entryExisting]);
+  }, [snapshot.connected, snapshot.connectionError, startError, onBootChange, chatUnavailable, warm, entryOpening, entryExisting]);
   useEffect(() => {
     const target = entryTarget.current;
     if (!entryAttaching || !target) return;
@@ -604,12 +609,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       validateImageSelection(attachmentRef.current, files);
       const added = await Promise.all(files.map(readImageAttachment));
       validateImageSelection(attachmentRef.current, added.map(item => ({ size: item.size, type: item.image.mimeType })));
-      if (!fitsSendBudget([...attachmentRef.current, ...added])) throw new Error("These images are too large to send together. Send fewer, or smaller ones.");
+      if (!fitsSendBudget([...attachmentRef.current, ...added])) throw new Error(t.imagesTooLarge);
       updateAttachments([...attachmentRef.current, ...added]);
     } catch (error) { failedAt("attach", error, t.attachFailed); }
     finally { readingRef.current = false; setReadingImages(false); }
   }
-  // "Quote" on an image artifact feeds the artifact through the same attachment
+  // t.quote on an image artifact feeds the artifact through the same attachment
   // path as a pasted image.
   const addImagesRef = useRef(addImages);
   addImagesRef.current = addImages;
@@ -679,10 +684,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     while (Date.now() < end && !sendCancelRef.current) {
       const current = connection.current;
       if (current?.snapshot.connected) return current;
-      if (current && current.snapshot.status === "stopped" && !switchingRef.current) {
-        if (!await reopenBoundSession()) return null;
-        continue;
-      }
       if (current?.snapshot.connectionError && !current.snapshot.connected && !switchingRef.current) return null;
       await new Promise(resolve => setTimeout(resolve, 25));
     }
@@ -715,10 +716,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (!ready || !await ensureSelectedSession(ready)) { settle("send", { ok: false, text: t.sendOpening }); return; }
       const client = connection.current;
       if (!client || sendCancelRef.current) return;
-      // A conversation opened by this send (a preview) has a runtime only now:
-      // until it reports a model nothing is sent, and the user is told so.
-      if (client.snapshot.modelState !== "ready") {
-        settle("send", { ok: false, text: client.snapshot.modelState === "none" ? t.sendNoModel : t.sendLoadingModel });
+      // A runtime that reported no model cannot take it; a model still on its way
+      // can (the host holds the message until the model is ready).
+      if (client.snapshot.modelState === "none") {
+        settle("send", { ok: false, text: t.sendNoModel });
         return;
       }
       const receipt = client.send(value, submitted.map(item => item.image));
@@ -762,7 +763,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       await reloadSession();
     } catch (error) { failedAt("send", error, t.imagesFailed); }
   }
-  const name = workspaceLabel(path);
+  const name = workspaceLabel(path, t);
   function parkPrevious(previous: ChatConnection | null) {
     if (!previous || previous.isDisposed()) return;
     const sessionFile = previous.snapshot.sessionFile;
@@ -798,7 +799,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const previous = connection.current;
     setHero(true);
     setSelectedSession(null);
-    // Do not leave the previous transcript under a hero titled "Default workspace"
+    // Do not leave the previous transcript under a hero titled t.defaultWorkspace
     // while the new host session is attaching.
     setSnapshot({
       projection: emptyProjection(),
@@ -806,8 +807,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       pending: false,
       connectionError: null,
       // The new session's model is its own runtime's, reported once it answers.
+      // Until then the runtimes' last answer is shown, as the host will show it.
       modelState: "resolving",
-      models: [],
+      model: knownModels.model,
+      models: knownModels.models,
       thinkingLevels: [],
     });
     previewRequest.current += 1;
@@ -835,7 +838,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         // Shown where it was asked for: the start page's composer, or the sidebar's
         // New session when the previous session is back on screen.
         if (previousFile) tellWhereAsked(explain(t, error, t.newSessionFailed));
-        else setStartError({ details: explain(t, error, t.newSessionFailed).details });
+        else { const explained = explain(t, error, t.newSessionFailed); setStartError({ text: explained.text, details: explained.details }); }
       } finally {
         switchingRef.current = false;
         switchingTarget.current = null;
@@ -1019,7 +1022,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
    * one is re-created from its file (the host replaces a stopped session at the
    * same path), a blank one gets a new session. Selection and preview are left as
    * the user set them; this only replaces the dead connection under them.
-   * The same path is the "Restart session" of a session the host gave up on
+   * The same path is the t.restartSession of a session the host gave up on
    * (#95: status "error"); that one runs only when the user asks.
    */
   async function reopenBoundSession(): Promise<boolean> {
@@ -1045,7 +1048,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         void refreshSessions();
         return true;
       } catch (error) {
-        // "Restart session" reports on its own button; a stopped session reopened for a send reports at Send.
+        // t.restartSession reports on its own button; a stopped session reopened for a send reports at Send.
         if (connection.current === stale) failedAt(stale.snapshot.status === "error" ? "restart" : "send", error, t.openFailed);
         return false;
       } finally {
@@ -1059,17 +1062,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     try { return await promise; }
     finally { if (switchPromise.current === current) switchPromise.current = null; }
   }
-  // Reopen automatically once per stopped connection. A failure is reported and
-  // left to the user's next send, so a runtime that cannot start is not retried
-  // in a loop.
-  const reopenTried = useRef<ChatConnection | null>(null);
-  useEffect(() => {
-    const stale = connection.current;
-    if (!stale || snapshot.connected || snapshot.status !== "stopped" || switching) return;
-    if (reopenTried.current === stale) return;
-    reopenTried.current = stale;
-    void reopenBoundSession();
-  }, [snapshot.connected, snapshot.status, switching]);
   function loadPreview(sessionPath: string) {
     const request = ++previewRequest.current;
     const cached = projectionCache.current.get(normalizedPath(sessionPath));
@@ -1172,7 +1164,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       startSwitch(sessionPath);
       return;
     }
+    // The session shown is the session the composer works on: the host opens it
+    // now (no runtime until a message needs one), so its model, its state and
+    // where Send goes are its own. Its saved transcript fills the screen meanwhile.
     loadPreview(sessionPath);
+    if (switchingRef.current) queuedSwitch.current = sessionPath;
+    else startSwitch(sessionPath);
   }
   async function forkTurn(prompt: string, turn: number) {
     const client = connection.current;
@@ -1187,7 +1184,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       // every other command on it does.
       if (!await ensureSelectedSession(client)) { setForkResult({ turn, result: { ok: false, text: t.branchFailed } }); return; }
       const source = connection.current?.snapshot.sessionFile;
-      if (!source) throw new Error("This session has no file to branch yet.");
+      if (!source) throw new Error(t.noBranchFile);
       // Copy the session through the clicked turn (its user message, replies and tool
       // results) into a new saved session. No runtime fork semantics change.
       branch = await api.sessions.branch(source, turn);
@@ -1224,7 +1221,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const here = onScreen();
     let selected: string | null;
     settle("commands", null);
-    try { selected = await api.native.saveFile({ title: "Export conversation", defaultPath: `${name}-conversation.html`, filters: [{ name: "HTML", extensions: ["html"] }] }); }
+    try { selected = await api.native.saveFile({ title: t.exportConversation, defaultPath: `${name}-conversation.html`, filters: [{ name: "HTML", extensions: ["html"] }] }); }
     catch (error) { failedAt("commands", error, t.exportFailed); return; }
     if (typeof selected !== "string" || connection.current !== client) return;
     beginCommand();
@@ -1240,7 +1237,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   async function switchWorkspace(next: string) {
     setAppView("chat");
     if (next === path) { setPickerOpen(false); return; }
-    if (snapshot.projection.running && !await api.native.confirm({ message: "Stop the current run and switch workspace?", title: "Switch workspace" }).catch(() => false)) return;
+    if (snapshot.projection.running && !await api.native.confirm({ message: t.switchWorkspaceConfirm, title: t.switchWorkspace }).catch(() => false)) return;
     setSelectedSession(null);
     setHero(true);
     onStartSession?.();
@@ -1249,13 +1246,16 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   }
   const groups = useMemo(() => {
     const map = new Map<string, { id: string; path: string; name: string; sessions: SessionSummary[] }>();
-    for (const workspace of workspaces) map.set(normalizedPath(workspace.path), { id: workspace.id, path: workspace.path, name: workspaceLabel(workspace.path), sessions: [] });
+    for (const workspace of workspaces) map.set(normalizedPath(workspace.path), { id: workspace.id, path: workspace.path, name: workspaceLabel(workspace.path, t), sessions: [] });
     for (const session of sessions) {
       if (session.archived && !showArchived) continue;
       const key = normalizedPath(session.workspace);
-      if (!map.has(key)) map.set(key, { id: key, path: session.workspace, name: workspaceLabel(session.workspace), sessions: [] });
+      if (!map.has(key)) map.set(key, { id: key, path: session.workspace, name: workspaceLabel(session.workspace, t), sessions: [] });
       map.get(key)!.sessions.push(session);
     }
+    // Most recent first, by the time each row shows: the list merges saved and
+    // live sessions and arrives in no order of its own.
+    for (const group of map.values()) group.sessions.sort((left, right) => right.updated - left.updated);
     let result = [...map.values()];
     if (search.trim()) {
       const query = search.trim().toLowerCase();
@@ -1373,19 +1373,19 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
 
   // One card for whatever the host is waiting on. Options are the host's exact
   // strings; a failed answer keeps the card and says why.
-  const reviewBody = prompt?.title.startsWith("Review tool call") ? prompt.title.split("\n").slice(1).join("\n") || prompt.message : null;
+  const reviewBody = prompt?.title.startsWith(t.reviewToolCall) ? prompt.title.split("\n").slice(1).join("\n") || prompt.message : null;
   const promptNode = !prompt ? null : <div>
     {reviewBody !== null
-      ? <ToolReviewDialog title="Review tool call" body={reviewBody} options={prompt.options} disabled={promptBusy} onSelect={value => void answerPrompt(value)} />
+      ? <ToolReviewDialog title={t.reviewToolCall} body={reviewBody} options={prompt.options} disabled={promptBusy} onSelect={value => void answerPrompt(value)} />
       : <section role="dialog" aria-modal="false" aria-label={prompt.title.split("\n")[0]} className="rounded-xl border border-primary bg-card p-4 shadow-2xl">
         <h3 className="font-semibold">{prompt.title.split("\n")[0]}</h3>
         {prompt.title.split("\n").slice(1).join("\n") && <p className="my-2 whitespace-pre-line text-sm">{prompt.title.split("\n").slice(1).join("\n")}</p>}
         {prompt.message && <p className="my-2 whitespace-pre-line text-sm">{prompt.message}</p>}
-        {!prompt.options.length && <textarea aria-label="Response" disabled={promptBusy} className="my-2 w-full rounded border border-border bg-background p-2" value={answer} onChange={event => setAnswer(event.target.value)} />}
+        {!prompt.options.length && <textarea aria-label={t.response} disabled={promptBusy} className="my-2 w-full rounded border border-border bg-background p-2" value={answer} onChange={event => setAnswer(event.target.value)} />}
         <fieldset disabled={promptBusy} className="mt-3 flex flex-wrap justify-end gap-2">
           {prompt.options.length
             ? prompt.options.map(option => <Button key={option} variant={option === "Deny" ? "outline" : "default"} onClick={() => void answerPrompt(option)}>{option}</Button>)
-            : <Button onClick={() => void answerPrompt(answer)}>Submit</Button>}
+            : <Button onClick={() => void answerPrompt(answer)}>{t.submit}</Button>}
         </fieldset>
       </section>}
     {promptError && <p role="alert" className="mt-1 text-xs text-destructive">{promptError}</p>}
@@ -1397,7 +1397,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const artifactsSessionId = activePreview ? sessionIdFromFile(activePreview.path) : snapshot.sessionId;
   const opening = !chatUnavailable && !hero && !!selectedSession && selectedKey !== activeSession && !activePreview;
   // One gate: the entry session is connected before the chat UI appears, so the user
-  // never sees a second, still-blocked "Connecting…" state.
+  // never sees a second, still-blocked t.connecting state.
   const booting = !chatUnavailable && !snapshot.connected && !sessionError;
   const conversationProjection = activePreview?.projection ?? snapshot.projection;
   // Earlier pages come from where the transcript on screen came from: the saved file for a
@@ -1411,15 +1411,18 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       ? { more: activePreview.before !== null, loading: !!activePreview.loading, load: loadEarlierPreview }
       : undefined;
   const activeMessage = conversationProjection.activeMessage === null ? undefined : conversationProjection.messages[conversationProjection.activeMessage];
+  // While the host opens the session on screen, the bound store is still the
+  // previous session: nothing of it (model, run, Stop) is shown for this one.
+  const elsewhere = !hero && !!selectedSession && selectedKey !== activeSession;
   // The host says when the step is reasoning; the words are the step's reasoning block being written.
   const turnStep = conversationProjection.running ? snapshot.activeTurn?.step : undefined;
   const streamingBlock = turnStep?.state === "thinking" ? activeMessage?.content.at(-1) : undefined;
   const liveThinking = streamingBlock?.type === "thinking" ? streamingBlock.thinking ?? "" : "";
   const lastMessage = conversationProjection.messages.at(-1);
+  // A failed reply says so on the reply; the status line only says a turn was stopped.
   const settled = !conversationProjection.running
-    ? lastMessage?.role === "assistant" && lastMessage.stopReason === "error" ? "failed" as const
-      : lastMessage?.role === "toolResult" || (lastMessage?.role === "assistant" && (lastMessage.stopReason === "aborted" || lastMessage.stopReason === "toolUse")) ? "interrupted" as const
-        : undefined
+    && (lastMessage?.role === "toolResult" || (lastMessage?.role === "assistant" && (lastMessage.stopReason === "aborted" || lastMessage.stopReason === "toolUse")))
+    ? "interrupted" as const
     : undefined;
   const outputReferences = useMemo(
     () => collectOutputReferences(conversationProjection.messages, artifactsSessionId),
@@ -1434,18 +1437,18 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const subagents = useMemo(() => showingAttached ? deriveSubagents(snapshot.projection.tools) : [], [showingAttached, snapshot.projection.tools]);
   const flowError = useMemo(() => showingAttached ? latestFlowError(snapshot.projection.messages) : undefined, [showingAttached, snapshot.projection.messages]);
   const workspacePicker = <div ref={picker} className="relative">
-    <Button type="button" variant="outline" className="h-8 max-w-64 gap-2 px-2 text-xs" aria-label="Choose workspace" aria-expanded={pickerOpen} onClick={() => { if (!pickerOpen) { const bounds = picker.current?.getBoundingClientRect(); if (bounds) setPickerSpace(pickerSpaceOf(bounds)); } setPickerOpen(value => !value); }}>
+    <Button type="button" variant="outline" className="h-8 max-w-64 gap-2 px-2 text-xs" aria-label={t.chooseWorkspace} aria-expanded={pickerOpen} onClick={() => { if (!pickerOpen) { const bounds = picker.current?.getBoundingClientRect(); if (bounds) setPickerSpace(pickerSpaceOf(bounds)); } setPickerOpen(value => !value); }}>
       <FolderOpen className="size-4 shrink-0" aria-hidden="true" /><span className="truncate">{name}</span><ChevronDown className="size-3 shrink-0" aria-hidden="true" />
     </Button>
-    {pickerOpen && <div role="menu" aria-label="Choose workspace" style={{ maxHeight: pickerSpace ?? undefined }} className="absolute left-0 top-full z-30 mt-1 flex w-80 max-w-[calc(100vw-2rem)] flex-col rounded-xl border border-border bg-popover p-2 shadow-xl">
+    {pickerOpen && <div role="menu" aria-label={t.chooseWorkspace} style={{ maxHeight: pickerSpace ?? undefined }} className="absolute left-0 top-full z-30 mt-1 flex w-80 max-w-[calc(100vw-2rem)] flex-col rounded-xl border border-border bg-popover p-2 shadow-xl">
       <div data-workspace-list className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
       {[...workspaces].sort((left, right) => Number(isDefaultWorkspace(left.path)) - Number(isDefaultWorkspace(right.path))).map(workspace => <button key={workspace.id} type="button" role="menuitemradio" aria-checked={workspace.path === path} onClick={() => void switchWorkspace(workspace.path)} className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent">
-        <span className="min-w-0"><span className="block truncate">{workspaceLabel(workspace.path)}</span><span className="block truncate text-xs text-muted-foreground">{workspace.path}</span></span>
-        {workspace.path === path && <span className="text-xs text-primary">Current</span>}
+        <span className="min-w-0"><span className="block truncate">{workspaceLabel(workspace.path, t)}</span><span className="block truncate text-xs text-muted-foreground">{workspace.path}</span></span>
+        {workspace.path === path && <span className="text-xs text-primary">{t.current}</span>}
       </button>)}
-      {!workspaces.length && <p className="px-2 py-2 text-sm text-muted-foreground">No workspaces yet.</p>}
+      {!workspaces.length && <p className="px-2 py-2 text-sm text-muted-foreground">{t.noWorkspaces}</p>}
       </div>
-      <div className="mt-1 shrink-0 border-t border-border pt-1"><Button type="button" variant="ghost" className="w-full justify-start" onClick={() => { setPickerOpen(false); onAddFolder(); }}><Plus className="size-4" />Add folder</Button></div>
+      <div className="mt-1 shrink-0 border-t border-border pt-1"><Button type="button" variant="ghost" className="w-full justify-start" onClick={() => { setPickerOpen(false); onAddFolder(); }}><Plus className="size-4" />{t.addFolder}</Button></div>
     </div>}
   </div>;
   // TextGuard: three modes, and the content it withheld. The runtime confirms the
@@ -1464,7 +1467,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const flowHold = showingAttached ? snapshot.flowHold : null;
   const failedTurn = showingAttached ? snapshot.failedTurn : null;
   const queued = showingAttached ? snapshot.queue ?? [] : [];
-  const replyError = !conversationProjection.running && lastMessage?.role === "assistant" && lastMessage.stopReason === "error" ? lastMessage.errorMessage ?? null : null;
   /**
    * Until the runtime reports these as structure (refused image: jouzu#54/#74;
    * Flow history: its Flow state; provider codes: runtime G6), their only sign is
@@ -1478,7 +1480,29 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (raw && isImageRefused(raw)) return { label: t.removeImages, run: () => void repairSessionImages(), disabled: commandBusy };
     return undefined;
   }
-  const replyRecovery = recoveryFor(replyError);
+  /**
+   * What recovers the latest failed reply, by the kind of failure the host names.
+   * Retry sends the person's message again, as they would by hand: the runtime
+   * has no command to rerun a failed reply (runtime request G12). A message with
+   * images is not sent again without them, so it gets no Retry.
+   */
+  function replyActionFor(message: ChatMessage | undefined): { label: string; run: () => void; disabled?: boolean } | undefined {
+    if (!message || message.role !== "assistant" || message.stopReason !== "error") return undefined;
+    const own = recoveryFor(message.errorMessage);
+    if (own && !isImageRefused(message.errorMessage)) return own;
+    switch (message.errorCode) {
+      case "image": return { label: t.removeImages, run: () => void repairSessionImages(), disabled: commandBusy };
+      case "auth": return { label: t.signIn, run: onSettings };
+      case "quota": return { label: t.settings, run: onSettings };
+      case "model-unavailable": return undefined;
+    }
+    const asked = [...conversationProjection.messages].reverse().find(item => item.role === "user");
+    if (!asked || asked.content.some(block => block.type === "image")) return undefined;
+    const words = asked.content.filter(block => block.type === "text").map(block => block.text ?? "").join("\n").trim();
+    if (!words) return undefined;
+    return { label: t.retry, run: () => { void connection.current?.send(words).catch(() => {}); }, disabled: commandBusy };
+  }
+  const replyAction = replyActionFor(lastMessage);
   // The one thing that ever takes the composer's place: the session cannot go on.
   const sessionFailure = showingAttached && snapshot.status === "error" ? snapshot.failure ?? { code: "", text: "" } : null;
   const blocked = sessionFailure
@@ -1486,8 +1510,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     : sessionError
       ? { text: t.openFailed, details: sessionError, action: selectedSession ? { label: t.retry, run: () => { setSessionError(null); startSwitch(selectedSession); } } : undefined }
       : null;
-  const heroBlocked = startError ? { text: t.newSessionFailed, details: startError.details, action: { label: t.retry, run: () => { setStartError(null); void startNewSession(); } } } : null;
-  const noReply = failedTurn && !conversationProjection.running ? {
+  const heroBlocked = startError ? { text: startError.text ?? t.newSessionFailed, details: startError.details, action: { label: t.retry, run: () => { setStartError(null); void startNewSession(); } } } : null;
+  // While the session itself cannot go on, that is the one cause shown; its message that got no
+  // reply comes back with Retry once the session is restarted (the host carries it over).
+  const noReply = failedTurn && !conversationProjection.running && !blocked ? {
     text: failedTurn.text,
     details: failedTurn.error?.text || undefined,
     onRetry: () => changeQueue(client => client.queue("retry"), "send"),
@@ -1501,9 +1527,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     ...(!results.stop && stopError ? { stop: { ok: false, text: t.stopFailed, details: stopError } } : {}),
     ...(!results.model && modelListError ? { model: { ok: false, text: t.modelsFailed, details: modelListError } } : {}),
   };
-  const hold = flowHold ? {
-    details: flowHold.text,
-    paused: flowHold.paused,
+  // Flow holds a message: its own notice says so, or the host keeps a message
+  // the runtime took without running it (held). Either way the person gets what
+  // lets it go; Flow's words, when it gave any, are behind Details.
+  const heldByFlow = queued.some(item => item.state === "held");
+  const hold = flowHold || heldByFlow ? {
+    details: flowHold?.text ?? "",
+    paused: flowHold?.paused ?? false,
     busy: commandBusy,
     onResume: () => void runFlow("resume"),
     onRelease: () => void runFlow("clear"),
@@ -1528,69 +1558,69 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // `overflow-clip`, not `overflow-hidden`: the layout is never a scroll container,
   // so a sideways wheel or scrollIntoView cannot shift it (#113).
   return <div ref={chatRoot} className="relative flex min-h-0 min-w-0 flex-1 overflow-clip">
-    {dropActive && <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-primary bg-background/85 text-sm font-medium text-primary">Drop images or files</div>}
-    {sidebar && <aside aria-label="Workspaces" className="absolute inset-y-0 left-0 z-20 flex w-80 max-w-[85%] flex-col border-r border-border bg-background shadow-xl md:relative md:z-auto md:shadow-none">
-      <div className="flex items-center gap-2 px-2 pb-2 pt-3"><Button className="min-w-0 flex-1 justify-start gap-2" disabled={locked} onClick={() => void startNewSession()}><Plus className="size-4" />New session</Button><Button variant="ghost" className="size-8 p-0 md:hidden" aria-label="Hide workspaces" onClick={() => setSidebar(false)}><X className="size-4" /></Button></div>
-      <div className="px-2 pb-2"><Button variant={appView === "artifacts" ? "default" : "ghost"} className="w-full justify-start gap-2" aria-pressed={appView === "artifacts"} onClick={() => setAppView(appView === "artifacts" ? "chat" : "artifacts")}><Images className="size-4" />Artifacts</Button></div>
+    {dropActive && <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-primary bg-background/85 text-sm font-medium text-primary">{t.dropFiles}</div>}
+    {sidebar && <aside aria-label={t.workspaces} className="absolute inset-y-0 left-0 z-20 flex w-80 max-w-[85%] flex-col border-r border-border bg-background shadow-xl md:relative md:z-auto md:shadow-none">
+      <div className="flex items-center gap-2 px-2 pb-2 pt-3"><Button className="min-w-0 flex-1 justify-start gap-2" disabled={locked} onClick={() => void startNewSession()}><Plus className="size-4" />{t.newSession}</Button><Button variant="ghost" className="size-8 p-0 md:hidden" aria-label={t.hideWorkspaces} onClick={() => setSidebar(false)}><X className="size-4" /></Button></div>
+      <div className="px-2 pb-2"><Button variant={appView === "artifacts" ? "default" : "ghost"} className="w-full justify-start gap-2" aria-pressed={appView === "artifacts"} onClick={() => setAppView(appView === "artifacts" ? "chat" : "artifacts")}><Images className="size-4" />{t.artifacts}</Button></div>
       <div className="flex items-center justify-between border-t border-border px-3 py-2">
-        <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Workspaces</h2>
+        <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t.workspaces}</h2>
         <div className="flex items-center gap-1">
-          <Button variant="ghost" className="size-7 p-0" aria-label="Search workspaces" aria-pressed={searchOpen} onClick={() => { setSearchOpen(value => !value); if (searchOpen) setSearch(""); }}><Search className="size-3.5" /></Button>
-          {(hasArchived || showArchived) && <Button variant="ghost" className="size-7 p-0" aria-label={showArchived ? "Hide archived sessions" : "Show archived sessions"} aria-pressed={showArchived} onClick={() => setShowArchived(value => !value)}><Archive className="size-3.5" /></Button>}
-          <Button variant="ghost" className="size-7 p-0" aria-label={sort === "recent" ? "Sort by name" : "Sort by recent"} onClick={() => setSort(value => value === "recent" ? "name" : "recent")}><ArrowUpDown className="size-3.5" /></Button>
-          <Button variant="ghost" className="size-7 p-0" aria-label="Add folder" onClick={onAddFolder}><FolderPlus className="size-3.5" /></Button>
+          <Button variant="ghost" className="size-7 p-0" aria-label={t.searchWorkspaces} aria-pressed={searchOpen} onClick={() => { setSearchOpen(value => !value); if (searchOpen) setSearch(""); }}><Search className="size-3.5" /></Button>
+          {(hasArchived || showArchived) && <Button variant="ghost" className="size-7 p-0" aria-label={showArchived ? t.hideArchived : t.showArchived} aria-pressed={showArchived} onClick={() => setShowArchived(value => !value)}><Archive className="size-3.5" /></Button>}
+          <Button variant="ghost" className="size-7 p-0" aria-label={sort === "recent" ? t.sortByName : t.sortByRecent} onClick={() => setSort(value => value === "recent" ? "name" : "recent")}><ArrowUpDown className="size-3.5" /></Button>
+          <Button variant="ghost" className="size-7 p-0" aria-label={t.addFolder} onClick={onAddFolder}><FolderPlus className="size-3.5" /></Button>
         </div>
       </div>
       {folderNotice && <div className="px-2 pb-2">{folderNotice}</div>}
       {/* Over the bottom of the list, so the list never moves. */}
       {sidebarNote && <div className="absolute inset-x-2 bottom-14 z-10 rounded-lg bg-background shadow-lg"><NoticeRow alert={{ id: "sidebar", level: "error", text: sidebarNote.text, details: sidebarNote.details, actions: [], dismiss: () => setSidebarNote(null) }} /></div>}
-      {searchOpen && <div className="px-2 pb-2"><Input autoFocus aria-label="Search sessions" placeholder="Search sessions" value={search} onChange={event => setSearch(event.target.value)} /></div>}
+      {searchOpen && <div className="px-2 pb-2"><Input autoFocus aria-label={t.searchSessions} placeholder={t.searchSessions} value={search} onChange={event => setSearch(event.target.value)} /></div>}
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 pb-2">
         {[...regularGroups, ...(defaultGroup ? [defaultGroup] : [])].map(group => {
           const open = !!search.trim() || !collapsedGroups.has(group.id);
           return <section key={group.id} className="mb-1">
             <div className={`group flex items-center gap-1 rounded-lg ${(selectedWorkspace ? normalizedPath(selectedWorkspace) === normalizedPath(group.path) : !selectedKey && normalizedPath(group.path) === normalizedPath(path)) ? "bg-accent/70" : "hover:bg-muted/60"}`}>
-              <button type="button" aria-label={`${open ? "Collapse" : "Expand"} ${group.name}`} onClick={() => setCollapsedGroups(current => { const next = toggleCollapsed(current, group.id); saveCollapsed(next); return next; })} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
+              <button type="button" aria-label={`${open ? t.collapse : t.expand} ${group.name}`} onClick={() => setCollapsedGroups(current => { const next = toggleCollapsed(current, group.id); saveCollapsed(next); return next; })} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
                 {open ? <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" /> : <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />}
                 <FolderOpen className="size-4 shrink-0 text-muted-foreground" /><span className="truncate text-sm">{group.name}</span>
               </button>
-              <Button variant="ghost" className="mr-1 size-6 p-0 opacity-0 group-hover:opacity-100 focus:opacity-100" aria-label={`Remove ${group.path}`} onClick={() => { const workspace = workspaces.find(item => normalizedPath(item.path) === normalizedPath(group.path)); if (workspace) onRemove(workspace.id); }}><X className="size-3" /></Button>
+              <Button variant="ghost" className="mr-1 size-6 p-0 opacity-0 group-hover:opacity-100 focus:opacity-100" aria-label={fill(t.removeNamed, { name: group.path })} onClick={() => { const workspace = workspaces.find(item => normalizedPath(item.path) === normalizedPath(group.path)); if (workspace) onRemove(workspace.id); }}><X className="size-3" /></Button>
             </div>
             {open && <div className="ml-4 border-l border-border pl-1.5">
               {warm.state === "failed" && normalizedPath(group.path) === normalizedPath(path) && <div className="py-1"><NoticeRow alert={{ id: "warm", level: "error", text: t.warmFailed, details: warm.error ?? undefined, actions: [{ label: t.retry, run: retryWarm }] }} /></div>}
               {group.sessions.map(session => <div key={session.path} ref={node => { if (selectedKey === normalizedPath(session.path)) selectedRowRef.current = node; }} data-session-selected={selectedKey === normalizedPath(session.path) || undefined} className={`group/session relative flex items-center rounded-md text-sm ${selectedKey === normalizedPath(session.path) ? "bg-accent text-foreground before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded-full before:bg-primary" : "hover:bg-muted/60"} ${session.archived ? "opacity-60" : ""}`}>
                 {renaming && normalizedPath(renaming.path) === normalizedPath(session.path)
-                  ? <Input autoFocus aria-label="Session name" className="m-0.5 h-7 min-w-0 flex-1 text-sm" value={renaming.title} onChange={event => setRenaming({ path: session.path, title: event.target.value })} onFocus={event => event.target.select()} onKeyDown={event => { if (event.key === "Enter") void finishRename(true); if (event.key === "Escape") void finishRename(false); }} onBlur={() => void finishRename(true)} />
+                  ? <Input autoFocus aria-label={t.sessionName} className="m-0.5 h-7 min-w-0 flex-1 text-sm" value={renaming.title} onChange={event => setRenaming({ path: session.path, title: event.target.value })} onFocus={event => event.target.select()} onKeyDown={event => { if (event.key === "Enter") void finishRename(true); if (event.key === "Escape") void finishRename(false); }} onBlur={() => void finishRename(true)} />
                   : <button type="button" onClick={() => void openSession(session.path)} title={session.path} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left">
-                  {session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label="Pinned" /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span className="min-w-0 flex-1 truncate">{session.title}</span>{chatPool.isRunning(session.path) && <span role="img" aria-label="Running" title="Running" data-session-running className="size-1.5 shrink-0 rounded-full bg-primary" />}<span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={`${artifactCount(session.path)} artifact${artifactCount(session.path) === 1 ? "" : "s"}`}>{artifactCount(session.path)}</span>}
+                  {session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label={t.pinned} /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span className="min-w-0 flex-1 truncate">{session.title}</span>{chatPool.isRunning(session.path) && <span role="img" aria-label={t.running} title={t.running} data-session-running className="size-1.5 shrink-0 rounded-full bg-primary" />}<span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={fill(t.artifactCount, { n: artifactCount(session.path) })}>{artifactCount(session.path)}</span>}
                 </button>}
                 <div className={`relative flex shrink-0 items-center gap-0.5 pr-1 transition-opacity focus-within:opacity-100 group-hover/session:opacity-100 ${sessionMenu === session.path ? "opacity-100" : "opacity-0"}`} data-session-menu>
-                  <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={session.pinned ? "Unpin session" : "Pin session"} title={session.pinned ? "Unpin session" : "Pin session"} onClick={() => void updateSession(session.path, { pinned: !session.pinned })}><Pin className={`size-3.5 ${session.pinned ? "text-primary" : "text-muted-foreground"}`} /></button>
-                  <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label="Session actions" title="Session actions" aria-haspopup="menu" aria-expanded={sessionMenu === session.path} onClick={() => setSessionMenu(value => value === session.path ? null : session.path)}><MoreHorizontal className="size-4 text-muted-foreground" /></button>
-                  {sessionMenu === session.path && <div role="menu" aria-label={`Actions for ${session.title}`} className="absolute right-0 top-full z-40 mt-1 w-52 rounded-xl border border-border bg-popover p-1 text-sm shadow-xl">
-                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { pinned: !session.pinned }); setSessionMenu(null); }}><Pin className="size-4 text-muted-foreground" />{session.pinned ? "Unpin session" : "Pin session"}</button>
-                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void renameSession(session)}><Pencil className="size-4 text-muted-foreground" />Rename</button>
-                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { archived: !session.archived }); setSessionMenu(null); }}>{session.archived ? <ArchiveRestore className="size-4 text-muted-foreground" /> : <Archive className="size-4 text-muted-foreground" />}{session.archived ? "Restore session" : "Archive session"}</button>
-                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void copySessionId(session)}>{copied === session.path ? <><Check className="size-4 text-primary" />Copied</> : <><Copy className="size-4 text-muted-foreground" />Copy Session ID</>}</button>
+                  <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={session.pinned ? t.unpinSession : t.pinSession} title={session.pinned ? t.unpinSession : t.pinSession} onClick={() => void updateSession(session.path, { pinned: !session.pinned })}><Pin className={`size-3.5 ${session.pinned ? "text-primary" : "text-muted-foreground"}`} /></button>
+                  <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={t.sessionActions} title={t.sessionActions} aria-haspopup="menu" aria-expanded={sessionMenu === session.path} onClick={() => setSessionMenu(value => value === session.path ? null : session.path)}><MoreHorizontal className="size-4 text-muted-foreground" /></button>
+                  {sessionMenu === session.path && <div role="menu" aria-label={fill(t.actionsFor, { name: session.title })} className="absolute right-0 top-full z-40 mt-1 w-52 rounded-xl border border-border bg-popover p-1 text-sm shadow-xl">
+                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { pinned: !session.pinned }); setSessionMenu(null); }}><Pin className="size-4 text-muted-foreground" />{session.pinned ? t.unpinSession : t.pinSession}</button>
+                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void renameSession(session)}><Pencil className="size-4 text-muted-foreground" />{t.rename}</button>
+                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { archived: !session.archived }); setSessionMenu(null); }}>{session.archived ? <ArchiveRestore className="size-4 text-muted-foreground" /> : <Archive className="size-4 text-muted-foreground" />}{session.archived ? t.restoreSession : t.archiveSession}</button>
+                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void copySessionId(session)}>{copied === session.path ? <><Check className="size-4 text-primary" />{t.copied}</> : <><Copy className="size-4 text-muted-foreground" />{t.copySessionId}</>}</button>
                   </div>}
                 </div>
               </div>)}
-              {!group.sessions.length && <p className="px-2 py-1.5 text-xs text-muted-foreground">No sessions yet</p>}
+              {!group.sessions.length && <p className="px-2 py-1.5 text-xs text-muted-foreground">{t.noSessions}</p>}
             </div>}
           </section>;
         })}
-        {!groups.length && <p className="p-3 text-sm text-muted-foreground">{search ? "No matching sessions" : "No workspaces yet."}</p>}
+        {!groups.length && <p className="p-3 text-sm text-muted-foreground">{search ? t.noMatchingSessions : t.noWorkspaces}</p>}
       </div>
       <div className="mt-auto border-t border-border p-2">
         <div className="flex items-center gap-1">
-          <Button variant="ghost" className="min-w-0 flex-1 justify-start gap-2" onClick={onSettings}><Settings className="size-4" />Settings</Button>
-          {onUpdate && <Button variant="ghost" className={`size-8 shrink-0 p-0 ${updateAvailable ? "text-primary hover:text-primary" : ""}`} aria-label={updateAvailable ? "Update available" : "Check for updates"} title={updateAvailable ? "Update available" : "Check for updates"} disabled={updateBusy} onClick={onUpdate}>{updateAvailable ? <ArrowUpCircle className={`size-4 ${updateBusy ? "animate-pulse" : ""}`} /> : <RefreshCw className={`size-4 ${updateBusy ? "animate-spin" : ""}`} />}</Button>}
+          <Button variant="ghost" className="min-w-0 flex-1 justify-start gap-2" onClick={onSettings}><Settings className="size-4" />{t.settings}</Button>
+          {onUpdate && <Button variant="ghost" className={`size-8 shrink-0 p-0 ${updateAvailable ? "text-primary hover:text-primary" : ""}`} aria-label={updateAvailable ? t.updateAvailable : t.checkUpdates} title={updateAvailable ? t.updateAvailable : t.checkUpdates} disabled={updateBusy} onClick={onUpdate}>{updateAvailable ? <ArrowUpCircle className={`size-4 ${updateBusy ? "animate-pulse" : ""}`} /> : <RefreshCw className={`size-4 ${updateBusy ? "animate-spin" : ""}`} />}</Button>}
         </div>
       </div>
     </aside>}
     <section className={appView === "artifacts" ? "hidden" : "flex min-h-0 min-w-0 flex-1 flex-col"}>
-      {hero ? <div className="flex items-center px-2 py-1.5"><Button variant="ghost" className="size-8 shrink-0 p-0" aria-label={sidebar ? "Hide workspaces" : "Show workspaces"} title="Workspaces" aria-expanded={sidebar} onClick={() => setSidebar(value => !value)}><PanelLeft className="size-4" /></Button></div> : <div className="flex items-center gap-2 border-b border-border px-2 py-2 sm:px-3">
-        <Button variant="ghost" className="size-8 shrink-0 p-0" aria-label={sidebar ? "Hide workspaces" : "Show workspaces"} title="Workspaces" aria-expanded={sidebar} onClick={() => setSidebar(value => !value)}><PanelLeft className="size-4" /></Button>
+      {hero ? <div className="flex items-center px-2 py-1.5"><Button variant="ghost" className="size-8 shrink-0 p-0" aria-label={sidebar ? t.hideWorkspaces : t.showWorkspaces} title={t.workspaces} aria-expanded={sidebar} onClick={() => setSidebar(value => !value)}><PanelLeft className="size-4" /></Button></div> : <div className="flex items-center gap-2 border-b border-border px-2 py-2 sm:px-3">
+        <Button variant="ghost" className="size-8 shrink-0 p-0" aria-label={sidebar ? t.hideWorkspaces : t.showWorkspaces} title={t.workspaces} aria-expanded={sidebar} onClick={() => setSidebar(value => !value)}><PanelLeft className="size-4" /></Button>
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <h2 className="max-w-60 min-w-0 shrink-0 truncate text-sm font-semibold" title={`${name} · ${path}${snapshot.model ? ` · ${snapshot.model}` : ""}`}>{selectedTitle ?? name}</h2>
           {reconnecting || snapshot.connectionError
@@ -1600,19 +1630,19 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
             <SubagentMenu agents={subagents} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} />
             <BackgroundMenu jobs={flow.background} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} />
             <FlowMenu key={snapshot.sessionId ?? path} flow={flow} widgets={snapshot.widgets ?? {}} statuses={snapshot.statuses ?? {}} error={flowError} reports={reportsSession && normalizedPath(reportsSession) === activeSession ? mergeReports(diskReports, snapshot.projection.flowReports) : []} onCommand={command => void runFlowCommand(command)} busy={commandBusy || composerRunning} result={results.flow} />
-            <McpMenu onReload={() => void reloadSession()} onAsk={() => updateDraft("Add an MCP server to this workspace. Ask me for the name, transport, target, and any required environment variables.")} />
+            <McpMenu onReload={() => void reloadSession()} onAsk={() => updateDraft(t.mcpAskPrompt)} />
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
-          <Button variant="ghost" className="size-7 shrink-0 p-0" aria-label="Toggle artifacts panel" title="Artifacts panel" aria-pressed={panes.length > 0} onClick={toggleSide}><PanelRight className="size-3.5" /></Button>
+          <Button variant="ghost" className="size-7 shrink-0 p-0" aria-label={t.toggleArtifacts} title={t.artifactsPanel} aria-pressed={panes.length > 0} onClick={toggleSide}><PanelRight className="size-3.5" /></Button>
         </div>
       </div>}
-      {booting && !hero && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Starting session…</div> : hero ? <div className="flex min-h-0 flex-1 justify-center overflow-y-auto px-4 py-8 sm:px-8">
+      {booting && !hero && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">{t.startingSession}</div> : hero ? <div className="flex min-h-0 flex-1 justify-center overflow-y-auto px-4 py-8 sm:px-8">
         <div className="my-auto w-full max-w-3xl">
           <div className="mb-7 flex flex-col items-center gap-3 text-center">
             <span className="flex size-12 items-center justify-center rounded-2xl border border-border bg-card"><Sparkles className="size-6 text-primary" aria-hidden="true" /></span>
-            <h1 className="text-2xl font-semibold tracking-tight">What would you like to build?</h1>
-            <p className="max-w-md text-sm text-muted-foreground">Choose a workspace, then describe the task. Jouzu can explore code, explain it, or make a change.</p>
+            <h1 className="text-2xl font-semibold tracking-tight">{t.heroTitle}</h1>
+            <p className="max-w-md text-sm text-muted-foreground">{t.heroHint}</p>
           </div>
           <div className="mb-2 flex flex-wrap items-center gap-2 px-1">{workspacePicker}</div>
           {promptNode && <div className="mb-3">{promptNode}</div>}
@@ -1620,18 +1650,18 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           <Composer hero blocked={heroBlocked} results={controlResults} connected={snapshot.connected} pending={snapshot.pending || locked } settling={commandBusy} opening={switching || opening || booting} starting={composerStarting} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={snapshot.models ?? []} model={snapshot.model} modelState={snapshot.modelState ?? "resolving"} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
           <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>
-      </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
+      </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">{t.openingSession}</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
           {showingAttached && snapshot.historyError && <div className="absolute inset-x-0 top-2 z-10 mx-auto w-[min(48rem,calc(100%-2rem))]"><NoticeRow alert={{ id: "history", level: "error", text: t.historyFailed, details: snapshot.historyError, actions: [{ label: t.retry, run: () => void connection.current?.retryHistory() }] }} /></div>}
-          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onRetrySend={id => void connection.current?.retry(id)?.catch(() => {})} onDiscardSend={id => connection.current?.discard(id)} forkResult={forkResult} onFork={(prompt, turn) => void forkTurn(prompt, turn)} history={earlierHistory} onOpenArtifacts={openArtifactsPanel} changedFiles={showingAttached && turnChanged && normalizedPath(turnChanged.session) === normalizedPath(snapshot.sessionFile ?? "") ? turnChanged.files : []} />
+          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onRetrySend={id => void connection.current?.retry(id)?.catch(() => {})} onDiscardSend={id => connection.current?.discard(id)} forkResult={forkResult} onFork={(prompt, turn) => void forkTurn(prompt, turn)} history={earlierHistory} onOpenArtifacts={openArtifactsPanel} replyAction={showingAttached ? replyAction : undefined} changedFiles={showingAttached && turnChanged && normalizedPath(turnChanged.session) === normalizedPath(snapshot.sessionFile ?? "") ? turnChanged.files : []} />
         </div>
         <div className="relative">
           <div className="mx-auto w-full max-w-3xl">
             {banners}
-            <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now)} running={conversationProjection.running} elapsed={elapsed} settled={settled} failure={settled === "failed" ? { details: replyError ?? undefined, action: replyRecovery } : undefined} noReply={noReply} hold={hold} notice={runtimeNotice} />
+            <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now, t)} running={conversationProjection.running} elapsed={elapsed} settled={settled} noReply={noReply} hold={hold} notice={runtimeNotice} />
           </div>
           {promptNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{promptNode}</div>}
-          <Composer autoFocus={composerFocus} blocked={blocked} results={controlResults} connected={snapshot.connected || !!activePreview} pending={snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={opening && !activePreview} starting={composerStarting} unavailable={!!sessionError} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={snapshot.models ?? []} model={snapshot.model} modelState={snapshot.modelState ?? "resolving"} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
+          <Composer autoFocus={composerFocus} blocked={blocked} results={controlResults} connected={snapshot.connected || !!activePreview} pending={elsewhere ? locked : snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={elsewhere || (opening && !activePreview)} starting={!elsewhere && composerStarting} unavailable={!!sessionError} running={!elsewhere && composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={elsewhere ? [] : snapshot.models ?? []} model={elsewhere ? undefined : snapshot.model} modelState={elsewhere ? "ready" : snapshot.modelState ?? "resolving"} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={elsewhere ? undefined : snapshot.thinkingLevel} thinkingLevels={elsewhere ? [] : snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
         </div>
         <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>
@@ -1640,20 +1670,20 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
             <div className="flex items-center gap-1 border-b border-border px-2 py-1">
               <TabsList variant="line" className="h-9 min-w-0 flex-1 justify-start gap-1 overflow-visible rounded-none p-0">
                 {pane.tabs.map(tab => <div key={tab} className="relative flex shrink-0 items-center">
-                  <TabsTrigger value={tab} className="h-9 flex-none px-3 pr-7 text-xs">{tab === "artifacts" ? "Artifacts" : tab === "start" ? "Start" : tab === "files" ? "Files" : tab}</TabsTrigger>
-                  <button type="button" className="absolute right-1 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground" aria-label={`Close ${tab} tab`} title="Close tab" onClick={() => closePaneTab(index, tab)}><X className="size-3" /></button>
+                  <TabsTrigger value={tab} className="h-9 flex-none px-3 pr-7 text-xs">{paneTabLabel(tab)}</TabsTrigger>
+                  <button type="button" className="absolute right-1 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground" aria-label={fill(t.closeNamedTab, { name: paneTabLabel(tab) })} title={t.closeTab} onClick={() => closePaneTab(index, tab)}><X className="size-3" /></button>
                 </div>)}
               </TabsList>
-              <Button variant="ghost" className="size-7 shrink-0 p-0" aria-label="Add panel tab" title="Add tab" onClick={() => addPaneTab(index)}><Plus className="size-3.5" /></Button>
+              <Button variant="ghost" className="size-7 shrink-0 p-0" aria-label={t.addPanelTab} title={t.addTab} onClick={() => addPaneTab(index)}><Plus className="size-3.5" /></Button>
               <div className="ml-auto flex items-center">
-                {index === panes.length - 1 && <Button variant="ghost" className="size-7 shrink-0 p-0" aria-label={panes.length < 2 ? "Split pane" : "Close second pane"} title={panes.length < 2 ? "Split pane" : "Close second pane"} onClick={() => panes.length < 2 ? addPane() : removePane(1)}><Columns2 className="size-3.5" /></Button>}
+                {index === panes.length - 1 && <Button variant="ghost" className="size-7 shrink-0 p-0" aria-label={panes.length < 2 ? t.splitPane : t.closeSecondPane} title={panes.length < 2 ? t.splitPane : t.closeSecondPane} onClick={() => panes.length < 2 ? addPane() : removePane(1)}><Columns2 className="size-3.5" /></Button>}
               </div>
             </div>
             <TabsContent value={pane.active} className="min-h-0 flex-1 overflow-auto p-3">
               {pane.active === "start" ? <PanelStart onOpen={id => openPaneView(index, id)} /> : pane.active === "artifacts" ? <ArtifactsPanel embedded sessionId={artifactsSessionId} workspace={selectedSessionWorkspacePath} references={outputReferences} /> : pane.active === "files" ? <FilesPanel key={selectedSessionWorkspacePath} path={selectedSessionWorkspacePath} /> : null}
             </TabsContent>
           </Tabs>
-          <div role="separator" aria-orientation="vertical" aria-label="Resize pane" className="absolute left-0 top-0 h-full w-1 cursor-col-resize hover:bg-primary/30" onPointerDown={event => { resizingPane.current = { index, startX: event.clientX, startWidth: pane.width }; event.preventDefault(); }} />
+          <div role="separator" aria-orientation="vertical" aria-label={t.resizePane} className="absolute left-0 top-0 h-full w-1 cursor-col-resize hover:bg-primary/30" onPointerDown={event => { resizingPane.current = { index, startX: event.clientX, startWidth: pane.width }; event.preventDefault(); }} />
         </aside>)}
       </div>}
     </section>

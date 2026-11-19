@@ -198,7 +198,8 @@ export interface EnvironmentEntry {
 
 export interface SessionApi {
   list(): Promise<SessionSummary[]>;
-  attach(workspacePath: string, sessionPath?: string): Promise<SessionHandle>;
+  /** `model`: for a new conversation, the model to put it on (the last pick); the host hands it to the runtime once the runtime lists it. */
+  attach(workspacePath: string, sessionPath?: string, model?: { provider: string; id: string }): Promise<SessionHandle>;
   /** This client shows the session now; the host streams its content here again. */
   view?(sessionId: string): Promise<void>;
   /** The session as it stands now; `cursor` is the last event it includes. */
