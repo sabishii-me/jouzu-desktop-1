@@ -5,6 +5,8 @@ describe("configuration response boundary", () => {
  it("accepts a sign-out advisory and rejects unknown revocation values", () => {
    expect(parseControlState({...valid,account:{signedIn:false,revocation:"unconfirmed"}}).account.revocation).toBe("unconfirmed");
    expect(()=>parseControlState({...valid,account:{signedIn:false,revocation:"maybe"}})).toThrow();
+   expect(parseControlState({...valid,account:{signedIn:true,providers:["shisa","catalog:a:b:c"]}}).account.providers).toEqual(["shisa","catalog:a:b:c"]);
+   expect(()=>parseControlState({...valid,account:{signedIn:true,providers:[1]}})).toThrow();
  });
  it("accepts complete empty state", () => expect(parseControlState(valid).customProviders).toEqual([]));
  it("carries provider auth capabilities without rejecting older rows", () => {

@@ -1,9 +1,9 @@
 export interface ControlState {
   connectionCheck?: { provider: string; status: string };
   profile: string | null;
-  account: { signedIn: boolean; revocation?: "confirmed" | "unconfirmed" | "not-linked" };
+  account: { signedIn: boolean; revocation?: "confirmed" | "unconfirmed" | "not-linked"; /** The runtime providers this sign-in authenticates. */ providers?: string[] };
   customProviders: { id: string; url: string; model: string; editable: boolean; imageInput?: boolean; contextWindow?: number; maxTokens?: number }[];
-  providers: { id: string; name: string; oauth?: boolean; oauthName?: string; apiKey?: boolean; /** "shisa": the Shisa.AI sign-in is this provider's credential. */ signIn?: string }[];
+  providers: { id: string; name: string; oauth?: boolean; oauthName?: string; apiKey?: boolean; }[];
   credentials: { providerId: string }[];
   defaultProvider?: string;
   defaultModel?: string;
@@ -63,6 +63,7 @@ export function parseControlState(value: unknown): ControlState {
   if (!record(value)) return fail();
   if (value.schemaVersion !== 1 || !record(value.account) || typeof value.account.signedIn !== "boolean" || !(value.profile === null || typeof value.profile === "string")) return fail();
   if (value.account.revocation !== undefined && !["confirmed", "unconfirmed", "not-linked"].includes(value.account.revocation as string)) return fail();
+  if (value.account.providers !== undefined && !(Array.isArray(value.account.providers) && value.account.providers.every(id => typeof id === "string"))) return fail();
   const fields = { credentials: ["providerId"], providers: ["id", "name"], customProviders: ["id"] };
   for (const [key, required] of Object.entries(fields)) {
     const rows = value[key];
@@ -74,7 +75,7 @@ export function parseControlState(value: unknown): ControlState {
   for (const row of value.providers as Record<string, unknown>[]) {
     if (row.oauth !== undefined && typeof row.oauth !== "boolean") return fail();
     if (row.apiKey !== undefined && typeof row.apiKey !== "boolean") return fail();
-    for (const key of ["oauthName", "signIn"]) if (row[key] !== undefined && typeof row[key] !== "string") return fail();
+    for (const key of ["oauthName"]) if (row[key] !== undefined && typeof row[key] !== "string") return fail();
   }
   for (const key of ["defaultProvider", "defaultModel"]) if (value[key] !== undefined && typeof value[key] !== "string") return fail();
   if (value.connectionCheck !== undefined && (!record(value.connectionCheck) || typeof value.connectionCheck.provider !== "string" || typeof value.connectionCheck.status !== "string")) return fail();

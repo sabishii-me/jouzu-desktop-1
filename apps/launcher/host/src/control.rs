@@ -249,17 +249,12 @@ impl Outcome {
 }
 
 /// What a finished operation leaves behind.
-/// The providers whose credential is the Shisa.AI sign-in, as the settings say.
+/// The providers whose credential is the Shisa.AI sign-in, as the settings'
+/// account lists them.
 fn shisa_providers(settings: Option<&Value>) -> Vec<String> {
     let mut ids = vec!["shisa".to_string()];
-    let rows = settings.and_then(|settings| settings.get("providers")).and_then(Value::as_array);
-    for row in rows.into_iter().flatten() {
-        if row.get("signIn").and_then(Value::as_str) == Some("shisa") {
-            if let Some(id) = row.get("id").and_then(Value::as_str) {
-                ids.push(id.to_string());
-            }
-        }
-    }
+    let listed = settings.and_then(|settings| settings.pointer("/account/providers")).and_then(Value::as_array);
+    ids.extend(listed.into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
     ids
 }
 
@@ -524,7 +519,7 @@ impl ControlManager {
                 if let Some(providers) = self.providers.get() {
                     match (kind.name, &operation_payload_provider) {
                         // The sign-in is the credential of every provider the
-                        // settings mark with it (the Shisa API catalog's).
+                        // account lists (the Shisa API catalog's).
                         ("shisa-login" | "shisa-logout", _) => {
                             let known = done.settings.clone().or_else(|| self.lock().settings.clone());
                             for id in shisa_providers(known.as_ref()) {

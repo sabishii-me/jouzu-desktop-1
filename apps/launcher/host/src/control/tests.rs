@@ -121,7 +121,7 @@ if (request.action === 'shisa-login') {{
   process.stderr.write(JSON.stringify({{ type: 'device', url: 'https://platform.shisa.ai/connect', code: 'ABCD' }}) + '\n');
   await new Promise(() => setInterval(() => {{}}, 1000));
 }}
-const settings = {{ schemaVersion: 1, last: request.action, key: process.env.SHISA_API_KEY ?? null, providers: [{{ id: 'catalog:ai.shisa.api-router:Shisa%20AI:57024af9495fc6b0', name: 'Shisa AI', signIn: 'shisa' }}, {{ id: 'openai', name: 'OpenAI' }}] }};
+const settings = {{ schemaVersion: 1, last: request.action, key: process.env.SHISA_API_KEY ?? null, account: {{ signedIn: true, providers: ['shisa', 'catalog:ai.shisa.api-router:Shisa%20AI:57024af9495fc6b0'] }}, providers: [{{ id: 'openai', name: 'OpenAI' }}] }};
 if (request.action === 'refresh-catalogs') settings.catalog = {{ status: 'quarantined', sources: [], held: {{ revision: 'r1' }} }};
 console.log(JSON.stringify(settings));
 "#
