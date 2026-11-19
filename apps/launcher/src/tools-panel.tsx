@@ -44,6 +44,7 @@ function imageWhy(t: ChatText, code: string): string {
     "no-credential": "imageWhyNoCredential",
     "sign-in-refused": "imageWhySignInRefused",
     "not-allowed": "imageWhyNotAllowed",
+    "no-credit": "imageWhyNoCredit",
     "no-models": "imageWhyNoModels",
     unreachable: "imageWhyUnreachable",
     busy: "imageWhyBusy",

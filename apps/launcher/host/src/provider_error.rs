@@ -26,6 +26,18 @@ pub fn code(text: &str) -> &'static str {
                     && !after.is_some_and(|c| c.is_ascii_alphanumeric())
             })
     };
+    // A provider that names its error says what it is, whatever the status:
+    // the Shisa router answers 403 for a model outside the plan and 429 for a
+    // used-up free allowance, neither of which is a refused key or a pause.
+    if has(&["model_not_in_plan"]) {
+        return "model-unavailable";
+    }
+    if has(&["insufficient_balance", "free_allowance_exhausted"]) {
+        return "quota";
+    }
+    if has(&["auth_verification_busy", "backend_at_capacity"]) {
+        return "unavailable";
+    }
     if status("401")
         || status("403")
         || has(&[
@@ -97,6 +109,13 @@ mod tests {
         assert_eq!(code("503 Service Unavailable"), "unavailable");
         assert_eq!(code("fetch failed"), "unavailable");
         assert_eq!(code("Connection error."), "unavailable");
+        // Shisa router codes decide over the status they come with.
+        assert_eq!(code("403 {\"error\":{\"message\":\"Model not in plan\",\"code\":\"model_not_in_plan\"}}"), "model-unavailable");
+        assert_eq!(code("402 {\"error\":{\"code\":\"insufficient_balance\"}}"), "quota");
+        assert_eq!(code("429 {\"error\":{\"code\":\"free_allowance_exhausted\"}}"), "quota");
+        assert_eq!(code("429 {\"error\":{\"code\":\"rate_limit_exceeded\"}}"), "rate-limit");
+        assert_eq!(code("503 {\"error\":{\"code\":\"auth_verification_busy\"}}"), "unavailable");
+        assert_eq!(code("401 {\"error\":{\"message\":\"Invalid API key.\",\"code\":\"invalid_api_key\"}}"), "auth");
         assert_eq!(code("Something odd happened"), "other");
         // A number inside a longer one is not a status.
         assert_eq!(code("request 14010 failed"), "other");

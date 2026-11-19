@@ -18,9 +18,12 @@ async function failure(response) {
   } catch {
     body = null;
   }
-  const code = body?.code ?? body?.error?.code;
+  const code = body?.error?.code ?? body?.code;
+  // The router names its errors; the name decides over the status.
+  if (code === "model_not_in_plan") return coded("not-allowed", "This account's plan does not include image generation.");
+  if (code === "insufficient_balance" || code === "free_allowance_exhausted") return coded("no-credit", "This account is out of credit for image generation.");
   if (response.status === 401) return coded("sign-in-refused", "Sign in to Shisa.AI again to generate images.");
-  if (response.status === 403 && code === 311) return coded("not-allowed", "This account cannot use image generation (shisa/image).");
+  if (response.status === 403 && (code === 311 || body?.code === 311)) return coded("not-allowed", "This account cannot use image generation (shisa/image).");
   if (response.status === 400) return coded("other", `The model or image size was rejected${body?.error?.message ? ` (${body.error.message})` : ""}.`);
   if (response.status === 413) return coded("other", "The prompt is too large.");
   if (response.status === 429 || response.status === 503) return coded("busy", "Image generation is busy. Try again in a moment.");

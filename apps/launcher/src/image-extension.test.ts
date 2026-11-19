@@ -293,6 +293,16 @@ describe("image provider availability", () => {
     expect(await availability(shisa)).toEqual({ available: false, code: "sign-in-refused", reason: "Sign in to Shisa.AI again to generate images." });
   });
 
+  it("reads the router's error code before its status", async () => {
+    setCredentialReader(async () => ({ type: "oauth", access: "t" }));
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 403, json: async () => ({ error: { code: "model_not_in_plan" } }) });
+    expect(await availability(shisa)).toMatchObject({ available: false, code: "not-allowed" });
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 429, json: async () => ({ error: { code: "free_allowance_exhausted" } }) });
+    expect(await availability(shisa)).toMatchObject({ available: false, code: "no-credit" });
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 402, json: async () => ({ error: { code: "insufficient_balance" } }) });
+    expect(await availability(shisa)).toMatchObject({ available: false, code: "no-credit" });
+  });
+
   it("is unavailable when the account cannot use image generation", async () => {
     setCredentialReader(async () => ({ type: "oauth", access: "t" }));
     vi.mocked(fetch).mockResolvedValue({ ok: false, status: 403, json: async () => ({ code: 311 }) });
