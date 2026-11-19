@@ -5033,6 +5033,25 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_saved_conversation_written_with_plain_text_content_shows_its_history() {
+        let (manager, _home, workspace) = manager(50);
+        let header = json!({ "type": "session", "version": 1, "id": "old", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let user = json!({ "type": "message", "message": { "role": "user", "content": "Session from an older version" } });
+        let reply = json!({ "type": "message", "message": { "role": "assistant", "content": "An answer written by an older version." } });
+        let file = workspace.path().join("old.jsonl");
+        std::fs::write(&file, format!("{header}\n{user}\n{reply}\n")).unwrap();
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+        session.open_saved_history();
+        let rows = session.history(50, None)["messages"].as_array().cloned().unwrap_or_default();
+        let mut texts: Vec<&str> = rows.iter().filter_map(|row| row["text"].as_str()).collect();
+        texts.sort_unstable();
+        assert_eq!(texts, ["An answer written by an older version.", "Session from an older version"], "{rows:?}");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
     async fn a_saved_conversation_keeps_the_model_it_used() {
         let (manager, _home, workspace) = manager(50);
         let header = json!({ "type": "session", "version": 3, "id": "saved-model", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });

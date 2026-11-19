@@ -355,6 +355,14 @@ const FLOW_RELEASE_ID: &str = "host-flow-release";
 /// mapping, so a conversation has the same shape either way.
 fn reply_blocks(message: &Value) -> Vec<Value> {
     let mut blocks = Vec::new();
+    // A message's content may be plain text instead of blocks (the runtime's
+    // message format allows it; older versions wrote it that way).
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        if !text.is_empty() {
+            blocks.push(json!({ "type": "text", "text": text }));
+        }
+        return blocks;
+    }
     let Some(content) = message.get("content").and_then(Value::as_array) else {
         return blocks;
     };
