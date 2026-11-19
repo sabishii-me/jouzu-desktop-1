@@ -69,13 +69,17 @@ const control = (path, body) => post(world, path, body);
 // ---- Words the person sees, per interface language (from src/chat-text.ts, src/i18n.ts) ----
 const allWords = {
   en: { newSession: "New session", retry: "Retry", settings: "Settings", restart: "Restart session", continue: "Continue", discard: "Discard",
-    composer: "Message composer", conversation: "Conversation", workspaces: "Workspaces", message: "Message Jouzu", chooseImages: "Choose images", attachedImages: "Attached images", queued: "Queued messages", stop: "Stop" },
+    composer: "Message composer", conversation: "Conversation", workspaces: "Workspaces", message: "Message Jouzu", chooseImages: "Choose images", attachedImages: "Attached images", queued: "Queued messages", stop: "Stop",
+    providers: "Model providers", service: "Service", defaultModel: "Default model" },
   ja: { newSession: "新しいセッション", retry: "再試行", settings: "設定", restart: "セッションを再起動", continue: "続ける", discard: "破棄",
-    composer: "メッセージ入力", conversation: "会話", workspaces: "ワークスペース", message: "Jouzu へのメッセージ", chooseImages: "画像を選択", attachedImages: "添付画像", queued: "待機中のメッセージ", stop: "停止" },
+    composer: "メッセージ入力", conversation: "会話", workspaces: "ワークスペース", message: "Jouzu へのメッセージ", chooseImages: "画像を選択", attachedImages: "添付画像", queued: "待機中のメッセージ", stop: "停止",
+    providers: "モデルプロバイダー", service: "サービス", defaultModel: "既定のモデル" },
   "zh-Hans": { newSession: "新会话", retry: "重试", settings: "设置", restart: "重启会话", continue: "继续", discard: "丢弃",
-    composer: "消息输入框", conversation: "对话", workspaces: "工作区", message: "给 Jouzu 发消息", chooseImages: "选择图片", attachedImages: "已添加的图片", queued: "排队中的消息", stop: "停止" },
+    composer: "消息输入框", conversation: "对话", workspaces: "工作区", message: "给 Jouzu 发消息", chooseImages: "选择图片", attachedImages: "已添加的图片", queued: "排队中的消息", stop: "停止",
+    providers: "模型提供商", service: "服务", defaultModel: "默认模型" },
   "zh-Hant": { newSession: "新工作階段", retry: "重試", settings: "設定", restart: "重新啟動工作階段", continue: "繼續", discard: "捨棄",
-    composer: "訊息輸入框", conversation: "對話", workspaces: "工作區", message: "傳訊息給 Jouzu", chooseImages: "選擇圖片", attachedImages: "已加入的圖片", queued: "排隊中的訊息", stop: "停止" },
+    composer: "訊息輸入框", conversation: "對話", workspaces: "工作區", message: "傳訊息給 Jouzu", chooseImages: "選擇圖片", attachedImages: "已加入的圖片", queued: "排隊中的訊息", stop: "停止",
+    providers: "模型供應商", service: "服務", defaultModel: "預設模型" },
 };
 const words = allWords[lang];
 const english = allWords.en;
@@ -670,11 +674,21 @@ add("Settings file cannot be written", "When a setting cannot be saved, that car
   const lock = await control("/file", { path: "data/agent/settings.json", readOnly: true });
   if (!lock.effective) { c.record.skipped = true; c.note("this machine cannot make the file unwritable (running as an administrator)"); await control("/file", { path: "data/agent/settings.json", readOnly: false }); return; }
   try {
-    const dialog = await openSettings(/^(language|言語|语言|語言)$/i);
+    // The default model is the setting saved in settings.json (the language controls are
+    // saved in localization.json, and changing them would change the interface language).
+    const dialog = await openSettings(named("providers"));
     const before = await layout();
-    const combo = dialog.getByRole("combobox").first();
-    await combo.click();
-    await page.getByRole("option").nth(2).click();
+    // Open the saved provider (its row in the provider list, or the service picker).
+    const row = dialog.getByRole("button", { name: /^fixture\b/i }).first();
+    if (await row.count()) await row.click();
+    else {
+      await dialog.getByRole("combobox", { name: named("service") }).first().click();
+      await page.getByRole("option", { name: /fixture/i }).first().click();
+    }
+    const model = dialog.getByRole("combobox", { name: named("defaultModel") }).first();
+    if (!await model.count()) { c.fail("no default model control found for the provider"); await page.keyboard.press("Escape"); return; }
+    await model.click();
+    await page.getByRole("option", { name: /second/i }).first().click();
     // Only a problem on the settings card counts: a line left by an earlier case elsewhere
     // (a composer warning) is not this save's answer.
     let shown = null;
@@ -689,6 +703,8 @@ add("Settings file cannot be written", "When a setting cannot be saved, that car
     await page.keyboard.press("Escape");
   } finally {
     await control("/file", { path: "data/agent/settings.json", readOnly: false });
+    // Leave the home as it was for the cases after this one.
+    await control("/file", { path: "data/agent/settings.json", text: JSON.stringify({ defaultProvider: "fixture", defaultModel: "deterministic" }, null, 2) });
   }
   await freshSession();
   const next = ask();
