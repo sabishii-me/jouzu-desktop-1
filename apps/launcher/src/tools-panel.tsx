@@ -4,7 +4,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./com
 import { Label } from "./components/ui/label";
 import { Switch } from "./components/ui/switch";
 import { ErrorLine } from "./session-alerts-view";
-import { explain, fill, useChatText } from "./chat-text";
+import { explain, fill, useChatText, type ChatText } from "./chat-text";
 
 interface ImageSettings {
   enabled: boolean;
@@ -30,11 +30,26 @@ interface ImageProvider {
   id: string;
   label: string;
   available: boolean;
+  /** Why it is not usable, as a code this page words; `reason` is the original text. */
+  code: string;
   reason: string;
   models: ImageModel[] | null;
 }
 
 const SIZES = ["1K", "2K", "4K"];
+
+/** Why an image provider is not usable, in the interface language. */
+function imageWhy(t: ChatText, code: string): string {
+  const key = ({
+    "no-credential": "imageWhyNoCredential",
+    "sign-in-refused": "imageWhySignInRefused",
+    "not-allowed": "imageWhyNotAllowed",
+    "no-models": "imageWhyNoModels",
+    unreachable: "imageWhyUnreachable",
+    busy: "imageWhyBusy",
+  } as const)[code];
+  return key ? t[key] : t.notAvailable;
+}
 const MAX_IMAGES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 const select = "mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm";
 
@@ -52,12 +67,13 @@ function readModels(value: unknown): ImageModel[] {
 function readProviders(value: unknown): ImageProvider[] {
   const list: unknown[] = Array.isArray(value) ? value : [];
   return list.flatMap(item => {
-    const entry = item as { id?: unknown; label?: unknown; available?: unknown; reason?: unknown; models?: unknown };
+    const entry = item as { id?: unknown; label?: unknown; available?: unknown; code?: unknown; reason?: unknown; models?: unknown };
     if (typeof entry?.id !== "string" || !entry.id) return [];
     return [{
       id: entry.id,
       label: typeof entry.label === "string" && entry.label ? entry.label : entry.id,
       available: entry.available !== false,
+      code: typeof entry.code === "string" ? entry.code : "",
       reason: typeof entry.reason === "string" ? entry.reason : "",
       models: Array.isArray(entry.models) ? readModels(entry.models) : null,
     }];
@@ -191,7 +207,7 @@ export function ToolsPanel() {
       </div>
       {notInstalled && <p role="status" data-tools-not-installed className="text-xs text-muted-foreground">{t.codeToolsUnavailable}</p>}
       {unusable.length > 0 && <ul aria-label={t.unavailableImageProviders} className="space-y-1 text-xs text-muted-foreground">
-        {unusable.map(provider => <li key={provider.id}>{provider.label}: {provider.reason || t.notAvailable}</li>)}
+        {unusable.map(provider => <li key={provider.id} title={provider.reason || undefined}>{provider.label}: {imageWhy(t, provider.code)}</li>)}
       </ul>}
       {error != null && <ErrorLine raw={error} failed={t.toolsChangeFailed} onDismiss={() => setError(null)} />}
       <div className="border-t border-border pt-3 text-xs text-muted-foreground">

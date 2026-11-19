@@ -6,6 +6,11 @@ const BASE = "https://api.shisa.ai/image";
 const SIZES = { "gemini-3.1-flash-lite-image": ["1K"], "gemini-3.1-flash-image": ["1K", "2K", "4K"], "gemini-3-pro-image": ["1K", "2K", "4K"] };
 const ALL_SIZES = ["1K", "2K", "4K"];
 
+/** An error with the code the desktop words in its own language; the text stays for Details. */
+function coded(code, text) {
+  return Object.assign(new Error(text), { code });
+}
+
 async function failure(response) {
   let body = null;
   try {
@@ -14,12 +19,12 @@ async function failure(response) {
     body = null;
   }
   const code = body?.code ?? body?.error?.code;
-  if (response.status === 401) return "Sign in to Shisa.AI again to generate images.";
-  if (response.status === 403 && code === 311) return "This account cannot use image generation (shisa/image).";
-  if (response.status === 400) return `The model or image size was rejected${body?.error?.message ? ` (${body.error.message})` : ""}.`;
-  if (response.status === 413) return "The prompt is too large.";
-  if (response.status === 429 || response.status === 503) return "Image generation is busy. Try again in a moment.";
-  return `Image generation failed (HTTP ${response.status}).`;
+  if (response.status === 401) return coded("sign-in-refused", "Sign in to Shisa.AI again to generate images.");
+  if (response.status === 403 && code === 311) return coded("not-allowed", "This account cannot use image generation (shisa/image).");
+  if (response.status === 400) return coded("other", `The model or image size was rejected${body?.error?.message ? ` (${body.error.message})` : ""}.`);
+  if (response.status === 413) return coded("other", "The prompt is too large.");
+  if (response.status === 429 || response.status === 503) return coded("busy", "Image generation is busy. Try again in a moment.");
+  return coded("other", `Image generation failed (HTTP ${response.status}).`);
 }
 
 export default {
@@ -53,9 +58,9 @@ export default {
       headers: { authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(15_000),
     }).catch(() => {
-      throw new Error("Shisa.AI could not be reached.");
+      throw coded("unreachable", "Shisa.AI could not be reached.");
     });
-    if (!response.ok) throw new Error(await failure(response));
+    if (!response.ok) throw await failure(response);
     const body = await response.json().catch(() => null);
     const list = Array.isArray(body?.models) ? body.models : Array.isArray(body?.data) ? body.data : [];
     return list
@@ -72,7 +77,7 @@ export default {
       body: JSON.stringify({ model, input: prompt, store: false, response_format: { type: "image", image_size: size } }),
       signal: AbortSignal.timeout(180_000),
     });
-    if (!response.ok) throw new Error(await failure(response));
+    if (!response.ok) throw await failure(response);
     const body = await response.json().catch(() => null);
     const image = (body?.steps ?? [])
       .flatMap(step => (Array.isArray(step?.content) ? step.content : []))
