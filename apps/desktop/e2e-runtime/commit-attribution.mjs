@@ -17,7 +17,7 @@ const repo = mkdtempSync(join(tmpdir(), 'attr-repo-'));
 mkdirSync(join(home, 'agent', 'extensions'), { recursive: true });
 cpSync(extDir, join(home, 'agent', 'extensions', 'jouzu-attribution'), { recursive: true });
 const on = process.env.ATTR_ON === '1';
-writeFileSync(join(home, 'agent', 'tools.json'), JSON.stringify({ commitAttribution: { enabled: on } }));
+writeFileSync(join(home, 'agent', 'attribution.json'), JSON.stringify({ enabled: on }));
 const genv = { ...process.env, GIT_AUTHOR_NAME: 'a', GIT_AUTHOR_EMAIL: 'a@x', GIT_COMMITTER_NAME: 'a', GIT_COMMITTER_EMAIL: 'a@x', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(repo, '.none') };
 delete genv.GIT_CONFIG_COUNT;
 spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: repo, env: genv });

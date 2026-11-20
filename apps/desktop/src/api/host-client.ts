@@ -373,8 +373,12 @@ export class HostClient {
     return this.request("/v1/tools", { method: "PUT", body: JSON.stringify({ image }) });
   }
 
-  saveCommitAttribution(enabled: boolean): Promise<Record<string, unknown>> {
-    return this.request("/v1/tools/commit-attribution", { method: "PUT", body: JSON.stringify({ enabled }) });
+  attribution(): Promise<{ enabled: boolean }> {
+    return this.request("/v1/attribution");
+  }
+
+  saveAttribution(enabled: boolean): Promise<{ enabled: boolean }> {
+    return this.request("/v1/attribution", { method: "PUT", body: JSON.stringify({ enabled }) });
   }
 
   toolProviders(): Promise<{ providers: Array<{ id: string; label: string; available?: boolean; reason?: string; models?: unknown }> }> {

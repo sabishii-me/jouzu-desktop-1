@@ -14,19 +14,19 @@ function temp(prefix: string) {
 }
 afterEach(() => { for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-function homeWith(tools?: unknown) {
+function homeWith(setting?: unknown) {
   const home = temp("jouzu-attr-home-");
   mkdirSync(join(home, "agent"), { recursive: true });
-  if (tools !== undefined) writeFileSync(join(home, "agent", "tools.json"), JSON.stringify(tools));
+  if (setting !== undefined) writeFileSync(join(home, "agent", "attribution.json"), JSON.stringify(setting));
   return home;
 }
 
 describe("jouzu-attribution extension", () => {
-  it("is off unless tools.json turns it on", () => {
+  it("is off unless attribution.json turns it on", () => {
     expect(enabled(homeWith())).toBe(false);
-    expect(enabled(homeWith({ image: {} }))).toBe(false);
-    expect(enabled(homeWith({ commitAttribution: { enabled: "yes" } }))).toBe(false);
-    expect(enabled(homeWith({ commitAttribution: { enabled: true } }))).toBe(true);
+    expect(enabled(homeWith({}))).toBe(false);
+    expect(enabled(homeWith({ enabled: "yes" }))).toBe(false);
+    expect(enabled(homeWith({ enabled: true }))).toBe(true);
   });
 
   it("appends its git configuration after the runtime's own and takes it back", () => {
@@ -52,7 +52,7 @@ describe("jouzu-attribution extension", () => {
     const handlers = new Map();
     extension({ on: (event, handler) => handlers.set(event, handler) });
     const run = async (on: boolean, guidelines: string[]) => {
-      process.env.JOUZU_HOME = homeWith({ commitAttribution: { enabled: on } });
+      process.env.JOUZU_HOME = homeWith({ enabled: on });
       await handlers.get("before_agent_start")({ systemPromptOptions: { promptGuidelines: guidelines } }, { model: { id: "m-1", name: "Model One" } });
       return guidelines;
     };

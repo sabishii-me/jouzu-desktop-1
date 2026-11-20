@@ -1,4 +1,4 @@
-// Jouzu Desktop: "Mark commits made by the agent" (Settings > Tools, off by
+// Jouzu Desktop: "Mark commits made by the agent" (Settings > Collaboration, off by
 // default). Installed into the agent's extension directory by the desktop; it
 // is not part of the runtime.
 //
@@ -39,7 +39,7 @@ export function home() {
 /** On only when the person turned it on; anything unreadable is off. */
 export function enabled(root = home()) {
   try {
-    return JSON.parse(readFileSync(join(root, "agent", "tools.json"), "utf8"))?.commitAttribution?.enabled === true;
+    return JSON.parse(readFileSync(join(root, "agent", "attribution.json"), "utf8"))?.enabled === true;
   } catch {
     return false;
   }

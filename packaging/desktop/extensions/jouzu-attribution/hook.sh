@@ -1,5 +1,5 @@
 #!/bin/sh
-# Jouzu Desktop: "Mark commits made by the agent" (Settings > Tools).
+# Jouzu Desktop: "Mark commits made by the agent" (Settings > Collaboration).
 # While that is on, git started by the agent uses this folder as its hooks
 # folder (index.js sets it). Every hook here first runs the repository's own
 # hook of the same name, unchanged; then prepare-commit-msg adds the trailers.
