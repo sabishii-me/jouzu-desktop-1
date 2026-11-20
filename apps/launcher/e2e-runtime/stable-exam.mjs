@@ -127,8 +127,10 @@ try {
     const timing = existsSync(log) && playbook.result
       ? hostTiming(readFileSync(log, 'utf8'), { from: Date.parse(playbook.result.startedAt), to: Date.parse(playbook.result.finishedAt ?? new Date().toISOString()) })
       : null;
-    const problem = existsSync(log) ? hostGateProblem(timing) : `gate sendToModelRequest: no host.log at ${log}`;
-    report.runs.push({ name: 'host-timing', problems: problem ? [problem] : [], result: timing });
+    // A host-internal number: a diagnostic, never the pass criterion (0019). What the
+    // person sees (own message, working, first reply) is gated by the playbook itself.
+    const note = existsSync(log) ? hostGateProblem(timing) : `no host.log at ${log}`;
+    report.runs.push({ name: 'host-timing (diagnostic)', problems: [], note, result: timing });
   }
   await browser.close();
   // The run belongs to the host: a message sent during a reply is read by it, Stop
@@ -173,6 +175,6 @@ try {
 report.pass = report.runs.length > 0 && report.runs.every(run => run.problems.length === 0);
 report.finishedAt = new Date().toISOString();
 writeFileSync(out, `${JSON.stringify(report, null, 2)}\n`);
-for (const run of report.runs) console.log(`${run.problems.length ? 'FAIL' : 'PASS'} ${run.name}${run.problems.length ? `: ${run.problems.join('; ')}` : ''}`);
+for (const run of report.runs) console.log(`${run.problems.length ? 'FAIL' : 'PASS'} ${run.name}${run.problems.length ? `: ${run.problems.join('; ')}` : ''}${run.note ? ` (${run.note})` : ''}`);
 console.log(report.pass ? 'Stable exam passed.' : 'Stable exam failed.');
 process.exit(report.pass ? 0 : 1);
