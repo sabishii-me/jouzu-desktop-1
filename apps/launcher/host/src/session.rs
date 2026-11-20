@@ -4591,8 +4591,20 @@ impl Session {
         };
         if changed {
             self.publish_summary();
+            self.write_attribution();
         }
         changed
+    }
+
+    /// Tell the commit attribution hooks of this session's runtime which
+    /// session and model its commits come from (nothing when that is off).
+    fn write_attribution(&self) {
+        let runtime = self.runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let Some(file) = runtime.as_ref().and_then(|runtime| runtime.attribution_file()) else {
+            return;
+        };
+        let model = self.model.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        crate::commit_attribution::describe(file, &self.id, model.as_ref());
     }
 
     /// Replace one of the runtime's lists; publish when it changed.
@@ -5441,6 +5453,7 @@ impl Session {
             return;
         }
         self.restarts.settle();
+        self.write_attribution();
         let session = self.clone();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {

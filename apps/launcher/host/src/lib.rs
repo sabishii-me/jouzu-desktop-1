@@ -1389,7 +1389,7 @@ async fn read_environment(
 
 async fn read_commit_attribution(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     commit_attribution::read(state.sessions.runtime_home())
-        .map(|setting| Json(json!({ "enabled": setting.enabled, "trailer": commit_attribution::TRAILER })))
+        .map(|setting| Json(json!({ "enabled": setting.enabled, "trailer": format!("{}\n{}", commit_attribution::TRAILER, commit_attribution::SESSION_TRAILER) })))
         .map_err(ApiError::bad_request)
 }
 
@@ -4799,6 +4799,34 @@ mod session_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(session.summary()["thinkingLevel"], "high");
+    }
+
+    /// Commit attribution on: the session's runtime file names the session and
+    /// follows the model the runtime reports.
+    #[tokio::test]
+    async fn commit_attribution_follows_the_session_and_its_model() {
+        let (manager, _home, workspace) = manager(50);
+        commit_attribution::save(manager.runtime_home(), commit_attribution::Setting { enabled: true }).unwrap();
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let runs = manager.runtime_home().join("git-hooks").join("runs");
+        let read = || -> Vec<String> {
+            std::fs::read_dir(&runs)
+                .map(|entries| entries.flatten().filter_map(|entry| std::fs::read_to_string(entry.path()).ok()).collect())
+                .unwrap_or_default()
+        };
+        let wanted = |model: &str| format!("session={}\nmodel={model}\n", session.id);
+        for _ in 0..100 {
+            if read().contains(&wanted("fixture-model")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(read().contains(&wanted("fixture-model")), "{:?}", read());
+        session.select_model("fixture", "other").await.unwrap();
+        assert!(read().contains(&wanted("Fixture Other")), "{:?}", read());
     }
 
     #[tokio::test]

@@ -7,6 +7,12 @@
 //! are untouched. Each of those hooks runs the repository's own hook of the same
 //! name first, unchanged; `prepare-commit-msg` then adds [`TRAILER`].
 //!
+//! Like Claude Code's attribution, the trailer names the model and a second
+//! trailer names the session: each runtime gets a file of its own
+//! (`JOUZU_GIT_ATTRIBUTION`) where the session it serves writes its id and its
+//! current model ([`describe`]); the hook reads it at commit time, so a warm
+//! runtime taken by a session and a model picked mid-session are both right.
+//!
 //! It marks commits, it does not prove who made them: git started with a cleared
 //! environment or its own `core.hooksPath` skips it.
 
@@ -18,7 +24,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const TRAILER: &str = "Co-authored-by: Jouzu Desktop <noreply@shisa.ai>";
+/// The line as the setting shows it; commits carry the model in parentheses
+/// after the name and a `Jouzu-Session:` line when the session is known.
+pub const TRAILER: &str = "Co-authored-by: Jouzu Desktop (<model>) <noreply@shisa.ai>";
+pub const SESSION_TRAILER: &str = "Jouzu-Session: <session id>";
+
+const FILE_VARIABLE: &str = "JOUZU_GIT_ATTRIBUTION";
 
 const HOOK: &str = include_str!("git_hooks/hook.sh");
 
@@ -65,6 +76,43 @@ fn path(home: &Path) -> PathBuf {
 
 fn hooks_dir(home: &Path) -> PathBuf {
     home.join("git-hooks")
+}
+
+fn runs_dir(home: &Path) -> PathBuf {
+    hooks_dir(home).join("runs")
+}
+
+/// A name no other runtime of this host or an earlier one uses.
+fn run_name() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    format!("{}-{now:x}-{next}", std::process::id())
+}
+
+/// The file a runtime started with `env` reads its attribution from, if any.
+pub fn runtime_file(env: &[(OsString, OsString)]) -> Option<PathBuf> {
+    env.iter()
+        .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(FILE_VARIABLE))
+        .map(|(_, value)| PathBuf::from(value))
+}
+
+/// Write which session a runtime serves and its model, for the hooks. A model
+/// is named by its name, else its id; `<`, `>` and line breaks are dropped so
+/// the line stays one valid trailer.
+pub fn describe(file: &Path, session: &str, model: Option<&serde_json::Value>) {
+    let label = model
+        .and_then(|model| model.get("name").or_else(|| model.get("id")))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let clean = |text: &str| text.chars().filter(|c| !matches!(c, '<' | '>' | '\n' | '\r')).collect::<String>();
+    let temp = file.with_extension("tmp");
+    if std::fs::write(&temp, format!("session={}\nmodel={}\n", clean(session), clean(label).trim())).is_ok() {
+        let _ = std::fs::rename(&temp, file);
+    }
 }
 
 /// The saved choice; nothing saved is off.
@@ -118,6 +166,7 @@ pub fn variables(
         return Ok(Vec::new());
     }
     let dir = install(home)?;
+    std::fs::create_dir_all(runs_dir(home)).map_err(|_| "Cannot create the git hooks folder")?;
     let index = environment
         .get("GIT_CONFIG_COUNT")
         .and_then(|(_, value)| value.to_str())
@@ -130,6 +179,7 @@ pub fn variables(
         // The hooks find the repository's own hooks folder by switching this
         // entry off for one git call.
         ("JOUZU_GIT_HOOKS_INDEX".into(), OsString::from(index.to_string())),
+        (FILE_VARIABLE.into(), runs_dir(home).join(run_name()).into_os_string()),
     ])
 }
 
@@ -157,6 +207,9 @@ mod tests {
         assert_eq!(get("GIT_CONFIG_VALUE_3"), Some(hooks_dir(home.path()).into_os_string()));
         assert_eq!(get("GIT_CONFIG_COUNT"), Some(OsString::from("4")));
         assert_eq!(get("JOUZU_GIT_HOOKS_INDEX"), Some(OsString::from("3")));
+        let file = PathBuf::from(get("JOUZU_GIT_ATTRIBUTION").unwrap());
+        assert_eq!(file.parent(), Some(runs_dir(home.path()).as_path()));
+        assert!(file.parent().unwrap().is_dir());
         for name in HOOKS {
             assert_eq!(std::fs::read_to_string(hooks_dir(home.path()).join(name)).unwrap(), HOOK);
         }
@@ -203,15 +256,31 @@ mod tests {
         assert!(git(&["init", "-q", "-b", "main"]).0);
 
         assert!(git(&["commit", "-q", "--allow-empty", "-m", "first"]).0);
-        assert_eq!(message().trim_end(), format!("first\n\n{TRAILER}"));
+        // No session took this runtime yet: the name alone.
+        const PLAIN: &str = "Co-authored-by: Jouzu Desktop <noreply@shisa.ai>";
+        assert_eq!(message().trim_end(), format!("first\n\n{PLAIN}"));
 
+        // A session with a model: both trailers. Amending after a model change
+        // keeps one set, the current one.
+        let file = runtime_file(&env.iter().map(|(key, value)| (OsString::from(key), value.clone())).collect::<Vec<_>>()).unwrap();
+        describe(&file, "s-1", Some(&serde_json::json!({ "id": "m-1", "name": "Model <One>" })));
         assert!(git(&["commit", "-q", "--amend", "--allow-empty", "-m", "first again"]).0);
-        assert_eq!(message().trim_end(), format!("first again\n\n{TRAILER}"));
+        assert_eq!(
+            message().trim_end(),
+            "first again\n\nCo-authored-by: Jouzu Desktop (Model One) <noreply@shisa.ai>\nJouzu-Session: s-1"
+        );
+        describe(&file, "s-1", Some(&serde_json::json!({ "id": "m-2" })));
+        assert!(git(&["commit", "-q", "--amend", "--allow-empty", "--no-edit"]).0);
+        assert_eq!(
+            message().trim_end(),
+            "first again\n\nCo-authored-by: Jouzu Desktop (m-2) <noreply@shisa.ai>\nJouzu-Session: s-1"
+        );
+        std::fs::remove_file(&file).unwrap();
 
         // Another agent's trailer stays and ours is added once.
         let other = "Co-authored-by: Someone <someone@example.com>";
         assert!(git(&["commit", "-q", "--allow-empty", "-m", &format!("both\n\n{other}")]).0);
-        assert_eq!(message().trim_end(), format!("both\n\n{other}\n{TRAILER}"));
+        assert_eq!(message().trim_end(), format!("both\n\n{other}\n{PLAIN}"));
 
         // An empty message still aborts.
         let (ok, _, _) = Command::new("git")
@@ -237,7 +306,7 @@ mod tests {
         assert!(git(&["config", "core.hooksPath", ".hooks"]).0);
         assert!(!git(&["commit", "-q", "--allow-empty", "-m", "BLOCK this"]).0);
         assert!(git(&["commit", "-q", "--allow-empty", "-m", "allowed"]).0);
-        assert_eq!(message().trim_end(), format!("allowed\n\n{TRAILER}"));
+        assert_eq!(message().trim_end(), format!("allowed\n\n{PLAIN}"));
 
         // A commit copied by cherry-pick keeps its message.
         assert!(git(&["checkout", "-q", "-b", "side"]).0);
