@@ -150,11 +150,12 @@ try {
   const restart = await run('entry-restart', 'e2e-runtime/entry-restart.mjs', { JOUZU_E2E_HOST_HOME: main, JOUZU_E2E_HOST_TOKEN: mainHost.token });
   judge({ ...restart, result: restart.result ?? (restart.code === 0 ? { scenarios: [{ name: 'entry restart', ok: true }] } : null) });
 
-  // 2. A Shisa key saved in Settings works without a restart, on a home never connected.
+  // 2. A new user's first run: a home never set up asks for the languages, then a
+  //    model connection; a Shisa API key saved there gives a reply without a restart.
   const fresh = home('key');
   const freshHost = await startHost(fresh, {});
   browser = await openBrowser(freshHost, 9225);
-  const key = await run('shisa-key', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9225', PLAYBOOK_SCENARIO: 'shisa-key', PLAYBOOK_SHISA_API_KEY: shisaKey });
+  const key = await run('shisa-first-run', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9225', PLAYBOOK_SCENARIO: 'shisa-first-run', PLAYBOOK_SHISA_API_KEY: shisaKey });
   judge(key);
   await browser.close();
 
