@@ -291,6 +291,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assistant", get(assistant_snapshot).put(update_assistant))
         .route("/assistant/recommended", get(assistant_recommended))
         .route("/assistant/messages", get(assistant_messages).post(send_assistant))
+        .route("/assistant/seen", axum::routing::post(assistant_seen))
         .route("/workflow", get(read_workflow).put(save_workflow))
         .route("/workflow/versions", get(workflow_versions))
         .route("/workflow/restore", axum::routing::post(restore_workflow))
@@ -523,6 +524,10 @@ async fn assistant_recommended(State(state): State<AppState>) -> Json<Value> {
 
 async fn assistant_messages(State(state): State<AppState>, Query(query): Query<TaskQuery>) -> Json<Value> {
     Json(state.assistant.messages(query.limit.unwrap_or(50)))
+}
+
+async fn assistant_seen(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    state.assistant.mark_seen().await.map(Json)
 }
 
 async fn send_assistant(

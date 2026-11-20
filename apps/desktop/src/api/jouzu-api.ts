@@ -390,6 +390,25 @@ export interface AssistantState {
   thinkingLevels: string[];
   phase: string;
   error: string | null;
+  /** It said something (a reply or an error) since the person last looked at its pane. */
+  unseen?: boolean;
+}
+
+/** The person's grouping of folders, sessions and tasks; it owns none of them. */
+export interface Project {
+  id: string;
+  name: string;
+  description: string;
+  workspaceIds: string[];
+  /** Saved sessions by file id (`sessionIndex` maps them to files). */
+  sessionIds: string[];
+  taskIds: string[];
+}
+
+export interface ProjectsSnapshot {
+  projects: Project[];
+  /** Every session the host knows, by the id projects link it with. */
+  sessions: Array<{ sessionId: string; sessionPath?: string; title?: string; workspacePath?: string }>;
 }
 
 export interface AssistantMessage {
@@ -433,6 +452,9 @@ export interface SettingsApi {
     recommended(): Promise<{ about: string; models: AssistantRecommendation[] }>;
     messages(limit?: number): Promise<AssistantMessage[]>;
     send(text: string): Promise<AssistantState>;
+    /** The person looked at the pane: what it said so far is read (one mark for every window). */
+    seen(): Promise<AssistantState>;
+    projects(): Promise<ProjectsSnapshot>;
   };
   /** Only the desktop window may manage web access; web clients get `forbidden`. */
   webAccess: {

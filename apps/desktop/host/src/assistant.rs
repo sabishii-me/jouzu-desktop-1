@@ -322,6 +322,7 @@ impl Assistant {
             "phase": state.phase.as_str(),
             "error": state.error,
             "queued": state.queue.len(),
+            "unseen": self.unseen(),
             "scheduledWakes": state.scheduled.iter().map(|wake| json!({
                 "inSeconds": wake.at.saturating_duration_since(Instant::now()).as_secs(),
                 "note": wake.note,
@@ -399,6 +400,39 @@ impl Assistant {
             tokio::spawn(async move { assistant.start().await });
         }
         self.kick.notify_one();
+        Ok(self.snapshot().await)
+    }
+
+    /// Whether the Assistant said something (a reply or an error) after the
+    /// last time the person looked at its pane. One mark for every window.
+    fn unseen(&self) -> bool {
+        let seen = std::fs::read_to_string(self.dir.join("seen.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| value["at"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        self.latest_said().is_some_and(|at| at > seen)
+    }
+
+    /// When the Assistant last said something to the person.
+    fn latest_said(&self) -> Option<String> {
+        std::fs::read_to_string(self.transcript())
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|row| matches!(row["kind"].as_str(), Some("assistant" | "error")))
+            .and_then(|row| row["at"].as_str().map(str::to_string))
+    }
+
+    /// The person has seen the pane: everything said so far is read.
+    pub async fn mark_seen(&self) -> Result<Value, ApiError> {
+        if self.unseen() {
+            let at = self.latest_said().unwrap_or_default();
+            std::fs::create_dir_all(&self.dir).map_err(io)?;
+            std::fs::write(self.dir.join("seen.json"), json!({ "at": at }).to_string()).map_err(io)?;
+            self.sessions.publish_control("assistant.changed", json!({ "seen": at }));
+        }
         Ok(self.snapshot().await)
     }
 
@@ -1052,6 +1086,21 @@ mod tests {
         // Refused tool calls come back as results the Assistant reads.
         fixture.assistant.send("tool start_task {\"workspace\":\"/\",\"text\":\"/flow clear\"}").await.unwrap();
         until(|| replies(&fixture.assistant).iter().any(|reply| reply.contains("\"ok\":false"))).await;
+    }
+
+    #[tokio::test]
+    async fn what_the_assistant_said_is_unseen_until_its_pane_is_seen() {
+        let fixture = setup(WakePolicy::default());
+        let assistant = &fixture.assistant;
+        assert_eq!(assistant.snapshot().await["unseen"], false);
+        assistant.record("user", "hello");
+        assert_eq!(assistant.snapshot().await["unseen"], false, "the person's own words are not news");
+        assistant.record("assistant", "hi");
+        assert_eq!(assistant.snapshot().await["unseen"], true);
+        assert_eq!(assistant.mark_seen().await.unwrap()["unseen"], false);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assistant.record("error", "the model refused");
+        assert_eq!(assistant.snapshot().await["unseen"], true);
     }
 
     #[tokio::test]

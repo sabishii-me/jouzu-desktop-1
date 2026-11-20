@@ -3,6 +3,7 @@ import { ArrowUpCircle, ArrowUpDown, Archive, ArchiveRestore, Check, ChevronDown
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { AssistantWorkspace } from "./assistant-workspace";
+import { AssistantOverview } from "./assistant-overview";
 import { McpMenu } from "./mcp-menu";
 import { ChatConversation, type EarlierHistory } from "./chat-conversation";
 import { AgentAction, turnLabel } from "./chat-live";
@@ -11,7 +12,7 @@ import { changedFiles, snapshotComplete, type WorkspaceSnapshot } from "./worksp
 import { loadCollapsed, saveCollapsed, toggleCollapsed } from "./sidebar-state";
 import { ArtifactsPanel } from "./artifacts-panel";
 import { useApi } from "./api/context";
-import type { JouzuApi } from "./api/jouzu-api";
+import type { AssistantState, JouzuApi } from "./api/jouzu-api";
 import { collectOutputReferences } from "./artifact-references";
 import { PanelStart } from "./panel-start";
 import { FilesPanel } from "./files-panel";
@@ -1317,6 +1318,21 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [appView, setAppView] = useState<"chat" | "assistant" | "artifacts">("chat");
   // Mounted once opened, so its draft survives switching back to a session.
   const [assistantOpened, setAssistantOpened] = useState(false);
+  // The dot on the Assistant entry: it said something the person has not seen,
+  // or a task waits for them. The host keeps the seen mark for every window.
+  const [assistantInfo, setAssistantInfo] = useState<AssistantState | null>(null);
+  useEffect(() => {
+    let current = true;
+    const load = () => void api.settings.assistant.read().then(value => { if (current) setAssistantInfo(value); }, () => {});
+    load();
+    const stop = eventRouter.subscribe(event => { if (event.event === "assistant.changed") load(); });
+    return () => { current = false; stop(); };
+  }, [api]);
+  useEffect(() => {
+    if (appView === "assistant" && assistantInfo?.unseen) void api.settings.assistant.seen().then(setAssistantInfo, () => {});
+  }, [api, appView, assistantInfo?.unseen]);
+  const tasksWaiting = sessions.some(session => startedBy(session.task, t) && rowStates.get(session.path)?.kind === "waiting");
+  const assistantAttention = !!assistantInfo?.unseen || tasksWaiting;
   const [artifactCounts, setArtifactCounts] = useState<Record<string, number>>({});
   const [panes, setPanes] = useState<Array<{ tabs: string[]; active: string; width: number }>>([]);
   const resizingPane = useRef<{ index: number; startX: number; startWidth: number } | null>(null);
@@ -1592,7 +1608,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     {dropActive && <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-primary bg-background/85 text-sm font-medium text-primary">{t.dropFiles}</div>}
     {sidebar && <aside aria-label={t.workspaces} className="absolute inset-y-0 left-0 z-20 flex w-80 max-w-[85%] flex-col border-r border-border bg-background shadow-xl md:relative md:z-auto md:shadow-none">
       <div className="flex items-center gap-2 px-2 pb-2 pt-3"><Button className="min-w-0 flex-1 justify-start gap-2" disabled={locked} onClick={() => void startNewSession()}><Plus className="size-4" />{t.newSession}</Button><Button variant="ghost" className="size-8 p-0 md:hidden" aria-label={t.hideWorkspaces} onClick={() => setSidebar(false)}><X className="size-4" /></Button></div>
-      <div className="px-2 pb-2"><Button variant={appView === "assistant" ? "default" : "ghost"} className="w-full justify-start gap-2" aria-pressed={appView === "assistant"} onClick={() => { setAssistantOpened(true); setAppView(appView === "assistant" ? "chat" : "assistant"); }}><Sparkles className="size-4" />{t.assistant}</Button></div>
+      <div className="px-2 pb-2"><Button variant={appView === "assistant" ? "default" : "ghost"} className="w-full justify-start gap-2" aria-pressed={appView === "assistant"} onClick={() => { setAssistantOpened(true); setAppView(appView === "assistant" ? "chat" : "assistant"); }}><Sparkles className="size-4" />{t.assistant}{assistantAttention && <><span aria-hidden="true" data-assistant-attention="" className={`ml-auto size-2 rounded-full ${appView === "assistant" ? "bg-primary-foreground" : "bg-primary"}`} /><span className="sr-only">{t.assistantAttention}</span></>}</Button></div>
       <div className="px-2 pb-2"><Button variant={appView === "artifacts" ? "default" : "ghost"} className="w-full justify-start gap-2" aria-pressed={appView === "artifacts"} onClick={() => setAppView(appView === "artifacts" ? "chat" : "artifacts")}><Images className="size-4" />{t.artifacts}</Button></div>
       <div className="flex items-center justify-between border-t border-border px-3 py-2">
         <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t.workspaces}</h2>
@@ -1652,7 +1668,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     </aside>}
     {assistantOpened && <section aria-label={t.assistant} className={appView === "assistant" ? "flex min-h-0 min-w-0 flex-1 flex-col" : "hidden"}>
       <div className="flex items-center px-2 py-1.5"><Button variant="ghost" className="size-8 shrink-0 p-0" aria-label={sidebar ? t.hideWorkspaces : t.showWorkspaces} title={t.workspaces} aria-expanded={sidebar} onClick={() => setSidebar(value => !value)}><PanelLeft className="size-4" /></Button></div>
-      <AssistantWorkspace />
+      <AssistantWorkspace overview={<AssistantOverview rows={sessions} states={rowStates} now={listNow} onOpen={path => void openSession(path)} />} />
     </section>}
     <section className={appView !== "chat" ? "hidden" : "flex min-h-0 min-w-0 flex-1 flex-col"}>
       {hero ? <div className="flex items-center px-2 py-1.5"><Button variant="ghost" className="size-8 shrink-0 p-0" aria-label={sidebar ? t.hideWorkspaces : t.showWorkspaces} title={t.workspaces} aria-expanded={sidebar} onClick={() => setSidebar(value => !value)}><PanelLeft className="size-4" /></Button></div> : <div className="flex items-center gap-2 border-b border-border px-2 py-2 sm:px-3">

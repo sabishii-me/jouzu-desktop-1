@@ -19,6 +19,7 @@ import {
   type AssistantModel,
   type AssistantRecommendation,
   type AssistantState,
+  type ProjectsSnapshot,
   type SavedMessagesPage,
   type Model,
   type Receipt,
@@ -425,6 +426,14 @@ export class HostClient {
 
   sendAssistant(text: string): Promise<AssistantState> {
     return this.request("/v1/assistant/messages", { method: "POST", body: JSON.stringify({ text }) });
+  }
+
+  assistantSeen(): Promise<AssistantState> {
+    return this.request("/v1/assistant/seen", { method: "POST", body: "{}" });
+  }
+
+  projects(): Promise<ProjectsSnapshot> {
+    return this.request("/v1/projects");
   }
 
   async removeMcpAgent(id: string): Promise<void> {

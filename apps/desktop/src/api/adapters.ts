@@ -182,6 +182,8 @@ function hostGroups(client: HostClient) {
       recommended: () => client.assistantRecommended(),
       messages: limit => client.assistantMessages(limit),
       send: text => client.sendAssistant(text),
+      seen: () => client.assistantSeen(),
+      projects: () => client.projects(),
     },
     webAccess: {
       read: () => client.webAccess(),

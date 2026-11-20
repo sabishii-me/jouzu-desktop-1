@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowUp, LoaderCircle, Sparkles } from "lucide-react";
 import { useApi } from "./api/context";
 import type { AssistantMessage, AssistantState } from "./api/jouzu-api";
@@ -12,7 +12,7 @@ import { fill, useChatText } from "./chat-text";
  * The Assistant's conversation. The host owns the Assistant, its model and its
  * transcript; this pane shows them and sends the user's messages.
  */
-export function AssistantWorkspace() {
+export function AssistantWorkspace({ overview }: { overview?: ReactNode }) {
   const api = useApi();
   const t = useChatText();
   const [state, setState] = useState<AssistantState | null>(null);
@@ -51,6 +51,7 @@ export function AssistantWorkspace() {
 
   const working = state?.phase === "running" || state?.phase === "starting" || state?.phase === "installing";
   return <div className="flex min-h-0 flex-1 flex-col">
+    {overview}
     {messages.length ? <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5"><div className="mx-auto max-w-3xl space-y-5">
       {messages.map((message, index) => message.kind === "user"
         ? <article key={index} aria-label="user message" className="rounded-xl bg-muted p-4"><ChatMarkdown text={message.text} /></article>
