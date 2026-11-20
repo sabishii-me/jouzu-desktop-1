@@ -412,6 +412,8 @@ export interface ProjectsSnapshot {
 }
 
 export interface AssistantMessage {
+  /** Fixed id (`m<n>`); the Assistant quotes the person's messages to tasks by it. */
+  id?: string;
   at: string;
   /** user, assistant, wake (what woke it, from the host), error. */
   kind: string;

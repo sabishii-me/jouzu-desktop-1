@@ -4,6 +4,7 @@
 //   "tool <name> <json>" -> call that tool, reply with its result
 //   "exit"            -> the process ends
 //   anything else     -> reply "ok: <text>"
+// A user message's "[user message mN]" first line is read past, as a model would.
 // turns.log in the working folder: each turn's text, one JSON line each.
 import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -19,8 +20,11 @@ const call = (name, args) => new Promise(resolve => {
   send({ type: "tool", callId, name, arguments: args });
 });
 
-async function turn({ turnId, text }) {
-  appendFileSync("turns.log", `${JSON.stringify(text)}\n`);
+async function turn({ turnId, text: raw }) {
+  appendFileSync("turns.log", `${JSON.stringify(raw)}\n`);
+  // A user message comes with its id first ("[user message m3]"), for quoting.
+  const header = /^\[user message (m\d+)\]\n/u.exec(raw);
+  const text = header ? raw.slice(header[0].length) : raw;
   let reply;
   if (text.startsWith("[wake]")) {
     const inbox = await call("read_inbox", {});

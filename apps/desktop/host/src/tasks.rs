@@ -60,7 +60,15 @@ pub struct InboxEntry {
     pub task_id: String,
     pub state: String,
     pub at: String,
+    /// The person wrote in the task's session themselves since the client
+    /// last acknowledged it. Kept until then, whatever the state does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_wrote: bool,
 }
+
+/// Messages a task's client sends carry this id prefix; any other message in
+/// the session came from the person.
+const TASK_MESSAGE: &str = "task-msg-";
 
 #[derive(Default, Serialize, Deserialize)]
 struct Inbox {
@@ -365,7 +373,7 @@ impl TaskManager {
             task_id.to_string(),
             Live { state: Some("starting".into()), ran: false, watching: false },
         );
-        if let Err(error) = session.send_with_client(&new_id("task-msg-"), &text, Some(&record.client_id), &[]) {
+        if let Err(error) = session.send_with_client(&new_id(TASK_MESSAGE), &text, Some(&record.client_id), &[]) {
             self.live().remove(task_id);
             session.stop();
             return Err(error);
@@ -425,6 +433,11 @@ impl TaskManager {
                                 if let Some(live) = manager.live().get_mut(&task_id) {
                                     live.ran = true;
                                 }
+                            }
+                            if event.event == "message.accepted"
+                                && event.data["clientMessageId"].as_str().is_some_and(|id| !id.starts_with(TASK_MESSAGE))
+                            {
+                                manager.user_wrote(&task_id);
                             }
                             true
                         }
@@ -491,16 +504,36 @@ impl TaskManager {
         true
     }
 
+    /// The person wrote in the task's session: the client hears of it, with
+    /// the task's state as it stands.
+    fn user_wrote(&self, task_id: &str) {
+        let Ok(record) = self.record(task_id) else { return };
+        let state = self.state_of(&record);
+        self.post(task_id, &state, true);
+        self.changed(task_id);
+    }
+
     /// One inbox entry per task: a newer state replaces the one not yet read.
     fn report(&self, task_id: &str, state: &str) {
+        self.post(task_id, state, false);
+    }
+
+    fn post(&self, task_id: &str, state: &str, user_wrote: bool) {
         let Ok(record) = self.record(task_id) else { return };
         {
             let mut store = self.store();
             let inbox = store.inboxes.entry(record.client_id.clone()).or_default();
             inbox.seq += 1;
             let seq = inbox.seq;
+            let wrote_before = inbox.entries.iter().any(|entry| entry.task_id == task_id && entry.user_wrote);
             inbox.entries.retain(|entry| entry.task_id != task_id);
-            inbox.entries.push(InboxEntry { seq, task_id: task_id.to_string(), state: state.to_string(), at: now() });
+            inbox.entries.push(InboxEntry {
+                seq,
+                task_id: task_id.to_string(),
+                state: state.to_string(),
+                at: now(),
+                user_wrote: user_wrote || wrote_before,
+            });
             self.save(&store);
             self.sessions.publish_control("inbox.changed", json!({ "clientId": record.client_id, "seq": seq }));
         }
@@ -607,7 +640,7 @@ impl TaskManager {
         if let Some(live) = self.live().get_mut(task_id) {
             live.ran = false;
         }
-        session.send_with_client(&new_id("task-msg-"), text, Some(client), &[])?;
+        session.send_with_client(&new_id(TASK_MESSAGE), text, Some(client), &[])?;
         self.live().entry(task_id.to_string()).or_default().ran = false;
         self.watch(task_id, session, events);
         self.view(&self.record(task_id)?)
@@ -641,8 +674,39 @@ impl TaskManager {
     pub fn read(&self, client: &str, task_id: &str, limit: usize) -> Result<Value, ApiError> {
         let record = self.owned(client, task_id)?;
         policy::authorize(self.home(), client, Some(&record.workspace), Action::ReadTask)?;
+        let messages = self.conversation(record.session_id.as_deref(), record.session_path.as_deref(), limit)?;
+        Ok(json!({
+            "taskId": record.task_id,
+            "state": self.state_of(&record),
+            "messages": messages,
+        }))
+    }
+
+    /// Any session's latest messages, each whole, read only: the live session
+    /// when it is open, else its saved file. Only sessions the host lists.
+    pub fn read_session(&self, session_path: &str, limit: usize) -> Result<Value, ApiError> {
+        let key = |path: &str| path.replace('\\', "/").to_lowercase();
+        let wanted = key(session_path);
+        let mut listed = self.sessions.list();
+        listed.extend(self.sessions.persisted(None, false));
+        let found = listed
+            .iter()
+            .find(|session| session["sessionPath"].as_str().map(key).as_deref() == Some(wanted.as_str()))
+            .ok_or_else(|| ApiError::bad_request("No such session; use a sessionPath from list_sessions"))?;
+        let path = found["sessionPath"].as_str().map(str::to_string);
+        let live = self
+            .sessions
+            .list()
+            .into_iter()
+            .find(|session| session["sessionPath"].as_str().map(key).as_deref() == Some(wanted.as_str()))
+            .and_then(|session| session["sessionId"].as_str().map(str::to_string));
+        let messages = self.conversation(live.as_deref(), path.as_deref(), limit)?;
+        Ok(json!({ "sessionPath": path, "title": found["title"], "messages": messages }))
+    }
+
+    fn conversation(&self, session_id: Option<&str>, session_path: Option<&str>, limit: usize) -> Result<Vec<Value>, ApiError> {
         let limit = limit.clamp(1, 200);
-        let live = record.session_id.as_deref().and_then(|id| self.sessions.get(id));
+        let live = session_id.and_then(|id| self.sessions.get(id));
         let messages: Vec<Value> = if let Some(session) = live {
             // Newest first; a streaming reply has cursor 0 and is the newest.
             let mut rows: Vec<Value> = session.history(limit, None)["messages"]
@@ -654,7 +718,7 @@ impl TaskManager {
                 Some(cursor) => cursor,
             });
             rows.iter().filter_map(live_row).collect()
-        } else if let Some(path) = record.session_path.as_deref() {
+        } else if let Some(path) = session_path {
             self.sessions.messages(path, Some(limit), None)?["messages"]
                 .as_array()
                 .map(|items| items.iter().filter_map(saved_message).collect())
@@ -662,11 +726,7 @@ impl TaskManager {
         } else {
             Vec::new()
         };
-        Ok(json!({
-            "taskId": record.task_id,
-            "state": self.state_of(&record),
-            "messages": messages,
-        }))
+        Ok(messages)
     }
 
     pub fn inbox(&self, client: &str, after: u64) -> Result<Value, ApiError> {
@@ -904,6 +964,34 @@ mod flow_tests {
         let mut saved = vec![json!({ "sessionId": null, "sessionPath": path.replace('/', "\\").to_uppercase() })];
         tasks.mark_sessions(&mut saved);
         assert_eq!(saved[0]["task"]["taskId"], task_id.as_str(), "a differently spelled path is the same file");
+    }
+
+    #[tokio::test]
+    async fn the_client_hears_when_the_person_writes_in_its_task() {
+        let (manager, _home, workspace) = setup(&[]);
+        let tasks = TaskManager::new(manager.clone(), DEFAULT_CAP);
+        let task = tasks.start("agent-a", &folder(&workspace), "write a haiku").unwrap();
+        let task_id = task["taskId"].as_str().unwrap().to_string();
+        let seen = wait_for(&tasks, "agent-a", &task_id, "finished").await;
+        assert!(seen.iter().all(|entry| !entry.user_wrote), "its own message is not the person's: {seen:?}");
+        let seq = tasks.inbox("agent-a", 0).unwrap()["seq"].as_u64().unwrap();
+        tasks.ack("agent-a", seq).unwrap();
+
+        let session = manager.get(task["sessionId"].as_str().unwrap()).unwrap();
+        session.send_with_client("ui-1", "also make it rhyme", Some("desktop"), &[]).unwrap();
+        let mut wrote = None;
+        for _ in 0..50 {
+            let entries: Vec<InboxEntry> = serde_json::from_value(tasks.inbox("agent-a", seq).unwrap()["entries"].clone()).unwrap();
+            if let Some(entry) = entries.into_iter().find(|entry| entry.task_id == task_id && entry.user_wrote) {
+                wrote = Some(entry);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let wrote = wrote.expect("the person's message never reached the inbox");
+        // The mark stays when the state moves on, until the client acknowledges it.
+        let after = wait_for(&tasks, "agent-a", &task_id, "finished").await;
+        assert!(after.iter().filter(|entry| entry.seq > wrote.seq).all(|entry| entry.user_wrote), "{after:?}");
     }
 
     #[tokio::test]

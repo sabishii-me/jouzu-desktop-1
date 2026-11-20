@@ -55,6 +55,7 @@ pub const SKILLS: &[(&str, &str)] = &[
     ("draw-task-views", include_str!("../../../../packaging/desktop/assistant/skills/draw-task-views.md")),
     ("configure-workflow", include_str!("../../../../packaging/desktop/assistant/skills/configure-workflow.md")),
     ("keep-memory", include_str!("../../../../packaging/desktop/assistant/skills/keep-memory.md")),
+    ("catch-requests", include_str!("../../../../packaging/desktop/assistant/skills/catch-requests.md")),
 ];
 
 const MEMORY_LIMIT: usize = 4096;
@@ -291,14 +292,18 @@ impl Assistant {
         self.dir.join("transcript.jsonl")
     }
 
-    fn record(&self, kind: &str, text: &str) {
+    /// Adds a row to the transcript. Each row has a fixed id (`m<line>`), by
+    /// which the Assistant quotes the person's words to a task.
+    fn record(&self, kind: &str, text: &str) -> Value {
         let _ = std::fs::create_dir_all(&self.dir);
-        let row = json!({ "at": now_iso(), "kind": kind, "text": text });
+        let line = std::fs::read_to_string(self.transcript()).map(|text| text.lines().count()).unwrap_or(0) + 1;
+        let row = json!({ "id": format!("m{line}"), "at": now_iso(), "kind": kind, "text": text });
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(self.transcript()) {
             use std::io::Write;
             let _ = writeln!(file, "{row}");
         }
         self.sessions.publish_control("assistant.changed", json!({ "message": row }));
+        row
     }
 
     /// Starts the scheduler and, when the user turned the Assistant on, the
@@ -389,12 +394,13 @@ impl Assistant {
         if !self.settings().enabled {
             return Err(ApiError::new(axum::http::StatusCode::CONFLICT, "assistant-off", "Turn the Assistant on first", false));
         }
+        let row = self.record("user", text);
         let restart = {
             let mut state = self.state();
-            state.queue.push_back(text.to_string());
+            // The id lets the Assistant hand these exact words to a task (quote).
+            state.queue.push_back(format!("[user message {}]\n{text}", row["id"].as_str().unwrap_or("")));
             matches!(state.phase, Phase::Stopped | Phase::Off)
         };
-        self.record("user", text);
         if restart {
             let assistant = Arc::clone(self);
             tokio::spawn(async move { assistant.start().await });
@@ -629,7 +635,9 @@ impl Assistant {
                             .await;
                     });
                 }
-                Some("reply") => self.record("assistant", message["text"].as_str().unwrap_or("")),
+                Some("reply") => {
+                    self.record("assistant", message["text"].as_str().unwrap_or(""));
+                }
                 Some("turn_end") => {
                     if message["stopReason"] == "error" {
                         let error = message["error"].as_str().unwrap_or("The turn failed").to_string();
@@ -793,8 +801,76 @@ impl Assistant {
                     .map(|(_, text)| json!({ "skill": text }))
                     .ok_or_else(|| ApiError::bad_request(format!("No skill named {wanted}")))
             }
+            "list_sessions" => Ok(self.list_sessions(arguments["limit"].as_u64().unwrap_or(30) as usize)),
+            "read_session" => self.tasks.read_session(string(arguments, "sessionPath")?, arguments["limit"].as_u64().unwrap_or(30) as usize),
+            "start_task" | "send_task" if arguments["quote"].is_array() => {
+                let mut arguments = arguments.clone();
+                let quoted = self.quoted(&arguments["quote"])?;
+                let brief = arguments["text"].as_str().unwrap_or("").to_string();
+                arguments["text"] = Value::String(format!("{quoted}[Brief from the Assistant]\n{brief}"));
+                if let Some(object) = arguments.as_object_mut() {
+                    object.remove("quote");
+                }
+                mcp::call_task_tool(&self.tasks, &self.sessions, &client, name, &arguments).await
+            }
             _ => mcp::call_task_tool(&self.tasks, &self.sessions, &client, name, arguments).await,
         }
+    }
+
+    /// The person's messages the Assistant names, word for word, each marked
+    /// as theirs: a task reads the person, not a retelling.
+    fn quoted(&self, ids: &Value) -> Result<String, ApiError> {
+        let ids: Vec<&str> = ids.as_array().map(|items| items.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        if ids.is_empty() || ids.len() > 20 {
+            return Err(ApiError::bad_request("quote names 1 to 20 user message ids"));
+        }
+        let rows: Vec<Value> = std::fs::read_to_string(self.transcript())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let mut text = String::new();
+        for id in ids {
+            let row = rows
+                .iter()
+                .find(|row| row["id"] == id && row["kind"] == "user")
+                .ok_or_else(|| ApiError::bad_request(format!("{id} is not a message from the user")))?;
+            text.push_str(&format!(
+                "[The user's words, {}, unchanged]\n{}\n\n",
+                row["at"].as_str().unwrap_or(""),
+                row["text"].as_str().unwrap_or("")
+            ));
+        }
+        Ok(text)
+    }
+
+    /// Recent sessions in every folder, newest first, with which are tasks.
+    fn list_sessions(&self, limit: usize) -> Value {
+        let mut sessions = self.sessions.persisted(None, false);
+        let live = self.sessions.list();
+        let key = |value: &Value| value["sessionPath"].as_str().map(|path| path.replace('\\', "/").to_lowercase());
+        for session in live {
+            match sessions.iter_mut().find(|saved| key(saved).is_some() && key(saved) == key(&session)) {
+                Some(saved) => *saved = session,
+                None if key(&session).is_some() => sessions.push(session),
+                None => {}
+            }
+        }
+        self.tasks.mark_sessions(&mut sessions);
+        sessions.sort_by(|a, b| b["updatedAt"].as_str().unwrap_or("").cmp(a["updatedAt"].as_str().unwrap_or("")));
+        sessions.truncate(limit.clamp(1, 200));
+        let rows: Vec<Value> = sessions
+            .iter()
+            .map(|session| json!({
+                "sessionPath": session["sessionPath"],
+                "title": session["title"],
+                "workspace": session["workspacePath"],
+                "updatedAt": session["updatedAt"],
+                "status": session["status"],
+                "task": session["task"],
+            }))
+            .collect();
+        json!({ "sessions": rows })
     }
 
     fn workflow(&self) -> crate::workflow::Workflow {
@@ -917,8 +993,11 @@ fn wake_summary(entries: &[Value]) -> String {
     let shown = entries.len().min(WAKE_ENTRIES);
     for entry in &entries[entries.len() - shown..] {
         text.push_str(&format!(
-            "\n- seq {} {} {}",
-            entry["seq"], entry["taskId"].as_str().unwrap_or("?"), entry["state"].as_str().unwrap_or("?")
+            "\n- seq {} {} {}{}",
+            entry["seq"],
+            entry["taskId"].as_str().unwrap_or("?"),
+            entry["state"].as_str().unwrap_or("?"),
+            if entry["userWrote"] == true { " (the user wrote in this task: read_task it)" } else { "" }
         ));
     }
     if entries.len() > shown {
@@ -932,6 +1011,16 @@ fn wake_summary(entries: &[Value]) -> String {
 /// projects, memory, history, wakes and skills.
 pub fn tool_definitions() -> Vec<Value> {
     let mut tools = mcp::task_tools();
+    // Only the Assistant has the person's conversation, so only it can quote it.
+    for tool in tools.iter_mut() {
+        if matches!(tool["name"].as_str(), Some("start_task" | "send_task")) {
+            tool["inputSchema"]["properties"]["quote"] = json!({
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Ids of the user's messages (the m… in [user message m…]) to put in front of your text word for word, marked as the user's. Use it whenever the user's own words state the request.",
+            });
+        }
+    }
     let name = json!({ "type": "string", "description": "kebab-case, a-z 0-9 -, at most 64" });
     tools.extend([
         json!({ "name": "list_projects", "description": "The user's projects (name, description, linked folders, sessions, tasks) and the sessions that exist.", "inputSchema": { "type": "object", "properties": {} } }),
@@ -940,6 +1029,8 @@ pub fn tool_definitions() -> Vec<Value> {
             "workspaceIds": { "type": "array", "items": { "type": "string" } },
             "sessionIds": { "type": "array", "items": { "type": "string" } },
             "taskIds": { "type": "array", "items": { "type": "string" } } }, "required": ["name"] } }),
+        json!({ "name": "list_sessions", "description": "Recent sessions in all the user's folders, newest first: path, title, folder, time, status, and task (who started it) when it is a task. Read only.", "inputSchema": { "type": "object", "properties": { "limit": { "type": "integer", "minimum": 1, "maximum": 200 } } } }),
+        json!({ "name": "read_session", "description": "Read any session's latest messages, each whole. Read only: you can write only to your own tasks.", "inputSchema": { "type": "object", "properties": { "sessionPath": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "maximum": 200 } }, "required": ["sessionPath"] } }),
         json!({ "name": "memory_index", "description": "One line per memory: name (type): description.", "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "memory_read", "description": "Read one memory.", "inputSchema": { "type": "object", "properties": { "name": name }, "required": ["name"] } }),
         json!({ "name": "memory_write", "description": "Create or replace one memory (one subject per memory, at most 4 KB). type: user, feedback, project, decision or reference. The body says the fact, why it matters and what it does not mean. Never store live task state.", "inputSchema": { "type": "object", "properties": {
@@ -1101,6 +1192,52 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(5)).await;
         assistant.record("error", "the model refused");
         assert_eq!(assistant.snapshot().await["unseen"], true);
+    }
+
+    #[tokio::test]
+    async fn a_task_gets_the_users_own_words_and_the_assistant_reads_any_session() {
+        let fixture = setup(WakePolicy::default());
+        let assistant = &fixture.assistant;
+        let said = assistant.record("user", "Please fix the login bug.\nIt fails on Safari only.");
+        let id = said["id"].as_str().unwrap().to_string();
+        let reply = assistant.record("assistant", "On it.");
+        let folder = fixture.workspace.path().to_string_lossy().into_owned();
+
+        // Only the person's messages can be quoted.
+        let refused = assistant
+            .run_tool("start_task", &json!({ "workspace": folder, "text": "x", "quote": [reply["id"]] }))
+            .await
+            .unwrap_err();
+        assert!(refused.message.contains("not a message from the user"), "{}", refused.message);
+
+        let task = assistant
+            .run_tool("start_task", &json!({ "workspace": folder, "text": "Find the root cause first.", "quote": [id] }))
+            .await
+            .unwrap();
+        let task_id = task["taskId"].as_str().unwrap().to_string();
+        let mut first = String::new();
+        until(|| {
+            let read = fixture.tasks.read(CLIENT, &task_id, 20).unwrap();
+            first = read["messages"].as_array().and_then(|rows| rows.iter().find(|row| row["role"] == "user")).and_then(|row| row["text"].as_str()).unwrap_or("").to_string();
+            !first.is_empty()
+        })
+        .await;
+        assert!(first.starts_with("[The user's words, "), "{first}");
+        assert!(first.contains("Please fix the login bug.\nIt fails on Safari only.\n"), "word for word: {first}");
+        assert!(first.ends_with("[Brief from the Assistant]\nFind the root cause first."), "{first}");
+
+        // It sees every session, with which are tasks, and reads one whole.
+        let mut path = None;
+        until(|| {
+            let listed = assistant.list_sessions(10);
+            path = listed["sessions"].as_array().unwrap().iter().find(|row| row["task"]["taskId"] == task_id.as_str()).and_then(|row| row["sessionPath"].as_str().map(str::to_string));
+            path.is_some()
+        })
+        .await;
+        let read = assistant.run_tool("read_session", &json!({ "sessionPath": path.unwrap() })).await.unwrap();
+        assert!(read["messages"].as_array().unwrap().iter().any(|row| row["text"].as_str().is_some_and(|text| text.contains("Safari only"))), "{read}");
+        let outside = assistant.run_tool("read_session", &json!({ "sessionPath": "/etc/passwd" })).await.unwrap_err();
+        assert!(outside.message.contains("No such session"));
     }
 
     #[tokio::test]

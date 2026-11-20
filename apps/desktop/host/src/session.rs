@@ -4232,7 +4232,7 @@ impl Session {
         }
         self.publish(
             "message.accepted",
-            json!({ "messageId": message_id.clone(), "receipt": "queued" }),
+            json!({ "messageId": message_id.clone(), "receipt": "queued", "clientMessageId": client_message_id }),
         );
         self.publish(
             "turn.start",
