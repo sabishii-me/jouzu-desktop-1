@@ -232,7 +232,8 @@ impl TaskManager {
                 false,
             ));
         }
-        Ok(candidate.to_string_lossy().into_owned())
+        // Without Windows' verbatim `\\?\` prefix, spelled like the folder list.
+        Ok(crate::session::canonical_path(&candidate.to_string_lossy()))
     }
 
     fn check_text(text: &str) -> Result<(), ApiError> {
