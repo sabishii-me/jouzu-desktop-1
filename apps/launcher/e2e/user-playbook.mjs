@@ -622,53 +622,25 @@ async function shisaKeyWithoutRestart() {
 }
 
 /**
- * Scenario: a new user connects Shisa.AI with an API key on first run and gets a
- * reply, without restarting the app. On a home that was never set up the app asks
- * for the languages first, then for a model connection; the user continues past
- * the languages, picks Shisa.AI, saves the key, and the chat opens with its models.
- * Needs PLAYBOOK_SHISA_API_KEY (a test key); without it the scenario is not run.
+ * Scenario: a new user's first run. On a home that was never set up the app asks
+ * for the languages, then for a model connection, where Shisa.AI is connected by
+ * signing in through the browser. The browser sign-in cannot run unattended, so
+ * the playbook checks the pages up to the sign-in button and records the sign-in
+ * and the first reply after it as a manual check, not as passed.
  */
-async function shisaKeyFirstRun() {
-  const name = "First run: a Shisa API key saved on the setup page gives a reply without restart";
-  const key = process.env.PLAYBOOK_SHISA_API_KEY;
-  if (!key) {
-    result.scenarios.push({ name, ok: true, skipped: true, detail: "not run: PLAYBOOK_SHISA_API_KEY is not set" });
-    return;
-  }
+async function shisaFirstRun() {
+  const name = "First run asks for the languages, then offers Shisa.AI sign-in";
   const proceed = page.getByRole("button", { name: L.setupContinue, exact: true });
-  const service = page.getByRole("combobox", { name: L.service, exact: true }).first();
+  const signIn = page.getByRole("button", { name: L.signIn, exact: true });
   // The app shows the chat until the runtime reports that no model is set up, then
   // the first-run pages; wait for the first-run page itself.
-  await proceed.or(service).first().waitFor({ timeout: 120_000 });
-  const start = now();
-  if (await proceed.isVisible().catch(() => false)) await proceed.click();
-  await service.waitFor({ timeout: 60_000 });
-  await service.click();
-  await page.getByRole("option").filter({ hasText: /Shisa/i }).first().click();
-  await page.getByLabel(L.apiKey, { exact: true }).fill(key);
-  await page.getByRole("button", { name: L.save, exact: true }).click();
-  await newSession().waitFor({ timeout: 120_000 });
-  await mark("shisaKeySavedToChat", now() - start);
-  await newSession().click();
-  await composer().waitFor({ timeout: 10_000 });
-  const modelButton = page.getByRole("button", { name: C.model, exact: true }).first();
-  const end = now() + 30_000;
-  let model = "";
-  while (now() < end) {
-    model = (await modelButton.innerText().catch(() => "")).trim();
-    if (model && !either(C.selectModel, C.setUpModel).test(model)) break;
-    await page.waitForTimeout(100);
-  }
-  const prompt = "Reply with only the word OK.";
-  await composer().fill(prompt);
-  await send().click();
-  await waitForConversationText(prompt, 5_000);
-  await stop().waitFor({ state: "detached", timeout: 60_000 }).catch(() => {});
-  await send().waitFor({ timeout: 60_000 });
-  await mark("shisaFirstRunFirstTurnEnd", now() - start);
-  const text = await conversation().innerText();
-  scenario(name, /\bok\b/i.test(text.replace(prompt, "")), `model: ${model}`);
+  await proceed.or(signIn).first().waitFor({ timeout: 120_000 });
+  const languagePage = await proceed.isVisible().catch(() => false);
+  if (languagePage) await proceed.click();
+  const offered = await signIn.waitFor({ timeout: 60_000 }).then(() => true, () => false);
+  scenario(name, languagePage && offered, `language page: ${languagePage}; Shisa.AI sign-in offered: ${offered}`);
   await page.screenshot({ path: process.env.TEMP + "\\playbook-03-shisa-first-run.png" });
+  result.scenarios.push({ name: "First run: Shisa.AI browser sign-in, then a reply without restart (manual)", ok: true, skipped: true, detail: "manual: the browser sign-in cannot run unattended" });
 }
 
 /**
@@ -701,7 +673,7 @@ try {
   // PLAYBOOK_SCENARIO=shisa-first-run: a home that was never set up, as a new user
   // has it; the stable release exam runs it on a home of its own (#86).
   if (process.env.PLAYBOOK_SCENARIO === "shisa-first-run") {
-    await shisaKeyFirstRun();
+    await shisaFirstRun();
     throw Object.assign(new Error("done"), { done: true });
   }
   await firstSessionHasModel();

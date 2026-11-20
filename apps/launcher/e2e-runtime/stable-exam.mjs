@@ -151,12 +151,12 @@ try {
   judge({ ...restart, result: restart.result ?? (restart.code === 0 ? { scenarios: [{ name: 'entry restart', ok: true }] } : null) });
 
   // 2. A new user's first run: a home never set up asks for the languages, then a
-  //    model connection; a Shisa API key saved there gives a reply without a restart.
+  //    model connection with Shisa.AI sign-in. The browser sign-in itself is manual.
   const fresh = home('key');
   const freshHost = await startHost(fresh, {});
   browser = await openBrowser(freshHost, 9225);
-  const key = await run('shisa-first-run', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9225', PLAYBOOK_SCENARIO: 'shisa-first-run', PLAYBOOK_SHISA_API_KEY: shisaKey });
-  judge(key);
+  const key = await run('shisa-first-run', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9225', PLAYBOOK_SCENARIO: 'shisa-first-run', PLAYBOOK_SHISA_API_KEY: '' });
+  judge(key, { allowSkipped: ['First run: Shisa.AI browser sign-in, then a reply without restart (manual)'] });
   await browser.close();
 
   // 3. A long saved session reads back to its first message and branches from an
