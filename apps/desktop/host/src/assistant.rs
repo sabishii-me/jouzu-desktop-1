@@ -46,7 +46,15 @@ pub const SDK_PACKAGE: &str = "@earendil-works/pi-coding-agent";
 pub const SDK_VERSION: &str = "1.5.0";
 const SCRIPT: &str = include_str!("../../../../packaging/desktop/assistant/assistant.mjs");
 const PROMPT: &str = include_str!("../../../../packaging/desktop/assistant/prompt.md");
-pub const SKILLS: &[(&str, &str)] = &[];
+pub const SKILLS: &[(&str, &str)] = &[
+    ("write-a-brief", include_str!("../../../../packaging/desktop/assistant/skills/write-a-brief.md")),
+    ("break-down-work", include_str!("../../../../packaging/desktop/assistant/skills/break-down-work.md")),
+    ("follow-up", include_str!("../../../../packaging/desktop/assistant/skills/follow-up.md")),
+    ("accept-with-evidence", include_str!("../../../../packaging/desktop/assistant/skills/accept-with-evidence.md")),
+    ("work-an-issue", include_str!("../../../../packaging/desktop/assistant/skills/work-an-issue.md")),
+    ("draw-task-views", include_str!("../../../../packaging/desktop/assistant/skills/draw-task-views.md")),
+    ("keep-memory", include_str!("../../../../packaging/desktop/assistant/skills/keep-memory.md")),
+];
 
 const MEMORY_LIMIT: usize = 4096;
 const MEMORY_TYPES: [&str; 5] = ["user", "feedback", "project", "decision", "reference"];
@@ -507,10 +515,7 @@ impl Assistant {
 
     fn system_prompt(&self) -> String {
         let mut prompt = PROMPT.to_string();
-        prompt.push_str("\n## Skills\n");
-        if SKILLS.is_empty() {
-            prompt.push_str("(none yet)\n");
-        }
+        prompt.push_str("\n## Skills (load with skill_read before doing that kind of work)\n");
         for (name, text) in SKILLS {
             let summary = text.lines().find(|line| line.starts_with("description:")).unwrap_or("");
             prompt.push_str(&format!("- {name}: {}\n", summary.trim_start_matches("description:").trim()));
@@ -1064,6 +1069,19 @@ mod tests {
         assert!(!assistant.sdk_installed());
         assistant.install_sdk(&node()).await.unwrap();
         assert!(assistant.sdk_installed());
+    }
+
+    #[tokio::test]
+    async fn skills_are_listed_in_the_prompt_and_load_by_name() {
+        let fixture = setup(WakePolicy::default());
+        let prompt = fixture.assistant.system_prompt();
+        for (name, text) in SKILLS {
+            assert!(text.starts_with(&format!("---\nname: {name}\n")), "{name} has a matching header");
+            assert!(prompt.contains(&format!("- {name}: ")), "{name} is listed");
+        }
+        let skill = fixture.assistant.run_tool("skill_read", &json!({ "name": "draw-task-views" })).await.unwrap();
+        assert!(skill["skill"].as_str().unwrap().contains("jouzu-view"));
+        assert!(fixture.assistant.run_tool("skill_read", &json!({ "name": "nope" })).await.is_err());
     }
 
     #[test]
