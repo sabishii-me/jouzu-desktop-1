@@ -1,4 +1,5 @@
-import type { SessionSummary } from "./api/jouzu-api";
+import type { SessionSummary, UnseenRun } from "./api/jouzu-api";
+import type { ActiveTurn } from "./chat-types";
 
 /**
  * A session the host is working on, or holds something for, must be opened
@@ -25,6 +26,12 @@ export interface SessionRow {
   status: string;
   queued?: number;
   hasFailedTurn?: boolean;
+  /** What the running turn is doing now, as the host reports it. */
+  activeTurn?: ActiveTurn | null;
+  /** An approval or a question waits for the person. */
+  waiting?: "approval" | "answer";
+  /** A run that ended while no client showed it, until one does (#212). */
+  unseenRun?: UnseenRun | null;
 }
 
 /** The list row for a host session entry, or null for one that is not listed. */
@@ -48,5 +55,27 @@ export function sessionRow(value: SessionSummary): SessionRow | null {
     status: value.status,
     queued: value.queued,
     hasFailedTurn: value.hasFailedTurn,
+    activeTurn: value.activeTurn ?? null,
+    waiting: (value.pendingApprovalCount ?? 0) > 0 || value.status === "waiting_approval" ? "approval"
+      : (value.pendingQuestionCount ?? 0) > 0 || value.status === "waiting_question" ? "answer" : undefined,
+    unseenRun: value.unseenRun ?? null,
   };
+}
+
+/**
+ * What a session-list row says about its session (#212), from the host's record:
+ * what it is doing now, or how a run ended that nobody has looked at since.
+ * `null` for a session at rest, which shows its age only.
+ */
+export type RowState =
+  | { kind: "running"; turn: ActiveTurn | null }
+  | { kind: "waiting"; on: "approval" | "answer" }
+  | { kind: "failed" | "done" | "stopped" };
+
+export function rowState(row: Pick<SessionRow, "running" | "status" | "activeTurn" | "waiting" | "unseenRun">): RowState | null {
+  if (row.waiting) return { kind: "waiting", on: row.waiting };
+  if (row.running || row.status === "running" || row.status === "starting" || row.status === "recovering") return { kind: "running", turn: row.activeTurn ?? null };
+  if (row.status === "error") return { kind: "failed" };
+  if (row.unseenRun) return { kind: row.unseenRun.outcome };
+  return null;
 }

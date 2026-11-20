@@ -22,6 +22,7 @@ pub mod known_models;
 pub mod provider_answers;
 mod provider_error;
 pub mod runtime;
+pub mod run_marks;
 pub mod sessions_repair;
 pub mod session;
 pub mod web_access;
@@ -291,6 +292,7 @@ pub fn router(state: AppState) -> Router {
             "/sessions/update",
             axum::routing::post(update_session),
         )
+        .route("/sessions/seen", axum::routing::post(session_seen))
         .route("/artifacts", get(list_artifacts))
         .route("/artifacts/counts", get(artifact_counts))
         .route(
@@ -547,6 +549,20 @@ async fn update_session(
         request.archived,
         request.title,
     )?))
+}
+
+#[derive(Deserialize)]
+struct SeenRequest {
+    #[serde(rename = "sessionPath")]
+    session_path: String,
+}
+
+/// A client shows this session now (#212): a run that ended unseen is seen.
+async fn session_seen(
+    State(state): State<AppState>,
+    Json(request): Json<SeenRequest>,
+) -> Json<Value> {
+    Json(state.sessions.seen(&request.session_path))
 }
 
 #[derive(Deserialize)]
@@ -5006,6 +5022,45 @@ mod session_tests {
         wait_until(|| session.runtime_pid().is_some_and(|now| now != pid)).await;
         wait_until(|| session.summary()["model"]["state"] == "ready" && session.status() == Status::Idle).await;
         assert_eq!(session.summary()["model"]["id"], "other", "{}", session.summary());
+        manager.stop_all();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_that_ends_where_nobody_looks_is_listed_until_shown() {
+        let (manager, _home, workspace) = manager(50);
+        let folder = workspace.path().to_str().unwrap();
+        let shown = manager.create_pending(folder, None, None).unwrap();
+        shown.attach_early();
+        let background = manager.create_pending(folder, None, None).unwrap();
+        background.attach_early();
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &background.id);
+        manager.hold("window", &shown.id);
+        for session in [&shown, &background] {
+            wait_status(session, Status::Idle).await;
+            session.send(&format!("m-{}", session.id), "hello").unwrap();
+        }
+        let answered = |session: &Arc<crate::session::Session>| {
+            session.status() == Status::Idle
+                && session.saved_path().is_some()
+                && session.history(50, None)["messages"].as_array().is_some_and(|rows| rows.iter().any(|row| row["kind"] == "assistant"))
+        };
+        wait_until(|| answered(&shown) && answered(&background)).await;
+        // The run in view needs no mark; the one in the background ends finished.
+        assert_eq!(shown.summary()["unseenRun"], Value::Null, "{}", shown.summary());
+        assert_eq!(background.summary()["unseenRun"]["outcome"], "done", "{}", background.summary());
+        let listed = manager.list();
+        let row = listed.iter().find(|row| row["sessionId"] == background.id.as_str()).unwrap();
+        assert_eq!(row["unseenRun"]["outcome"], "done", "{row}");
+        // Showing it is seeing it.
+        manager.hold("window", &background.id);
+        assert_eq!(background.summary()["unseenRun"], Value::Null);
+        // A client that shows a saved session from its file says so.
+        shown.send("again", "hello").unwrap();
+        wait_until(|| shown.summary()["unseenRun"]["outcome"] == "done").await;
+        manager.seen(&shown.saved_path().unwrap());
+        assert_eq!(shown.summary()["unseenRun"], Value::Null);
         manager.stop_all();
     }
 

@@ -30,7 +30,8 @@ import { BackgroundMenu, deriveFlow, deriveSubagents, FlowMenu, latestFlowError,
 import { SessionStatsBar } from "./session-stats-bar";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import type { TextGuardMode } from "./session-notices";
-import { opensLive, sessionRow as fromApiSession, type SessionRow as SessionSummary } from "./session-open";
+import { opensLive, rowState, sessionRow as fromApiSession, type RowState, type SessionRow as SessionSummary } from "./session-open";
+import { SessionRowStatus } from "./session-row-status";
 import { useWarmRuntime, warmBlocks, type WarmView } from "./warm-runtime";
 import { newId, copyText } from "./secure-context";
 
@@ -262,7 +263,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   useEffect(() => { if (hero) setComposerFocus(false); }, [hero]);
   // The pool owns every live session, including the ones that are not on screen;
   // the list re-renders when one of them starts or stops a turn.
-  const [, setPoolStatusVersion] = useState(0);
+  const [poolStatusVersion, setPoolStatusVersion] = useState(0);
   useEffect(() => chatPool.subscribeStatus(() => setPoolStatusVersion(value => value + 1)), []);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [diskReports, setDiskReports] = useState<FlowReportRecord[]>([]);
@@ -577,6 +578,23 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   useEffect(() => eventRouter.subscribe(event => {
     if (event.event === "session.updated" || event.event === "resync") void refreshSessions();
   }), []);
+  // What each listed session is doing, or how a run ended unseen (#212). A session
+  // this window has open says it is running as soon as its own snapshot does.
+  const rowStates = useMemo(() => {
+    const states = new Map<string, RowState>();
+    for (const session of sessions) {
+      const state = rowState({ ...session, running: session.running || chatPool.isRunning(session.path) });
+      if (state) states.set(session.path, state);
+    }
+    return states;
+  }, [sessions, poolStatusVersion]);
+  const listRunning = [...rowStates.values()].some(state => state.kind === "running");
+  const [listNow, setListNow] = useState(Date.now());
+  useEffect(() => {
+    if (!listRunning) return;
+    const timer = setInterval(() => setListNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [listRunning]);
   useEffect(() => { if (snapshot.connected) void connection.current?.loadStats(); }, [snapshot.connected, snapshot.sessionFile, snapshot.projection.messages.length, snapshot.projection.running]);
   useEffect(() => {
     // Reports belong to the loaded session, not to a selected session that is still opening.
@@ -1273,6 +1291,15 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const regularGroups = defaultGroup ? groups.filter(group => group !== defaultGroup) : groups;
   const activeSession = normalizedPath(snapshot.sessionFile ?? "");
   const selectedKey = normalizedPath(selectedSession ?? snapshot.sessionFile ?? "");
+  // The session on screen has been seen: a run that ended unseen is not news any
+  // more, here or in any other client (#212). The host also marks it when a live
+  // session is shown; this covers a session shown from its file.
+  const selectedRow = hero ? undefined : sessions.find(item => normalizedPath(item.path) === selectedKey);
+  const selectedUnseenAt = selectedRow?.unseenRun?.endedAt;
+  useEffect(() => {
+    if (!selectedRow || !selectedUnseenAt) return;
+    void api.sessions.seen?.(selectedRow.path).catch(() => { /* The mark stays; the list says so. */ });
+  }, [selectedRow?.path, selectedUnseenAt]);
   const selectedSessionWorkspace = sessions.find(item => normalizedPath(item.path) === selectedKey)?.workspace ?? path;
   const selectedSessionWorkspacePath = selectedSessionWorkspace.startsWith("\\\\?\\") ? selectedSessionWorkspace.slice(4) : selectedSessionWorkspace;
   // Stop belongs to the session on screen. A running turn in the background must
@@ -1592,7 +1619,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
                 {renaming && normalizedPath(renaming.path) === normalizedPath(session.path)
                   ? <Input autoFocus aria-label={t.sessionName} className="m-0.5 h-7 min-w-0 flex-1 text-sm" value={renaming.title} onChange={event => setRenaming({ path: session.path, title: event.target.value })} onFocus={event => event.target.select()} onKeyDown={event => { if (event.key === "Enter") void finishRename(true); if (event.key === "Escape") void finishRename(false); }} onBlur={() => void finishRename(true)} />
                   : <button type="button" onClick={() => void openSession(session.path)} title={session.path} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left">
-                  {session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label={t.pinned} /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span className="min-w-0 flex-1 truncate">{session.title}</span>{chatPool.isRunning(session.path) && <span role="img" aria-label={t.running} title={t.running} data-session-running className="size-1.5 shrink-0 rounded-full bg-primary" />}<span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={fill(t.artifactCount, { n: artifactCount(session.path) })}>{artifactCount(session.path)}</span>}
+                  {session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label={t.pinned} /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span className="flex min-w-0 flex-1 flex-col"><span className="truncate">{session.title}</span>{rowStates.get(session.path) && <SessionRowStatus state={rowStates.get(session.path)!} now={listNow} t={t} />}</span><span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={fill(t.artifactCount, { n: artifactCount(session.path) })}>{artifactCount(session.path)}</span>}
                 </button>}
                 <div className={`relative flex shrink-0 items-center gap-0.5 pr-1 transition-opacity focus-within:opacity-100 group-hover/session:opacity-100 ${sessionMenu === session.path ? "opacity-100" : "opacity-0"}`} data-session-menu>
                   <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={session.pinned ? t.unpinSession : t.pinSession} title={session.pinned ? t.unpinSession : t.pinSession} onClick={() => void updateSession(session.path, { pinned: !session.pinned })}><Pin className={`size-3.5 ${session.pinned ? "text-primary" : "text-muted-foreground"}`} /></button>

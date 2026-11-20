@@ -74,6 +74,7 @@ function hostGroups(client: HostClient) {
       await client.stop(sessionId);
     },
     update: (sessionPath, change) => client.updateSession(sessionPath, change),
+    seen: sessionPath => client.seen(sessionPath),
     branch: (sessionPath, turn) => client.branch(sessionPath, turn),
     recover: sessionPath => client.recover(sessionPath),
     timing: async sessionPath => (await client.timing(sessionPath)) as never,
