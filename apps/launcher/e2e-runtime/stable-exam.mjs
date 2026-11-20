@@ -26,6 +26,9 @@ const out = resolve(process.env.EXAM_OUT ?? 'stable-exam.json');
 for (const [name, value] of Object.entries({ EXAM_MANAGED: managed, EXAM_HOST: hostExe, EXAM_DIST: dist, PLAYBOOK_SHISA_API_KEY: shisaKey })) {
   if (!value) { console.error(`${name} is not set; the stable exam cannot run.`); process.exit(2); }
 }
+// Shisa.AI's OpenAI-compatible API and a small chat model on it, for the first run.
+const SHISA_OPENAI_URL = 'https://api.shisa.ai/v1';
+const SHISA_FIRST_RUN_MODEL = 'qwen38-flash-next-nvfp4';
 const here = import.meta.dirname;
 const launcher = resolve(here, '..');
 const extension = resolve(launcher, '..', '..', 'packaging', 'launcher', 'extensions', 'jouzu-image');
@@ -49,7 +52,6 @@ async function startHost(root, extraEnv) {
   const env = { ...process.env, ...extraEnv };
   delete env.PLAYBOOK_SHISA_API_KEY;
   delete env.PLAYBOOK_OPENROUTER_API_KEY;
-  delete env.PLAYBOOK_FIRST_RUN_API_KEY;
   const child = spawn(hostExe, ['--dist', dist, '--home', root, '--runtime-home', join(root, 'data'), '--install', root], { env, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
   children.push(child);
   // The host gives its port and API token to its starter on its first output
@@ -153,11 +155,12 @@ try {
 
   // 2. A new user's first run: a home never set up asks for the languages, then a
   //    model connection. Shisa.AI sign-in (browser) is checked as offered; the run
-  //    itself is completed with an API key provider (PLAYBOOK_FIRST_RUN_*).
+  //    itself is completed by adding Shisa.AI's OpenAI-compatible API as a custom
+  //    provider with the test key.
   const fresh = home('key');
   const freshHost = await startHost(fresh, {});
   browser = await openBrowser(freshHost, 9225);
-  const key = await run('first-run', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9225', PLAYBOOK_SCENARIO: 'first-run', PLAYBOOK_SHISA_API_KEY: '' });
+  const key = await run('first-run', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9225', PLAYBOOK_SCENARIO: 'first-run', PLAYBOOK_SHISA_API_KEY: '', PLAYBOOK_FIRST_RUN_URL: SHISA_OPENAI_URL, PLAYBOOK_FIRST_RUN_MODEL_ID: SHISA_FIRST_RUN_MODEL, PLAYBOOK_FIRST_RUN_CONTEXT: '262144', PLAYBOOK_FIRST_RUN_API_KEY: shisaKey });
   judge(key);
   await browser.close();
 

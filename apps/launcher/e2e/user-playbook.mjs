@@ -626,9 +626,9 @@ async function shisaKeyWithoutRestart() {
  * for the languages, then for a model connection. Shisa.AI is connected there by
  * signing in through the browser, which cannot run unattended, so the playbook
  * checks that the sign-in is offered. The rest of the first run is walked with a
- * provider that takes an API key on the same page (PLAYBOOK_FIRST_RUN_PROVIDER and
- * PLAYBOOK_FIRST_RUN_API_KEY): pick it, save the key, open a new session and get a
- * reply, with no restart. PLAYBOOK_FIRST_RUN_MODEL picks the model by its menu text.
+ * custom provider (an OpenAI-compatible API) added on the same page:
+ * PLAYBOOK_FIRST_RUN_URL, PLAYBOOK_FIRST_RUN_MODEL_ID and PLAYBOOK_FIRST_RUN_API_KEY.
+ * It is saved, a new session opens on that model and gets a reply, no restart.
  */
 async function firstRun() {
   const proceed = page.getByRole("button", { name: L.setupContinue, exact: true });
@@ -642,33 +642,35 @@ async function firstRun() {
   const offered = await signIn.waitFor({ timeout: 60_000 }).then(() => true, () => false);
   scenario("First run asks for the languages, then offers Shisa.AI sign-in", languagePage && offered, `language page: ${languagePage}; Shisa.AI sign-in offered: ${offered}`);
 
-  const name = "First run: an API key saved on the setup page gives a reply without restart";
-  const provider = process.env.PLAYBOOK_FIRST_RUN_PROVIDER;
+  const name = "First run: a custom provider added on the setup page gives a reply without restart";
+  const url = process.env.PLAYBOOK_FIRST_RUN_URL;
+  const model = process.env.PLAYBOOK_FIRST_RUN_MODEL_ID;
   const key = process.env.PLAYBOOK_FIRST_RUN_API_KEY;
-  if (!provider || !key) {
-    result.scenarios.push({ name, ok: true, skipped: true, detail: "not run: PLAYBOOK_FIRST_RUN_PROVIDER or PLAYBOOK_FIRST_RUN_API_KEY is not set" });
+  if (!url || !model || !key) {
+    result.scenarios.push({ name, ok: true, skipped: true, detail: "not run: PLAYBOOK_FIRST_RUN_URL, _MODEL_ID or _API_KEY is not set" });
     return;
   }
   await page.getByRole("combobox", { name: L.service, exact: true }).first().click();
-  await page.getByRole("option", { name: provider, exact: true }).click();
+  await page.getByRole("option", { name: L.customProvider, exact: true }).click();
+  await page.getByLabel(L.providerId, { exact: true }).fill("exam-custom");
+  await page.getByLabel(L.endpoint, { exact: true }).fill(url);
+  await page.getByLabel(L.modelId, { exact: true }).fill(model);
+  // Jouzu's own instructions do not fit the form's default 32K context.
+  if (process.env.PLAYBOOK_FIRST_RUN_CONTEXT) await page.getByLabel(L.contextWindow, { exact: true }).fill(process.env.PLAYBOOK_FIRST_RUN_CONTEXT);
   await page.getByLabel(L.apiKey, { exact: true }).fill(key);
   await page.getByRole("button", { name: L.save, exact: true }).click();
   await newSession().waitFor({ timeout: 120_000 });
-  await mark("firstRunKeySavedToChat", now() - start);
+  await mark("firstRunSavedToChat", now() - start);
   await newSession().click();
   await composer().waitFor({ timeout: 10_000 });
-  const wanted = process.env.PLAYBOOK_FIRST_RUN_MODEL;
-  if (wanted) {
-    const items = await modelMenuItems();
-    const match = items.find(item => item.includes(wanted));
-    if (!match) {
-      await page.keyboard.press("Escape");
-      scenario(name, false, `model ${wanted} not in the menu: ${items.slice(0, 10).join(", ")}`);
-      return;
-    }
-    await page.getByRole("menuitemradio", { name: match }).first().click();
+  const modelButton = page.getByRole("button", { name: C.model, exact: true }).first();
+  const end = now() + 30_000;
+  let shown = "";
+  while (now() < end) {
+    shown = (await modelButton.innerText().catch(() => "")).trim();
+    if (shown && !either(C.selectModel, C.setUpModel).test(shown)) break;
+    await page.waitForTimeout(100);
   }
-  const model = (await page.getByRole("button", { name: C.model, exact: true }).first().innerText().catch(() => "")).trim();
   const prompt = "Reply with only the word OK.";
   await composer().fill(prompt);
   await send().click();
@@ -677,7 +679,7 @@ async function firstRun() {
   await send().waitFor({ timeout: 60_000 });
   await mark("firstRunFirstTurnEnd", now() - start);
   const text = await conversation().innerText();
-  scenario(name, /\bok\b/i.test(text.replace(prompt, "")), `${provider}, model: ${model}`);
+  scenario(name, /\bok\b/i.test(text.replace(prompt, "")), `model shown: ${shown}`);
   await page.screenshot({ path: process.env.TEMP + "\\playbook-03-first-run.png" });
 }
 
