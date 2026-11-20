@@ -120,5 +120,6 @@ describe("jouzu-attribution extension", () => {
     expect(run(base, "checkout", "-q", "main").status).toBe(0);
     expect(run(agent, "cherry-pick", "--allow-empty", "side").status).toBe(0);
     expect(message()).toBe("by a person");
-  });
+  // Each git call starts sh for every hook: on Windows this test takes several seconds.
+  }, 60_000);
 });
