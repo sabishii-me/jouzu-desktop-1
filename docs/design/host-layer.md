@@ -234,6 +234,16 @@ The session list entry carries what the host holds for a session even while it
 is idle (`queued` count, `hasFailedTurn`), so a client opens such a session
 through the host, never from its saved file, which has none of it.
 
+Every list entry also carries what the session list shows about it (#212): a
+live session's `status`, `activeTurn` and pending approval/question counts, and
+for any session, live or saved, `unseenRun` (`outcome` `done` / `failed`,
+`endedAt`): a run that ended while no client showed the session. A run someone
+stopped leaves no mark (the list shows it at rest).
+The host keeps that mark in its home (`session-runs.json`) so it outlives the
+session's place in the table and a restart, and drops it when any client shows
+the session (holding it live, or `POST /v1/sessions/seen` for one shown from its
+file). It is one mark for all clients, not one per client.
+
 ### 7.2 AppView (global)
 
 | Field | Content |
