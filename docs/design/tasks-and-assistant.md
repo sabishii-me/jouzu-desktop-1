@@ -24,6 +24,22 @@ Operations return at once. Changes reach the client's inbox: one entry per
 task (its latest state), increasing `seq`, read / ack / wait (long poll, at
 most 60 s). Many tasks ending together are one short read.
 
+Every window hears of these changes on the host's global event stream, the
+same one the session list already follows: `task.changed` (task id, client,
+session, state; on start, when the session file is known, and on each state
+change), `inbox.changed` (client, seq) and `project.changed` (project id).
+They carry ids and states only; a window reads the rest itself. The remote
+web page gets them the same way; nothing polls.
+
+A task's session is an ordinary row in the session list. The host's session
+lists add `task: {taskId, clientId, clientName}` to it, matched by live id or
+by saved file, so it survives a restart; the task record is the only source.
+The sidebar shows it with a small bot icon in place of the plain conversation
+icon, its tooltip naming who started it (the Assistant, or an agent by the
+name the user gave it). While it runs, waits or has an unseen end, the #212
+state icon shows instead and its tooltip adds the starter. There is no
+separate task list.
+
 Tasks run only in folders the user added, never send slash commands, and a
 client sees only its own tasks. `policy::authorize` is called before every
 operation and `policy::launch_profile` before every process start; both allow
