@@ -111,6 +111,8 @@ function bridge() {
       read: vi.fn(async () => { throw new Error('unused'); }),
       update: vi.fn(async () => { throw new Error('unused'); }),
       recommended: vi.fn(async () => { throw new Error('unused'); }),
+      messages: vi.fn(async () => []),
+      send: vi.fn(async () => { throw new Error('unused'); }),
     },
     webAccess: {
       read: vi.fn(async () => { throw new Error('unused'); }),

@@ -15,6 +15,7 @@ import {
   type HistoryPage,
   type McpAgent,
   type McpServerState,
+  type AssistantMessage,
   type AssistantModel,
   type AssistantRecommendation,
   type AssistantState,
@@ -416,6 +417,14 @@ export class HostClient {
 
   assistantRecommended(): Promise<{ about: string; models: AssistantRecommendation[] }> {
     return this.request("/v1/assistant/recommended");
+  }
+
+  async assistantMessages(limit = 200): Promise<AssistantMessage[]> {
+    return (await this.request<{ messages: AssistantMessage[] }>(`/v1/assistant/messages?${new URLSearchParams({ limit: String(limit) })}`)).messages;
+  }
+
+  sendAssistant(text: string): Promise<AssistantState> {
+    return this.request("/v1/assistant/messages", { method: "POST", body: JSON.stringify({ text }) });
   }
 
   async removeMcpAgent(id: string): Promise<void> {

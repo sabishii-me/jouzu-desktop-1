@@ -5971,6 +5971,13 @@ impl SessionManager {
         &self.home
     }
 
+    /// Tell every client something outside any session changed.
+    pub fn publish_control(&self, event: &str, data: Value) {
+        if let Some(events) = self.config.get().and_then(|config| config.events.as_ref()) {
+            events.publish_control(event, data);
+        }
+    }
+
     /// What replies said about each provider's sign-in.
     pub fn providers(&self) -> Arc<crate::provider_answers::ProviderAnswers> {
         self.providers.clone()

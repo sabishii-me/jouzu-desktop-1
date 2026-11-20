@@ -277,8 +277,9 @@ impl Assistant {
     fn set_phase(&self, phase: Phase, error: Option<String>) {
         let mut state = self.state();
         state.phase = phase;
-        state.error = error;
+        state.error = error.clone();
         drop(state);
+        self.sessions.publish_control("assistant.changed", json!({ "phase": phase.as_str(), "error": error }));
         self.kick.notify_one();
     }
 
@@ -297,6 +298,7 @@ impl Assistant {
             use std::io::Write;
             let _ = writeln!(file, "{row}");
         }
+        self.sessions.publish_control("assistant.changed", json!({ "message": row }));
     }
 
     /// Starts the scheduler and, when the user turned the Assistant on, the

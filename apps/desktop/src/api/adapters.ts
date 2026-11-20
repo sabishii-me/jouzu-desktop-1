@@ -179,6 +179,8 @@ function hostGroups(client: HostClient) {
       read: () => client.assistant(),
       update: change => client.updateAssistant(change),
       recommended: () => client.assistantRecommended(),
+      messages: limit => client.assistantMessages(limit),
+      send: text => client.sendAssistant(text),
     },
     webAccess: {
       read: () => client.webAccess(),

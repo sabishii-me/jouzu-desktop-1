@@ -377,6 +377,13 @@ export interface AssistantState {
   error: string | null;
 }
 
+export interface AssistantMessage {
+  at: string;
+  /** user, assistant, wake (what woke it, from the host), error. */
+  kind: string;
+  text: string;
+}
+
 export interface AssistantRecommendation {
   id: string;
   thinking: string;
@@ -409,6 +416,8 @@ export interface SettingsApi {
     read(): Promise<AssistantState>;
     update(change: { enabled?: boolean; model?: AssistantModel | null }): Promise<AssistantState>;
     recommended(): Promise<{ about: string; models: AssistantRecommendation[] }>;
+    messages(limit?: number): Promise<AssistantMessage[]>;
+    send(text: string): Promise<AssistantState>;
   };
   /** Only the desktop window may manage web access; web clients get `forbidden`. */
   webAccess: {
