@@ -460,6 +460,7 @@ pub fn install(managed: &Path, progress: Progress) -> Result<String, String> {
     write_tool_scripts(managed)?;
     install_tools(managed, progress)?;
     crate::image_tool::ensure(&crate::runtime::effective_home()?)?;
+    crate::attribution_extension::ensure(&crate::runtime::effective_home()?)?;
     Ok(version)
 }
 

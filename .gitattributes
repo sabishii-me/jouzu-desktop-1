@@ -1,0 +1,2 @@
+# Hook scripts run by sh, also from Git for Windows: never CRLF.
+packaging/desktop/extensions/jouzu-attribution/hook.sh text eol=lf

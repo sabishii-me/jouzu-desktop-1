@@ -1,0 +1,10 @@
+{
+  "name": "jouzu-attribution",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Marks commits and pull requests made by the Jouzu Desktop agent (Settings > Collaboration, off by default)",
+  "pi": {
+    "extensions": ["./index.js"]
+  }
+}

@@ -348,6 +348,11 @@ export interface SettingsApi {
     /** Saving goes through the configuration queue (`environment`). */
     read(): Promise<EnvironmentEntry[]>;
   };
+  /** "Mark commits made by the agent" (Settings > Collaboration): off unless turned on. */
+  attribution: {
+    read(): Promise<{ enabled: boolean }>;
+    save(enabled: boolean): Promise<{ enabled: boolean }>;
+  };
   /** Only the desktop window may manage web access; web clients get `forbidden`. */
   webAccess: {
     read(): Promise<WebAccessState>;

@@ -100,6 +100,7 @@ function bridge() {
   };
   const settings: SettingsApi = {
     environment: { read: vi.fn(async () => [] as EnvironmentEntry[]) },
+    attribution: { read: vi.fn(async () => ({ enabled: false })), save: vi.fn(async (enabled: boolean) => ({ enabled })) },
     webAccess: {
       read: vi.fn(async () => { throw new Error('unused'); }),
       update: vi.fn(async () => { throw new Error('unused'); }),
