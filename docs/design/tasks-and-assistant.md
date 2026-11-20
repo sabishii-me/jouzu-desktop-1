@@ -79,6 +79,22 @@ Assistant is idle. Task changes wake it only when idle, after a quiet period
 and acknowledges its inbox itself. `schedule_wake` lets it look again later.
 If the process ends it stays stopped until the user writes or turns it on.
 
+### Its pane
+
+The sidebar entry "Assistant" opens its pane. From the top: the task sessions
+waiting for the person (an approval or an answer; a click opens the session),
+then the person's projects, each expanding to its linked sessions and tasks
+with their state icons, then the conversation. Everything is read from the
+host (the session list with its task marks, `/v1/projects`, the Assistant's
+snapshot) and read again on `task.changed`, `project.changed` and
+`assistant.changed`; the remote web page shows the same.
+
+The entry carries a dot while the Assistant said something (a reply or an
+error) the person has not seen, or while a task waits for them. The host keeps
+one seen mark for every window (`POST /v1/assistant/seen`, sent when the pane
+is shown), as it does for a session's unseen run end (#212). There are no
+pop-ups.
+
 ### Its model
 
 The Assistant plans and dispatches; it runs only on the model the user saved
