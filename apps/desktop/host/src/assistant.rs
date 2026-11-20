@@ -60,7 +60,6 @@ pub const SKILLS: &[(&str, &str)] = &[
 const MEMORY_LIMIT: usize = 4096;
 const MEMORY_TYPES: [&str; 5] = ["user", "feedback", "project", "decision", "reference"];
 const WAKE_ENTRIES: usize = 20;
-const TRANSCRIPT_TEXT: usize = 16_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModelPick {
@@ -265,7 +264,7 @@ impl Assistant {
 
     fn record(&self, kind: &str, text: &str) {
         let _ = std::fs::create_dir_all(&self.dir);
-        let row = json!({ "at": now_iso(), "kind": kind, "text": cut(text, TRANSCRIPT_TEXT) });
+        let row = json!({ "at": now_iso(), "kind": kind, "text": text });
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(self.transcript()) {
             use std::io::Write;
             let _ = writeln!(file, "{row}");
@@ -814,12 +813,6 @@ impl Assistant {
             .lines()
             .filter(|line| line.to_lowercase().contains(&query))
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .map(|mut row| {
-                if let Some(text) = row["text"].as_str() {
-                    row["text"] = json!(cut(text, 600));
-                }
-                row
-            })
             .collect();
         let start = rows.len().saturating_sub(limit.clamp(1, 50));
         json!({ "hits": rows[start..] })

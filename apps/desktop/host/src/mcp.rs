@@ -510,7 +510,7 @@ pub(crate) fn task_tools() -> Vec<Value> {
         }),
         json!({
             "name": "read_task",
-            "description": "A task's latest messages, oldest first. Long texts are cut; the full conversation is in Desktop.",
+            "description": "A task's latest messages, oldest first, each in full. limit is how many messages.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "taskId": task_id, "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 } },

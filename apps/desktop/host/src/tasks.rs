@@ -31,8 +31,6 @@ use crate::{
 pub const DEFAULT_CAP: usize = 4;
 /// Longest a client may wait on its inbox in one call.
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
-/// Text kept per message in a task read; the full text stays in the session.
-const READ_TEXT_LIMIT: usize = 4000;
 
 /// What the host keeps about a task. No state: that lives in the session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -593,7 +591,8 @@ impl TaskManager {
         self.view(&record)
     }
 
-    /// The task's conversation, newest last, text cut to a readable size.
+    /// The task's latest messages, oldest first, each in full. `limit` pages
+    /// by message count, never by cutting text.
     pub fn read(&self, client: &str, task_id: &str, limit: usize) -> Result<Value, ApiError> {
         let record = self.owned(client, task_id)?;
         policy::authorize(self.home(), client, Some(&record.workspace), Action::ReadTask)?;
@@ -682,12 +681,9 @@ impl TaskManager {
     }
 }
 
-fn cut(text: &str) -> Value {
-    if text.chars().count() <= READ_TEXT_LIMIT {
-        return json!(text);
-    }
-    let kept: String = text.chars().take(READ_TEXT_LIMIT).collect();
-    json!(format!("{kept}…"))
+/// A message's text, whole: what a task produced is the task's answer.
+fn whole(text: &str) -> Value {
+    json!(text)
 }
 
 /// A row of a loaded session's history, in the task read shape.
@@ -695,7 +691,7 @@ fn live_row(row: &Value) -> Option<Value> {
     match row["kind"].as_str()? {
         "user" | "assistant" => Some(json!({
             "role": row["kind"],
-            "text": cut(row["text"].as_str().unwrap_or("")),
+            "text": whole(row["text"].as_str().unwrap_or("")),
         })),
         "tool" => Some(json!({
             "role": "tool",
@@ -722,7 +718,7 @@ fn saved_message(message: &Value) -> Option<Value> {
         }
     };
     match role {
-        "user" => Some(json!({ "role": "user", "text": cut(&text_of(&message["content"])) })),
+        "user" => Some(json!({ "role": "user", "text": whole(&text_of(&message["content"])) })),
         "assistant" => {
             let tools: Vec<Value> = message["content"]
                 .as_array()
@@ -734,7 +730,7 @@ fn saved_message(message: &Value) -> Option<Value> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(json!({ "role": "assistant", "text": cut(&text_of(&message["content"])), "tools": tools }))
+            Some(json!({ "role": "assistant", "text": whole(&text_of(&message["content"])), "tools": tools }))
         }
         _ => None,
     }
@@ -825,6 +821,7 @@ mod flow_tests {
 
         wait_for(&tasks, "agent-a", &task_id, "finished").await;
         let read = tasks.read("agent-a", &task_id, 20).unwrap();
+
         let messages = read["messages"].as_array().unwrap();
         assert!(messages.iter().any(|message| message["role"] == "user" && message["text"] == "write a haiku"), "{read}");
         assert!(messages.iter().any(|message| message["role"] == "assistant"), "{read}");
@@ -836,6 +833,20 @@ mod flow_tests {
         // A follow-up goes to the same conversation and finishes again.
         tasks.send("agent-a", &task_id, "and another").unwrap();
         wait_for(&tasks, "agent-a", &task_id, "finished").await;
+    }
+
+    #[tokio::test]
+    async fn a_read_returns_whole_messages_however_long() {
+        // The fake runtime echoes the text back one character per tick.
+        let (manager, _home, workspace) = setup(&[("FAKE_RUNTIME_DELAY_MS", "0")]);
+        let tasks = TaskManager::new(manager, DEFAULT_CAP);
+        let long = format!("{}END", "x".repeat(6_000));
+        let task = tasks.start("agent-a", &folder(&workspace), &long).unwrap();
+        let task_id = task["taskId"].as_str().unwrap().to_string();
+        wait_for(&tasks, "agent-a", &task_id, "finished").await;
+        let read = tasks.read("agent-a", &task_id, 20).unwrap();
+        let user = read["messages"].as_array().unwrap().iter().find(|message| message["role"] == "user").unwrap().clone();
+        assert_eq!(user["text"].as_str().unwrap().len(), long.len());
     }
 
     #[tokio::test]
