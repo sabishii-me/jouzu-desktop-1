@@ -4855,9 +4855,13 @@ mod session_tests {
         assert_eq!(summary["model"]["state"], "ready", "{summary}");
         assert_eq!(summary["model"]["id"], "model", "{summary}");
         assert_eq!(summary["model"]["name"], "fixture-model", "{summary}");
-        // The lists are the same runtime's, unchanged.
+        // The lists are the same runtime's, unchanged. They come in separate
+        // answers, so wait for both.
         for _ in 0..100 {
-            if session.summary()["models"].as_array().is_some_and(|models| models.len() == 2) {
+            let summary = session.summary();
+            if summary["models"].as_array().is_some_and(|models| models.len() == 2)
+                && summary["thinkingLevels"].as_array().is_some_and(|levels| !levels.is_empty())
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
