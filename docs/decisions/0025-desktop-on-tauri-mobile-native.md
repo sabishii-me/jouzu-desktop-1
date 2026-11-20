@@ -22,6 +22,9 @@ compromises it makes to fit every platform.
   devices are used, not ported from the desktop UI.
 - Every app is a client of the host's `/v1` HTTP and SSE contract
   ([`../design/host-layer.md`](../design/host-layer.md)). The host stays free of layout.
+- The web client ([0021](0021-web-and-remote-are-one-client.md)) keeps working on every
+  device that reaches it, phones and tablets included: narrow screens, touch input and
+  browser-only actions (#200, #201). Native apps are added beside it, not instead of it.
 - Each app is checked on its own platform against the same host contract.
 - NSH is not used.
 
@@ -30,6 +33,5 @@ compromises it makes to fit every platform.
 - No mobile app is scheduled; this only fixes the direction when one is built.
 - The desktop UI ([`../design/ui-layer.md`](../design/ui-layer.md)) is not the mobile
   design. A mobile app has its own UI document.
-- Web and remote access stay one browser client ([0021](0021-web-and-remote-are-one-client.md));
-  a native app does not replace it.
+- The web client is not trimmed to desktop screens because native apps are planned.
 - The desktop shell does not move off Tauri while Tauri is enough for the three systems.
