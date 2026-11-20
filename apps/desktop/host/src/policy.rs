@@ -59,6 +59,7 @@ pub fn authorize(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Launch {
     Runtime,
+    Assistant,
 }
 
 /// Applies the launch profile for `purpose` to a command before it spawns.

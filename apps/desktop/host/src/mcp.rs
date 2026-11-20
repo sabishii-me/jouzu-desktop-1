@@ -58,6 +58,20 @@ pub struct AgentClient {
     pub created_at: String,
 }
 
+impl AgentClient {
+    /// A client the host runs itself (the Assistant): no token, every folder.
+    pub(crate) fn builtin(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: id.to_string(),
+            token_hash: String::new(),
+            scopes: default_scopes(),
+            workspaces: Vec::new(),
+            created_at: String::new(),
+        }
+    }
+}
+
 fn default_scopes() -> Vec<String> {
     vec!["tasks".to_string()]
 }
@@ -161,7 +175,7 @@ impl McpServer {
         let clients = self.clients_guard();
         let mut found = None;
         for client in clients.iter() {
-            if same(&client.token_hash, &presented) {
+            if !client.token_hash.is_empty() && same(&client.token_hash, &presented) {
                 found = Some(client.clone());
             }
         }
@@ -384,11 +398,11 @@ async fn handle(State(state): State<McpState>, headers: HeaderMap, body: Bytes) 
             )
         }
         "ping" => rpc_result(id, json!({})),
-        "tools/list" => rpc_result(id, json!({ "tools": tool_list() })),
+        "tools/list" => rpc_result(id, json!({ "tools": task_tools() })),
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("").to_string();
             let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            let result = call_tool(&state.server, &client, &name, &arguments).await;
+            let result = call_task_tool(&state.server.tasks, &state.server.sessions, &client, &name, &arguments).await;
             rpc_result(id, tool_result(result))
         }
         _ => rpc_error(id, -32601, "Method not found"),
@@ -438,7 +452,8 @@ fn string_arg<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, ApiError>
         .ok_or_else(|| ApiError::bad_request(format!("{name} is required")))
 }
 
-fn tool_list() -> Vec<Value> {
+/// The task tools, as MCP lists them. The Assistant gets the same ones.
+pub(crate) fn task_tools() -> Vec<Value> {
     let task_id = json!({ "type": "string", "description": "The taskId start_task returned." });
     vec![
         json!({
@@ -516,9 +531,8 @@ fn tool_list() -> Vec<Value> {
 }
 
 /// Folders this agent may use: the user's, narrowed by the agent's own list.
-fn agent_workspaces(server: &McpServer, client: &AgentClient) -> Vec<Value> {
-    server
-        .sessions
+fn agent_workspaces(sessions: &SessionManager, client: &AgentClient) -> Vec<Value> {
+    sessions
         .workspaces()
         .into_iter()
         .filter(|value| {
@@ -538,14 +552,20 @@ fn agent_workspaces(server: &McpServer, client: &AgentClient) -> Vec<Value> {
         .collect()
 }
 
-async fn call_tool(server: &Arc<McpServer>, client: &AgentClient, name: &str, arguments: &Value) -> Result<Value, ApiError> {
+/// Runs one task tool for `client`. Unknown names are refused.
+pub(crate) async fn call_task_tool(
+    tasks: &Arc<TaskManager>,
+    sessions: &SessionManager,
+    client: &AgentClient,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, ApiError> {
     if !client.scopes.iter().any(|scope| scope == "tasks") {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "scope-missing", "This agent may not run tasks", false));
     }
-    let tasks = &server.tasks;
     let id = client.id.as_str();
     match name {
-        "list_workspaces" => Ok(json!({ "workspaces": agent_workspaces(server, client) })),
+        "list_workspaces" => Ok(json!({ "workspaces": agent_workspaces(sessions, client) })),
         "start_task" => {
             let workspace = string_arg(arguments, "workspace")?;
             if !client.workspaces.is_empty() {

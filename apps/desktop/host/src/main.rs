@@ -201,6 +201,7 @@ async fn main() -> ExitCode {
     println!("{}", jouzu_host::ready_line(port, &token));
 
     let tasks = jouzu_host::tasks::TaskManager::new(sessions.clone(), jouzu_host::tasks::DEFAULT_CAP);
+    let projects = jouzu_host::projects::ProjectStore::new(sessions.clone(), tasks.clone());
     let state = AppState {
         token: std::sync::Arc::new(token.clone()),
         port,
@@ -213,10 +214,20 @@ async fn main() -> ExitCode {
         web: std::sync::Arc::new(jouzu_host::web_access::WebAccess::load(&home)),
         tasks: tasks.clone(),
         mcp: jouzu_host::mcp::McpServer::new(&home, VERSION, tasks.clone(), sessions.clone()),
-        projects: jouzu_host::projects::ProjectStore::new(sessions.clone(), tasks),
+        projects: projects.clone(),
+        assistant: jouzu_host::assistant::Assistant::new(
+            &home,
+            jouzu_host::assistant::Assistant::default_paths(&home, &sessions),
+            jouzu_host::assistant::WakePolicy::default(),
+            sessions.clone(),
+            tasks.clone(),
+            projects,
+        ),
     };
     // Agents reach Desktop here once the user turned it on (Collaboration).
     state.mcp.reconcile().await;
+    // The Assistant (experimental) starts if the user turned it on.
+    state.assistant.launch();
     // Tasks that waited for a free slot when the host stopped start now.
     state.tasks.resume();
     // A configuration change reaches new sessions through a fresh warm runtime.

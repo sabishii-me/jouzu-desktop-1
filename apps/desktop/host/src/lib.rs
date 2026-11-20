@@ -13,6 +13,7 @@ use std::{
 };
 
 mod artifacts;
+pub mod assistant;
 pub mod awake;
 pub mod control;
 mod environment;
@@ -71,6 +72,7 @@ pub struct AppState {
     pub tasks: Arc<tasks::TaskManager>,
     pub mcp: Arc<mcp::McpServer>,
     pub projects: Arc<projects::ProjectStore>,
+    pub assistant: Arc<assistant::Assistant>,
 }
 
 #[derive(Debug, Serialize)]
@@ -284,6 +286,8 @@ pub fn router(state: AppState) -> Router {
         .route("/collaboration/mcp", get(mcp_server_snapshot).put(update_mcp_server))
         .route("/collaboration/mcp/clients", axum::routing::post(create_mcp_client))
         .route("/collaboration/mcp/clients/{id}", axum::routing::delete(revoke_mcp_client))
+        .route("/assistant", get(assistant_snapshot).put(update_assistant))
+        .route("/assistant/messages", get(assistant_messages).post(send_assistant))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", axum::routing::put(update_project).delete(delete_project))
         .route("/tasks", get(list_tasks).post(start_task))
@@ -466,6 +470,47 @@ async fn revoke_mcp_client(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+// ---- Assistant (experimental) ----
+
+async fn assistant_snapshot(State(state): State<AppState>) -> Json<Value> {
+    Json(state.assistant.snapshot().await)
+}
+
+#[derive(Deserialize)]
+struct AssistantUpdate {
+    enabled: Option<bool>,
+    /// Absent: unchanged. null: back to the runtime's default model.
+    #[serde(default, deserialize_with = "present")]
+    model: Option<Option<assistant::ModelPick>>,
+}
+
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+async fn update_assistant(
+    State(state): State<AppState>,
+    Json(request): Json<AssistantUpdate>,
+) -> Result<Json<Value>, ApiError> {
+    state.assistant.update(request.enabled, request.model).await.map(Json)
+}
+
+async fn assistant_messages(State(state): State<AppState>, Query(query): Query<TaskQuery>) -> Json<Value> {
+    Json(state.assistant.messages(query.limit.unwrap_or(50)))
+}
+
+async fn send_assistant(
+    State(state): State<AppState>,
+    Json(request): Json<TaskMessageRequest>,
+) -> Result<Response, ApiError> {
+    let value = state.assistant.send(&request.text).await?;
+    Ok((StatusCode::ACCEPTED, Json(value)).into_response())
 }
 
 // ---- Projects ----
@@ -2657,6 +2702,7 @@ mod tests {
     fn state(dist: PathBuf) -> AppState {
         let sessions = Arc::new(SessionManager::new(None, dist.clone(), dist.clone(), None, 10, None));
         let tasks = tasks::TaskManager::new(sessions.clone(), tasks::DEFAULT_CAP);
+        let projects = projects::ProjectStore::new(sessions.clone(), tasks.clone());
         AppState {
             token: Arc::new("a".repeat(64)),
             port: 40123,
@@ -2669,7 +2715,8 @@ mod tests {
             web: Arc::new(web_access::WebAccess::disabled()),
             tasks: tasks.clone(),
             mcp: mcp::McpServer::new(&dist, "0.1.0", tasks.clone(), sessions.clone()),
-            projects: projects::ProjectStore::new(sessions, tasks),
+            projects: projects.clone(),
+            assistant: assistant::Assistant::new(&dist, assistant::Assistant::default_paths(&dist, &sessions), assistant::WakePolicy::default(), sessions.clone(), tasks, projects),
         }
     }
 
@@ -3268,6 +3315,7 @@ mod session_tests {
     fn app(manager: Arc<SessionManager>) -> Router {
         let home = std::env::temp_dir();
         let tasks = tasks::TaskManager::new(manager.clone(), tasks::DEFAULT_CAP);
+        let projects = projects::ProjectStore::new(manager.clone(), tasks.clone());
         AppState {
             token: Arc::new("a".repeat(64)),
             port: 40123,
@@ -3280,7 +3328,8 @@ mod session_tests {
             web: Arc::new(web_access::WebAccess::disabled()),
             tasks: tasks.clone(),
             mcp: mcp::McpServer::new(manager.home(), "0.1.0", tasks.clone(), manager.clone()),
-            projects: projects::ProjectStore::new(manager.clone(), tasks),
+            projects: projects.clone(),
+            assistant: assistant::Assistant::new(manager.home(), assistant::Assistant::default_paths(manager.home(), &manager), assistant::WakePolicy::default(), manager.clone(), tasks, projects),
         }
         .pipe(router)
     }
