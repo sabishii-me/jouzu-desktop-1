@@ -27,6 +27,8 @@ pub fn spawn(spec: &SpawnSpec) -> io::Result<Spawned> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Where the sandbox will isolate the runtime (#197); no change yet.
+    crate::policy::launch_profile(&mut command, crate::policy::Launch::Runtime);
 
     #[cfg(windows)]
     {

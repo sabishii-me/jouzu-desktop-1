@@ -19,11 +19,13 @@ mod environment;
 pub mod events;
 mod files;
 pub mod known_models;
+pub mod policy;
 pub mod provider_answers;
 mod provider_error;
 pub mod runtime;
 pub mod sessions_repair;
 pub mod session;
+pub mod tasks;
 pub mod web_access;
 
 use session::{ApiError, CreateRequest, SendRequest, SessionManager};
@@ -64,6 +66,7 @@ pub struct AppState {
     pub control: Arc<control::ControlManager>,
     pub events: Arc<events::EventHub>,
     pub web: Arc<web_access::WebAccess>,
+    pub tasks: Arc<tasks::TaskManager>,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,6 +276,14 @@ pub fn router(state: AppState) -> Router {
             "/workspaces/forget",
             axum::routing::post(forget_workspace),
         )
+        .route("/tasks", get(list_tasks).post(start_task))
+        .route("/tasks/{id}", get(get_task))
+        .route("/tasks/{id}/messages", axum::routing::post(send_task))
+        .route("/tasks/{id}/stop", axum::routing::post(stop_task))
+        .route("/tasks/{id}/read", get(read_task))
+        .route("/inbox", get(read_inbox))
+        .route("/inbox/ack", axum::routing::post(ack_inbox))
+        .route("/inbox/wait", get(wait_inbox))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/persisted", get(persisted_sessions))
         .route("/sessions/flow", get(session_flow))
@@ -369,6 +380,120 @@ pub fn router(state: AppState) -> Router {
             host_origin_guard,
         ))
         .with_state(state)
+}
+
+// ---- Tasks (host token: Desktop itself; agents reach these through MCP) ----
+
+const DESKTOP_CLIENT: &str = "desktop";
+
+fn task_client(client: Option<&str>) -> String {
+    client
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DESKTOP_CLIENT)
+        .to_string()
+}
+
+#[derive(Deserialize)]
+struct TaskQuery {
+    #[serde(rename = "clientId")]
+    client_id: Option<String>,
+    limit: Option<usize>,
+    after: Option<u64>,
+    #[serde(rename = "timeoutMs")]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct StartTaskRequest {
+    #[serde(rename = "clientId")]
+    client_id: Option<String>,
+    workspace: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct TaskMessageRequest {
+    #[serde(rename = "clientId")]
+    client_id: Option<String>,
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct AckRequest {
+    #[serde(rename = "clientId")]
+    client_id: Option<String>,
+    seq: u64,
+}
+
+async fn list_tasks(State(state): State<AppState>, Query(query): Query<TaskQuery>) -> Result<Json<Value>, ApiError> {
+    state.tasks.list(&task_client(query.client_id.as_deref())).map(Json)
+}
+
+async fn start_task(
+    State(state): State<AppState>,
+    Json(request): Json<StartTaskRequest>,
+) -> Result<Response, ApiError> {
+    let client = task_client(request.client_id.as_deref());
+    let task = state.tasks.start(&client, &request.workspace, &request.text)?;
+    Ok((StatusCode::ACCEPTED, Json(task)).into_response())
+}
+
+async fn get_task(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<TaskQuery>,
+) -> Result<Json<Value>, ApiError> {
+    state.tasks.get(&task_client(query.client_id.as_deref()), &id).map(Json)
+}
+
+async fn send_task(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<TaskMessageRequest>,
+) -> Result<Response, ApiError> {
+    let task = state.tasks.send(&task_client(request.client_id.as_deref()), &id, &request.text)?;
+    Ok((StatusCode::ACCEPTED, Json(task)).into_response())
+}
+
+async fn stop_task(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<TaskMessageRequest>,
+) -> Result<Json<Value>, ApiError> {
+    state.tasks.stop(&task_client(request.client_id.as_deref()), &id).map(Json)
+}
+
+async fn read_task(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<TaskQuery>,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .tasks
+        .read(&task_client(query.client_id.as_deref()), &id, query.limit.unwrap_or(20))
+        .map(Json)
+}
+
+async fn read_inbox(State(state): State<AppState>, Query(query): Query<TaskQuery>) -> Result<Json<Value>, ApiError> {
+    state
+        .tasks
+        .inbox(&task_client(query.client_id.as_deref()), query.after.unwrap_or(0))
+        .map(Json)
+}
+
+async fn ack_inbox(State(state): State<AppState>, Json(request): Json<AckRequest>) -> Result<Json<Value>, ApiError> {
+    state.tasks.ack(&task_client(request.client_id.as_deref()), request.seq).map(Json)
+}
+
+async fn wait_inbox(State(state): State<AppState>, Query(query): Query<TaskQuery>) -> Result<Json<Value>, ApiError> {
+    let timeout = Duration::from_millis(query.timeout_ms.unwrap_or(30_000));
+    state
+        .tasks
+        .wait(&task_client(query.client_id.as_deref()), query.after.unwrap_or(0), timeout)
+        .await
+        .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -2367,23 +2492,18 @@ mod tests {
     }
 
     fn state(dist: PathBuf) -> AppState {
+        let sessions = Arc::new(SessionManager::new(None, dist.clone(), dist.clone(), None, 10, None));
         AppState {
             token: Arc::new("a".repeat(64)),
             port: 40123,
             dist: dist.clone(),
             started: Instant::now(),
             version: "0.1.0".to_string(),
-            sessions: Arc::new(SessionManager::new(
-                None,
-                dist.clone(),
-                dist.clone(),
-                None,
-                10,
-                None,
-            )),
+            sessions: sessions.clone(),
             control: control_manager(&dist),
             events: events::EventHub::new(),
             web: Arc::new(web_access::WebAccess::disabled()),
+            tasks: tasks::TaskManager::new(sessions, tasks::DEFAULT_CAP),
         }
     }
 
@@ -2987,10 +3107,11 @@ mod session_tests {
             dist: home.clone(),
             started: Instant::now(),
             version: "0.1.0".to_string(),
-            sessions: manager,
+            sessions: manager.clone(),
             control: Arc::new(control::ControlManager::new(&home, &home, None, &home.join("data"), None).expect("control manager")),
             events: events::EventHub::new(),
             web: Arc::new(web_access::WebAccess::disabled()),
+            tasks: tasks::TaskManager::new(manager, tasks::DEFAULT_CAP),
         }
         .pipe(router)
     }
@@ -3016,6 +3137,35 @@ mod session_tests {
         let headers = response.headers().clone();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn tasks_start_over_http_and_return_at_once() {
+        let (manager, _home, workspace) = manager(50);
+        manager
+            .add_workspaces(&[workspace.path().to_string_lossy().into_owned()])
+            .unwrap();
+        let app = app(manager);
+        let body = json!({ "clientId": "agent-a", "workspace": workspace.path(), "text": "hello" });
+        let started = call(
+            app.clone(),
+            request(Method::POST, "/v1/tasks")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(started.0, StatusCode::ACCEPTED, "{}", started.2);
+        let task: Value = serde_json::from_str(&started.2).unwrap();
+        let listed = call(
+            app.clone(),
+            request(Method::GET, "/v1/tasks?clientId=agent-a").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert!(listed.2.contains(task["taskId"].as_str().unwrap()));
+        // Desktop's own list is separate from the agent's.
+        let desktop = call(app, request(Method::GET, "/v1/tasks").body(Body::empty()).unwrap()).await;
+        assert!(!desktop.2.contains(task["taskId"].as_str().unwrap()));
     }
 
     #[tokio::test]

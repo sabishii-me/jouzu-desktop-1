@@ -210,7 +210,10 @@ async fn main() -> ExitCode {
         control,
         events,
         web: std::sync::Arc::new(jouzu_host::web_access::WebAccess::load(&home)),
+        tasks: jouzu_host::tasks::TaskManager::new(sessions.clone(), jouzu_host::tasks::DEFAULT_CAP),
     };
+    // Tasks that waited for a free slot when the host stopped start now.
+    state.tasks.resume();
     // A configuration change reaches new sessions through a fresh warm runtime.
     // Live sessions keep what they started with until the runtime can reload (G2).
     {
