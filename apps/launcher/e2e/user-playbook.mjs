@@ -1,9 +1,14 @@
 import { chromium } from "@playwright/test";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 /**
  * Black-box user playbook. It uses accessible actions, visible text and a unique
  * reply sentinel only. It never reads host logs, endpoints, DOM structure or
- * layout. UI changes may require updating only the semantic locators below.
+ * layout; the one exception is the reply language check, which reads the saved
+ * session (PLAYBOOK_DATA_DIR) because what Desktop owns is the instruction it sends,
+ * not the language the model answers in. UI changes may require updating only the
+ * semantic locators below.
  *
  * Controls are found by the words the app renders, taken from its own text tables
  * in the app's current interface language, so the playbook runs in any of them.
@@ -210,6 +215,13 @@ const settingsDialog = () => page.getByRole("dialog").first();
  * Web access is set back to Off at the end.
  */
 async function webAccessScenario() {
+  // Web access is managed only from the app's own window: a browser client gets no
+  // Web access tab (it must not widen who can connect). Where the playbook drives the
+  // UI in a browser (the stable release exam), this part is recorded as not run.
+  if (!await page.evaluate(() => "__TAURI_INTERNALS__" in window)) {
+    result.scenarios.push({ name: "Web access (#91, #106)", ok: true, skipped: true, detail: "not run: the UI runs in a browser; Web access is managed only in the app window" });
+    return;
+  }
   const visitor = await chromium.launch();
   const openWebAccess = async () => {
     await openSettingsTab(W.title);
@@ -308,7 +320,11 @@ async function longSessionScenario() {
   const start = now();
   // Earlier messages are either already loaded (Show N earlier) or read from the host
   // (Load earlier messages); either way the user keeps asking until neither is offered.
-  const earlier = () => conversation().getByRole("button", { name: C.loadEarlier, exact: true }).first();
+  // "Show N earlier messages" (already loaded, not yet shown; English only in the UI
+  // today) or "Load earlier messages" (read from the host).
+  const shownEarlier = /^Show \d+ earlier messages?$/;
+  const earlier = () => conversation().getByRole("button").filter({ hasText: shownEarlier })
+    .or(conversation().getByRole("button", { name: C.loadEarlier, exact: true })).first();
   let clicks = 0;
   while (await earlier().isVisible().catch(() => false)) {
     await earlier().click();
@@ -514,6 +530,23 @@ async function runOwnershipScenarios() {
   }
 }
 
+/** The newest saved session that holds `prompt`, read from PLAYBOOK_DATA_DIR: does its
+ * language contract say Japanese, and does its system prompt carry that line? */
+function sessionLanguageEvidence(prompt) {
+  const dataDir = process.env.PLAYBOOK_DATA_DIR;
+  if (!dataDir) return null;
+  const directory = join(dataDir, "state", "sessions");
+  const files = (existsSync(directory) ? readdirSync(directory, { recursive: true }) : [])
+    .map(name => join(directory, String(name)))
+    .filter(file => file.endsWith(".jsonl"))
+    .map(file => ({ file, text: readFileSync(file, "utf8") }))
+    .filter(({ text }) => text.includes(JSON.stringify(prompt).slice(1, -1)));
+  const found = files.at(-1);
+  if (!found) return { contract: false, prompt: false, file: "none holds the prompt" };
+  const contract = found.text.split("\n").some(line => line.includes("jouzu-language-contract-v1") && /"returnLanguage":"ja"/.test(line));
+  return { contract, prompt: found.text.includes("Response language: Japanese (ja)"), file: found.file };
+}
+
 async function openSettingsTab(name) {
   await page.getByRole("button", { name: C.settings, exact: true }).first().click();
   await settingsDialog().getByRole("tab", { name, exact: true }).click();
@@ -589,6 +622,68 @@ async function shisaKeyWithoutRestart() {
 }
 
 /**
+ * Scenario: a new user's first run. On a home that was never set up the app asks
+ * for the languages, then for a model connection. Shisa.AI is connected there by
+ * signing in through the browser, which cannot run unattended, so the playbook
+ * checks that the sign-in is offered. The rest of the first run is walked with a
+ * custom provider (an OpenAI-compatible API) added on the same page:
+ * PLAYBOOK_FIRST_RUN_URL, PLAYBOOK_FIRST_RUN_MODEL_ID and PLAYBOOK_FIRST_RUN_API_KEY.
+ * It is saved, a new session opens on that model and gets a reply, no restart.
+ */
+async function firstRun() {
+  const proceed = page.getByRole("button", { name: L.setupContinue, exact: true });
+  const signIn = page.getByRole("button", { name: L.signIn, exact: true });
+  // The app shows the chat until the runtime reports that no model is set up, then
+  // the first-run pages; wait for the first-run page itself.
+  await proceed.or(signIn).first().waitFor({ timeout: 120_000 });
+  const start = now();
+  const languagePage = await proceed.isVisible().catch(() => false);
+  if (languagePage) await proceed.click();
+  const offered = await signIn.waitFor({ timeout: 60_000 }).then(() => true, () => false);
+  scenario("First run asks for the languages, then offers Shisa.AI sign-in", languagePage && offered, `language page: ${languagePage}; Shisa.AI sign-in offered: ${offered}`);
+
+  const name = "First run: a custom provider added on the setup page gives a reply without restart";
+  const url = process.env.PLAYBOOK_FIRST_RUN_URL;
+  const model = process.env.PLAYBOOK_FIRST_RUN_MODEL_ID;
+  const key = process.env.PLAYBOOK_FIRST_RUN_API_KEY;
+  if (!url || !model || !key) {
+    result.scenarios.push({ name, ok: true, skipped: true, detail: "not run: PLAYBOOK_FIRST_RUN_URL, _MODEL_ID or _API_KEY is not set" });
+    return;
+  }
+  await page.getByRole("combobox", { name: L.service, exact: true }).first().click();
+  await page.getByRole("option", { name: L.customProvider, exact: true }).click();
+  await page.getByLabel(L.providerId, { exact: true }).fill("exam-custom");
+  await page.getByLabel(L.endpoint, { exact: true }).fill(url);
+  await page.getByLabel(L.modelId, { exact: true }).fill(model);
+  // Jouzu's own instructions do not fit the form's default 32K context.
+  if (process.env.PLAYBOOK_FIRST_RUN_CONTEXT) await page.getByLabel(L.contextWindow, { exact: true }).fill(process.env.PLAYBOOK_FIRST_RUN_CONTEXT);
+  await page.getByLabel(L.apiKey, { exact: true }).fill(key);
+  await page.getByRole("button", { name: L.save, exact: true }).click();
+  await newSession().waitFor({ timeout: 120_000 });
+  await mark("firstRunSavedToChat", now() - start);
+  await newSession().click();
+  await composer().waitFor({ timeout: 10_000 });
+  const modelButton = page.getByRole("button", { name: C.model, exact: true }).first();
+  const end = now() + 30_000;
+  let shown = "";
+  while (now() < end) {
+    shown = (await modelButton.innerText().catch(() => "")).trim();
+    if (shown && !either(C.selectModel, C.setUpModel).test(shown)) break;
+    await page.waitForTimeout(100);
+  }
+  const prompt = "Reply with only the word OK.";
+  await composer().fill(prompt);
+  await send().click();
+  await waitForConversationText(prompt, 5_000);
+  await stop().waitFor({ state: "detached", timeout: 60_000 }).catch(() => {});
+  await send().waitFor({ timeout: 60_000 });
+  await mark("firstRunFirstTurnEnd", now() - start);
+  const text = await conversation().innerText();
+  scenario(name, /\bok\b/i.test(text.replace(prompt, "")), `model shown: ${shown}`);
+  await page.screenshot({ path: process.env.TEMP + "\\playbook-03-first-run.png" });
+}
+
+/**
  * The first new session after the app starts (#99). Its model is the one its
  * runtime reports: the button shows it once the runtime answered. With no model
  * at all, Send is not offered and the button leads to setting one up.
@@ -615,6 +710,12 @@ async function firstSessionHasModel() {
 }
 
 try {
+  // PLAYBOOK_SCENARIO=first-run: a home that was never set up, as a new user
+  // has it; the stable release exam runs it on a home of its own (#86).
+  if (process.env.PLAYBOOK_SCENARIO === "first-run") {
+    await firstRun();
+    throw Object.assign(new Error("done"), { done: true });
+  }
   await firstSessionHasModel();
   let start = now();
   await page.reload({ waitUntil: "domcontentloaded" });
@@ -797,7 +898,16 @@ try {
   await stop().waitFor({ state: "detached", timeout: 60_000 }).catch(() => {});
   await send().waitFor({ timeout: 60_000 });
   const languageReply = (await conversation().innerText()).replace(languagePrompt, "");
-  scenario("Reply language set in Settings applies to the next new session", /[\u3040-\u30ff]/.test(languageReply), languageReply.slice(0, 200));
+  // What Desktop controls is what reaches the model: the session's language contract
+  // and the response language line of its system prompt. Whether the model then
+  // answers in that language is the model's behaviour, recorded but not judged.
+  const languageEvidence = sessionLanguageEvidence(languagePrompt);
+  if (languageEvidence === null) {
+    result.scenarios.push({ name: "Reply language set in Settings applies to the next new session", ok: true, skipped: true, detail: "not run: PLAYBOOK_DATA_DIR is not set, so the session file cannot be read" });
+  } else {
+    scenario("Reply language set in Settings applies to the next new session", languageEvidence.contract && languageEvidence.prompt,
+      `contract returnLanguage ja: ${languageEvidence.contract}; system prompt "Response language: Japanese (ja)": ${languageEvidence.prompt}; file: ${languageEvidence.file}; model replied: ${languageReply.slice(0, 120)}`);
+  }
   await page.screenshot({ path: process.env.TEMP + "\\playbook-03-reply-language.png" });
   replyLanguage = await openLanguageSettings();
   await replyLanguage.click();

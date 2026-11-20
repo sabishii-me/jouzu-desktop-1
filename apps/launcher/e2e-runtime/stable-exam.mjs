@@ -26,6 +26,9 @@ const out = resolve(process.env.EXAM_OUT ?? 'stable-exam.json');
 for (const [name, value] of Object.entries({ EXAM_MANAGED: managed, EXAM_HOST: hostExe, EXAM_DIST: dist, PLAYBOOK_SHISA_API_KEY: shisaKey })) {
   if (!value) { console.error(`${name} is not set; the stable exam cannot run.`); process.exit(2); }
 }
+// Shisa.AI's OpenAI-compatible API and a small chat model on it, for the first run.
+const SHISA_OPENAI_URL = 'https://api.shisa.ai/v1';
+const SHISA_FIRST_RUN_MODEL = 'qwen38-flash-next-nvfp4';
 const here = import.meta.dirname;
 const launcher = resolve(here, '..');
 const extension = resolve(launcher, '..', '..', 'packaging', 'launcher', 'extensions', 'jouzu-image');
@@ -117,17 +120,20 @@ try {
   const main = home('main');
   const mainHost = await startHost(main, { SHISA_API_KEY: shisaKey });
   let browser = await openBrowser(mainHost, 9224);
-  const playbook = await run('playbook', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9224', PLAYBOOK_IMAGE_PROVIDER: process.env.PLAYBOOK_OPENROUTER_API_KEY ? 'OpenRouter' : '' , PLAYBOOK_SHISA_API_KEY: '' });
+  const playbook = await run('playbook', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9224', PLAYBOOK_DATA_DIR: join(main, 'data'), PLAYBOOK_IMAGE_PROVIDER: process.env.PLAYBOOK_OPENROUTER_API_KEY ? 'OpenRouter' : '' , PLAYBOOK_SHISA_API_KEY: '' });
   // The Shisa key scenario runs on its own home below, so it is expected to skip here.
-  judge(playbook, { allowSkipped: ['Shisa key saved in Settings works without restart', ...imageProviderOptional] });
+  // Web access is managed only in the app's own window, which this exam does not drive.
+  judge(playbook, { allowSkipped: ['Shisa key saved in Settings works without restart', 'Web access (#91, #106)', ...imageProviderOptional] });
   // The host's part of a first reply, from this home's host.log over the playbook's run (#117, #129).
   {
     const log = join(main, 'logs', 'host.log');
     const timing = existsSync(log) && playbook.result
       ? hostTiming(readFileSync(log, 'utf8'), { from: Date.parse(playbook.result.startedAt), to: Date.parse(playbook.result.finishedAt ?? new Date().toISOString()) })
       : null;
-    const problem = existsSync(log) ? hostGateProblem(timing) : `gate sendToModelRequest: no host.log at ${log}`;
-    report.runs.push({ name: 'host-timing', problems: problem ? [problem] : [], result: timing });
+    // A host-internal number: a diagnostic, never the pass criterion (0019). What the
+    // person sees (own message, working, first reply) is gated by the playbook itself.
+    const note = existsSync(log) ? hostGateProblem(timing) : `no host.log at ${log}`;
+    report.runs.push({ name: 'host-timing (diagnostic)', problems: [], note, result: timing });
   }
   await browser.close();
   // The run belongs to the host: a message sent during a reply is read by it, Stop
@@ -143,14 +149,18 @@ try {
     report.runs.push({ name: 'run-ownership-log', problems, result: null });
   }
   await browser.close();
-  const restart = await run('entry-restart', 'e2e-runtime/entry-restart.mjs', { JOUZU_E2E_HOST_HOME: main });
+  // The host gives its token only to its starter (#130); pass it on.
+  const restart = await run('entry-restart', 'e2e-runtime/entry-restart.mjs', { JOUZU_E2E_HOST_HOME: main, JOUZU_E2E_HOST_TOKEN: mainHost.token });
   judge({ ...restart, result: restart.result ?? (restart.code === 0 ? { scenarios: [{ name: 'entry restart', ok: true }] } : null) });
 
-  // 2. A Shisa key saved in Settings works without a restart, on a home never connected.
+  // 2. A new user's first run: a home never set up asks for the languages, then a
+  //    model connection. Shisa.AI sign-in (browser) is checked as offered; the run
+  //    itself is completed by adding Shisa.AI's OpenAI-compatible API as a custom
+  //    provider with the test key.
   const fresh = home('key');
   const freshHost = await startHost(fresh, {});
   browser = await openBrowser(freshHost, 9225);
-  const key = await run('shisa-key', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9225', PLAYBOOK_SCENARIO: 'shisa-key', PLAYBOOK_SHISA_API_KEY: shisaKey });
+  const key = await run('first-run', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9225', PLAYBOOK_SCENARIO: 'first-run', PLAYBOOK_SHISA_API_KEY: '', PLAYBOOK_FIRST_RUN_URL: SHISA_OPENAI_URL, PLAYBOOK_FIRST_RUN_MODEL_ID: SHISA_FIRST_RUN_MODEL, PLAYBOOK_FIRST_RUN_CONTEXT: '262144', PLAYBOOK_FIRST_RUN_API_KEY: shisaKey });
   judge(key);
   await browser.close();
 
@@ -171,6 +181,6 @@ try {
 report.pass = report.runs.length > 0 && report.runs.every(run => run.problems.length === 0);
 report.finishedAt = new Date().toISOString();
 writeFileSync(out, `${JSON.stringify(report, null, 2)}\n`);
-for (const run of report.runs) console.log(`${run.problems.length ? 'FAIL' : 'PASS'} ${run.name}${run.problems.length ? `: ${run.problems.join('; ')}` : ''}`);
+for (const run of report.runs) console.log(`${run.problems.length ? 'FAIL' : 'PASS'} ${run.name}${run.problems.length ? `: ${run.problems.join('; ')}` : ''}${run.note ? ` (${run.note})` : ''}`);
 console.log(report.pass ? 'Stable exam passed.' : 'Stable exam failed.');
 process.exit(report.pass ? 0 : 1);
