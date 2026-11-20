@@ -1,3 +1,4 @@
+import type React from "react";
 import { CircleCheck, CircleStop, CircleX, Hand, LoaderCircle } from "lucide-react";
 import { turnLabel } from "./chat-live";
 import type { ChatText } from "./chat-text";
@@ -6,38 +7,28 @@ import type { RowState } from "./session-open";
 const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}`;
 
 /**
- * The line under a session-list row's title (#212): what the session is doing,
- * in the same words as the status line of the session in view, or how its last
- * run ended while nobody looked. One line, never wrapped.
+ * The mark beside a session-list row's title (#212): what the session is doing,
+ * or how its last run ended while nobody looked. Only an icon; its words (the
+ * same as the status line of the session in view) are its label and tooltip.
  */
 export function SessionRowStatus({ state, now, t }: { state: RowState; now: number; t: ChatText }) {
-  const line = "flex min-w-0 items-center gap-1 text-[11px] leading-4";
+  const mark = (kind: string, text: string, tone: string, icon: React.ReactNode, extra?: Record<string, unknown>) =>
+    <span role="img" aria-label={text} title={text} data-session-state={kind} {...extra} className={`flex shrink-0 items-center ${tone}`}>{icon}</span>;
+  const size = "size-3.5";
   switch (state.kind) {
     case "running": {
       const turn = state.turn;
       const elapsed = turn?.startedAt ? ` · ${clock(Math.max(0, now - turn.startedAt))}` : "";
       const text = `${turn ? turnLabel(turn, now, t) : t.running}${elapsed}`;
-      return <span data-session-state="running" data-session-running className={`${line} text-primary`} title={text}>
-        <LoaderCircle className="size-3 shrink-0 animate-spin" aria-hidden="true" /><span className="truncate tabular-nums">{text}</span>
-      </span>;
+      return mark("running", text, "text-primary", <LoaderCircle className={`${size} animate-spin`} aria-hidden="true" />, { "data-session-running": "" });
     }
-    case "waiting": {
-      const text = state.on === "approval" ? t.sessionWaitingApproval : t.sessionWaitingAnswer;
-      return <span data-session-state="waiting" className={`${line} text-amber-700 dark:text-amber-300`} title={text}>
-        <Hand className="size-3 shrink-0" aria-hidden="true" /><span className="truncate">{text}</span>
-      </span>;
-    }
+    case "waiting":
+      return mark("waiting", state.on === "approval" ? t.sessionWaitingApproval : t.sessionWaitingAnswer, "text-amber-700 dark:text-amber-300", <Hand className={size} aria-hidden="true" />);
     case "failed":
-      return <span data-session-state="failed" className={`${line} text-destructive`}>
-        <CircleX className="size-3 shrink-0" aria-hidden="true" /><span className="truncate">{t.sessionFailed}</span>
-      </span>;
+      return mark("failed", t.sessionFailed, "text-destructive", <CircleX className={size} aria-hidden="true" />);
     case "stopped":
-      return <span data-session-state="stopped" className={`${line} text-muted-foreground`}>
-        <CircleStop className="size-3 shrink-0" aria-hidden="true" /><span className="truncate">{t.sessionStopped}</span>
-      </span>;
+      return mark("stopped", t.sessionStopped, "text-muted-foreground", <CircleStop className={size} aria-hidden="true" />);
     case "done":
-      return <span data-session-state="done" className={`${line} text-emerald-700 dark:text-emerald-400`}>
-        <CircleCheck className="size-3 shrink-0" aria-hidden="true" /><span className="truncate">{t.sessionFinished}</span>
-      </span>;
+      return mark("done", t.sessionFinished, "text-emerald-700 dark:text-emerald-400", <CircleCheck className={size} aria-hidden="true" />);
   }
 }
