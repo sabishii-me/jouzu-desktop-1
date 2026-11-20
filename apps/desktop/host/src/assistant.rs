@@ -609,7 +609,12 @@ impl Assistant {
 
     /// The next turn to take, if any: the user first, then a wake.
     fn next_turn(&self) -> Option<String> {
-        let inbox = self.tasks.inbox(CLIENT, 0).ok();
+        // Off, starting or busy: nothing to read, nothing to log.
+        if self.state().phase != Phase::Idle {
+            return None;
+        }
+        // The host's own look at the inbox, not the Assistant's: no policy check.
+        let inbox = Some(self.tasks.peek_inbox(CLIENT));
         let memory = self.memory_index_text();
         let mut state = self.state();
         if state.phase != Phase::Idle {
@@ -1016,6 +1021,15 @@ mod tests {
         assert_eq!(fixture.assistant.state().phase, Phase::Stopped);
         fixture.assistant.send("again").await.unwrap();
         until(|| replies(&fixture.assistant).iter().any(|reply| reply == "ok: again")).await;
+    }
+
+    #[tokio::test]
+    async fn an_assistant_that_is_off_reads_and_logs_nothing() {
+        let fixture = setup(WakePolicy::default());
+        fixture.assistant.launch();
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        let log = std::fs::read_to_string(fixture._home.path().join("logs").join("host.log")).unwrap_or_default();
+        assert!(!log.contains("policy.authorize"), "{log}");
     }
 
     #[tokio::test]

@@ -640,6 +640,14 @@ impl TaskManager {
         Ok(json!({ "entries": entries, "seq": seq }))
     }
 
+    /// The host's own view of a client's inbox (for wake decisions); not a
+    /// client operation, so no policy check and no log line.
+    pub fn peek_inbox(&self, client: &str) -> Value {
+        let store = self.store();
+        let entries = store.inboxes.get(client).map(|inbox| inbox.entries.clone()).unwrap_or_default();
+        json!({ "entries": entries })
+    }
+
     /// Removes entries up to `seq`: the client has read them.
     pub fn ack(&self, client: &str, seq: u64) -> Result<Value, ApiError> {
         policy::authorize(self.home(), client, None, Action::ReadInbox)?;
