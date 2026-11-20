@@ -373,6 +373,14 @@ export class HostClient {
     return this.request("/v1/tools", { method: "PUT", body: JSON.stringify({ image }) });
   }
 
+  attribution(): Promise<{ enabled: boolean }> {
+    return this.request("/v1/attribution");
+  }
+
+  saveAttribution(enabled: boolean): Promise<{ enabled: boolean }> {
+    return this.request("/v1/attribution", { method: "PUT", body: JSON.stringify({ enabled }) });
+  }
+
   toolProviders(): Promise<{ providers: Array<{ id: string; label: string; available?: boolean; reason?: string; models?: unknown }> }> {
     return this.request("/v1/tools/providers");
   }

@@ -4,7 +4,7 @@ import type { ConfigKind } from "./app-view";
 const en = {
   setupLanguage: "Choose your languages", setupLanguageHint: "First the language of Jouzu’s interface, then the language Jouzu replies in. You can change both later in Settings.", responseLanguage: "Jouzu reply language", responseLanguageHint: "The language Jouzu writes its explanations in. Automatic adds no instruction and follows the conversation.", responseAuto: "Automatic",
   artifactLanguage: "Language for comments, docs, commits and reviews", artifactLanguageHint: "The default keeps code comments as written and follows the project's existing language for the rest. Existing files are not translated.", artifactDefault: "Default", artifactPreserve: "Keep the existing language", artifactProject: "Follow the project", artifactCustom: "Custom", languageAppliesNew: "Jouzu language settings apply to sessions opened after the change. They are shared with Jouzu in the terminal.", languageFileUnreadable: "Jouzu's language settings file could not be read, so the defaults are in effect. Fix or remove localization.json in the Jouzu data folder to change them here.",
-  toolsTab: "Tools",
+  toolsTab: "Tools", collaborationTab: "Collaboration",
   artifactsTab: "Artifacts",
 updateAvailable: "Update available", upToDate: "Up to date", installingUpdate: "Installing…", downloadingUpdate: "Downloading…", checkUpdates: "Check for updates", updateReady: "An update is ready", jouzuUpdatePending: "Jouzu updates: the qualified pnpm release source is not configured.",
  profileOffHint: "When disabled, no Japanese-first instructions are added. Reply language follows the conversation and other settings.",
@@ -33,7 +33,7 @@ type Messages = typeof en;
 const ja: Messages = {
   setupLanguage: "言語を選択", setupLanguageHint: "まず Jouzu の表示言語、次に Jouzu が応答する言語を選びます。どちらも後から設定で変更できます。", responseLanguage: "Jouzu の応答言語", responseLanguageHint: "Jouzu が説明を書く言語です。自動の場合は指示を追加せず、会話に合わせます。", responseAuto: "自動",
   artifactLanguage: "コメント・ドキュメント・コミット・レビューの言語", artifactLanguageHint: "既定では、コードコメントは元の言語のまま、その他はプロジェクトの既存の言語に合わせます。既存のファイルは翻訳しません。", artifactDefault: "既定", artifactPreserve: "元の言語を保つ", artifactProject: "プロジェクトに合わせる", artifactCustom: "カスタム", languageAppliesNew: "Jouzu の言語設定は、変更後に開いたセッションから適用されます。ターミナルの Jouzu と共通です。", languageFileUnreadable: "Jouzu の言語設定ファイルを読み込めないため、既定値が使われています。ここで変更するには、Jouzu データフォルダーの localization.json を修正または削除してください。",
-  toolsTab: "ツール",
+  toolsTab: "ツール", collaborationTab: "コラボレーション",
   artifactsTab: "アーティファクト",
 updateAvailable: "更新があります", upToDate: "最新です", installingUpdate: "インストール中…", downloadingUpdate: "ダウンロード中…", checkUpdates: "更新を確認", updateReady: "更新があります", jouzuUpdatePending: "Jouzu 更新：検証済み pnpm リリース元は未設定です。",
  profileOffHint: "無効にすると、日本語優先の指示を追加しません。応答言語は会話や他の設定に従います。",
@@ -61,7 +61,7 @@ minimize: "最小化", maximize: "最大化・元に戻す", profile: "日本語
 const hans: Messages = {
   setupLanguage: "选择语言", setupLanguageHint: "先选择 Jouzu 界面的语言，再选择 Jouzu 回复使用的语言。之后都可以在设置中修改。", responseLanguage: "Jouzu 回复语言", responseLanguageHint: "Jouzu 写说明时使用的语言。自动表示不额外指定，跟随对话。", responseAuto: "自动",
   artifactLanguage: "注释、文档、提交信息和评审的语言", artifactLanguageHint: "默认：代码注释保持原有语言，其余跟随项目已有的语言。不会翻译已有文件。", artifactDefault: "默认", artifactPreserve: "保持原有语言", artifactProject: "跟随项目", artifactCustom: "自定义", languageAppliesNew: "Jouzu 的语言设置从修改后新开的会话开始生效，并与终端里的 Jouzu 共用。", languageFileUnreadable: "无法读取 Jouzu 的语言设置文件，当前使用默认值。要在这里修改，请修复或删除 Jouzu 数据文件夹中的 localization.json。",
-  toolsTab: "工具",
+  toolsTab: "工具", collaborationTab: "协作",
   artifactsTab: "产物",
 updateAvailable: "发现更新", upToDate: "已是最新", installingUpdate: "正在安装…", downloadingUpdate: "正在下载…", checkUpdates: "检查更新", updateReady: "有可用更新", jouzuUpdatePending: "Jouzu 更新：尚未配置经过验证的 pnpm 发布源。",
  profileOffHint: "关闭后不再添加日语优先指令，回复语言由对话及其他配置决定，不会自动固定为中文。",
@@ -89,7 +89,7 @@ minimize: "最小化", maximize: "最大化或还原", profile: "日语优先模
 const hant: Messages = {
   setupLanguage: "選擇語言", setupLanguageHint: "先選擇 Jouzu 介面的語言，再選擇 Jouzu 回覆使用的語言。之後都可以在設定中修改。", responseLanguage: "Jouzu 回覆語言", responseLanguageHint: "Jouzu 撰寫說明時使用的語言。自動表示不額外指定，跟隨對話。", responseAuto: "自動",
   artifactLanguage: "註解、文件、提交訊息和審查的語言", artifactLanguageHint: "預設：程式碼註解保持原有語言，其餘跟隨專案既有的語言。不會翻譯既有檔案。", artifactDefault: "預設", artifactPreserve: "保持原有語言", artifactProject: "跟隨專案", artifactCustom: "自訂", languageAppliesNew: "Jouzu 的語言設定從修改後新開的工作階段開始生效，並與終端機中的 Jouzu 共用。", languageFileUnreadable: "無法讀取 Jouzu 的語言設定檔，目前使用預設值。若要在這裡修改，請修復或刪除 Jouzu 資料夾中的 localization.json。",
-  toolsTab: "工具",
+  toolsTab: "工具", collaborationTab: "協作",
   artifactsTab: "產物",
 updateAvailable: "發現更新", upToDate: "已是最新", installingUpdate: "正在安裝…", downloadingUpdate: "正在下載…", checkUpdates: "檢查更新", updateReady: "有可用更新", jouzuUpdatePending: "Jouzu 更新：尚未設定經過驗證的 pnpm 發行來源。",
  profileOffHint: "關閉後不再加入日語優先指令，回覆語言由對話及其他設定決定，不會自動固定為中文。",

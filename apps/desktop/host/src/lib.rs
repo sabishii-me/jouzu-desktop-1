@@ -267,6 +267,7 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(global_events))
         .route("/models", get(models))
         .route("/tools", get(tools_snapshot).put(update_tools))
+        .route("/attribution", get(attribution_snapshot).put(update_attribution))
         .route("/tools/providers", get(tool_providers))
         .route("/tools/models", get(tool_models))
         .route("/mcp", get(mcp_snapshot))
@@ -1611,6 +1612,46 @@ fn read_tools_settings(value: &Value) -> Value {
         .filter(|tools| !tools.is_empty())
         .unwrap_or_else(|| vec![json!("generate_image")]);
     json!({ "image": image_tool_fields(image, provider, model), "reviewTools": review })
+}
+
+/// "Mark commits made by the agent" (Settings > Collaboration, off by default).
+/// The jouzu-attribution extension reads this file at every shell tool call
+/// and every run, so a change applies at once and nothing is restarted.
+fn attribution_path(state: &AppState) -> PathBuf {
+    state.sessions.runtime_home().join("agent").join("attribution.json")
+}
+
+fn read_attribution(path: &Path) -> Value {
+    let enabled = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.get("enabled").and_then(Value::as_bool))
+        .unwrap_or(false);
+    json!({ "enabled": enabled })
+}
+
+async fn attribution_snapshot(State(state): State<AppState>) -> Json<Value> {
+    Json(read_attribution(&attribution_path(&state)))
+}
+
+async fn update_attribution(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let enabled = body
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ApiError::bad_request("enabled must be true or false"))?;
+    let path = attribution_path(&state);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| ApiError::internal(format!("Could not create the agent folder: {error}")))?;
+    }
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, format!("{}\n", json!({ "enabled": enabled })))
+        .and_then(|_| std::fs::rename(&temp, &path))
+        .map_err(|error| ApiError::internal(format!("Could not save the setting: {error}")))?;
+    Ok(Json(read_attribution(&path)))
 }
 
 fn valid_image_model(model: &str) -> bool {
@@ -4522,6 +4563,35 @@ mod session_tests {
             body["settings"],
             json!({ "image": { "enabled": false, "provider": "", "model": "", "size": "1K", "maxImages": 10 }, "reviewTools": ["generate_image"] })
         );
+    }
+
+    /// "Mark commits made by the agent" is off until saved on, in a file of its
+    /// own beside tools.json.
+    #[tokio::test]
+    async fn attribution_is_off_until_saved_on() {
+        let (manager, home, _workspace) = manager(50);
+        let app = app(manager);
+        let get = || request(Method::GET, "/v1/attribution").body(Body::empty()).unwrap();
+        let put = |body: Value| {
+            request(Method::PUT, "/v1/attribution")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let fresh = call(app.clone(), get()).await;
+        assert_eq!(fresh.2, json!({ "enabled": false }).to_string());
+        let refused = call(app.clone(), put(json!({ "enabled": "yes" }))).await;
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{}", refused.2);
+        let on = call(app.clone(), put(json!({ "enabled": true }))).await;
+        assert_eq!(on.0, StatusCode::OK, "{}", on.2);
+        let file: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join("data").join("agent").join("attribution.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(file, json!({ "enabled": true }));
+        assert_eq!(call(app.clone(), get()).await.2, json!({ "enabled": true }).to_string());
+        call(app.clone(), put(json!({ "enabled": false }))).await;
+        assert_eq!(call(app, get()).await.2, json!({ "enabled": false }).to_string());
     }
 
     #[tokio::test]

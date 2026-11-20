@@ -21,6 +21,7 @@ mod jouzu_update;
 mod environment;
 mod runtime;
 mod image_tool;
+mod attribution_extension;
 mod update_channel;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
