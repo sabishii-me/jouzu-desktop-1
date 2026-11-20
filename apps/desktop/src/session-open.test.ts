@@ -51,7 +51,6 @@ describe("rowState (#212)", () => {
   it("shows how a run ended unseen, and nothing for a session at rest", () => {
     expect(rowState(row({ unseenRun: { outcome: "done", endedAt: "t" } }))).toEqual({ kind: "done" });
     expect(rowState(row({ unseenRun: { outcome: "failed", endedAt: "t" } }))).toEqual({ kind: "failed" });
-    expect(rowState(row({ unseenRun: { outcome: "stopped", endedAt: "t" } }))).toEqual({ kind: "stopped" });
     expect(rowState(row({}))).toBeNull();
     // A saved session the host does not hold is "stopped" in the list: at rest.
     expect(rowState(row({ status: "stopped" }))).toBeNull();

@@ -75,7 +75,7 @@ export interface SessionSummary {
   unseenRun?: UnseenRun | null;
 }
 
-export interface UnseenRun { outcome: "done" | "failed" | "stopped"; endedAt: string }
+export interface UnseenRun { outcome: "done" | "failed"; endedAt: string }
 
 export interface SessionHandle {
   sessionId: string;

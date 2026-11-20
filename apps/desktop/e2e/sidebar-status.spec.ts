@@ -20,7 +20,6 @@ const saved = [
   ...live.map(item => ({ ...item, sessionId: null, status: "stopped", running: false, activeTurn: undefined, pendingApprovalCount: undefined })),
   row("Finished", { status: "stopped", unseenRun: { outcome: "done", endedAt: new Date(now - 30_000).toISOString() } }),
   row("Failed", { status: "stopped", unseenRun: { outcome: "failed", endedAt: new Date(now - 30_000).toISOString() } }),
-  row("Stopped", { status: "stopped", unseenRun: { outcome: "stopped", endedAt: new Date(now - 30_000).toISOString() } }),
   row("Quiet", { status: "stopped" }),
 ];
 
@@ -60,8 +59,8 @@ async function setup(page: Page, language: string, seen: string[]) {
 }
 
 for (const [language, words] of [
-  ["en", { running: "Running bash · 0:4", waiting: "Waiting for your review", done: "Finished", failed: "Failed", stopped: "Stopped" }],
-  ["ja", { running: "bash を実行中 · 0:4", waiting: "確認待ち", done: "完了", failed: "失敗", stopped: "停止しました" }],
+  ["en", { running: "Running bash · 0:4", waiting: "Waiting for your review", done: "Finished", failed: "Failed" }],
+  ["ja", { running: "bash を実行中 · 0:4", waiting: "確認待ち", done: "完了", failed: "失敗" }],
 ] as const) {
   test(`each session row says what its session is doing (${language})`, async ({ page }) => {
     const seen: string[] = [];
@@ -72,7 +71,6 @@ for (const [language, words] of [
     await expect(state("Waiting")).toHaveAttribute("title", words.waiting);
     await expect(state("Finished")).toHaveAttribute("title", words.done);
     await expect(state("Failed")).toHaveAttribute("title", words.failed);
-    await expect(state("Stopped")).toHaveAttribute("title", words.stopped);
     await expect(state("Quiet")).toHaveCount(0);
     await page.locator("aside").screenshot({ path: `test-results/sidebar-status-${language}.png` });
     // Opening a session whose run ended unseen tells the host it has been seen.

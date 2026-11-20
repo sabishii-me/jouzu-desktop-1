@@ -24,8 +24,6 @@ pub enum Outcome {
     /// The run ended in an error: the last reply failed, the runtime refused
     /// the message, or the runtime went away.
     Failed,
-    /// Someone stopped it.
-    Stopped,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -124,7 +122,7 @@ mod tests {
     fn marks_outlive_the_host() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session-runs.json");
-        RunMarks::new(Some(path.clone())).ended("a", Outcome::Stopped, "t", false);
-        assert_eq!(RunMarks::new(Some(path)).view("a")["outcome"], "stopped");
+        RunMarks::new(Some(path.clone())).ended("a", Outcome::Failed, "t", false);
+        assert_eq!(RunMarks::new(Some(path)).view("a")["outcome"], "failed");
     }
 }

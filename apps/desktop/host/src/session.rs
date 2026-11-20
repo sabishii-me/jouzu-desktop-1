@@ -1887,19 +1887,21 @@ impl Session {
         stored
     }
 
-    /// How a run ended, from its `turn.end`; `None` when no run ended (the
-    /// message went back to the queue, or an extension handled a command).
-    fn run_outcome(&self, data: &Value) -> Option<crate::run_marks::Outcome> {
+    /// How a run ended, from its `turn.end`, for the session list: `None` when
+    /// no run ended (the message went back to the queue, or an extension handled
+    /// a command), and `Some(None)` for a run someone stopped, which the list
+    /// shows like a session at rest.
+    fn run_outcome(&self, data: &Value) -> Option<Option<crate::run_marks::Outcome>> {
         use crate::run_marks::Outcome;
         let status = data.get("status").and_then(Value::as_str);
         if matches!(status, Some("queued" | "handled")) {
             return None;
         }
         if status == Some("failed") || data.get("reason").is_some_and(|reason| !reason.is_null()) {
-            return Some(Outcome::Failed);
+            return Some(Some(Outcome::Failed));
         }
         if status == Some("interrupted") || data.get("aborted").and_then(Value::as_bool) == Some(true) {
-            return Some(Outcome::Stopped);
+            return Some(None);
         }
         // Completed: failed when its last reply did (the provider refused it
         // and no retry answered).
@@ -1915,15 +1917,23 @@ impl Session {
                     && row.get("turnId").and_then(Value::as_str) == Some(turn)
             })
             .is_some_and(|row| row.get("errorMessage").is_some_and(|error| !error.is_null()));
-        Some(if failed { Outcome::Failed } else { Outcome::Done })
+        Some(Some(if failed { Outcome::Failed } else { Outcome::Done }))
     }
 
     /// A run ended: marked for the session list unless a client shows the session (#212).
     fn note_run_end(&self, data: &Value) {
         let Some(outcome) = self.run_outcome(data) else { return };
         let Some(path) = self.list_key() else { return };
-        let shown = self.viewers.load(Ordering::SeqCst) > 0;
-        self.config.runs.ended(&path, outcome, &Self::now_iso(), shown);
+        match outcome {
+            Some(outcome) => {
+                let shown = self.viewers.load(Ordering::SeqCst) > 0;
+                self.config.runs.ended(&path, outcome, &Self::now_iso(), shown);
+            }
+            // Stopped: nothing to tell, and an older mark is out of date.
+            None => {
+                self.config.runs.seen(&path);
+            }
+        }
     }
 
     /// The session's file as the session list keys it.

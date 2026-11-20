@@ -1,5 +1,5 @@
 import type React from "react";
-import { CircleCheck, CircleStop, CircleX, Hand, LoaderCircle } from "lucide-react";
+import { CircleCheck, CircleX, Hand, LoaderCircle } from "lucide-react";
 import { turnLabel } from "./chat-live";
 import type { ChatText } from "./chat-text";
 import type { RowState } from "./session-open";
@@ -16,7 +16,6 @@ export function rowStateText(state: RowState, now: number, t: ChatText): string 
     }
     case "waiting": return state.on === "approval" ? t.sessionWaitingApproval : t.sessionWaitingAnswer;
     case "failed": return t.sessionFailed;
-    case "stopped": return t.sessionStopped;
     case "done": return t.sessionFinished;
   }
 }
@@ -25,7 +24,6 @@ const ICONS: Record<RowState["kind"], { tone: string; icon: (className: string) 
   running: { tone: "text-primary", icon: className => <LoaderCircle className={`${className} animate-spin`} aria-hidden="true" /> },
   waiting: { tone: "text-amber-700 dark:text-amber-300", icon: className => <Hand className={className} aria-hidden="true" /> },
   failed: { tone: "text-destructive", icon: className => <CircleX className={className} aria-hidden="true" /> },
-  stopped: { tone: "text-muted-foreground", icon: className => <CircleStop className={className} aria-hidden="true" /> },
   done: { tone: "text-emerald-700 dark:text-emerald-400", icon: className => <CircleCheck className={className} aria-hidden="true" /> },
 };
 

@@ -70,7 +70,7 @@ export function sessionRow(value: SessionSummary): SessionRow | null {
 export type RowState =
   | { kind: "running"; turn: ActiveTurn | null }
   | { kind: "waiting"; on: "approval" | "answer" }
-  | { kind: "failed" | "done" | "stopped" };
+  | { kind: "failed" | "done" };
 
 export function rowState(row: Pick<SessionRow, "running" | "status" | "activeTurn" | "waiting" | "unseenRun">): RowState | null {
   if (row.waiting) return { kind: "waiting", on: row.waiting };
