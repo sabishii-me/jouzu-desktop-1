@@ -1,9 +1,14 @@
 import { chromium } from "@playwright/test";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 /**
  * Black-box user playbook. It uses accessible actions, visible text and a unique
  * reply sentinel only. It never reads host logs, endpoints, DOM structure or
- * layout. UI changes may require updating only the semantic locators below.
+ * layout; the one exception is the reply language check, which reads the saved
+ * session (PLAYBOOK_DATA_DIR) because what Desktop owns is the instruction it sends,
+ * not the language the model answers in. UI changes may require updating only the
+ * semantic locators below.
  *
  * Controls are found by the words the app renders, taken from its own text tables
  * in the app's current interface language, so the playbook runs in any of them.
@@ -210,6 +215,13 @@ const settingsDialog = () => page.getByRole("dialog").first();
  * Web access is set back to Off at the end.
  */
 async function webAccessScenario() {
+  // Web access is managed only from the app's own window: a browser client gets no
+  // Web access tab (it must not widen who can connect). Where the playbook drives the
+  // UI in a browser (the stable release exam), this part is recorded as not run.
+  if (!await page.evaluate(() => "__TAURI_INTERNALS__" in window)) {
+    result.scenarios.push({ name: "Web access (#91, #106)", ok: true, skipped: true, detail: "not run: the UI runs in a browser; Web access is managed only in the app window" });
+    return;
+  }
   const visitor = await chromium.launch();
   const openWebAccess = async () => {
     await openSettingsTab(W.title);
@@ -308,7 +320,11 @@ async function longSessionScenario() {
   const start = now();
   // Earlier messages are either already loaded (Show N earlier) or read from the host
   // (Load earlier messages); either way the user keeps asking until neither is offered.
-  const earlier = () => conversation().getByRole("button", { name: C.loadEarlier, exact: true }).first();
+  // "Show N earlier messages" (already loaded, not yet shown; English only in the UI
+  // today) or "Load earlier messages" (read from the host).
+  const shownEarlier = /^Show \d+ earlier messages?$/;
+  const earlier = () => conversation().getByRole("button").filter({ hasText: shownEarlier })
+    .or(conversation().getByRole("button", { name: C.loadEarlier, exact: true })).first();
   let clicks = 0;
   while (await earlier().isVisible().catch(() => false)) {
     await earlier().click();
@@ -512,6 +528,23 @@ async function runOwnershipScenarios() {
     scenario(name, results.every(n => n === 1) && await alerts().count() === 0 && idle, `each shown ${results.join("/")} times; idle after: ${idle}`);
     await page.screenshot({ path: process.env.TEMP + "\\playbook-run-4-edge.png" });
   }
+}
+
+/** The newest saved session that holds `prompt`, read from PLAYBOOK_DATA_DIR: does its
+ * language contract say Japanese, and does its system prompt carry that line? */
+function sessionLanguageEvidence(prompt) {
+  const dataDir = process.env.PLAYBOOK_DATA_DIR;
+  if (!dataDir) return null;
+  const directory = join(dataDir, "state", "sessions");
+  const files = (existsSync(directory) ? readdirSync(directory, { recursive: true }) : [])
+    .map(name => join(directory, String(name)))
+    .filter(file => file.endsWith(".jsonl"))
+    .map(file => ({ file, text: readFileSync(file, "utf8") }))
+    .filter(({ text }) => text.includes(JSON.stringify(prompt).slice(1, -1)));
+  const found = files.at(-1);
+  if (!found) return { contract: false, prompt: false, file: "none holds the prompt" };
+  const contract = found.text.split("\n").some(line => line.includes("jouzu-language-contract-v1") && /"returnLanguage":"ja"/.test(line));
+  return { contract, prompt: found.text.includes("Response language: Japanese (ja)"), file: found.file };
 }
 
 async function openSettingsTab(name) {
@@ -797,7 +830,16 @@ try {
   await stop().waitFor({ state: "detached", timeout: 60_000 }).catch(() => {});
   await send().waitFor({ timeout: 60_000 });
   const languageReply = (await conversation().innerText()).replace(languagePrompt, "");
-  scenario("Reply language set in Settings applies to the next new session", /[\u3040-\u30ff]/.test(languageReply), languageReply.slice(0, 200));
+  // What Desktop controls is what reaches the model: the session's language contract
+  // and the response language line of its system prompt. Whether the model then
+  // answers in that language is the model's behaviour, recorded but not judged.
+  const languageEvidence = sessionLanguageEvidence(languagePrompt);
+  if (languageEvidence === null) {
+    result.scenarios.push({ name: "Reply language set in Settings applies to the next new session", ok: true, skipped: true, detail: "not run: PLAYBOOK_DATA_DIR is not set, so the session file cannot be read" });
+  } else {
+    scenario("Reply language set in Settings applies to the next new session", languageEvidence.contract && languageEvidence.prompt,
+      `contract returnLanguage ja: ${languageEvidence.contract}; system prompt "Response language: Japanese (ja)": ${languageEvidence.prompt}; file: ${languageEvidence.file}; model replied: ${languageReply.slice(0, 120)}`);
+  }
   await page.screenshot({ path: process.env.TEMP + "\\playbook-03-reply-language.png" });
   replyLanguage = await openLanguageSettings();
   await replyLanguage.click();

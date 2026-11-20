@@ -117,9 +117,10 @@ try {
   const main = home('main');
   const mainHost = await startHost(main, { SHISA_API_KEY: shisaKey });
   let browser = await openBrowser(mainHost, 9224);
-  const playbook = await run('playbook', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9224', PLAYBOOK_IMAGE_PROVIDER: process.env.PLAYBOOK_OPENROUTER_API_KEY ? 'OpenRouter' : '' , PLAYBOOK_SHISA_API_KEY: '' });
+  const playbook = await run('playbook', 'e2e/user-playbook.mjs', { PLAYBOOK_CDP: 'http://127.0.0.1:9224', PLAYBOOK_DATA_DIR: join(main, 'data'), PLAYBOOK_IMAGE_PROVIDER: process.env.PLAYBOOK_OPENROUTER_API_KEY ? 'OpenRouter' : '' , PLAYBOOK_SHISA_API_KEY: '' });
   // The Shisa key scenario runs on its own home below, so it is expected to skip here.
-  judge(playbook, { allowSkipped: ['Shisa key saved in Settings works without restart', ...imageProviderOptional] });
+  // Web access is managed only in the app's own window, which this exam does not drive.
+  judge(playbook, { allowSkipped: ['Shisa key saved in Settings works without restart', 'Web access (#91, #106)', ...imageProviderOptional] });
   // The host's part of a first reply, from this home's host.log over the playbook's run (#117, #129).
   {
     const log = join(main, 'logs', 'host.log');
@@ -143,7 +144,8 @@ try {
     report.runs.push({ name: 'run-ownership-log', problems, result: null });
   }
   await browser.close();
-  const restart = await run('entry-restart', 'e2e-runtime/entry-restart.mjs', { JOUZU_E2E_HOST_HOME: main });
+  // The host gives its token only to its starter (#130); pass it on.
+  const restart = await run('entry-restart', 'e2e-runtime/entry-restart.mjs', { JOUZU_E2E_HOST_HOME: main, JOUZU_E2E_HOST_TOKEN: mainHost.token });
   judge({ ...restart, result: restart.result ?? (restart.code === 0 ? { scenarios: [{ name: 'entry restart', ok: true }] } : null) });
 
   // 2. A Shisa key saved in Settings works without a restart, on a home never connected.
