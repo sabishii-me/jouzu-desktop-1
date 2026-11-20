@@ -343,6 +343,24 @@ export interface WebAccessPairing {
   links: Array<{ network: string; url: string }>;
 }
 
+export interface McpAgent {
+  id: string;
+  name: string;
+  scopes: string[];
+  /** Folders the agent is limited to; empty means every folder you added. */
+  workspaces: string[];
+  createdAt: string;
+}
+
+export interface McpServerState {
+  enabled: boolean;
+  port: number;
+  url: string;
+  serving: boolean;
+  error: string | null;
+  agents: McpAgent[];
+}
+
 export interface SettingsApi {
   environment: {
     /** Saving goes through the configuration queue (`environment`). */
@@ -352,6 +370,14 @@ export interface SettingsApi {
   attribution: {
     read(): Promise<{ enabled: boolean }>;
     save(enabled: boolean): Promise<{ enabled: boolean }>;
+  };
+  /** Agent access over MCP (Settings > Collaboration). Desktop window only. */
+  mcp: {
+    read(): Promise<McpServerState>;
+    update(change: { enabled?: boolean; port?: number }): Promise<McpServerState>;
+    /** The token is returned only here, once. */
+    addAgent(name: string): Promise<{ agent: McpAgent; token: string }>;
+    removeAgent(id: string): Promise<void>;
   };
   /** Only the desktop window may manage web access; web clients get `forbidden`. */
   webAccess: {

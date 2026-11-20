@@ -389,9 +389,26 @@ pub fn router(state: AppState) -> Router {
 }
 
 // ---- Collaboration > MCP: the user's switch and agent tokens ----
+// Managed only in the Desktop window, like web access: a paired browser
+// cannot let new agents in.
 
-async fn mcp_server_snapshot(State(state): State<AppState>) -> Json<Value> {
-    Json(state.mcp.snapshot().await)
+fn desktop_window_only(listener: Option<axum::Extension<web_access::Listener>>) -> Result<(), Response> {
+    match listener.map(|value| value.0) {
+        Some(web_access::Listener::Web { .. }) => {
+            Err(forbidden("Agent access is managed only in Jouzu Desktop"))
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn mcp_server_snapshot(
+    State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
+) -> Response {
+    if let Err(response) = desktop_window_only(listener) {
+        return response;
+    }
+    Json(state.mcp.snapshot().await).into_response()
 }
 
 #[derive(Deserialize)]
@@ -402,9 +419,16 @@ struct McpServerUpdate {
 
 async fn update_mcp_server(
     State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
     Json(request): Json<McpServerUpdate>,
-) -> Result<Json<Value>, ApiError> {
-    state.mcp.update(request.enabled, request.port).await.map(Json)
+) -> Response {
+    if let Err(response) = desktop_window_only(listener) {
+        return response;
+    }
+    match state.mcp.update(request.enabled, request.port).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -414,18 +438,30 @@ struct McpClientRequest {
 
 async fn create_mcp_client(
     State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
     Json(request): Json<McpClientRequest>,
-) -> Result<Response, ApiError> {
-    let created = state.mcp.create_client(&request.name)?;
-    Ok((StatusCode::CREATED, Json(created)).into_response())
+) -> Response {
+    if let Err(response) = desktop_window_only(listener) {
+        return response;
+    }
+    match state.mcp.create_client(&request.name) {
+        Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn revoke_mcp_client(
     State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
     AxumPath(id): AxumPath<String>,
-) -> Result<StatusCode, ApiError> {
-    state.mcp.revoke_client(&id)?;
-    Ok(StatusCode::NO_CONTENT)
+) -> Response {
+    if let Err(response) = desktop_window_only(listener) {
+        return response;
+    }
+    match state.mcp.revoke_client(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 // ---- Tasks (host token: Desktop itself; agents reach these through MCP) ----

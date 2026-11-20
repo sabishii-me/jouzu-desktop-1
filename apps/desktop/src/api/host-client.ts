@@ -13,6 +13,8 @@ import {
   type EnvironmentEntry,
   type FileEntry,
   type HistoryPage,
+  type McpAgent,
+  type McpServerState,
   type SavedMessagesPage,
   type Model,
   type Receipt,
@@ -27,6 +29,13 @@ import {
   type WebAccessPairing,
   type WebAccessState,
 } from "./jouzu-api";
+
+/** The host calls agents "clients"; the UI calls them agents. */
+type HostMcpState = Omit<McpServerState, "agents"> & { clients: McpAgent[] };
+
+function mcpState({ clients, ...rest }: HostMcpState): McpServerState {
+  return { ...rest, agents: clients };
+}
 
 export interface HostClientOptions {
   baseUrl?: string;
@@ -379,6 +388,23 @@ export class HostClient {
 
   saveAttribution(enabled: boolean): Promise<{ enabled: boolean }> {
     return this.request("/v1/attribution", { method: "PUT", body: JSON.stringify({ enabled }) });
+  }
+
+  async mcpServer(): Promise<McpServerState> {
+    return mcpState(await this.request<HostMcpState>("/v1/collaboration/mcp"));
+  }
+
+  async updateMcpServer(change: { enabled?: boolean; port?: number }): Promise<McpServerState> {
+    return mcpState(await this.request<HostMcpState>("/v1/collaboration/mcp", { method: "PUT", body: JSON.stringify(change) }));
+  }
+
+  async addMcpAgent(name: string): Promise<{ agent: McpAgent; token: string }> {
+    const created = await this.request<{ client: McpAgent; token: string }>("/v1/collaboration/mcp/clients", { method: "POST", body: JSON.stringify({ name }) });
+    return { agent: created.client, token: created.token };
+  }
+
+  async removeMcpAgent(id: string): Promise<void> {
+    await this.request<unknown>(`/v1/collaboration/mcp/clients/${encodeURIComponent(id)}`, { method: "DELETE" });
   }
 
   toolProviders(): Promise<{ providers: Array<{ id: string; label: string; available?: boolean; reason?: string; models?: unknown }> }> {
