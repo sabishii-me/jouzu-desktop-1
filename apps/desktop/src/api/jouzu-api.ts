@@ -6,8 +6,6 @@
  * See docs/adr/0009 and docs/contracts/jouzu-api-v1.md.
  */
 
-import type { ActiveTurn } from "../chat-types";
-
 export type Unsubscribe = () => void;
 
 export interface ApiCapabilities {
@@ -68,7 +66,8 @@ export interface SessionSummary {
   /** The host holds a failed message to retry. */
   hasFailedTurn?: boolean;
   /** What the running turn is doing now (live sessions only). */
-  activeTurn?: ActiveTurn | null;
+  /** As the host sends it: times are ISO strings. */
+  activeTurn?: unknown;
   pendingApprovalCount?: number;
   pendingQuestionCount?: number;
   /** A run that ended while no client showed this session, until one does (#212). */

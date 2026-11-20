@@ -39,8 +39,9 @@ describe("rowState (#212)", () => {
   const row = (extra: Record<string, unknown>) => sessionRow({ ...base, status: "idle", running: false, ...extra } as never)!;
 
   it("says what a running session is doing, from the host's active turn", () => {
-    const turn = { turnId: "t", phase: "running", startedAt: 1, step: { n: 1, state: "tools", tools: [{ id: "1", name: "bash" }] } };
-    expect(rowState(row({ status: "running", running: true, activeTurn: turn }))).toEqual({ kind: "running", turn });
+    const turn = { turnId: "t", phase: "running", startedAt: "2026-11-21T00:00:00.000Z", step: { n: 1, state: "tools", since: "2026-11-21T00:00:01.000Z", tools: [{ id: "1", name: "bash" }] } };
+    const state = rowState(row({ status: "running", running: true, activeTurn: turn }));
+    expect(state).toMatchObject({ kind: "running", turn: { turnId: "t", startedAt: Date.parse("2026-11-21T00:00:00.000Z"), step: { state: "tools", since: Date.parse("2026-11-21T00:00:01.000Z"), tools: [{ id: "1", name: "bash" }] } } });
   });
 
   it("puts a waiting approval or question before the run", () => {

@@ -13,7 +13,7 @@ const row = (name: string, extra: Record<string, unknown>) => ({
   status: "idle", updatedAt: new Date(now - 60_000).toISOString(), running: false, pinned: false, archived: false, ...extra,
 });
 const live = [
-  row("Running", { sessionId: "r", status: "running", running: true, activeTurn: { turnId: "t", phase: "running", startedAt: now - 48_000, step: { n: 2, state: "tools", since: now - 48_000, tools: [{ id: "1", name: "bash" }] } } }),
+  row("Running", { sessionId: "r", status: "running", running: true, activeTurn: { turnId: "t", phase: "running", startedAt: new Date(now - 48_000).toISOString(), step: { n: 2, state: "tools", since: new Date(now - 48_000).toISOString(), tools: [{ id: "1", name: "bash" }] } } }),
   row("Waiting", { sessionId: "w", status: "waiting_approval", running: true, pendingApprovalCount: 1 }),
 ];
 const saved = [

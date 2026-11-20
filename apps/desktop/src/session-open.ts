@@ -1,5 +1,6 @@
 import type { SessionSummary, UnseenRun } from "./api/jouzu-api";
 import type { ActiveTurn } from "./chat-types";
+import { activeTurnOf } from "./session-store";
 
 /**
  * A session the host is working on, or holds something for, must be opened
@@ -55,7 +56,8 @@ export function sessionRow(value: SessionSummary): SessionRow | null {
     status: value.status,
     queued: value.queued,
     hasFailedTurn: value.hasFailedTurn,
-    activeTurn: value.activeTurn ?? null,
+    // The host sends times as ISO strings; the status words need numbers.
+    activeTurn: activeTurnOf(value.activeTurn),
     waiting: (value.pendingApprovalCount ?? 0) > 0 || value.status === "waiting_approval" ? "approval"
       : (value.pendingQuestionCount ?? 0) > 0 || value.status === "waiting_question" ? "answer" : undefined,
     unseenRun: value.unseenRun ?? null,
