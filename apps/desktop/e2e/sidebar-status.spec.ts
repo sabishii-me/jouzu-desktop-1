@@ -21,6 +21,7 @@ const saved = [
   row("Finished", { status: "stopped", unseenRun: { outcome: "done", endedAt: new Date(now - 30_000).toISOString() } }),
   row("Failed", { status: "stopped", unseenRun: { outcome: "failed", endedAt: new Date(now - 30_000).toISOString() } }),
   row("Quiet", { status: "stopped" }),
+  row("Dispatched", { status: "stopped", task: { taskId: "task-1", clientId: "agent-1", clientName: "CI bot" } }),
 ];
 
 async function setup(page: Page, language: string, seen: string[]) {
@@ -59,8 +60,8 @@ async function setup(page: Page, language: string, seen: string[]) {
 }
 
 for (const [language, words] of [
-  ["en", { running: "Running bash · 0:\\d\\d", waiting: "Waiting for your review", done: "Finished", failed: "Failed" }],
-  ["ja", { running: "bash を実行中 · 0:\\d\\d", waiting: "確認待ち", done: "完了", failed: "失敗" }],
+  ["en", { running: "Running bash · 0:\\d\\d", waiting: "Waiting for your review", done: "Finished", failed: "Failed", by: "Started by CI bot" }],
+  ["ja", { running: "bash を実行中 · 0:\\d\\d", waiting: "確認待ち", done: "完了", failed: "失敗", by: "CI bot が開始" }],
 ] as const) {
   test(`each session row says what its session is doing (${language})`, async ({ page }) => {
     const seen: string[] = [];
@@ -72,6 +73,9 @@ for (const [language, words] of [
     await expect(state("Finished")).toHaveAttribute("title", words.done);
     await expect(state("Failed")).toHaveAttribute("title", words.failed);
     await expect(state("Quiet")).toHaveCount(0);
+    // A session started as a task says who started it, in place of the plain icon.
+    const task = page.locator("div.group\\/session").filter({ hasText: "Dispatched session" }).locator("[data-session-task]");
+    await expect(task).toHaveAttribute("title", words.by);
     await page.locator("aside").screenshot({ path: `test-results/sidebar-status-${language}.png` });
     // Opening a session whose run ended unseen tells the host it has been seen.
     await page.locator("button", { hasText: "Finished session" }).click();

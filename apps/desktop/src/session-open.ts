@@ -1,4 +1,4 @@
-import type { SessionSummary, UnseenRun } from "./api/jouzu-api";
+import type { SessionSummary, SessionTask, UnseenRun } from "./api/jouzu-api";
 import type { ActiveTurn } from "./chat-types";
 import { activeTurnOf } from "./session-store";
 
@@ -33,6 +33,8 @@ export interface SessionRow {
   waiting?: "approval" | "answer";
   /** A run that ended while no client showed it, until one does (#212). */
   unseenRun?: UnseenRun | null;
+  /** Started as a task by the Assistant or an agent, not by the person. */
+  task?: SessionTask | null;
 }
 
 /** The list row for a host session entry, or null for one that is not listed. */
@@ -61,6 +63,7 @@ export function sessionRow(value: SessionSummary): SessionRow | null {
     waiting: (value.pendingApprovalCount ?? 0) > 0 || value.status === "waiting_approval" ? "approval"
       : (value.pendingQuestionCount ?? 0) > 0 || value.status === "waiting_question" ? "answer" : undefined,
     unseenRun: value.unseenRun ?? null,
+    task: value.task ?? null,
   };
 }
 

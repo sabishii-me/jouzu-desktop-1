@@ -72,7 +72,11 @@ export interface SessionSummary {
   pendingQuestionCount?: number;
   /** A run that ended while no client showed this session, until one does (#212). */
   unseenRun?: UnseenRun | null;
+  /** The task this session runs, and who started it: the Assistant or an agent. */
+  task?: SessionTask | null;
 }
+
+export interface SessionTask { taskId: string; clientId: string; clientName?: string }
 
 export interface UnseenRun { outcome: "done" | "failed"; endedAt: string }
 

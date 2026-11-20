@@ -190,6 +190,44 @@ impl TaskManager {
         }
     }
 
+    /// Tells every window that a task changed: the event names the task and
+    /// its state; a window reads the rest (the session list, the task) itself.
+    fn changed(&self, task_id: &str) {
+        let Ok(record) = self.record(task_id) else { return };
+        let state = self.state_of(&record);
+        self.sessions.publish_control(
+            "task.changed",
+            json!({
+                "taskId": record.task_id,
+                "clientId": record.client_id,
+                "sessionId": record.session_id,
+                "sessionPath": record.session_path,
+                "state": state,
+            }),
+        );
+    }
+
+    /// Marks each session a task runs in with `task: {taskId, clientId}`, so a
+    /// list shows who started it. Matched by live id, else by saved file.
+    pub fn mark_sessions(&self, sessions: &mut [Value]) {
+        let store = self.store();
+        if store.tasks.is_empty() {
+            return;
+        }
+        let key = |path: &str| path.replace('\\', "/").to_lowercase();
+        for session in sessions.iter_mut() {
+            let id = session["sessionId"].as_str().map(str::to_string);
+            let path = session["sessionPath"].as_str().map(key);
+            let owner = store.tasks.iter().rev().find(|task| {
+                (id.is_some() && task.session_id == id)
+                    || (path.is_some() && task.session_path.as_deref().map(key) == path)
+            });
+            if let Some(task) = owner {
+                session["task"] = json!({ "taskId": task.task_id, "clientId": task.client_id });
+            }
+        }
+    }
+
     fn record(&self, task_id: &str) -> Result<TaskRecord, ApiError> {
         self.store()
             .tasks
@@ -298,6 +336,7 @@ impl TaskManager {
             self.save(&store);
             return Err(error);
         }
+        self.changed(&task_id);
         self.view(&self.record(&task_id)?)
     }
 
@@ -420,6 +459,8 @@ impl TaskManager {
                 if task.session_path.as_deref() != Some(path.as_str()) {
                     task.session_path = Some(path);
                     self.save(&store);
+                    drop(store);
+                    self.changed(task_id);
                 }
             }
         }
@@ -439,6 +480,7 @@ impl TaskManager {
             }
         };
         if let Some(state) = changed {
+            self.changed(task_id);
             if reportable(&state) {
                 self.report(task_id, &state);
             }
@@ -460,6 +502,7 @@ impl TaskManager {
             inbox.entries.retain(|entry| entry.task_id != task_id);
             inbox.entries.push(InboxEntry { seq, task_id: task_id.to_string(), state: state.to_string(), at: now() });
             self.save(&store);
+            self.sessions.publish_control("inbox.changed", json!({ "clientId": record.client_id, "seq": seq }));
         }
         self.notify.notify_waiters();
     }
@@ -494,6 +537,7 @@ impl TaskManager {
                 }
                 self.live().insert(task_id.clone(), Live { state: Some("failed".into()), ..Live::default() });
                 self.report(&task_id, "failed");
+                self.changed(&task_id);
             }
         }
     }
@@ -583,6 +627,7 @@ impl TaskManager {
             }
             self.live().insert(task_id.to_string(), Live { state: Some("stopped".into()), ..Live::default() });
             self.report(task_id, "stopped");
+            self.changed(task_id);
             return self.view(&self.record(task_id)?);
         }
         if let Some(session) = record.session_id.as_deref().and_then(|id| self.sessions.get(id)) {
@@ -660,6 +705,9 @@ impl TaskManager {
             None => 0,
         };
         self.save(&store);
+        let seq = store.inboxes.get(client).map(|inbox| inbox.seq).unwrap_or(0);
+        drop(store);
+        self.sessions.publish_control("inbox.changed", json!({ "clientId": client, "seq": seq }));
         Ok(json!({ "left": left }))
     }
 
@@ -807,6 +855,55 @@ mod flow_tests {
             }
         }
         panic!("{task_id} never reached {state}; inbox saw {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn windows_hear_of_tasks_and_see_which_session_is_one() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-runtime.mjs");
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventHub::new();
+        let mut heard = hub.subscribe();
+        let manager = Arc::new(SessionManager::new(
+            Some(RuntimeSpec::node_script(&fixture)),
+            home.path().to_path_buf(),
+            home.path().join("data"),
+            None,
+            50,
+            Some(hub.clone()),
+        ));
+        manager.add_workspaces(&[folder(&workspace)]).unwrap();
+        let tasks = TaskManager::new(manager.clone(), DEFAULT_CAP);
+        let task = tasks.start("agent-a", &folder(&workspace), "write a haiku").unwrap();
+        let task_id = task["taskId"].as_str().unwrap().to_string();
+        wait_for(&tasks, "agent-a", &task_id, "finished").await;
+
+        let mut states = Vec::new();
+        let mut inbox = false;
+        while let Ok(event) = heard.try_recv() {
+            match event.event.as_str() {
+                "task.changed" if event.data["taskId"] == task_id.as_str() => {
+                    assert_eq!(event.data["clientId"], "agent-a");
+                    states.push(event.data["state"].as_str().unwrap_or("").to_string());
+                }
+                "inbox.changed" if event.data["clientId"] == "agent-a" => inbox = true,
+                _ => {}
+            }
+        }
+        assert!(states.first().is_some_and(|state| state == "starting" || state == "running"), "{states:?}");
+        assert!(states.iter().any(|state| state == "finished"), "{states:?}");
+        assert!(inbox, "the client's inbox change was not announced");
+
+        // The session list says the session is the task's, live and once saved.
+        let mut live = manager.list();
+        tasks.mark_sessions(&mut live);
+        let marked: Vec<&Value> = live.iter().filter(|session| !session["task"].is_null()).collect();
+        assert_eq!(marked.len(), 1, "{live:?}");
+        assert_eq!(marked[0]["task"], json!({ "taskId": task_id, "clientId": "agent-a" }));
+        let path = tasks.get("agent-a", &task_id).unwrap()["sessionPath"].as_str().unwrap().to_string();
+        let mut saved = vec![json!({ "sessionId": null, "sessionPath": path.replace('/', "\\").to_uppercase() })];
+        tasks.mark_sessions(&mut saved);
+        assert_eq!(saved[0]["task"]["taskId"], task_id.as_str(), "a differently spelled path is the same file");
     }
 
     #[tokio::test]

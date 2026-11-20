@@ -846,8 +846,22 @@ async fn forget_workspace(
     })))
 }
 
+/// Says which sessions a task runs in and who started it: the Assistant, or
+/// an agent by the name the user gave it.
+fn mark_tasks(state: &AppState, sessions: &mut [Value]) {
+    state.tasks.mark_sessions(sessions);
+    for session in sessions.iter_mut() {
+        let Some(client) = session["task"]["clientId"].as_str().map(str::to_string) else { continue };
+        if let Some(name) = state.mcp.client_name(&client) {
+            session["task"]["clientName"] = Value::String(name);
+        }
+    }
+}
+
 async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "sessions": state.sessions.list() }))
+    let mut sessions = state.sessions.list();
+    mark_tasks(&state, &mut sessions);
+    Json(json!({ "sessions": sessions }))
 }
 
 #[derive(Deserialize)]
@@ -866,11 +880,9 @@ async fn persisted_sessions(
         .refresh
         .as_deref()
         .is_some_and(|value| value == "1" || value == "true");
-    Json(json!({
-        "sessions": state
-            .sessions
-            .persisted(query.workspace_path.as_deref(), refresh),
-    }))
+    let mut sessions = state.sessions.persisted(query.workspace_path.as_deref(), refresh);
+    mark_tasks(&state, &mut sessions);
+    Json(json!({ "sessions": sessions }))
 }
 
 #[derive(Deserialize)]

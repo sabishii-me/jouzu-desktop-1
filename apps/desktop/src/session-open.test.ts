@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { opensLive, rowState, sessionRow } from "./session-open";
+import { startedBy } from "./session-row-status";
+import { chatTexts } from "./chat-text";
 
 describe("opensLive", () => {
   it("opens a session waiting for an approval or an answer live", () => {
@@ -55,5 +57,20 @@ describe("rowState (#212)", () => {
     expect(rowState(row({}))).toBeNull();
     // A saved session the host does not hold is "stopped" in the list: at rest.
     expect(rowState(row({ status: "stopped" }))).toBeNull();
+  });
+});
+
+describe("who started a task's session", () => {
+  const base = { sessionId: "s", sessionPath: "C:/s/a.jsonl", workspacePath: "C:/w", title: "Fix the build", status: "idle", running: false, pinned: false, archived: false };
+  it("keeps the task on the row and names its starter", () => {
+    const row = sessionRow({ ...base, task: { taskId: "task-1", clientId: "agent-1", clientName: "CI bot" } })!;
+    expect(row.task?.taskId).toBe("task-1");
+    expect(startedBy(row.task, chatTexts.en)).toBe("Started by CI bot");
+    expect(startedBy({ taskId: "t", clientId: "assistant" }, chatTexts.ja)).toBe("アシスタントが開始");
+    expect(startedBy({ taskId: "t", clientId: "agent-2" }, chatTexts.en)).toBe("Started by an agent");
+  });
+  it("marks nothing on the person's own sessions", () => {
+    expect(startedBy(sessionRow(base)!.task, chatTexts.en)).toBeUndefined();
+    expect(startedBy({ taskId: "t", clientId: "desktop" }, chatTexts.en)).toBeUndefined();
   });
 });

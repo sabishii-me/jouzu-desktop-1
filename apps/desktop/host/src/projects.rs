@@ -169,6 +169,7 @@ impl ProjectStore {
         let mut store = self.load()?;
         let saved = commit_project(&mut store, project, id, |candidate| self.save(candidate))?;
         crate::log(self.sessions.home(), "info", "project.saved", json!({ "projectId": saved["id"] }));
+        self.sessions.publish_control("project.changed", json!({ "projectId": saved["id"] }));
         Ok(saved)
     }
 
@@ -182,6 +183,7 @@ impl ProjectStore {
         }
         self.save(&store)?;
         crate::log(self.sessions.home(), "info", "project.deleted", json!({ "projectId": id }));
+        self.sessions.publish_control("project.changed", json!({ "projectId": id, "deleted": true }));
         Ok(())
     }
 }

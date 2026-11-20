@@ -32,7 +32,7 @@ import { SessionStatsBar } from "./session-stats-bar";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import type { TextGuardMode } from "./session-notices";
 import { opensLive, rowState, sessionRow as fromApiSession, type RowState, type SessionRow as SessionSummary } from "./session-open";
-import { SessionRowStatus, rowStateText } from "./session-row-status";
+import { SessionRowStatus, SessionTaskMark, rowStateText, startedBy } from "./session-row-status";
 import { useWarmRuntime, warmBlocks, type WarmView } from "./warm-runtime";
 import { newId, copyText } from "./secure-context";
 
@@ -577,7 +577,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (snapshot.outbox?.some(item => item.text === localSubmitted)) setLocalSubmitted("");
   }, [snapshot.outbox, localSubmitted]);
   useEffect(() => eventRouter.subscribe(event => {
-    if (event.event === "session.updated" || event.event === "resync") void refreshSessions();
+    // A task names its session when its file is known, and can end before it has one.
+    if (event.event === "session.updated" || event.event === "task.changed" || event.event === "resync") void refreshSessions();
   }), []);
   // What each listed session is doing, or how a run ended unseen (#212). A session
   // this window has open says it is running as soon as its own snapshot does.
@@ -1623,7 +1624,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
                 {renaming && normalizedPath(renaming.path) === normalizedPath(session.path)
                   ? <Input autoFocus aria-label={t.sessionName} className="m-0.5 h-7 min-w-0 flex-1 text-sm" value={renaming.title} onChange={event => setRenaming({ path: session.path, title: event.target.value })} onFocus={event => event.target.select()} onKeyDown={event => { if (event.key === "Enter") void finishRename(true); if (event.key === "Escape") void finishRename(false); }} onBlur={() => void finishRename(true)} />
                   : <button type="button" onClick={() => void openSession(session.path)} title={session.path} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left">
-                  {rowStates.get(session.path) ? <SessionRowStatus state={rowStates.get(session.path)!} now={listNow} t={t} /> : session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label={t.pinned} /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span className="min-w-0 flex-1 truncate">{session.title}</span>{rowStates.get(session.path) && <span className="sr-only">{rowStateText(rowStates.get(session.path)!, listNow, t)}</span>}<span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={fill(t.artifactCount, { n: artifactCount(session.path) })}>{artifactCount(session.path)}</span>}
+                  {rowStates.get(session.path) ? <SessionRowStatus state={rowStates.get(session.path)!} now={listNow} t={t} by={startedBy(session.task, t)} /> : session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label={t.pinned} /> : startedBy(session.task, t) ? <SessionTaskMark by={startedBy(session.task, t)!} /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span className="min-w-0 flex-1 truncate">{session.title}</span>{(rowStates.get(session.path) || startedBy(session.task, t)) && <span className="sr-only">{[rowStates.get(session.path) && rowStateText(rowStates.get(session.path)!, listNow, t), startedBy(session.task, t)].filter(Boolean).join(" · ")}</span>}<span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={fill(t.artifactCount, { n: artifactCount(session.path) })}>{artifactCount(session.path)}</span>}
                 </button>}
                 <div className={`relative flex shrink-0 items-center gap-0.5 pr-1 transition-opacity focus-within:opacity-100 group-hover/session:opacity-100 ${sessionMenu === session.path ? "opacity-100" : "opacity-0"}`} data-session-menu>
                   <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={session.pinned ? t.unpinSession : t.pinSession} title={session.pinned ? t.unpinSession : t.pinSession} onClick={() => void updateSession(session.path, { pinned: !session.pinned })}><Pin className={`size-3.5 ${session.pinned ? "text-primary" : "text-muted-foreground"}`} /></button>

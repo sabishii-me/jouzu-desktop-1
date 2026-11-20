@@ -182,6 +182,11 @@ impl McpServer {
         found
     }
 
+    /// The name the user gave an agent.
+    pub fn client_name(&self, id: &str) -> Option<String> {
+        self.clients_guard().iter().find(|client| client.id == id).map(|client| client.name.clone())
+    }
+
     /// Adds an agent and returns its token. This is the only time it is shown.
     pub fn create_client(&self, name: &str) -> Result<Value, ApiError> {
         let name = name.trim();

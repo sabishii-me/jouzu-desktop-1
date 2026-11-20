@@ -1,8 +1,19 @@
 import type React from "react";
-import { CircleCheck, CircleX, Hand, LoaderCircle } from "lucide-react";
+import { Bot, CircleCheck, CircleX, Hand, LoaderCircle } from "lucide-react";
 import { turnLabel } from "./chat-live";
 import type { ChatText } from "./chat-text";
+import type { SessionTask } from "./api/jouzu-api";
 import type { RowState } from "./session-open";
+
+/**
+ * Who started a session that runs as a task: the Assistant, or an agent by the
+ * name the person gave it. Undefined for the person's own sessions.
+ */
+export function startedBy(task: SessionTask | null | undefined, t: ChatText): string | undefined {
+  if (!task || task.clientId === "desktop") return undefined;
+  if (task.clientId === "assistant") return t.startedByAssistant;
+  return task.clientName ? t.startedByAgent.replace("{name}", task.clientName) : t.startedByAnAgent;
+}
 
 const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}`;
 
@@ -33,7 +44,12 @@ const ICONS: Record<RowState["kind"], { tone: string; icon: (className: string) 
  * nobody looked. Its words are its tooltip; screen readers get them after the
  * title (`rowStateText`), so the row's name still starts with the title.
  */
-export function SessionRowStatus({ state, now, t }: { state: RowState; now: number; t: ChatText }) {
+export function SessionRowStatus({ state, now, t, by }: { state: RowState; now: number; t: ChatText; by?: string }) {
   const { tone, icon } = ICONS[state.kind];
-  return <span title={rowStateText(state, now, t)} data-session-state={state.kind} data-session-running={state.kind === "running" ? "" : undefined} className={`flex shrink-0 items-center ${tone}`}>{icon("size-3.5")}</span>;
+  return <span title={by ? `${rowStateText(state, now, t)} · ${by}` : rowStateText(state, now, t)} data-session-state={state.kind} data-session-running={state.kind === "running" ? "" : undefined} className={`flex shrink-0 items-center ${tone}`}>{icon("size-3.5")}</span>;
+}
+
+/** The icon at the start of a task's row while it is at rest: who started it. */
+export function SessionTaskMark({ by }: { by: string }) {
+  return <span title={by} data-session-task="" className="flex shrink-0 items-center text-muted-foreground"><Bot className="size-3.5" aria-hidden="true" /></span>;
 }
