@@ -808,9 +808,9 @@ mod flow_tests {
     async fn a_task_returns_at_once_and_its_end_reaches_the_inbox() {
         let (manager, _home, workspace) = setup(&[]);
         let tasks = TaskManager::new(manager, DEFAULT_CAP);
-        let started = std::time::Instant::now();
         let task = tasks.start("agent-a", &folder(&workspace), "write a haiku").unwrap();
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // It returned before the work ran: the end arrives later, in the inbox.
+        assert_ne!(task["state"], "finished", "{task}");
         let task_id = task["taskId"].as_str().unwrap().to_string();
         assert!(task["sessionId"].is_string());
 

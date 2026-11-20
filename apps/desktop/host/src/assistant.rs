@@ -1092,7 +1092,10 @@ mod tests {
         let fixture = setup(WakePolicy::default());
         let prompt = fixture.assistant.system_prompt();
         for (name, text) in SKILLS {
-            assert!(text.starts_with(&format!("---\nname: {name}\n")), "{name} has a matching header");
+            // Line by line: a Windows checkout may have CRLF endings.
+            let mut lines = text.lines();
+            assert_eq!(lines.next(), Some("---"), "{name} starts with a header");
+            assert_eq!(lines.next(), Some(format!("name: {name}").as_str()), "{name} has a matching header");
             assert!(prompt.contains(&format!("- {name}: ")), "{name} is listed");
         }
         let skill = fixture.assistant.run_tool("skill_read", &json!({ "name": "draw-task-views" })).await.unwrap();
