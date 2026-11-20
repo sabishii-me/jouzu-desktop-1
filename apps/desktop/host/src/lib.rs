@@ -21,6 +21,7 @@ mod files;
 pub mod known_models;
 pub mod mcp;
 pub mod policy;
+pub mod projects;
 pub mod provider_answers;
 mod provider_error;
 pub mod runtime;
@@ -69,6 +70,7 @@ pub struct AppState {
     pub web: Arc<web_access::WebAccess>,
     pub tasks: Arc<tasks::TaskManager>,
     pub mcp: Arc<mcp::McpServer>,
+    pub projects: Arc<projects::ProjectStore>,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,6 +284,8 @@ pub fn router(state: AppState) -> Router {
         .route("/collaboration/mcp", get(mcp_server_snapshot).put(update_mcp_server))
         .route("/collaboration/mcp/clients", axum::routing::post(create_mcp_client))
         .route("/collaboration/mcp/clients/{id}", axum::routing::delete(revoke_mcp_client))
+        .route("/projects", get(list_projects).post(create_project))
+        .route("/projects/{id}", axum::routing::put(update_project).delete(delete_project))
         .route("/tasks", get(list_tasks).post(start_task))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/messages", axum::routing::post(send_task))
@@ -462,6 +466,43 @@ async fn revoke_mcp_client(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+// ---- Projects ----
+
+async fn list_projects(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    state.projects.snapshot().map(Json)
+}
+
+async fn create_project(
+    State(state): State<AppState>,
+    Query(query): Query<TaskQuery>,
+    Json(project): Json<projects::Project>,
+) -> Result<Response, ApiError> {
+    let saved = state
+        .projects
+        .save_project(&task_client(query.client_id.as_deref()), project, None)?;
+    Ok((StatusCode::CREATED, Json(saved)).into_response())
+}
+
+async fn update_project(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<TaskQuery>,
+    Json(project): Json<projects::Project>,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .projects
+        .save_project(&task_client(query.client_id.as_deref()), project, Some(&id))
+        .map(Json)
+}
+
+async fn delete_project(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    state.projects.delete_project(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---- Tasks (host token: Desktop itself; agents reach these through MCP) ----
@@ -2627,7 +2668,8 @@ mod tests {
             events: events::EventHub::new(),
             web: Arc::new(web_access::WebAccess::disabled()),
             tasks: tasks.clone(),
-            mcp: mcp::McpServer::new(&dist, "0.1.0", tasks, sessions),
+            mcp: mcp::McpServer::new(&dist, "0.1.0", tasks.clone(), sessions.clone()),
+            projects: projects::ProjectStore::new(sessions, tasks),
         }
     }
 
@@ -3237,7 +3279,8 @@ mod session_tests {
             events: events::EventHub::new(),
             web: Arc::new(web_access::WebAccess::disabled()),
             tasks: tasks.clone(),
-            mcp: mcp::McpServer::new(manager.home(), "0.1.0", tasks, manager.clone()),
+            mcp: mcp::McpServer::new(manager.home(), "0.1.0", tasks.clone(), manager.clone()),
+            projects: projects::ProjectStore::new(manager.clone(), tasks),
         }
         .pipe(router)
     }

@@ -212,7 +212,8 @@ async fn main() -> ExitCode {
         events,
         web: std::sync::Arc::new(jouzu_host::web_access::WebAccess::load(&home)),
         tasks: tasks.clone(),
-        mcp: jouzu_host::mcp::McpServer::new(&home, VERSION, tasks, sessions.clone()),
+        mcp: jouzu_host::mcp::McpServer::new(&home, VERSION, tasks.clone(), sessions.clone()),
+        projects: jouzu_host::projects::ProjectStore::new(sessions.clone(), tasks),
     };
     // Agents reach Desktop here once the user turned it on (Collaboration).
     state.mcp.reconcile().await;
