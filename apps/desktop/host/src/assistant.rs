@@ -53,6 +53,7 @@ pub const SKILLS: &[(&str, &str)] = &[
     ("accept-with-evidence", include_str!("../../../../packaging/desktop/assistant/skills/accept-with-evidence.md")),
     ("work-an-issue", include_str!("../../../../packaging/desktop/assistant/skills/work-an-issue.md")),
     ("draw-task-views", include_str!("../../../../packaging/desktop/assistant/skills/draw-task-views.md")),
+    ("configure-workflow", include_str!("../../../../packaging/desktop/assistant/skills/configure-workflow.md")),
     ("keep-memory", include_str!("../../../../packaging/desktop/assistant/skills/keep-memory.md")),
 ];
 
@@ -697,6 +698,13 @@ impl Assistant {
                 state.scheduled.push(Wake { at: Instant::now() + Duration::from_secs(seconds), note });
                 Ok(json!({ "scheduled": state.scheduled.len() }))
             }
+            "get_workflow" => self.workflow().read(),
+            "save_workflow" => {
+                let revision = string(arguments, "revision")?;
+                self.workflow().save(&arguments["config"], revision, CLIENT)
+            }
+            "list_workflow_versions" => Ok(self.workflow().versions()),
+            "restore_workflow" => self.workflow().restore(string(arguments, "version")?, CLIENT),
             "skill_read" => {
                 let wanted = string(arguments, "name")?;
                 SKILLS
@@ -707,6 +715,10 @@ impl Assistant {
             }
             _ => mcp::call_task_tool(&self.tasks, &self.sessions, &client, name, arguments).await,
         }
+    }
+
+    fn workflow(&self) -> crate::workflow::Workflow {
+        crate::workflow::Workflow::new(self.sessions.runtime_home(), self.sessions.home())
     }
 
     fn memory_index_text(&self) -> String {
@@ -862,6 +874,10 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({ "name": "memory_search", "description": "Find memories containing a text.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } }),
         json!({ "name": "history_search", "description": "Find earlier messages, replies and wakes of your conversation containing a text.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "maximum": 50 } }, "required": ["query"] } }),
         json!({ "name": "schedule_wake", "description": "Be woken after some seconds (60 to 86400) with a note to yourself.", "inputSchema": { "type": "object", "properties": { "seconds": { "type": "integer", "minimum": 60, "maximum": 86400 }, "note": { "type": "string" } }, "required": ["seconds"] } }),
+        json!({ "name": "get_workflow", "description": "jouzu's workflow definitions (agents.json): roles, their model tier, tools, instructions, maxConcurrent. config is null while the runtime uses its defaults. Load the configure-workflow skill first.", "inputSchema": { "type": "object", "properties": {} } }),
+        json!({ "name": "save_workflow", "description": "Replace the workflow definitions. Pass the revision get_workflow returned; a change since then is refused. The replaced version is kept and can be restored.", "inputSchema": { "type": "object", "properties": { "config": { "type": "object" }, "revision": { "type": "string" } }, "required": ["config", "revision"] } }),
+        json!({ "name": "list_workflow_versions", "description": "Earlier workflow definitions kept on each save, oldest first.", "inputSchema": { "type": "object", "properties": {} } }),
+        json!({ "name": "restore_workflow", "description": "Put an earlier workflow version back (the current one is kept).", "inputSchema": { "type": "object", "properties": { "version": { "type": "string" } }, "required": ["version"] } }),
         json!({ "name": "skill_read", "description": "Load one of the skills listed in your instructions.", "inputSchema": { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] } }),
     ]);
     tools
@@ -1088,9 +1104,11 @@ mod tests {
     fn the_assistant_has_no_user_only_tools() {
         let names: Vec<String> = tool_definitions().iter().filter_map(|tool| tool["name"].as_str().map(str::to_string)).collect();
         for name in &names {
-            for forbidden in ["approv", "answer", "flow", "textguard", "env", "key", "delete_session", "add_workspace", "web_access"] {
+            for forbidden in ["approv", "answer", "textguard", "env", "key", "delete_session", "add_workspace", "web_access", "release"] {
                 assert!(!name.contains(forbidden), "{name}");
             }
+            // Flow is the user's; jouzu's workflow definitions are not Flow.
+            assert!(!name.replace("workflow", "").contains("flow"), "{name}");
         }
         assert!(names.contains(&"start_task".to_string()) && names.contains(&"memory_write".to_string()));
     }

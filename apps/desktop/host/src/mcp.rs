@@ -469,9 +469,20 @@ pub(crate) fn task_tools() -> Vec<Value> {
                 "properties": {
                     "workspace": { "type": "string", "description": "A folder path from list_workspaces (or inside one)." },
                     "text": { "type": "string", "description": "What the task should do. Slash commands are not allowed." },
+                    "model": {
+                        "type": "object",
+                        "description": "Optional: run the task on this model (from list_models). Default: the user's default model.",
+                        "properties": { "provider": { "type": "string" }, "id": { "type": "string" } },
+                        "required": ["provider", "id"],
+                    },
                 },
                 "required": ["workspace", "text"],
             },
+        }),
+        json!({
+            "name": "list_models",
+            "description": "The models tasks can run on, as the runtime reports them.",
+            "inputSchema": { "type": "object", "properties": {} },
         }),
         json!({
             "name": "send_task",
@@ -584,7 +595,29 @@ pub(crate) async fn call_task_tool(
                     ));
                 }
             }
-            tasks.start(id, workspace, string_arg(arguments, "text")?)
+            let model = arguments.get("model").filter(|model| !model.is_null()).cloned();
+            tasks.start_with(id, workspace, string_arg(arguments, "text")?, model)
+        }
+        "list_models" => {
+            let answer = sessions.runtime_models().await.unwrap_or_else(|| {
+                Err(ApiError::unavailable("The runtime has not listed its models yet. Try again shortly."))
+            })?;
+            let models: Vec<Value> = answer["models"]
+                .as_array()
+                .map(|models| {
+                    models
+                        .iter()
+                        .map(|model| json!({
+                            "provider": model["provider"],
+                            "id": model["id"],
+                            "name": model["name"],
+                            "reasoning": model["reasoning"],
+                            "contextWindow": model["contextWindow"],
+                        }))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(json!({ "models": models }))
         }
         "send_task" => tasks.send(id, string_arg(arguments, "taskId")?, string_arg(arguments, "text")?),
         "stop_task" => tasks.stop(id, string_arg(arguments, "taskId")?),

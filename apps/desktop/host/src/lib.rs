@@ -30,6 +30,7 @@ pub mod sessions_repair;
 pub mod session;
 pub mod tasks;
 pub mod web_access;
+pub mod workflow;
 
 use session::{ApiError, CreateRequest, SendRequest, SessionManager};
 
@@ -288,6 +289,9 @@ pub fn router(state: AppState) -> Router {
         .route("/collaboration/mcp/clients/{id}", axum::routing::delete(revoke_mcp_client))
         .route("/assistant", get(assistant_snapshot).put(update_assistant))
         .route("/assistant/messages", get(assistant_messages).post(send_assistant))
+        .route("/workflow", get(read_workflow).put(save_workflow))
+        .route("/workflow/versions", get(workflow_versions))
+        .route("/workflow/restore", axum::routing::post(restore_workflow))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", axum::routing::put(update_project).delete(delete_project))
         .route("/tasks", get(list_tasks).post(start_task))
@@ -511,6 +515,39 @@ async fn send_assistant(
 ) -> Result<Response, ApiError> {
     let value = state.assistant.send(&request.text).await?;
     Ok((StatusCode::ACCEPTED, Json(value)).into_response())
+}
+
+// ---- Workflow (jouzu agents.json) ----
+
+fn workflow_files(state: &AppState) -> workflow::Workflow {
+    workflow::Workflow::new(state.sessions.runtime_home(), state.sessions.home())
+}
+
+async fn read_workflow(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    workflow_files(&state).read().map(Json)
+}
+
+#[derive(Deserialize)]
+struct WorkflowSave {
+    config: Value,
+    revision: String,
+}
+
+async fn save_workflow(State(state): State<AppState>, Json(request): Json<WorkflowSave>) -> Result<Json<Value>, ApiError> {
+    workflow_files(&state).save(&request.config, &request.revision, DESKTOP_CLIENT).map(Json)
+}
+
+async fn workflow_versions(State(state): State<AppState>) -> Json<Value> {
+    Json(workflow_files(&state).versions())
+}
+
+#[derive(Deserialize)]
+struct WorkflowRestore {
+    version: String,
+}
+
+async fn restore_workflow(State(state): State<AppState>, Json(request): Json<WorkflowRestore>) -> Result<Json<Value>, ApiError> {
+    workflow_files(&state).restore(&request.version, DESKTOP_CLIENT).map(Json)
 }
 
 // ---- Projects ----

@@ -71,3 +71,20 @@ Assistant is taught is `skills/draw-task-views.md`; it is the reference for
 the UI that will draw them. Views name tasks by `taskId` only and the UI
 fills in live state when it draws, so a view is never stale. The UI removes
 scripts, event handlers, `foreignObject` and external references from SVG.
+
+## Workflow and models
+
+`apps/desktop/host/src/workflow.rs` reads and writes jouzu's workflow
+definitions (`agents.json` in the runtime home: roles, their model tier,
+tools, instructions). The runtime owns the format; the host checks the
+runtime's own rules before writing, writes only over the revision the caller
+read, refuses while the runtime holds the file's lock, and keeps every
+version it replaces (`workflow-versions/` in the host home) so it can be
+restored. Routes: `GET/PUT /v1/workflow`, `GET /v1/workflow/versions`,
+`POST /v1/workflow/restore`. The Assistant has the same operations as tools.
+Agents over MCP do not.
+
+`start_task` takes an optional `model` (`{provider, id}`, from `list_models`)
+for the task's session; the host relays it like a model picked in Desktop.
+Turning Workflow on or off per task is not offered yet: it is a runtime
+command that has to be checked against the runtime first.

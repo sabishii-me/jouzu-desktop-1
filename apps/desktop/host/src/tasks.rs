@@ -49,6 +49,10 @@ pub struct TaskRecord {
     /// The request, only while the task waits for a free slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_text: Option<String>,
+    /// The model the client asked for ({provider, id}); the session's own
+    /// model is whatever its runtime reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -249,7 +253,23 @@ impl TaskManager {
 
     /// Starts a task and returns at once. Above the cap it waits to start.
     pub fn start(self: &Arc<Self>, client: &str, workspace: &str, text: &str) -> Result<Value, ApiError> {
+        self.start_with(client, workspace, text, None)
+    }
+
+    /// Like `start`, on a model of the client's choosing (`{provider, id}`).
+    pub fn start_with(
+        self: &Arc<Self>,
+        client: &str,
+        workspace: &str,
+        text: &str,
+        model: Option<Value>,
+    ) -> Result<Value, ApiError> {
         Self::check_text(text)?;
+        if let Some(model) = &model {
+            if !(model["provider"].is_string() && model["id"].is_string()) {
+                return Err(ApiError::bad_request("model is {provider, id}"));
+            }
+        }
         let workspace = self.allowed_workspace(workspace)?;
         policy::authorize(self.home(), client, Some(&workspace), Action::StartTask)?;
         let task_id = new_id("task-");
@@ -261,6 +281,7 @@ impl TaskManager {
             client_id: client.to_string(),
             created_at: now(),
             pending_text: Some(text.to_string()),
+            model,
         };
         {
             let mut store = self.store();
@@ -295,6 +316,11 @@ impl TaskManager {
             return Ok(());
         };
         let session = self.sessions.create_pending(&record.workspace, None, None)?;
+        if let Some(model) = &record.model {
+            if let (Some(provider), Some(id)) = (model["provider"].as_str(), model["id"].as_str()) {
+                session.request_model(provider, id);
+            }
+        }
         session.attach_early();
         let events = session.subscribe();
         self.live().insert(
