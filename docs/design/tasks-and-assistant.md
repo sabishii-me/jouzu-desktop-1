@@ -9,7 +9,12 @@ A task is an ordinary session started on a client's behalf
 (`apps/desktop/host/src/tasks.rs`). The host keeps only what links the task
 to its session: task id, session id, session file, folder, client, creation
 time. The task's state is derived from the live session every time it is
-read and is never stored (decision 0018).
+read (decision 0018). The record also keeps the last state the host saw, used
+only when the session is not open: how it ended, or that it was still running
+when the host went away. Such a task is reported `stopped` once, on the next
+start, so its client is not left waiting. A turn the user or client stopped
+is `stopped`, never `finished`. A model a client asks for that the runtime
+does not list is refused, never replaced by the default.
 
 | State | Meaning |
 |---|---|
@@ -78,6 +83,9 @@ Assistant is idle. Task changes wake it only when idle, after a quiet period
 (3 s) and no sooner than 30 s after the last wake, with a summary; it reads
 and acknowledges its inbox itself. `schedule_wake` lets it look again later.
 If the process ends it stays stopped until the user writes or turns it on.
+Scheduled wakes are kept on disk by wall-clock time, so a restart keeps a
+reminder the Assistant already promised; one that came due meanwhile fires
+when it is next idle.
 
 ### What it hears and reads
 
