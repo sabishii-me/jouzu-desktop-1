@@ -288,6 +288,7 @@ pub fn router(state: AppState) -> Router {
         .route("/collaboration/mcp/clients", axum::routing::post(create_mcp_client))
         .route("/collaboration/mcp/clients/{id}", axum::routing::delete(revoke_mcp_client))
         .route("/assistant", get(assistant_snapshot).put(update_assistant))
+        .route("/assistant/recommended", get(assistant_recommended))
         .route("/assistant/messages", get(assistant_messages).post(send_assistant))
         .route("/workflow", get(read_workflow).put(save_workflow))
         .route("/workflow/versions", get(workflow_versions))
@@ -485,7 +486,7 @@ async fn assistant_snapshot(State(state): State<AppState>) -> Json<Value> {
 #[derive(Deserialize)]
 struct AssistantUpdate {
     enabled: Option<bool>,
-    /// Absent: unchanged. null: back to the runtime's default model.
+    /// Absent: unchanged. null: no model (the Assistant must then be off).
     #[serde(default, deserialize_with = "present")]
     model: Option<Option<assistant::ModelPick>>,
 }
@@ -498,11 +499,24 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
+/// Turning the Assistant on and choosing its model are the user's: the
+/// desktop window only.
 async fn update_assistant(
     State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
     Json(request): Json<AssistantUpdate>,
-) -> Result<Json<Value>, ApiError> {
-    state.assistant.update(request.enabled, request.model).await.map(Json)
+) -> Response {
+    if let Err(response) = desktop_window_only(listener) {
+        return response;
+    }
+    match state.assistant.update(request.enabled, request.model).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn assistant_recommended(State(state): State<AppState>) -> Json<Value> {
+    Json(state.assistant.recommended().await)
 }
 
 async fn assistant_messages(State(state): State<AppState>, Query(query): Query<TaskQuery>) -> Json<Value> {

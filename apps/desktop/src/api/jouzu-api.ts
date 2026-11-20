@@ -361,6 +361,31 @@ export interface McpServerState {
   agents: McpAgent[];
 }
 
+export interface AssistantModel {
+  provider: string;
+  id: string;
+  /** Reasoning effort as the SDK names it; absent: the model's own. */
+  thinking?: string;
+}
+
+export interface AssistantState {
+  enabled: boolean;
+  /** Only a model the user chose; the Assistant never falls back to another. */
+  model: AssistantModel | null;
+  thinkingLevels: string[];
+  phase: string;
+  error: string | null;
+}
+
+export interface AssistantRecommendation {
+  id: string;
+  thinking: string;
+  label: string;
+  evidence: string;
+  /** Listed models with this id; null while the runtime has not listed yet. */
+  offeredBy: Array<{ provider: string; id: string; name: string }> | null;
+}
+
 export interface SettingsApi {
   environment: {
     /** Saving goes through the configuration queue (`environment`). */
@@ -378,6 +403,12 @@ export interface SettingsApi {
     /** The token is returned only here, once. */
     addAgent(name: string): Promise<{ agent: McpAgent; token: string }>;
     removeAgent(id: string): Promise<void>;
+  };
+  /** The Assistant (Settings > Collaboration): off until the user turns it on with a model. */
+  assistant: {
+    read(): Promise<AssistantState>;
+    update(change: { enabled?: boolean; model?: AssistantModel | null }): Promise<AssistantState>;
+    recommended(): Promise<{ about: string; models: AssistantRecommendation[] }>;
   };
   /** Only the desktop window may manage web access; web clients get `forbidden`. */
   webAccess: {

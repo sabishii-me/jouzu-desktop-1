@@ -107,6 +107,11 @@ function bridge() {
       addAgent: vi.fn(async () => { throw new Error('unused'); }),
       removeAgent: vi.fn(async () => undefined),
     },
+    assistant: {
+      read: vi.fn(async () => { throw new Error('unused'); }),
+      update: vi.fn(async () => { throw new Error('unused'); }),
+      recommended: vi.fn(async () => { throw new Error('unused'); }),
+    },
     webAccess: {
       read: vi.fn(async () => { throw new Error('unused'); }),
       update: vi.fn(async () => { throw new Error('unused'); }),

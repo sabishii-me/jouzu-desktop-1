@@ -94,6 +94,7 @@ async function start(request) {
   ({ session } = await createAgentSession({
     cwd, agentDir: request.agentDir, settingsManager, resourceLoader, sessionManager,
     modelRuntime, model, tools: names, excludeTools: ["mcp__*"], customTools,
+    ...(request.model?.thinking ? { thinkingLevel: request.model.thinking } : {}),
   }));
   // Only the host's tools, whatever the SDK offers by default.
   const active = [...session.getActiveToolNames()].sort();

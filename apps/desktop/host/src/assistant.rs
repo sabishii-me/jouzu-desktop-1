@@ -65,7 +65,14 @@ const WAKE_ENTRIES: usize = 20;
 pub struct ModelPick {
     pub provider: String,
     pub id: String,
+    /// Reasoning effort as the SDK names it (off … max); absent: the model's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
+
+/// Models recommended for the Assistant, with the evidence behind each.
+const RECOMMENDED: &str = include_str!("../../../../packaging/desktop/assistant/recommended-models.json");
+const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -167,6 +174,27 @@ pub struct Assistant {
     kick: Notify,
     /// Bumped each start, so a reader of an old process ignores its end.
     generation: std::sync::atomic::AtomicU64,
+}
+
+/// Each recommended model with the listed models that share its id (any
+/// provider); `offeredBy` is null while nothing is listed yet.
+fn recommend(data: &str, listed: Option<&[Value]>) -> Value {
+    let data: Value = serde_json::from_str(data).unwrap_or(Value::Null);
+    let entries = data["assistant"].as_array().cloned().unwrap_or_default();
+    json!({
+        "about": data["about"],
+        "models": entries.into_iter().map(|mut entry| {
+            let id = entry["id"].as_str().unwrap_or_default().to_string();
+            entry["offeredBy"] = match listed {
+                Some(models) => Value::Array(models.iter()
+                    .filter(|model| model["id"].as_str() == Some(id.as_str()))
+                    .map(|model| json!({ "provider": model["provider"], "id": model["id"], "name": model["name"] }))
+                    .collect()),
+                None => Value::Null,
+            };
+            entry
+        }).collect::<Vec<_>>(),
+    })
 }
 
 fn now_iso() -> String {
@@ -287,8 +315,8 @@ impl Assistant {
         let state = self.state();
         json!({
             "enabled": settings.enabled,
-            "model": settings.model.clone().or_else(|| self.default_model()),
-            "modelChosen": settings.model.is_some(),
+            "model": settings.model,
+            "thinkingLevels": THINKING_LEVELS,
             "phase": state.phase.as_str(),
             "error": state.error,
             "queued": state.queue.len(),
@@ -300,16 +328,38 @@ impl Assistant {
         })
     }
 
+    /// The recommended models, each with the runtime's matching models (by id,
+    /// any provider). Empty matches: this runtime does not offer that model.
+    /// `null` while the runtime has not listed its models yet.
+    pub async fn recommended(&self) -> Value {
+        let listed = match self.sessions.runtime_models().await {
+            Some(Ok(answer)) => Some(answer["models"].as_array().cloned().unwrap_or_default()),
+            _ => None,
+        };
+        recommend(RECOMMENDED, listed.as_deref())
+    }
+
     pub async fn update(self: &Arc<Self>, enabled: Option<bool>, model: Option<Option<ModelPick>>) -> Result<Value, ApiError> {
         let (before, after) = {
             let mut settings = self.settings.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let before = settings.clone();
+            let mut next = settings.clone();
             if let Some(enabled) = enabled {
-                settings.enabled = enabled;
+                next.enabled = enabled;
             }
             if let Some(model) = model {
-                settings.model = model;
+                next.model = model;
             }
+            if let Some(thinking) = next.model.as_ref().and_then(|model| model.thinking.as_deref()) {
+                if !THINKING_LEVELS.contains(&thinking) {
+                    return Err(ApiError::bad_request(format!("Unknown reasoning effort: {thinking}")));
+                }
+            }
+            // The Assistant runs only on a model the user chose: never a fallback.
+            if next.enabled && next.model.is_none() {
+                return Err(ApiError::bad_request("Choose a model for the Assistant"));
+            }
+            *settings = next;
             std::fs::create_dir_all(&self.dir).map_err(io)?;
             let bytes = serde_json::to_vec_pretty(&*settings).map_err(io)?;
             std::fs::write(self.dir.join("assistant.json"), bytes).map_err(io)?;
@@ -358,16 +408,6 @@ impl Assistant {
             .collect();
         let start = rows.len().saturating_sub(limit.clamp(1, 500));
         json!({ "messages": rows[start..] })
-    }
-
-    fn default_model(&self) -> Option<ModelPick> {
-        let settings: Value = std::fs::read(self.paths.runtime_agent.join("settings.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
-        Some(ModelPick {
-            provider: settings["defaultProvider"].as_str()?.to_string(),
-            id: settings["defaultModel"].as_str()?.to_string(),
-        })
     }
 
     fn sdk_installed(&self) -> bool {
@@ -453,7 +493,7 @@ impl Assistant {
         let model = if self.paths.faux.is_some() {
             None
         } else {
-            Some(self.settings().model.or_else(|| self.default_model()).ok_or("Choose a model for the Assistant")?)
+            Some(self.settings().model.ok_or("Choose a model for the Assistant")?)
         };
         let agent_dir = self.dir.join("agent");
         std::fs::create_dir_all(&agent_dir).map_err(|error| error.to_string())?;
@@ -884,6 +924,38 @@ pub fn tool_definitions() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn faux_pick() -> ModelPick {
+        ModelPick { provider: "faux".into(), id: "faux-1".into(), thinking: None }
+    }
+
+    #[tokio::test]
+    async fn the_assistant_never_turns_on_without_a_chosen_model() {
+        let fixture = setup(WakePolicy::default());
+        let refused = fixture.assistant.update(Some(true), None).await.unwrap_err();
+        assert!(refused.message.contains("Choose a model"), "{}", refused.message);
+        assert_eq!(fixture.assistant.snapshot().await["enabled"], false);
+        let bad = ModelPick { thinking: Some("extreme".into()), ..faux_pick() };
+        assert!(fixture.assistant.update(Some(true), Some(Some(bad))).await.is_err());
+        assert_eq!(fixture.assistant.snapshot().await["enabled"], false);
+    }
+
+    #[test]
+    fn recommendations_name_the_providers_that_offer_each_model() {
+        let listed = vec![
+            json!({ "provider": "openai-codex", "id": "gpt-6.1-sol", "name": "GPT-6.1 Sol" }),
+            json!({ "provider": "shisa", "id": "glm-5.3-flash", "name": "GLM 5.3 Flash" }),
+        ];
+        let answer = recommend(RECOMMENDED, Some(&listed));
+        let models = answer["models"].as_array().unwrap();
+        assert_eq!(models[0]["id"], "gpt-6.1-sol");
+        assert_eq!(models[0]["thinking"], "low");
+        assert_eq!(models[0]["offeredBy"][0]["provider"], "openai-codex");
+        assert_eq!(models[1]["id"], "gpt-6-astra");
+        assert_eq!(models[1]["offeredBy"], json!([]));
+        assert!(models.iter().all(|model| THINKING_LEVELS.contains(&model["thinking"].as_str().unwrap())));
+        assert_eq!(recommend(RECOMMENDED, None)["models"][0]["offeredBy"], Value::Null);
+    }
     use crate::session::RuntimeSpec;
 
     struct Fixture {
@@ -969,7 +1041,7 @@ mod tests {
         fixture.assistant.launch();
         let refused = fixture.assistant.send("hello").await.unwrap_err();
         assert_eq!(refused.code, "assistant-off");
-        fixture.assistant.update(Some(true), None).await.unwrap();
+        fixture.assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
         fixture.assistant.send("hello").await.unwrap();
         until(|| replies(&fixture.assistant).iter().any(|reply| reply == "ok: hello")).await;
         fixture.assistant.send("tool list_workspaces").await.unwrap();
@@ -984,7 +1056,7 @@ mod tests {
     async fn many_tasks_ending_together_wake_the_assistant_once() {
         let fixture = setup(WakePolicy { quiet: Duration::from_millis(1500), min_interval: Duration::from_secs(60) });
         fixture.assistant.launch();
-        fixture.assistant.update(Some(true), None).await.unwrap();
+        fixture.assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
         until(|| fixture.assistant.state().phase == Phase::Idle).await;
         let folder = fixture.workspace.path().to_string_lossy().into_owned();
         for n in 0..5 {
@@ -1007,7 +1079,7 @@ mod tests {
     async fn a_stopped_assistant_stays_stopped_until_the_user_writes() {
         let fixture = setup(WakePolicy::default());
         fixture.assistant.launch();
-        fixture.assistant.update(Some(true), None).await.unwrap();
+        fixture.assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
         fixture.assistant.send("exit").await.unwrap();
         until(|| fixture.assistant.state().phase == Phase::Stopped).await;
         tokio::time::sleep(Duration::from_millis(800)).await;
@@ -1069,7 +1141,7 @@ mod tests {
         // The installed SDK is the pinned one.
         assert!(real.sdk_installed());
         real.launch();
-        real.update(Some(true), None).await.unwrap();
+        real.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
         real.send("which folders?").await.unwrap();
         until(|| replies(&real).iter().any(|reply| reply == "One folder.")).await;
     }

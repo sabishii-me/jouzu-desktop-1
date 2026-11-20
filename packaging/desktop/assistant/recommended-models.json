@@ -1,0 +1,17 @@
+{
+  "about": "Models recommended for the Assistant, which plans work and dispatches tasks rather than writing code. Matched by model id against the models the runtime lists. Source: WorkflowArena (arXiv 2611.12856, 2026-11-09), Table 1, which measures orchestration: a model breaks work into tasks, hands them to workers and combines the results.",
+  "assistant": [
+    {
+      "id": "gpt-6.1-sol",
+      "thinking": "low",
+      "label": "default",
+      "evidence": "WorkflowArena: 27.6% resolved at low effort (about $3.61 a task); low effort resolved more than medium or high, xhigh added 1.9 points."
+    },
+    {
+      "id": "gpt-6-astra",
+      "thinking": "xhigh",
+      "label": "stronger",
+      "evidence": "WorkflowArena: 30.8% resolved at xhigh effort, about $29.26 a task."
+    }
+  ]
+}

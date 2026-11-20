@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { useApi } from "./api/context";
-import type { McpServerState } from "./api/jouzu-api";
+import type { AssistantModel, AssistantRecommendation, AssistantState, McpServerState, Model } from "./api/jouzu-api";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
 import { Input } from "./components/ui/input";
 import { Label } from "./components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select";
 import { Switch } from "./components/ui/switch";
 import { ErrorLine } from "./session-alerts-view";
 import { explain, fill, useChatText } from "./chat-text";
@@ -16,6 +17,7 @@ const COMMIT_LINES = "Co-authored-by: Jouzu Desktop (<model>) <359074535+jouzu-d
 /** Settings > Collaboration: who works with the agent, and how its work shows up. */
 export function CollaborationPanel() {
   return <>
+    <AssistantCard />
     <AgentAccessCard />
     <CommitMarkCard />
   </>;
@@ -28,6 +30,113 @@ async function copy(text: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+const modelKey = (model: { provider: string; id: string }) => `${model.provider}\n${model.id}`;
+
+/** A recommendation as a model to save: the first provider offering it, with its effort. */
+export function offeredModel(entry: AssistantRecommendation): AssistantModel | null {
+  const match = entry.offeredBy?.[0];
+  return match ? { provider: match.provider, id: match.id, thinking: entry.thinking } : null;
+}
+
+/** What the form shows: the saved model, else the user's unsaved pick, else the first recommendation on offer. */
+export function shownModel(saved: AssistantModel | null, draft: AssistantModel | null, recommended: AssistantRecommendation[]): AssistantModel | null {
+  return saved ?? draft ?? recommended.map(offeredModel).find(Boolean) ?? null;
+}
+
+/**
+ * The Assistant runs only on the model chosen here. Until one is saved, the
+ * recommended model is filled in, and turning the Assistant on saves it.
+ */
+function AssistantCard() {
+  const api = useApi();
+  const t = useChatText();
+  const [state, setState] = useState<AssistantState | null>(null);
+  const [models, setModels] = useState<Model[]>([]);
+  const [recommended, setRecommended] = useState<AssistantRecommendation[]>([]);
+  const [draft, setDraft] = useState<AssistantModel | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+
+  useEffect(() => {
+    void api.settings.assistant.read().then(setState, setError);
+    void api.models.list("").then(setModels, () => setModels([]));
+    void api.settings.assistant.recommended().then(value => setRecommended(value.models), () => setRecommended([]));
+  }, [api]);
+
+  const shown = shownModel(state?.model ?? null, draft, recommended);
+
+  async function save(change: { enabled?: boolean; model?: AssistantModel | null }) {
+    setBusy(true);
+    setError(null);
+    try {
+      setState(await api.settings.assistant.update(change));
+    } catch (failure) {
+      setError(failure);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function choose(model: AssistantModel) {
+    if (state?.model) void save({ model });
+    else setDraft(model);
+  }
+
+  const listed = shown && !models.some(model => modelKey(model) === modelKey(shown)) ? [...models, { ...shown, name: shown.id } as Model] : models;
+  return <Card className="border-border shadow-none">
+    <CardHeader>
+      <div className="flex items-center justify-between gap-4">
+        <CardTitle><Label htmlFor="assistant-on">{t.assistant}</Label></CardTitle>
+        <Switch id="assistant-on" aria-label={t.assistant} checked={state?.enabled === true} disabled={busy || state === null || (!state.enabled && !shown)}
+          onCheckedChange={enabled => void save(enabled ? { enabled, model: shown } : { enabled })} />
+      </div>
+      <CardDescription>{t.assistantHint}</CardDescription>
+    </CardHeader>
+    {state && <CardContent className="space-y-3">
+      <div className="grid gap-2 sm:grid-cols-[1fr_10rem]">
+        <div className="min-w-0 space-y-1">
+          <Label>{t.assistantModel}</Label>
+          <Select value={shown ? modelKey(shown) : ""} disabled={busy} onValueChange={value => {
+            const model = listed.find(candidate => modelKey(candidate) === value);
+            if (model) choose({ provider: model.provider, id: model.id, thinking: shown?.thinking });
+          }}>
+            <SelectTrigger className="w-full" aria-label={t.assistantModel}><SelectValue placeholder={t.assistantChooseModel} /></SelectTrigger>
+            <SelectContent>{listed.map(model => <SelectItem key={modelKey(model)} value={modelKey(model)}>{model.name} · {model.provider}</SelectItem>)}</SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-1">
+          <Label>{t.assistantThinking}</Label>
+          <Select value={shown?.thinking ?? "default"} disabled={busy || !shown} onValueChange={value => shown && choose({ ...shown, thinking: value === "default" ? undefined : value })}>
+            <SelectTrigger className="w-full" aria-label={t.assistantThinking}><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="default">{t.assistantThinkingDefault}</SelectItem>
+              {state.thinkingLevels.map(level => <SelectItem key={level} value={level}>{level}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+      {recommended.length > 0 && <ul className="space-y-2">
+        {recommended.map(entry => {
+          const model = offeredModel(entry);
+          const current = !!model && !!shown && modelKey(model) === modelKey(shown) && model.thinking === shown.thinking;
+          return <li key={entry.id} className="rounded-lg border border-border p-3 text-sm">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-medium">{entry.label === "default" ? t.assistantRecommended : t.assistantStronger}: {entry.id} · {entry.thinking}</span>
+              {model && !current && <Button variant="outline" disabled={busy} onClick={() => choose(model)}>{t.assistantUse}</Button>}
+            </div>
+            <p className="text-muted-foreground">{entry.evidence}</p>
+            {entry.offeredBy && entry.offeredBy.length === 0 && <p className="text-muted-foreground">{t.assistantNotOffered}</p>}
+          </li>;
+        })}
+      </ul>}
+      {state.enabled && <p className="text-sm text-muted-foreground">{fill(t.assistantPhase, { phase: state.phase })}</p>}
+      {state.error && <p className="text-sm text-destructive">{state.error}</p>}
+      {error != null && <ErrorLine raw={error} failed={t.assistantFailed} onDismiss={() => setError(null)} />}
+    </CardContent>}
+    {!state && error != null && <CardContent><p className="text-sm text-muted-foreground">{explain(t, error, t.assistantFailed).text}</p></CardContent>}
+  </Card>;
 }
 
 /** Other agents hand tasks to Desktop over MCP. Off until turned on here. */

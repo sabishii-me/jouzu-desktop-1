@@ -175,6 +175,11 @@ function hostGroups(client: HostClient) {
       addAgent: name => client.addMcpAgent(name),
       removeAgent: id => client.removeMcpAgent(id),
     },
+    assistant: {
+      read: () => client.assistant(),
+      update: change => client.updateAssistant(change),
+      recommended: () => client.assistantRecommended(),
+    },
     webAccess: {
       read: () => client.webAccess(),
       update: scope => client.updateWebAccess(scope),

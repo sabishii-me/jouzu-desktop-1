@@ -15,6 +15,9 @@ import {
   type HistoryPage,
   type McpAgent,
   type McpServerState,
+  type AssistantModel,
+  type AssistantRecommendation,
+  type AssistantState,
   type SavedMessagesPage,
   type Model,
   type Receipt,
@@ -401,6 +404,18 @@ export class HostClient {
   async addMcpAgent(name: string): Promise<{ agent: McpAgent; token: string }> {
     const created = await this.request<{ client: McpAgent; token: string }>("/v1/collaboration/mcp/clients", { method: "POST", body: JSON.stringify({ name }) });
     return { agent: created.client, token: created.token };
+  }
+
+  assistant(): Promise<AssistantState> {
+    return this.request("/v1/assistant");
+  }
+
+  updateAssistant(change: { enabled?: boolean; model?: AssistantModel | null }): Promise<AssistantState> {
+    return this.request("/v1/assistant", { method: "PUT", body: JSON.stringify(change) });
+  }
+
+  assistantRecommended(): Promise<{ about: string; models: AssistantRecommendation[] }> {
+    return this.request("/v1/assistant/recommended");
   }
 
   async removeMcpAgent(id: string): Promise<void> {
