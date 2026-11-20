@@ -1,8 +1,8 @@
 #!/bin/sh
-# Jouzu Desktop: "Mark commits made by the agent" (Settings).
-# Git started by the agent uses this folder as its hooks folder. Every hook here
-# first runs the repository's own hook of the same name, unchanged; then
-# prepare-commit-msg adds the attribution trailer.
+# Jouzu Desktop: "Mark commits made by the agent" (Settings > Tools).
+# While that is on, git started by the agent uses this folder as its hooks
+# folder (index.js sets it). Every hook here first runs the repository's own
+# hook of the same name, unchanged; then prepare-commit-msg adds the trailers.
 name=${0##*/}
 here=$(cd "${0%/*}" && pwd -P)
 
@@ -25,13 +25,11 @@ fi
 [ -e "$(git rev-parse --git-path CHERRY_PICK_HEAD)" ] && exit 0
 # An empty message must still abort the commit, so it gets nothing added.
 grep -v '^#' "$1" | grep -q '[^[:space:]]' || exit 0
-# The session and model of the runtime this git runs under, as the host wrote
-# them; a runtime no session took yet has neither.
-session= model=
-if [ -n "${JOUZU_GIT_ATTRIBUTION:-}" ] && [ -f "$JOUZU_GIT_ATTRIBUTION" ]; then
-  session=$(sed -n 's/^session=//p' "$JOUZU_GIT_ATTRIBUTION")
-  model=$(sed -n 's/^model=//p' "$JOUZU_GIT_ATTRIBUTION")
-fi
+# The model and session of the agent that runs this git: the runtime's shell
+# tools set them for every command.
+model=${PI_MODEL:-} session=${PI_SESSION_ID:-}
+model=$(printf '%s' "$model" | tr -d '<>\r\n')
+session=$(printf '%s' "$session" | tr -d '<>\r\n')
 who="Jouzu Desktop"
 [ -n "$model" ] && who="Jouzu Desktop ($model)"
 # Amending: our earlier lines give way to the current ones, others' lines stay.

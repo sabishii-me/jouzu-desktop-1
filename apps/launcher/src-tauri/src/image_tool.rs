@@ -207,7 +207,10 @@ pub async fn image_models(provider: String) -> Result<serde_json::Value, String>
 /// Called after a runtime install and on app start, so existing installs get it too.
 #[tauri::command]
 pub fn image_tool_ensure() -> Result<(), String> {
-    ensure(&crate::runtime::effective_home()?)
+    let home = crate::runtime::effective_home()?;
+    ensure(&home)?;
+    // The desktop's other extension is installed at the same moments.
+    crate::attribution_extension::ensure(&home)
 }
 
 #[cfg(test)]

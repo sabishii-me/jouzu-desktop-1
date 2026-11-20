@@ -41,23 +41,11 @@ pub struct RuntimeSupervisor {
     parse_errors: AtomicU64,
     probe_id: AtomicU64,
     probe_enabled: AtomicBool,
-    /// Where this runtime's session and model are written for the commit
-    /// attribution hooks (`commit_attribution.rs`); only while that is on.
-    attribution: Option<std::path::PathBuf>,
-}
-
-impl Drop for RuntimeSupervisor {
-    fn drop(&mut self) {
-        if let Some(file) = &self.attribution {
-            let _ = std::fs::remove_file(file);
-        }
-    }
 }
 
 impl RuntimeSupervisor {
     pub fn start(spec: SpawnSpec, events: mpsc::Sender<RuntimeEvent>) -> Result<Arc<Self>, String> {
         let mut spawned = process::spawn(&spec).map_err(|error| error.to_string())?;
-        let attribution = crate::commit_attribution::runtime_file(&spec.env);
         let stdin = spawned
             .child
             .stdin
@@ -82,7 +70,6 @@ impl RuntimeSupervisor {
             parse_errors: AtomicU64::new(0),
             probe_id: AtomicU64::new(0),
             probe_enabled: AtomicBool::new(false),
-            attribution,
         });
 
         let writer = supervisor.clone();
@@ -193,10 +180,6 @@ impl RuntimeSupervisor {
                 Err(RequestError::Timeout)
             }
         }
-    }
-
-    pub fn attribution_file(&self) -> Option<&std::path::Path> {
-        self.attribution.as_deref()
     }
 
     pub fn terminate(&self) {

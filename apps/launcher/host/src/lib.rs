@@ -13,7 +13,6 @@ use std::{
 };
 
 mod artifacts;
-mod commit_attribution;
 pub mod awake;
 pub mod control;
 mod environment;
@@ -249,7 +248,6 @@ pub fn router(state: AppState) -> Router {
         .route("/timing", axum::routing::post(record_ui_timing))
         .route("/runtime/warm", get(warm_runtime).post(aim_warm_runtime))
         .route("/environment", get(read_environment))
-        .route("/commit-attribution", get(read_commit_attribution))
         .route("/capabilities", get(capabilities))
         .route("/web-access", get(web_access_snapshot).put(update_web_access))
         .route(
@@ -264,6 +262,7 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(global_events))
         .route("/models", get(models))
         .route("/tools", get(tools_snapshot).put(update_tools))
+        .route("/tools/commit-attribution", axum::routing::put(update_commit_attribution))
         .route("/tools/providers", get(tool_providers))
         .route("/tools/models", get(tool_models))
         .route("/mcp", get(mcp_snapshot))
@@ -1387,12 +1386,6 @@ async fn read_environment(
         .map_err(ApiError::bad_request)
 }
 
-async fn read_commit_attribution(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    commit_attribution::read(state.sessions.runtime_home())
-        .map(|setting| Json(json!({ "enabled": setting.enabled, "trailer": format!("{}\n{}", commit_attribution::TRAILER, commit_attribution::SESSION_TRAILER) })))
-        .map_err(ApiError::bad_request)
-}
-
 /// The models a running runtime registered, as it answers them: the list
 /// `set_model` accepts. The host keeps no list of its own.
 async fn models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -1448,7 +1441,37 @@ fn read_tools_settings(value: &Value) -> Value {
         })
         .filter(|tools| !tools.is_empty())
         .unwrap_or_else(|| vec![json!("generate_image")]);
-    json!({ "image": image_tool_fields(image, provider, model), "reviewTools": review })
+    json!({
+        "image": image_tool_fields(image, provider, model),
+        "reviewTools": review,
+        "commitAttribution": commit_attribution(value),
+    })
+}
+
+/// "Mark commits made by the agent" (the jouzu-attribution extension reads it
+/// from tools.json at every tool call): off unless saved as on.
+fn commit_attribution(tools: &Value) -> Value {
+    let enabled = tools
+        .pointer("/commitAttribution/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    json!({ "enabled": enabled })
+}
+
+fn read_tools_file(path: &Path) -> Value {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn write_tools_file(path: &Path, value: &Value) -> Result<(), ApiError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| ApiError::internal(format!("Could not create the tools folder: {error}")))?;
+    }
+    std::fs::write(path, format!("{}\n", value))
+        .map_err(|error| ApiError::internal(format!("Could not save tools: {error}")))
 }
 
 fn valid_image_model(model: &str) -> bool {
@@ -1507,23 +1530,35 @@ async fn update_tools(
     let image = body.get("image").unwrap_or(&body);
     let image = normalize_image_tool(image)?;
     let path = state.sessions.runtime_home().join("agent").join("tools.json");
-    let current = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .unwrap_or_else(|| json!({}));
+    let current = read_tools_file(&path);
     let review = current
         .get("reviewTools")
         .cloned()
         .unwrap_or_else(|| json!(["generate_image"]));
-    let value = json!({ "image": image, "reviewTools": review });
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| ApiError::internal(format!("Could not create the tools folder: {error}")))?;
-    }
-    std::fs::write(&path, format!("{}\n", value))
-        .map_err(|error| ApiError::internal(format!("Could not save tools: {error}")))?;
+    let value = json!({ "image": image, "reviewTools": review, "commitAttribution": commit_attribution(&current) });
+    write_tools_file(&path, &value)?;
     recycle_warm_runtime(&state.sessions);
     Ok(Json(value))
+}
+
+/// Turn "Mark commits made by the agent" on or off. The extension reads it at
+/// every tool call, so nothing is restarted.
+async fn update_commit_attribution(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let enabled = body
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ApiError::bad_request("enabled must be true or false"))?;
+    let path = state.sessions.runtime_home().join("agent").join("tools.json");
+    let mut value = read_tools_file(&path);
+    if !value.is_object() {
+        value = json!({});
+    }
+    value["commitAttribution"] = json!({ "enabled": enabled });
+    write_tools_file(&path, &value)?;
+    Ok(Json(read_tools_settings(&value)))
 }
 
 async fn mcp_snapshot(State(state): State<AppState>) -> Json<Value> {
@@ -4308,7 +4343,7 @@ mod session_tests {
         assert_eq!(body["exists"], false);
         assert_eq!(
             body["settings"],
-            json!({ "image": { "enabled": true, "provider": "", "model": "", "size": "1K", "maxImages": 3 }, "reviewTools": ["generate_image"] })
+            json!({ "image": { "enabled": true, "provider": "", "model": "", "size": "1K", "maxImages": 3 }, "reviewTools": ["generate_image"], "commitAttribution": { "enabled": false } })
         );
 
         let agent = home.path().join("data").join("agent");
@@ -4329,8 +4364,38 @@ mod session_tests {
         let body: Value = serde_json::from_str(&partial.2).unwrap();
         assert_eq!(
             body["settings"],
-            json!({ "image": { "enabled": false, "provider": "", "model": "", "size": "1K", "maxImages": 10 }, "reviewTools": ["generate_image"] })
+            json!({ "image": { "enabled": false, "provider": "", "model": "", "size": "1K", "maxImages": 10 }, "reviewTools": ["generate_image"], "commitAttribution": { "enabled": false } })
         );
+    }
+
+    /// "Mark commits made by the agent" is off until saved on, survives an image
+    /// save, and keeps the rest of tools.json.
+    #[tokio::test]
+    async fn commit_attribution_is_saved_in_tools_json() {
+        let (manager, home, _workspace) = manager(50);
+        let app = app(manager);
+        let put = |path: &str, body: Value| {
+            request(Method::PUT, path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let refused = call(app.clone(), put("/v1/tools/commit-attribution", json!({ "enabled": "yes" }))).await;
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{}", refused.2);
+        let on = call(app.clone(), put("/v1/tools/commit-attribution", json!({ "enabled": true }))).await;
+        assert_eq!(on.0, StatusCode::OK, "{}", on.2);
+        let image = call(app.clone(), put("/v1/tools", json!({ "image": { "provider": "shisa", "model": "" } }))).await;
+        assert_eq!(image.0, StatusCode::OK, "{}", image.2);
+        let file: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join("data").join("agent").join("tools.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(file["commitAttribution"], json!({ "enabled": true }));
+        assert_eq!(file["image"]["provider"], "shisa");
+        let off = call(app, put("/v1/tools/commit-attribution", json!({ "enabled": false }))).await;
+        let body: Value = serde_json::from_str(&off.2).unwrap();
+        assert_eq!(body["commitAttribution"], json!({ "enabled": false }));
+        assert_eq!(body["image"]["provider"], "shisa");
     }
 
     #[tokio::test]
@@ -4799,34 +4864,6 @@ mod session_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(session.summary()["thinkingLevel"], "high");
-    }
-
-    /// Commit attribution on: the session's runtime file names the session and
-    /// follows the model the runtime reports.
-    #[tokio::test]
-    async fn commit_attribution_follows_the_session_and_its_model() {
-        let (manager, _home, workspace) = manager(50);
-        commit_attribution::save(manager.runtime_home(), commit_attribution::Setting { enabled: true }).unwrap();
-        let session = manager
-            .create(workspace.path().to_str().unwrap(), None, None)
-            .unwrap();
-        wait_status(&session, Status::Idle).await;
-        let runs = manager.runtime_home().join("git-hooks").join("runs");
-        let read = || -> Vec<String> {
-            std::fs::read_dir(&runs)
-                .map(|entries| entries.flatten().filter_map(|entry| std::fs::read_to_string(entry.path()).ok()).collect())
-                .unwrap_or_default()
-        };
-        let wanted = |model: &str| format!("session={}\nmodel={model}\n", session.id);
-        for _ in 0..100 {
-            if read().contains(&wanted("fixture-model")) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(read().contains(&wanted("fixture-model")), "{:?}", read());
-        session.select_model("fixture", "other").await.unwrap();
-        assert!(read().contains(&wanted("Fixture Other")), "{:?}", read());
     }
 
     #[tokio::test]

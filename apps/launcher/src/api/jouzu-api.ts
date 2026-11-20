@@ -270,6 +270,8 @@ export interface ToolsApi {
   /** Each provider says whether it can generate images now, and why not; `models` comes with a usable one. */
   providers(): Promise<{ providers: Array<{ id: string; label: string; available?: boolean; reason?: string; models?: unknown }> }>;
   models(provider: string): Promise<{ models: unknown }>;
+  /** "Mark commits made by the agent"; answers the tools settings as saved. */
+  saveCommitAttribution(enabled: boolean): Promise<Record<string, unknown>>;
 }
 
 export interface McpApi {
@@ -337,13 +339,6 @@ export interface WebAccessState {
   pairing: boolean;
 }
 
-/** "Mark commits made by the agent": off unless the person turned it on. */
-export interface CommitAttribution {
-  enabled: boolean;
-  /** The line added to the agent's commits, as the host writes it. */
-  trailer: string;
-}
-
 export interface WebAccessPairing {
   code: string;
   expiresInSeconds: number;
@@ -354,10 +349,6 @@ export interface SettingsApi {
   environment: {
     /** Saving goes through the configuration queue (`environment`). */
     read(): Promise<EnvironmentEntry[]>;
-  };
-  commitAttribution: {
-    /** Saving goes through the configuration queue (`commit-attribution`). */
-    read(): Promise<CommitAttribution>;
   };
   /** Only the desktop window may manage web access; web clients get `forbidden`. */
   webAccess: {

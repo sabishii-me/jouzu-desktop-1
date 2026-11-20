@@ -17,6 +17,24 @@ interface ImageSettings {
 interface ToolsSettings {
   image: ImageSettings;
   reviewTools: string[];
+  commitAttribution?: { enabled: boolean };
+}
+
+/** The lines the jouzu-attribution extension's hook adds to the agent's commits. */
+const COMMIT_LINES = "Co-authored-by: Jouzu Desktop (<model>) <noreply@shisa.ai>\nJouzu-Session: <session id>";
+
+/** "Mark commits made by the agent": off unless turned on; applies at the next tool call. */
+function CommitMarkCard({ t, enabled, busy, onChange }: { t: ChatText; enabled: boolean; busy: boolean; onChange: (enabled: boolean) => void }) {
+  return <Card className="border-border shadow-none">
+    <CardHeader>
+      <div className="flex items-center justify-between gap-4">
+        <CardTitle><Label htmlFor="commit-mark">{t.commitMark}</Label></CardTitle>
+        <Switch id="commit-mark" aria-label={t.commitMark} checked={enabled} disabled={busy} onCheckedChange={onChange} />
+      </div>
+      <CardDescription>{t.commitMarkHint}</CardDescription>
+    </CardHeader>
+    <CardContent><code className="block whitespace-pre-wrap break-all rounded-md bg-muted px-3 py-2 text-xs">{COMMIT_LINES}</code></CardContent>
+  </Card>;
 }
 
 interface ImageModel {
@@ -143,6 +161,18 @@ export function ToolsPanel() {
     })();
   }, []);
 
+  async function saveCommitMark(enabled: boolean) {
+    setBusy(true);
+    setError(null);
+    try {
+      setTools(await api.tools.saveCommitAttribution(enabled) as unknown as ToolsSettings);
+    } catch (failure) {
+      setError(failure);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function save(patch: Partial<ImageSettings>) {
     if (!tools) return;
     setBusy(true);
@@ -164,7 +194,7 @@ export function ToolsPanel() {
   const unusable = (providers ?? []).filter(provider => !provider.available);
   const noProvider = providers !== null && !usable.length;
 
-  return <Card className="border-border shadow-none">
+  return <div className="space-y-4"><Card className="border-border shadow-none">
     <CardHeader>
       <CardTitle>{t.imageGeneration}</CardTitle>
       <CardDescription>{t.imageGenerationHint}</CardDescription>
@@ -215,5 +245,6 @@ export function ToolsPanel() {
         {fill(t.reviewedCalls, { names: tools.reviewTools.join(", ") })}
       </div>
     </CardContent>
-  </Card>;
+  </Card>
+  <CommitMarkCard t={t} enabled={tools.commitAttribution?.enabled === true} busy={busy} onChange={enabled => void saveCommitMark(enabled)} /></div>;
 }

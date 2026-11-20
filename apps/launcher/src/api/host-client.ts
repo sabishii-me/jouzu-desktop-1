@@ -10,7 +10,6 @@ import {
   type Artifact,
   type ArtifactBody,
   type Attachment,
-  type CommitAttribution,
   type EnvironmentEntry,
   type FileEntry,
   type HistoryPage,
@@ -262,10 +261,6 @@ export class HostClient {
     return this.request<RuntimeStatus>("/v1/status");
   }
 
-  commitAttribution(): Promise<CommitAttribution> {
-    return this.request<CommitAttribution>("/v1/commit-attribution");
-  }
-
   environment(): Promise<EnvironmentEntry[]> {
     return this.request<{ entries: EnvironmentEntry[] }>("/v1/environment")
       .then(body => body.entries);
@@ -376,6 +371,10 @@ export class HostClient {
 
   async saveTools(image: Record<string, unknown>): Promise<Record<string, unknown>> {
     return this.request("/v1/tools", { method: "PUT", body: JSON.stringify({ image }) });
+  }
+
+  saveCommitAttribution(enabled: boolean): Promise<Record<string, unknown>> {
+    return this.request("/v1/tools/commit-attribution", { method: "PUT", body: JSON.stringify({ enabled }) });
   }
 
   toolProviders(): Promise<{ providers: Array<{ id: string; label: string; available?: boolean; reason?: string; models?: unknown }> }> {

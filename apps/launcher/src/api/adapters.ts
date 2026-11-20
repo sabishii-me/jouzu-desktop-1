@@ -121,6 +121,7 @@ function hostGroups(client: HostClient) {
     save: image => client.saveTools(image),
     providers: () => client.toolProviders(),
     models: provider => client.toolModels(provider),
+    saveCommitAttribution: enabled => client.saveCommitAttribution(enabled),
   };
 
   const mcp: McpApi = {
@@ -164,9 +165,6 @@ function hostGroups(client: HostClient) {
   const settings: SettingsApi = {
     environment: {
       read: () => client.environment(),
-    },
-    commitAttribution: {
-      read: () => client.commitAttribution(),
     },
     webAccess: {
       read: () => client.webAccess(),
