@@ -74,8 +74,10 @@ without a model is refused.
 Until a model is saved, Settings fills in a recommendation from
 `packaging/desktop/assistant/recommended-models.json`, matched by model id
 against the models the runtime lists. The recommendation is for planning
-work, so its evidence is an orchestration benchmark (WorkflowArena,
-arXiv 2611.12856), not a coding one: GPT-6.1 Sol at low effort by default,
+work, so its evidence is the closest orchestration benchmark (WorkflowArena,
+arXiv 2611.12856), not a coding one. That benchmark delegates to worker
+processes within one run, while the Assistant starts and follows separate
+sessions, so it supports the choice rather than proving it: GPT-6.1 Sol at low effort by default,
 GPT-6 Astra at xhigh as the stronger, costlier choice. Models for workflow
 roles (the workers) are a separate choice, recommended from COSPA
 (github.com/shisa-ai/cospa), a coding cost-performance benchmark.
