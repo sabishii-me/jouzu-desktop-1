@@ -63,6 +63,23 @@ Assistant is idle. Task changes wake it only when idle, after a quiet period
 and acknowledges its inbox itself. `schedule_wake` lets it look again later.
 If the process ends it stays stopped until the user writes or turns it on.
 
+### Its model
+
+The Assistant plans and dispatches; it runs only on the model the user saved
+in Settings > Collaboration (provider, id and reasoning effort). It never
+falls back to jouzu's default or to whatever model has a key, and it never
+switches: if that model is unusable it stops and shows why. Turning it on
+without a model is refused.
+
+Until a model is saved, Settings fills in a recommendation from
+`packaging/desktop/assistant/recommended-models.json`, matched by model id
+against the models the runtime lists. The recommendation is for planning
+work, so its evidence is an orchestration benchmark (WorkflowArena,
+arXiv 2611.12856), not a coding one: GPT-6.1 Sol at low effort by default,
+GPT-6 Astra at xhigh as the stronger, costlier choice. Models for workflow
+roles (the workers) are a separate choice, recommended from COSPA
+(github.com/shisa-ai/cospa), a coding cost-performance benchmark.
+
 ### Views
 
 The Assistant shows boards, tables, graphs, timelines and progress as fenced
