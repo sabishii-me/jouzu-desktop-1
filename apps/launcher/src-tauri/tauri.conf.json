@@ -5,8 +5,7 @@
   "identifier": "ai.shisa.jouzu.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
-    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build:app",
     "frontendDist": "../dist",
     "additionalWatchFolders": [
       "../../../packaging/launcher"
@@ -26,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:"
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://127.0.0.1:* ws://127.0.0.1:*; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:"
     }
   },
   "bundle": {
@@ -44,6 +43,10 @@
     ],
     "publisher": "Shisa, Inc.",
     "copyright": "Copyright © Shisa, Inc.",
+    "resources": {
+      "../host/target/package/jouzu-host.exe": "host/jouzu-host.exe",
+      "../dist/": "dist/"
+    },
     "windows": {
       "nsis": {
         "template": "../../../packaging/launcher/installer.nsi",
@@ -70,6 +73,8 @@
     }
   }
 }
+
+
 
 
 

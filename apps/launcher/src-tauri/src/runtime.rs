@@ -63,7 +63,7 @@ fn pick_root(candidates: Vec<PathBuf>) -> Result<PathBuf, String> {
         .ok_or_else(|| "Jouzu application files are missing. Please repair the installation.".into())
 }
 
-pub fn find_bash(app: &tauri::AppHandle) -> Option<PathBuf> {
+pub fn find_bash(_app: &tauri::AppHandle) -> Option<PathBuf> {
     let root = managed_root().ok()?;
     crate::git_environment::find(&root).ok()
 }
@@ -172,5 +172,6 @@ mod path_tests {
         );
     }
 }
+
 
 

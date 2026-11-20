@@ -8,6 +8,8 @@ import { record, toolText } from "./types";
 import { ArtifactImage } from "./artifact-image";
 import { artifactPathFromText } from "./artifact-path";
 import { RevealPath } from "../reveal-path";
+import { copyText } from "../secure-context";
+import { useChatText } from "../chat-text";
 
 const MAX_LINES = 2000;
 export const MAX_TOOL_IMAGE_BYTES = 8 * 1024 * 1024;
@@ -52,11 +54,13 @@ function AnsiPre({ text, expanded = false }: { text: string; expanded?: boolean 
 }
 
 function CopyButton({ text }: { text: string }) {
+  const t = useChatText();
   const [copied, setCopied] = useState(false);
-  return <Button variant="ghost" className="h-7 gap-1 px-2 text-[11px]" onClick={async () => { try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1200); } catch { setCopied(false); } }}>{copied ? <Check className="size-3" /> : <Copy className="size-3" />}{copied ? "Copied" : "Copy"}</Button>;
+  return <Button variant="ghost" className="h-7 gap-1 px-2 text-[11px]" onClick={async () => { try { await copyText(text); setCopied(true); setTimeout(() => setCopied(false), 1200); } catch { setCopied(false); } }}>{copied ? <Check className="size-3" /> : <Copy className="size-3" />}{copied ? t.copied : t.copy}</Button>;
 }
 
 function DownloadButton({ text }: { text: string }) {
+  const t = useChatText();
   return <Button variant="ghost" className="h-7 px-2 text-[11px]" onClick={() => {
     const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
     const anchor = document.createElement("a");
@@ -64,7 +68,7 @@ function DownloadButton({ text }: { text: string }) {
     anchor.download = "tool-output.txt";
     anchor.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }}>Download</Button>;
+  }}>{t.download}</Button>;
 }
 
 function truncatedLines(text: string) {
@@ -106,7 +110,7 @@ export interface ToolImageBlock {
  * Keep every image block a tool returned, including an oversized or unsupported
  * one: the image component renders a card explaining why it is not inline.
  */
-export function imageBlocks(result: unknown): ToolImageBlock[] {
+export function imageBlocks(result: unknown, fallbackAlt: string): ToolImageBlock[] {
   const value = record(result);
   const blocks = value && Array.isArray(value.content) ? value.content : [];
   return blocks.flatMap(block => {
@@ -114,7 +118,7 @@ export function imageBlocks(result: unknown): ToolImageBlock[] {
     if (item?.type !== "image" || typeof item.data !== "string") return [];
     const mime = typeof item.mimeType === "string" ? item.mimeType : "";
     const bytes = Math.floor(item.data.length * 0.75);
-    return [{ mime, data: item.data, alt: typeof item.alt === "string" ? item.alt : "Tool output image", bytes, tooLarge: bytes > MAX_TOOL_IMAGE_BYTES }];
+    return [{ mime, data: item.data, alt: typeof item.alt === "string" ? item.alt : fallbackAlt, bytes, tooLarge: bytes > MAX_TOOL_IMAGE_BYTES }];
   });
 }
 
@@ -149,9 +153,10 @@ function JsonOutput({ text, expanded = false }: { text: string; expanded?: boole
 }
 
 function MarkdownOutput({ text, expanded = false }: { text: string; expanded?: boolean }) {
+  const t = useChatText();
   const [rendered, setRendered] = useState(true);
   return <div className="rounded-md border border-border/60 bg-background">
-    <div className="flex justify-end border-b border-border/60 px-2 py-1"><Button variant="ghost" className="h-7 px-2 text-[11px]" onClick={() => setRendered(value => !value)}>{rendered ? "Source" : "Markdown"}</Button></div>
+    <div className="flex justify-end border-b border-border/60 px-2 py-1"><Button variant="ghost" className="h-7 px-2 text-[11px]" onClick={() => setRendered(value => !value)}>{rendered ? t.source : "Markdown"}</Button></div>
     <div className={`${expanded ? "max-h-[70vh]" : "max-h-96"} overflow-auto p-3`}>{rendered ? <ChatMarkdown text={text} /> : <AnsiPre text={text} expanded={expanded} />}</div>
   </div>;
 }
@@ -167,9 +172,10 @@ function resultMeta(result: unknown) {
 }
 
 export function ToolOutput({ tool }: { tool: ToolView }) {
+  const t = useChatText();
   const [expanded, setExpanded] = useState(false);
   const text = toolText(tool.result);
-  const blocks = imageBlocks(tool.result);
+  const blocks = imageBlocks(tool.result, t.toolOutputImage);
   const details = record(record(tool.result)?.details);
   const prompt = typeof details?.prompt === "string" ? details.prompt : "";
   const model = typeof details?.model === "string" ? details.model : "";
@@ -192,9 +198,9 @@ export function ToolOutput({ tool }: { tool: ToolView }) {
   const meta = resultMeta(tool.result);
   const long = text.length > 2000 || text.split("\n").length > 40;
   if (images.length) return <div className="space-y-3">{images.map((image, index) => <ArtifactImage key={index} image={image} caption={[model, size, image.width && image.height ? `${image.width}×${image.height}` : ""].filter(Boolean).join(" · ")} />)}{text && <AnsiPre text={text} expanded={expanded} />}</div>;
-  if (!text) return <p className="text-xs text-muted-foreground">No text output.</p>;
+  if (!text) return <p className="text-xs text-muted-foreground">{t.noTextOutput}</p>;
   return <div className="space-y-1">
-    <div className="flex items-center justify-between gap-2"><span className="flex min-w-0 items-center gap-2"><span className="min-w-0 truncate text-[10px] uppercase tracking-wide text-muted-foreground">{tool.name === "read" && path ? path : "Output"}{meta.length ? ` · ${meta.join(" · ")}` : ""}</span>{tool.name === "read" && path && <RevealPath path={path} compact label="Reveal" />}</span><div className="flex shrink-0"><CopyButton text={text} /><DownloadButton text={text} />{long && <Button variant="ghost" className="h-7 px-2 text-[11px]" onClick={() => setExpanded(value => !value)}>{expanded ? "Collapse" : "Expand"}</Button>}</div></div>
+    <div className="flex items-center justify-between gap-2"><span className="flex min-w-0 items-center gap-2"><span className="min-w-0 truncate text-[10px] uppercase tracking-wide text-muted-foreground">{tool.name === "read" && path ? path : t.output}{meta.length ? ` · ${meta.join(" · ")}` : ""}</span>{tool.name === "read" && path && <RevealPath path={path} compact label={t.reveal} />}</span><div className="flex shrink-0"><CopyButton text={text} /><DownloadButton text={text} />{long && <Button variant="ghost" className="h-7 px-2 text-[11px]" onClick={() => setExpanded(value => !value)}>{expanded ? t.collapse : t.expand}</Button>}</div></div>
     {tool.phase === "error" && <p className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-[11px] text-destructive">Tool failed{meta.length ? ` (${meta.join(", ")})` : ""}</p>}
     {tool.name === "bash" ? <AnsiPre text={text} expanded={expanded} />
       : tool.name === "read" && markdownPath(tool.args) ? <MarkdownOutput text={text} expanded={expanded} />

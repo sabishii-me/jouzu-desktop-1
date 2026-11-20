@@ -11,7 +11,9 @@ const args = process.argv.slice(2);
 const { parseJouzuArgs } = await import(pathToFileURL(join(app, "dist", "args.js")));
 const { resolveJouzuPaths } = await import(pathToFileURL(join(app, "dist", "paths.js")));
 const parsed = parseJouzuArgs(args);
-process.env.JOUZU_HOME ||= join(process.env.LOCALAPPDATA, "Shisa.ai", "Jouzu", "data");
+// Desktop passes JOUZU_HOME. Run on its own, the bootstrap uses the same home: `data` beside
+// the installation this file is in (<installation>/app/bootstrap.mjs). See #112.
+process.env.JOUZU_HOME ||= join(root, "..", "data");
 const paths = resolveJouzuPaths({ homeOverride: parsed.options.home });
 const node = dirname(process.execPath);
 const npm = join(node, "node_modules", "npm", "bin", "npm-cli.js");

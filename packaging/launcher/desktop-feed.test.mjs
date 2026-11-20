@@ -53,3 +53,9 @@ test('the feed file is UTF-8 without a byte order mark', () => {
 	assert.equal(JSON.parse(bytes.toString('utf8')).platforms['windows-x86_64'].signature, 'dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZQo');
 });
 
+// QA releases are release candidates (#86); their feed carries the rc version.
+test('a release candidate version is accepted', () => {
+	const feed = desktopFeed({ ...base, version: '1.1.3-rc.1', assetName: 'JouzuDesktop_1.1.3-rc.1_x64-setup.exe' });
+	assert.equal(feed.version, '1.1.3-rc.1');
+	assert.equal(feed.platforms['windows-x86_64'].url, 'https://github.com/shisa-ai/jouzu-desktop/releases/download/v1.1.3-rc.1/JouzuDesktop_1.1.3-rc.1_x64-setup.exe');
+});

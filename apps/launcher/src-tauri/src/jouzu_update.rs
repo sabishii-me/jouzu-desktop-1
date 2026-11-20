@@ -5,14 +5,14 @@ struct Guard;
 impl Drop for Guard {fn drop(&mut self){ACTIVE.store(false,Ordering::SeqCst);}}
 
 #[tauri::command]
-pub async fn jouzu_update(app: tauri::AppHandle, chat: tauri::State<'_, crate::chat::ChatService>, action: String, version: Option<String>) -> Result<serde_json::Value,String> {
+pub async fn jouzu_update(app: tauri::AppHandle, action: String, version: Option<String>) -> Result<serde_json::Value,String> {
  if action != "check" && action != "install" {return Err("Invalid update action".into());}
  if ACTIVE.swap(true,Ordering::SeqCst){return Err("A Jouzu update is already running".into());}
  let guard=Guard;
  if action=="install" {
   // The running desktop runtime holds the shared update-session lock. Stop it
   // before taking the exclusive installer lock; the frontend reconnects after install.
-  chat.pause();
+  crate::host_bootstrap::stop_sessions()?;
  }
  tauri::async_runtime::spawn_blocking(move || {
   let _guard=guard;
@@ -54,4 +54,5 @@ pub async fn jouzu_update(app: tauri::AppHandle, chat: tauri::State<'_, crate::c
   Ok(value)
  }).await.map_err(|e|e.to_string())?
 }
+
 

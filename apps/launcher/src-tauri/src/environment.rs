@@ -113,7 +113,7 @@ fn protect(_: &[u8], _: bool) -> Result<Vec<u8>, String> {
 }
 #[tauri::command]
 pub fn environment_read() -> Result<Vec<Entry>, String> {
-    let path = runtime::managed_root()?.join("data/launcher-environment.bin");
+    let path = runtime::effective_home()?.join("launcher-environment.bin");
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -127,7 +127,7 @@ pub fn environment_read() -> Result<Vec<Entry>, String> {
 #[tauri::command]
 pub fn environment_save(entries: Vec<Entry>) -> Result<(), String> {
     validate(&entries)?;
-    let data = runtime::managed_root()?.join("data");
+    let data = runtime::effective_home()?;
     std::fs::create_dir_all(&data).map_err(|_| "Cannot create settings directory")?;
     let bytes = serde_json::to_vec(&entries).map_err(|_| "Cannot encode environment settings")?;
     let encrypted = protect(&bytes, false)?;

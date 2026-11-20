@@ -17,3 +17,73 @@ export function isFlowHistoryError(message: string | null | undefined): boolean 
 export function humanizeRuntimeError(message: string): string {
   return isCapacityError(message) ? CAPACITY_MESSAGE : message;
 }
+
+const CODE_MESSAGES: Partial<Record<string, string>> = {
+  "runtime-unavailable": "The model runtime is not available right now. Try again in a moment.",
+  "runtime-timeout": "The model runtime did not respond in time. Try again.",
+  "session-not-found": "This session is no longer open. Select it in the sidebar to reopen it.",
+  unauthorized: "This window lost its connection to Jouzu. Reload the app.",
+  forbidden: "This window is not allowed to do that. Reload the app.",
+  "prompt-forbidden": "This window is not allowed to answer requests. Reload the app.",
+  "prompt-resolved": "This request was already answered.",
+  "prompt-expired": "This request expired before it was answered.",
+};
+
+/**
+ * The one place that turns a thrown value into text a user reads. Host errors
+ * carry a code; a known code gets a fixed sentence, anything else keeps the
+ * host's message without the JavaScript class prefix.
+ */
+export function describeError(error: unknown): string {
+  if (error && typeof error === "object") {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string" && CODE_MESSAGES[code]) return CODE_MESSAGES[code]!;
+  }
+  if (error instanceof TypeError && /fetch|network/iu.test(error.message)) return "Cannot reach Jouzu. Check that the app is still running.";
+  const raw = error instanceof Error ? error.message : String(error ?? "");
+  const text = raw.replace(/^(?:Api)?Error:\s*/u, "").trim();
+  return humanizeRuntimeError(text || "Something went wrong.");
+}
+
+/** What a person reads, and the raw text kept behind "Details". */
+export interface Explained { text: string; details?: string }
+
+/**
+ * A failed request whose reason names an image. Providers word image refusals in
+ * many ways (size, format, content, "does not support images"), so this does not
+ * try to tell them apart: any failure that blames an image counts. Whatever the
+ * exact reason, the image stays in the session history and is sent again with
+ * every later request (jouzu runtime, shisa-ai/jouzu#54), so the session cannot
+ * continue until the images are taken out of its history.
+ */
+export function isImageRefused(message: string | null | undefined): boolean {
+  return !!message && /\bimage/iu.test(message);
+}
+
+function rawText(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error ?? "");
+  return raw.replace(/^(?:Api)?Error:\s*/u, "").trim();
+}
+
+const sentence = (text: string) => /[.!?。]$/u.test(text) ? text : `${text}.`;
+
+/**
+ * Turn a failure into one plain sentence that says what did not happen, with the
+ * raw text kept for "Details" (and host.log). Known failures get a sentence that
+ * says what to do; a request the host refused as invalid says why, since that
+ * reason is written for people; anything else says what failed, never shows
+ * the technical message itself.
+ */
+export function explainError(error: unknown, failed: string): Explained {
+  const raw = rawText(error);
+  const details = raw && raw !== failed ? raw : undefined;
+  if (error && typeof error === "object") {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string" && CODE_MESSAGES[code]) return { text: CODE_MESSAGES[code]!, details };
+    if (code === "invalid-request" && raw) return { text: `${sentence(failed)} ${sentence(raw)}`, details: undefined };
+  }
+  if (error instanceof TypeError && /fetch|network/iu.test(error.message)) return { text: "Cannot reach Jouzu. Check that the app is still running.", details };
+  if (isCapacityError(raw)) return { text: CAPACITY_MESSAGE, details };
+  if (isFlowHistoryError(raw)) return { text: "Flow request history is full. Clear it before sending again.", details };
+  return { text: sentence(failed), details };
+}

@@ -35,15 +35,52 @@ pub fn managed_root() -> Result<PathBuf, String> {
     }
 }
 
-/// The home Jouzu runs with: what the user asked for, otherwise the data directory of this
-/// installation.
+/// The home Jouzu runs with: the user's `JOUZU_HOME` when set, otherwise `data` beside this
+/// installation (`%LOCALAPPDATA%\Shisa.ai\JouzuDesktop\data` on Windows), the home every
+/// Desktop release since 1.0 has used. Desktop's `jz` and `jouzu` commands use it too.
+///
+/// This location must not change between releases and its contents are never copied to or
+/// from another home: the runtime's Flow state records the absolute path of its folder, so
+/// a session only continues in the home it was created in (#112).
 pub fn effective_home() -> Result<PathBuf, String> {
+    if let Some(home) = user_home() {
+        return Ok(home);
+    }
+    Ok(default_home(&managed_root()?))
+}
+
+/// The user's `JOUZU_HOME`. A development run ignores it, so it stays inside the directory
+/// it names.
+fn user_home() -> Option<PathBuf> {
     #[cfg(debug_assertions)]
     if std::env::var_os("JOUZU_LAUNCHER_DEV_HOME").is_some() {
-        return Ok(managed_root()?.join("data"));
+        return None;
     }
-    if let Some(home) = std::env::var_os("JOUZU_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(home));
+    std::env::var_os("JOUZU_HOME").filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+fn default_home(managed: &std::path::Path) -> PathBuf {
+    managed.join("data")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Existing sessions live here. Moving the default strands them (#112).
+    #[test]
+    fn the_default_home_is_data_beside_the_installation() {
+        let managed = PathBuf::from("C:/Users/u/AppData/Local/Shisa.ai/JouzuDesktop");
+        assert_eq!(default_home(&managed), managed.join("data"));
     }
-    Ok(managed_root()?.join("data"))
+
+    #[cfg(windows)]
+    #[test]
+    fn the_installation_is_the_desktop_folder() {
+        if std::env::var_os("JOUZU_LAUNCHER_DEV_HOME").is_some() {
+            return;
+        }
+        let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        assert_eq!(managed_root().unwrap(), local.join("Shisa.ai").join("JouzuDesktop"));
+    }
 }

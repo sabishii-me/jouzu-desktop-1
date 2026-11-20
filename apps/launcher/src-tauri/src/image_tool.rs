@@ -15,6 +15,10 @@ const SHISA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../packaging/launcher/extensions/jouzu-image/providers/shisa.mjs"
 ));
+const RUNTIME_PROVIDERS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../packaging/launcher/extensions/jouzu-image/providers/runtime.mjs"
+));
 const ARTIFACTS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../packaging/launcher/extensions/jouzu-image/artifacts.mjs"
@@ -26,23 +30,25 @@ const DEFAULT_SIZE: &str = "1K";
 const DEFAULT_MAX_IMAGES: u64 = 3;
 const REVIEW_TOOLS: [&str; 1] = ["generate_image"];
 
-fn agent_dir(managed: &Path) -> PathBuf {
-    managed.join("data").join("agent")
+fn agent_dir(home: &Path) -> PathBuf {
+    home.join("agent")
 }
 
-/// Write the extension in place. Idempotent: a newer desktop replaces the files.
-pub fn ensure(managed: &Path) -> Result<(), String> {
-    let directory = agent_dir(managed).join("extensions").join("jouzu-image");
+/// Write the extension into the Jouzu home's agent folder, where the runtime loads it.
+/// Idempotent: a newer desktop replaces the files.
+pub fn ensure(home: &Path) -> Result<(), String> {
+    let directory = agent_dir(home).join("extensions").join("jouzu-image");
     std::fs::create_dir_all(directory.join("providers")).map_err(|error| format!("Could not create the image extension: {error}"))?;
     std::fs::write(directory.join("package.json"), MANIFEST).map_err(|error| error.to_string())?;
     std::fs::write(directory.join("index.js"), EXTENSION).map_err(|error| error.to_string())?;
     std::fs::write(directory.join("providers").join("shisa.mjs"), SHISA).map_err(|error| error.to_string())?;
+    std::fs::write(directory.join("providers").join("runtime.mjs"), RUNTIME_PROVIDERS).map_err(|error| error.to_string())?;
     std::fs::write(directory.join("artifacts.mjs"), ARTIFACTS).map_err(|error| error.to_string())?;
     Ok(())
 }
 
-fn tools_path(managed: &Path) -> PathBuf {
-    agent_dir(managed).join("tools.json")
+fn tools_path(home: &Path) -> PathBuf {
+    agent_dir(home).join("tools.json")
 }
 
 fn valid_model(model: &str) -> bool {
@@ -91,8 +97,8 @@ fn default_tools() -> serde_json::Value {
     serde_json::json!({ "image": normalize_image(&serde_json::json!({})), "reviewTools": REVIEW_TOOLS })
 }
 
-pub fn read_tools(managed: &Path) -> Result<serde_json::Value, String> {
-    let value: serde_json::Value = std::fs::read_to_string(tools_path(managed))
+pub fn read_tools(home: &Path) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = std::fs::read_to_string(tools_path(home))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_else(default_tools);
@@ -102,15 +108,15 @@ pub fn read_tools(managed: &Path) -> Result<serde_json::Value, String> {
     }))
 }
 
-pub fn save_tools(managed: &Path, image: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let current = read_tools(managed)?;
-    let directory = agent_dir(managed);
+pub fn save_tools(home: &Path, image: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let current = read_tools(home)?;
+    let directory = agent_dir(home);
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let value = serde_json::json!({
         "image": normalize_image(image),
         "reviewTools": current.get("reviewTools").cloned().unwrap_or_else(|| serde_json::json!(REVIEW_TOOLS)),
     });
-    std::fs::write(tools_path(managed), format!("{}\n", serde_json::to_string_pretty(&value).unwrap()))
+    std::fs::write(tools_path(home), format!("{}\n", serde_json::to_string_pretty(&value).unwrap()))
         .map_err(|error| error.to_string())?;
     Ok(value)
 }
@@ -172,12 +178,12 @@ fn run_cli(managed: &Path, args: &[&str]) -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 pub fn tools_settings_read() -> Result<serde_json::Value, String> {
-    read_tools(&crate::runtime::managed_root()?)
+    read_tools(&crate::runtime::effective_home()?)
 }
 
 #[tauri::command]
 pub fn tools_settings_save(image: serde_json::Value) -> Result<serde_json::Value, String> {
-    save_tools(&crate::runtime::managed_root()?, &image)
+    save_tools(&crate::runtime::effective_home()?, &image)
 }
 
 /// The image providers the extension offers, for the Tools page.
@@ -201,7 +207,7 @@ pub async fn image_models(provider: String) -> Result<serde_json::Value, String>
 /// Called after a runtime install and on app start, so existing installs get it too.
 #[tauri::command]
 pub fn image_tool_ensure() -> Result<(), String> {
-    ensure(&crate::runtime::managed_root()?)
+    ensure(&crate::runtime::effective_home()?)
 }
 
 #[cfg(test)]
@@ -212,10 +218,11 @@ mod tests {
     fn the_extension_lands_where_pi_looks_for_it() {
         let managed = tempfile::tempdir().unwrap();
         ensure(managed.path()).unwrap();
-        let directory = managed.path().join("data/agent/extensions/jouzu-image");
+        let directory = managed.path().join("agent/extensions/jouzu-image");
         assert!(directory.join("package.json").is_file());
         assert!(directory.join("index.js").is_file());
         assert!(directory.join("providers/shisa.mjs").is_file());
+        assert!(directory.join("providers/runtime.mjs").is_file());
         assert!(directory.join("artifacts.mjs").is_file());
         let manifest = std::fs::read_to_string(directory.join("package.json")).unwrap();
         assert!(manifest.contains("pi"));
@@ -253,7 +260,7 @@ mod tests {
     #[test]
     fn saving_keeps_a_custom_review_list() {
         let managed = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(managed.path().join("data/agent")).unwrap();
+        std::fs::create_dir_all(managed.path().join("agent")).unwrap();
         std::fs::write(tools_path(managed.path()), r#"{"reviewTools":["generate_image","other_tool"]}"#).unwrap();
         let saved = save_tools(managed.path(), &serde_json::json!({ "enabled": false })).unwrap();
         assert_eq!(saved["reviewTools"], serde_json::json!(["generate_image", "other_tool"]));

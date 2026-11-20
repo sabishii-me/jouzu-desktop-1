@@ -1,8 +1,10 @@
 // Presentation-only projection of the released JSONL event contract.
 // Agent history and completion remain authoritative in the runtime.
 export type WireObject = Record<string, unknown>;
-export interface ChatBlock { type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: unknown; data?: string; mimeType?: string }
-export interface ChatMessage { role: string; content: ChatBlock[]; details?: unknown; timestamp?: number; endedAt?: number; stopReason?: string; errorMessage?: string; toolCallId?: string; toolName?: string; isError?: boolean; provider?: string; model?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number; totalTokens?: number } }
+/** An image the host keeps for a message in history: fetched by id, never inlined in the row. */
+export interface HostAttachmentRef { sessionId: string; id: string }
+export interface ChatBlock { type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: unknown; data?: string; mimeType?: string; attachment?: HostAttachmentRef; content?: ChatBlock[]; toolCallId?: string; isError?: boolean }
+export interface ChatMessage { role: string; content: ChatBlock[]; turnId?: string; /** The user turn this message belongs to (1 = the first user message), as the host numbers it. */ turn?: number; details?: unknown; timestamp?: number; endedAt?: number; stopReason?: string; errorMessage?: string; /** What kind of failure ended the reply, as the host names it. */ errorCode?: string; toolCallId?: string; toolName?: string; isError?: boolean; provider?: string; model?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number; totalTokens?: number } }
 export interface ToolView { id: string; name: string; args: unknown; phase: "running" | "complete" | "error"; result?: unknown; interrupted?: boolean }
 export interface FlowReportRecord { kind: string; text: string; timestamp?: number }
 export interface ChatProjection {
@@ -12,9 +14,14 @@ export interface ChatProjection {
   flowReports: FlowReportRecord[];
   running: boolean;
   turnStartedAt?: number;
-  compatibility: string[];
+  /**
+   * Where `messages[0]` stands in the conversation relative to the first page
+   * loaded: 0, or negative once earlier pages are put in front. Rows keep
+   * their keys when earlier messages are loaded.
+   */
+  firstIndex?: number;
 }
-export function emptyProjection(): ChatProjection { return { messages: [], activeMessage: null, tools: {}, flowReports: [], running: false, turnStartedAt: undefined, compatibility: [] }; }
+export function emptyProjection(): ChatProjection { return { messages: [], activeMessage: null, tools: {}, flowReports: [], running: false, turnStartedAt: undefined }; }
 export function object(value: unknown): value is WireObject { return !!value && typeof value === "object" && !Array.isArray(value); }
 function contentShape(value: unknown): string {
   if (!Array.isArray(value)) return value === null ? "null" : typeof value;
@@ -47,6 +54,162 @@ export function historyProjection(messages: unknown): ChatProjection {
   }
   return { ...emptyProjection(), messages: parsed, tools };
 }
+/** Host history/`message.done` blocks in the shape the transcript renders. */
+export function hostBlocks(blocks: unknown): ChatBlock[] {
+  if (!Array.isArray(blocks)) return [];
+  return blocks.flatMap((block): ChatBlock[] => {
+    if (!object(block) || typeof block.type !== "string") return [];
+    if (block.type === "text" && typeof block.text === "string") return [{ type: "text", text: block.text }];
+    if (block.type === "thinking") return [{ type: "thinking", thinking: typeof block.text === "string" ? block.text : typeof block.thinking === "string" ? block.thinking : "" }];
+    if (block.type === "toolCall") {
+      const id = typeof block.toolCallId === "string" ? block.toolCallId : typeof block.id === "string" ? block.id : "";
+      return id ? [{ type: "toolCall", id, name: typeof block.name === "string" ? block.name : "tool", arguments: block.input ?? block.arguments }] : [];
+    }
+    // A tool's result is shown on its call (see `hostToolResults`), not as a block of its own.
+    if (block.type === "toolResult") return [];
+    if (block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string") return [{ type: "image", data: block.data, mimeType: block.mimeType }];
+    return [];
+  });
+}
+
+/** The tool results a host row or `message.done` carries, keyed by tool call. */
+export function hostToolResults(blocks: unknown, known: Record<string, ToolView>): Record<string, ToolView> {
+  if (!Array.isArray(blocks)) return {};
+  const calls = new Map<string, { name: string; args: unknown }>();
+  const results: Record<string, ToolView> = {};
+  for (const block of blocks) {
+    if (!object(block)) continue;
+    const id = typeof block.toolCallId === "string" ? block.toolCallId : typeof block.id === "string" ? block.id : "";
+    if (!id) continue;
+    if (block.type === "toolCall") calls.set(id, { name: typeof block.name === "string" ? block.name : "tool", args: block.input ?? block.arguments });
+    if (block.type === "toolResult") {
+      const call = calls.get(id);
+      results[id] = {
+        id,
+        name: known[id]?.name ?? call?.name ?? "tool",
+        args: known[id]?.args ?? call?.args,
+        phase: block.ok === false ? "error" : "complete",
+        // The same value `tool.result` carried live.
+        result: block.result ?? known[id]?.result,
+        ...(block.interrupted === true ? { interrupted: true } : {}),
+      };
+    }
+  }
+  return results;
+}
+
+/**
+ * Images the user attached, as the host lists them on the user row. A row names
+ * each image by id (no data); the transcript fetches it from the host (#119).
+ */
+function attachmentBlocks(attachments: unknown, sessionId?: string): ChatBlock[] {
+  if (!Array.isArray(attachments)) return [];
+  return attachments.flatMap((item): ChatBlock[] => {
+    if (!object(item) || typeof item.mimeType !== "string" || !item.mimeType.startsWith("image/")) return [];
+    if (typeof item.data === "string") return [{ type: "image", data: item.data, mimeType: item.mimeType }];
+    if (typeof item.id === "string" && item.id && sessionId) return [{ type: "image", mimeType: item.mimeType, attachment: { sessionId, id: item.id } }];
+    return [];
+  });
+}
+
+/** Host history rows as the transcript; `sessionId` is the host session the rows (and their images) belong to. */
+export function historyRowsProjection(rows: unknown, sessionId?: string): ChatProjection {
+  if (!Array.isArray(rows)) throw new Error("Invalid host history");
+  const messages: ChatMessage[] = [];
+  const tools: Record<string, ToolView> = {};
+  for (const row of rows) {
+    if (!object(row)) continue;
+    const kind = typeof row.kind === "string" ? row.kind : "";
+    const timestamp = typeof row.createdAt === "string" ? Date.parse(row.createdAt) : undefined;
+    if (kind === "user" || kind === "assistant") {
+      const content = [...hostBlocks(row.blocks), ...attachmentBlocks(row.attachments, sessionId)];
+      messages.push({
+        role: kind,
+        content,
+        timestamp: Number.isFinite(timestamp) ? timestamp : undefined,
+        ...(typeof row.turnId === "string" ? { turnId: row.turnId } : {}),
+        ...(typeof row.turn === "number" && row.turn > 0 ? { turn: row.turn } : {}),
+        ...(typeof row.model === "string" ? { model: row.model } : {}),
+        ...(typeof row.provider === "string" ? { provider: row.provider } : {}),
+        ...(typeof row.stopReason === "string" ? { stopReason: row.stopReason } : {}),
+        ...(typeof row.errorMessage === "string" ? { errorMessage: row.errorMessage } : {}),
+        ...(typeof row.errorCode === "string" ? { errorCode: row.errorCode } : {}),
+        ...(object(row.usage) ? { usage: row.usage as ChatMessage["usage"] } : {}),
+      });
+      for (const block of content) if (block.type === "toolCall" && typeof block.id === "string") tools[block.id] = { id: block.id, name: block.name ?? "tool", args: block.arguments, phase: tools[block.id]?.phase ?? "running", result: tools[block.id]?.result };
+      Object.assign(tools, hostToolResults(row.blocks, tools));
+      continue;
+    }
+    if (kind === "tool") {
+      const tool = object(row.tool) ? row.tool : {};
+      const id = typeof tool.callId === "string" ? tool.callId : typeof row.id === "string" ? row.id.replace(/^tool:/u, "") : "";
+      if (!id) continue;
+      const status = typeof tool.status === "string" ? tool.status : "running";
+      tools[id] = {
+        id,
+        name: typeof tool.name === "string" ? tool.name : "tool",
+        args: row.args,
+        phase: status === "error" || status === "interrupted" ? "error" : status === "ok" ? "complete" : "running",
+        result: row.result,
+        ...(status === "interrupted" ? { interrupted: true } : {}),
+      };
+    }
+  }
+  return { ...emptyProjection(), messages, tools };
+}
+
+/**
+ * The user turn (1 = the first user message of the conversation) that message
+ * `index` belongs to, for branching. It is counted from the nearest message the
+ * host numbered; messages added live after it count their own user messages.
+ * With no numbered message, counting from the start is right only when the
+ * whole conversation is loaded (`complete`); otherwise the turn is unknown.
+ */
+export function turnAt(messages: readonly ChatMessage[], index: number, complete: boolean): number | undefined {
+  let users = 0;
+  for (let at = Math.min(index, messages.length - 1); at >= 0; at -= 1) {
+    const message = messages[at];
+    if (typeof message.turn === "number" && message.turn > 0) return message.turn + users;
+    if (message.role === "user") users += 1;
+  }
+  return complete && users > 0 ? users : undefined;
+}
+
+/**
+ * A page of a saved session's runtime messages, as the preview shows it, with
+ * each message numbered by user turn from `turn` (user messages before the page).
+ */
+export function savedPageProjection(messages: unknown, turn: number): ChatProjection {
+  const projection = interruptUnfinishedTools(historyProjection(messages));
+  let current = turn;
+  return {
+    ...projection,
+    messages: projection.messages.map(message => {
+      if (message.role === "user") current += 1;
+      return current > 0 ? { ...message, turn: current } : message;
+    }),
+  };
+}
+
+/**
+ * Earlier history put in front of what is loaded: messages and tool states
+ * join at the start, and positions that point into the transcript move with it.
+ */
+export function prependHistory(state: ChatProjection, earlier: ChatProjection): ChatProjection {
+  const count = earlier.messages.length;
+  if (!count) return state;
+  const tools: Record<string, ToolView> = { ...earlier.tools };
+  // A call in the earlier page can have its result in the later one: the later state wins.
+  for (const [id, tool] of Object.entries(state.tools)) tools[id] = tools[id] ? { ...tools[id], ...tool, args: tool.args ?? tools[id].args } : tool;
+  return {
+    ...state,
+    messages: [...earlier.messages, ...state.messages],
+    tools,
+    activeMessage: state.activeMessage === null ? null : state.activeMessage + count,
+    firstIndex: (state.firstIndex ?? 0) - count,
+  };
+}
+
 export function interruptUnfinishedTools(state: ChatProjection): ChatProjection {
   if (state.running) return state;
   let changed = false;
@@ -57,106 +220,8 @@ export function interruptUnfinishedTools(state: ChatProjection): ChatProjection 
       ...tool,
       phase: "error" as const,
       interrupted: true,
-      result: { content: [{ type: "text", text: "Interrupted: the runtime has no result for this tool call." }] },
+      result: { content: [{ type: "text", text: "Interrupted" }] },
     }];
   }));
   return changed ? { ...state, tools } : state;
-}
-function compatibility(state: ChatProjection, type: string): ChatProjection {
-  return { ...state, compatibility: [...new Set([...state.compatibility, type])].slice(-32) };
-}
-const passiveEvents = new Set(["turn_start", "turn_end", "agent_end", "queue_update", "entry_appended", "session_info_changed", "thinking_level_changed", "compaction_start", "compaction_end", "auto_retry_start", "auto_retry_end", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished"]);
-export function projectEvent(state: ChatProjection, event: WireObject): ChatProjection {
-  const next = projectEventInner(state, event);
-  return next.running ? next : interruptUnfinishedTools(next);
-}
-function projectEventInner(state: ChatProjection, event: WireObject): ChatProjection {
-  const type = event.type;
-  if (typeof type !== "string") throw new Error("Runtime event has no type");
-  if (type === "agent_start") return { ...state, running: true, turnStartedAt: state.turnStartedAt ?? Date.now() };
-  if (type === "agent_settled") return interruptUnfinishedTools({ ...state, running: false, turnStartedAt: undefined });
-  if (type === "message_start") {
-    const message = parseMessage(event.message);
-    return { ...state, messages: [...state.messages, { ...message, timestamp: message.timestamp ?? Date.now() }], activeMessage: state.messages.length };
-  }
-  if (type === "message_end") {
-    const message = parseMessage(event.message);
-    if (state.activeMessage === null) throw new Error("Runtime ended a message without starting it");
-    const active = state.messages[state.activeMessage];
-    return { ...state, messages: state.messages.map((item, index) => index === state.activeMessage ? { ...message, timestamp: message.timestamp ?? active.timestamp, endedAt: Date.now(), usage: message.usage ?? active.usage } : item), activeMessage: null };
-  }
-  if (type === "message_update") {
-    if (state.activeMessage === null || !object(event.assistantMessageEvent)) throw new Error("Runtime message update has no active message");
-    const update = event.assistantMessageEvent;
-    const index = update.contentIndex;
-    if (typeof update.type !== "string") throw new Error("Invalid runtime content event");
-    if (update.type === "start") return state;
-    if (!Number.isInteger(index) || (index as number) < 0 || (index as number) > 4095) throw new Error("Invalid runtime content index");
-    const message = state.messages[state.activeMessage];
-    const content = [...message.content];    const blockIndex = index as number;
-    const previous = content[blockIndex];
-    switch (update.type) {
-      case "text_start": content[blockIndex] = { type: "text", text: "" }; break;
-      case "thinking_start": content[blockIndex] = { type: "thinking", thinking: "" }; break;
-      case "text_delta":
-      case "thinking_delta": {
-        if (typeof update.delta !== "string") throw new Error("Invalid runtime text delta");
-        const thinking = update.type === "thinking_delta";
-        if (previous?.type !== (thinking ? "thinking" : "text")) throw new Error("Runtime delta has no matching content block");
-        content[blockIndex] = thinking ? { ...previous, thinking: (previous.thinking ?? "") + update.delta } : { ...previous, text: (previous.text ?? "") + update.delta };
-        break;
-      }
-      case "text_end":
-      case "thinking_end": {
-        if (typeof update.content !== "string") throw new Error("Invalid completed runtime text");
-        content[blockIndex] = update.type === "text_end" ? { type: "text", text: update.content } : { type: "thinking", thinking: update.content };
-        break;
-      }
-      case "toolcall_start":
-        if (typeof update.id !== "string" || typeof update.toolName !== "string") throw new Error("Invalid runtime tool call");
-        content[blockIndex] = { type: "toolCall", id: update.id, name: update.toolName }; break;
-      case "toolcall_delta": return state; // Partial JSON arguments are not executable or authoritative.
-      case "toolcall_end":
-        if (!object(update.toolCall) || update.toolCall.type !== "toolCall") throw new Error("Invalid completed runtime tool call");
-        content[blockIndex] = update.toolCall as unknown as ChatBlock; break;
-      default: return compatibility(state, `message_update:${update.type}`);
-    }
-    return { ...state, messages: state.messages.map((item, position) => position === state.activeMessage ? { ...message, content, ...(object(event.usage) ? { usage: event.usage as ChatMessage["usage"] } : {}) } : item) };
-  }
-  if (type === "custom_message" || type === "entry_appended") {
-    const entry = type === "entry_appended" ? (object(event.entry) ? event.entry : undefined) : event;
-    if (entry && typeof entry.customType === "string" && entry.customType.startsWith("jouzu-flow") && entry.display !== false) {
-      const text = (Array.isArray(entry.content) ? entry.content : [])
-        .map(block => object(block) && block.type === "text" && typeof block.text === "string" ? block.text : "")
-        .filter(Boolean)
-        .join("\n");
-      let kind: string | undefined;
-      try { const parsed = JSON.parse(text); kind = object(parsed) && typeof parsed.kind === "string" ? parsed.kind : undefined; } catch { /* keep the raw text */ }
-      if (text && kind) {
-        const report = { kind, text, ...(typeof entry.timestamp === "number" ? { timestamp: entry.timestamp } : {}) };
-        return { ...state, flowReports: [...state.flowReports, report].slice(-30) };
-      }
-    }
-    if (type === "entry_appended") return state;
-  }
-  if (type === "tool_execution_start" || type === "tool_execution_update" || type === "tool_execution_end") {
-    if (typeof event.toolCallId !== "string" || typeof event.toolName !== "string") throw new Error("Invalid runtime tool event");
-    const prior = state.tools[event.toolCallId];
-    if (type !== "tool_execution_start" && !prior) {
-      // A resumed session can receive an update/end whose start was emitted before
-      // the history snapshot. Recover the card instead of failing the whole stream.
-      const recovered: ToolView = {
-        id: event.toolCallId,
-        name: event.toolName,
-        args: event.args,
-        phase: type === "tool_execution_end" ? event.isError === true ? "error" : "complete" : "running",
-        result: type === "tool_execution_end" ? event.result : event.partialResult,
-      };
-      return { ...state, tools: { ...state.tools, [recovered.id]: recovered } };
-    }
-    const tool: ToolView = { id: event.toolCallId, name: event.toolName, args: event.args ?? prior?.args, phase: type === "tool_execution_end" ? event.isError === true ? "error" : "complete" : "running", result: type === "tool_execution_end" ? event.result : type === "tool_execution_update" ? event.partialResult : undefined };
-    return { ...state, tools: { ...state.tools, [tool.id]: tool } };
-  }
-  if (passiveEvents.has(type)) return state;
-  return compatibility(state, type);
 }

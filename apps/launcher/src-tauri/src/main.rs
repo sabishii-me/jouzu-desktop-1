@@ -1,12 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#[cfg(windows)]
-mod chat_process;
-#[cfg(unix)]
-#[path = "chat_process_unix.rs"]
-mod chat_process;
-mod chat_transport;
-mod chat;
 mod artifacts;
 mod attachments;
 mod active_app;
@@ -17,7 +10,7 @@ mod logs;
 mod bug_report;
 mod command_path;
 mod managed_paths;
-mod migration;
+mod host_bootstrap;
 mod recovery;
 mod runtime_install;
 mod runtime_policy;
@@ -26,11 +19,10 @@ mod node_path;
 mod renderer;
 mod update_lock;
 mod jouzu_update;
-mod control;
 mod environment;
 mod runtime;
-mod sessions;
 mod image_tool;
+mod update_channel;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -422,13 +414,12 @@ fn model_catalog() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn runtime_install(
     app: tauri::AppHandle,
-    chat: tauri::State<'_, crate::chat::ChatService>,
 ) -> Result<serde_json::Value, String> {
     let managed = runtime::managed_root()?;
     // An update replaces node_modules underneath every live runtime. Stop the
     // sessions first; otherwise the old process keeps the old files mapped and
     // the user has to quit the whole app before a session can start again.
-    chat.pause();
+    host_bootstrap::stop_sessions()?;
     let handle = app.clone();
     let version = tauri::async_runtime::spawn_blocking(move || {
         let emit = |value: serde_json::Value| { let _ = tauri::Emitter::emit(&handle, "runtime-install-progress", value); };
@@ -506,6 +497,8 @@ fn component_versions(app: tauri::AppHandle) -> Result<serde_json::Value, String
         "jouzu": value.get("version").and_then(|v| v.as_str()),
         "development": cfg!(debug_assertions),
         "launcherUpdaterConfigured": launcher_updater,
+        "build": env!("JOUZU_BUILD_ID"),
+        "commit": env!("JOUZU_COMMIT"),
     }))
 }
 
@@ -570,7 +563,6 @@ fn main() {
         logs::install_panic_hook(managed, env!("CARGO_PKG_VERSION"));
     }
     tauri::Builder::default()
-        .manage(chat::ChatService::default())
         // The launcher is one window for one installation: a second start hands its wish to the window
         // that is open and leaves, so two launchers never work on the same update or the same session.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -583,14 +575,19 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(update_channel::Pending::default())
         .setup(|app| {
-            migration::migrate_legacy_launcher_data()
-                .map_err(std::io::Error::other)?;
             if let Ok(managed) = runtime::managed_root() {
                 logs::append(
                     &managed,
                     "launcher.log",
-                    &format!("launcher start version={}", env!("CARGO_PKG_VERSION")),
+                    &format!(
+                        "launcher start version={} build={} commit={} channel={:?}",
+                        env!("CARGO_PKG_VERSION"),
+                        env!("JOUZU_BUILD_ID"),
+                        env!("JOUZU_COMMIT"),
+                        update_channel::read(&managed)
+                    ),
                 );
             }
             if let Ok(executable) = std::env::current_exe() {
@@ -602,14 +599,48 @@ fn main() {
                 .map_err(std::io::Error::other)?
                 .join("cache/webview");
             std::fs::create_dir_all(&data)?;
+            let host_url = host_bootstrap::start(app.handle()).map_err(|error| {
+                if let Ok(managed) = runtime::managed_root() {
+                    logs::append(
+                        &managed,
+                        "launcher.log",
+                        &format!("host start failed: {error}"),
+                    );
+                }
+                host_bootstrap::show_start_failure(&error);
+                std::io::Error::other(error)
+            })?;
+            let host_url: url::Url = host_url
+                .parse()
+                .map_err(|error| std::io::Error::other(format!("Invalid host URL: {error}")))?;
+            let host_base = {
+                let mut base = host_url.clone();
+                base.set_query(None);
+                base.set_path("");
+                base.to_string()
+            };
+            let host_token = host_url
+                .query_pairs()
+                .find(|(key, _)| key == "token")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default();
             let config = app
                 .config()
                 .app
                 .windows
                 .first()
                 .ok_or("Missing window configuration")?;
+            // The window loads the local build; the host is only the data API. The
+            // endpoint and token are handed to the page before its own scripts run, so
+            // the UI has one data source and needs no remote IPC permission.
+            let endpoint_script = format!(
+                "window.__JOUZU_HOST__ = {{ baseUrl: {}, token: {} }};",
+                serde_json::to_string(&host_base)?,
+                serde_json::to_string(&host_token)?
+            );
             let window = tauri::WebviewWindowBuilder::from_config(app, config)?
                 .data_directory(data)
+                .initialization_script(&endpoint_script)
                 .build()?;
             renderer::watch(&window, runtime::managed_root().ok());
             let close_window = window.clone();
@@ -655,16 +686,6 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            chat::chat_start,
-            chat::chat_send,
-            chat::chat_poll,
-            chat::chat_scratch_dir,
-            chat::chat_poll_many,
-            chat::chat_release_generation,
-            chat::chat_stop,
-            chat::chat_stop_all,
-            chat::chat_claim,
-            chat::chat_stop_session,
             attachments::read_dropped_image,
             attachments::read_local_image,
             attachments::reveal_path,
@@ -672,20 +693,15 @@ fn main() {
             attachments::workspace_list,
             attachments::workspace_snapshot,
             attachments::workspace_read,
-            sessions::chat_sessions,
-            sessions::chat_session_update,
-            sessions::chat_flow_reports,
-            sessions::chat_session_messages,
-            sessions::chat_session_bytes,
-            sessions::chat_session_sanitize_images,
-            sessions::chat_session_branch,
-            sessions::chat_session_timing,
-            sessions::chat_session_recover,
             launcher_state,
             launch_jouzu,
             forget_workspace,
             add_workspaces,
             component_versions,
+            update_channel::update_channel,
+            update_channel::update_channel_set,
+            update_channel::update_check,
+            update_channel::update_install,
             model_catalog,
             runtime_report,
             runtime_install,
@@ -713,9 +729,7 @@ fn main() {
             command_entry_remove,
             command_entry_repair,
             jouzu_update::jouzu_update,
-            control::control_request,
-            control::cancel_control,
-            terminal,
+                            terminal,
             terminal_install,
             git_bash,
             git_bash_install,
@@ -728,8 +742,7 @@ fn main() {
         .expect("Unable to start Jouzu Desktop")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
-                use tauri::Manager;
-                app.state::<chat::ChatService>().shutdown();
+                host_bootstrap::stop(app);
             }
         });
 }
@@ -801,10 +814,6 @@ mod build_check_tests {
         assert_eq!(production_build_check(arguments(&["jouzu-desktop.exe"])), None);
     }
 }
-
-
-
-
 
 
 

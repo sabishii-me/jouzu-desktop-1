@@ -87,7 +87,7 @@ test('a launch falls back to the machine copy, and preparation never does', () =
 
 test('the managed copy answers a launch that has no bundled copy', () => {
   const space = workspace('git-managed-');
-  const managed = gitTree(join(space.local, 'Shisa.ai', 'Jouzu', 'tools', 'git'));
+  const managed = gitTree(join(space.local, 'Shisa.ai', 'JouzuDesktop', 'tools', 'git'));
   const result = run(['-InstallRoot', space.install], machineEnv(space));
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), join(managed, 'bin', 'bash.exe'));
@@ -113,13 +113,13 @@ test('an unsigned tree is not a copy, and is still reported as present', () => {
 test('the report names every location and the version it read', () => {
   const space = workspace('git-report-');
   gitTree(join(space.install, 'runtime', 'git', 'installed'));
-  gitTree(join(space.local, 'Shisa.ai', 'Jouzu', 'tools', 'git'));
+  gitTree(join(space.local, 'Shisa.ai', 'JouzuDesktop', 'tools', 'git'));
   gitTree(space.machine);
   const result = run(['-InstallRoot', space.install, '-Report'], machineEnv(space));
   assert.equal(result.status, 0, result.stderr);
   const report = JSON.parse(result.stdout);
   assert.equal(report.bundled.path, join(space.install, 'runtime', 'git', 'installed', 'bin', 'bash.exe'));
-  assert.equal(report.managed.path, join(space.local, 'Shisa.ai', 'Jouzu', 'tools', 'git', 'bin', 'bash.exe'));
+  assert.equal(report.managed.path, join(space.local, 'Shisa.ai', 'JouzuDesktop', 'tools', 'git', 'bin', 'bash.exe'));
   assert.ok(report.system.path.endsWith(join('bin', 'bash.exe')), report.system.path);
   assert.ok(report.system.path.endsWith(join('bin', 'bash.exe')), report.system.path);
   assert.equal(report.bundled.git, report.bundled.bash);

@@ -1,38 +1,124 @@
 import { useState } from "react";
-import { AlertTriangle, Brain, ChevronDown, LoaderCircle, Square } from "lucide-react";
+import { AlertTriangle, Brain, ChevronDown, Info, LoaderCircle, Square, X } from "lucide-react";
 import { ChatMarkdown } from "./chat-markdown";
+import type { ActiveTurn } from "./chat-types";
+import { Button } from "./components/ui/button";
+import { DetailsPopover } from "./control-result";
+import { fill, replyReason, useChatText, type ChatText } from "./chat-text";
+
+type RecoveryAction = { label: string; run: () => void; disabled?: boolean };
+
+const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}`;
 
 /**
- * One turn status line above the composer. It only carries turn state
- * (reasoning / working / interrupted / failed); tools stay in the activity strip.
+ * The status line's words for a running turn, as the host reports it: which step,
+ * what it is doing, and for how long when the wait is the point.
  */
-export function AgentAction({ thinking, label, running, elapsed, settled }: {
+export function turnLabel(turn: ActiveTurn | null | undefined, now: number, t: ChatText): string {
+  if (!turn) return t.working;
+  if (turn.phase === "starting") return t.startingSession;
+  if (turn.phase === "cancelling") return t.stopping;
+  const step = turn.step;
+  if (!step) return t.working;
+  // The status line already shows the turn's own clock; a second one is only worth showing
+  // once this state started later than the turn did.
+  const ownClock = step.since !== undefined && (turn.startedAt === undefined || step.since - turn.startedAt >= 1000);
+  const waited = ownClock ? ` · ${clock(Math.max(0, now - step.since!))}` : "";
+  switch (step.state) {
+    case "waiting_model": return `${t.waitingModel}${waited}`;
+    case "thinking": return t.thinking;
+    case "writing": return t.writing;
+    case "calling_tool": return t.preparingTool;
+    case "tools": {
+      const names = [...new Set(step.tools.map(tool => tool.name))];
+      return names.length ? `${fill(t.runningTools, { names: names.join(", ") })}${waited}` : t.toolsDone;
+    }
+    case "retrying": {
+      const attempt = step.retry?.attempt !== undefined ? ` ${step.retry.attempt}${step.retry.maxAttempts !== undefined ? `/${step.retry.maxAttempts}` : ""}` : "";
+      return `${t.retryingModel}${attempt}${step.retry?.code ? ` (${replyReason(t, step.retry.code)})` : ""}`;
+    }
+    case "compacting": return `${t.compactingContext}${waited}`;
+    default: return t.working;
+  }
+}
+
+/**
+ * One turn status line at the end of the conversation, above the composer. It
+ * carries the latest turn's state (reasoning / working / interrupted / failed),
+ * the message that got no reply, or else the runtime's latest notice: one line,
+ * one thing at a time, never a list. Tools stay in the activity strip.
+ */
+export function AgentAction({ thinking, label, running, elapsed, settled, noReply, hold, notice }: {
   thinking: string;
   label: string;
   running: boolean;
   elapsed?: string;
-  settled?: "interrupted" | "failed";
+  /** The latest turn was stopped. A failed reply says so on the reply itself, not here. */
+  settled?: "interrupted";
+  /** The last message got no reply: its text, the runtime's reason, and Retry. */
+  noReply?: { text: string; details?: string; onRetry: () => void; action?: RecoveryAction } | null;
+  /** Flow control is holding the last message: its words behind Details, and what lets it go. */
+  hold?: { details: string; paused: boolean; busy?: boolean; onResume: () => void; onRelease: () => void; onOff: () => void } | null;
+  /** The runtime's latest word to the person (a command reply, an extension failure). */
+  notice?: { text: string; level: "info" | "warning" | "error"; extension?: boolean; onDismiss: () => void } | null;
 }) {
+  const t = useChatText();
   const [open, setOpen] = useState(false);
   const text = thinking.trim();
-  if (!running && !text && settled) {
-    const Icon = settled === "failed" ? AlertTriangle : Square;
-    return <div role="status" aria-live="polite" className={`flex min-h-6 items-center gap-2 px-1 py-1 text-[11px] ${settled === "failed" ? "text-destructive" : "text-muted-foreground"}`}>
-      <Icon className="size-3.5 shrink-0" aria-hidden="true" />
-      <span className="font-medium">{settled === "failed" ? "Failed" : "Interrupted"}</span>
+  // Every state of the line is one row of the same height, and an idle line
+  // keeps its row: a failure or notice appearing never moves the conversation.
+  const row = "flex h-8 items-center gap-2 px-1 text-[11px]";
+  const small = "h-6 shrink-0 px-2 text-[10px]";
+  if (!running && !text && noReply) {
+    return <div role="alert" data-no-reply className={`${row} text-destructive`}>
+      <AlertTriangle className="size-3.5 shrink-0" aria-hidden="true" />
+      <span className="shrink-0 font-medium">{t.noReply}</span>
+      <span className="min-w-0 flex-1 truncate text-muted-foreground" title={noReply.text}>{noReply.text}</span>
+      {noReply.details && <DetailsPopover details={noReply.details} />}
+      {noReply.action && <Button type="button" variant="outline" className={small} disabled={noReply.action.disabled} onClick={noReply.action.run}>{noReply.action.label}</Button>}
+      <Button type="button" variant="outline" className={small} onClick={noReply.onRetry}>{t.retry}</Button>
     </div>;
   }
-  if (!running && !text) return null;
-  if (!text) return <div role="status" aria-live="polite" className="flex min-h-6 items-center gap-2 px-1 py-1 text-[11px] text-muted-foreground">
+  if (!running && !text && hold) {
+    return <div role="status" data-flow-hold className={`${row} text-amber-700 dark:text-amber-300`}>
+      <AlertTriangle className="size-3.5 shrink-0" aria-hidden="true" />
+      <span className="min-w-0 flex-1 truncate" title={t.flowHolding}>{t.flowHolding}</span>
+      {hold.details && <DetailsPopover details={hold.details} />}
+      {hold.paused && <Button type="button" variant="outline" className={small} disabled={hold.busy} onClick={hold.onResume}>{t.resume}</Button>}
+      <Button type="button" variant="outline" className={small} disabled={hold.busy} onClick={hold.onRelease}>{t.release}</Button>
+      <Button type="button" variant="ghost" className={small} disabled={hold.busy} onClick={hold.onOff}>{t.turnOffFlow}</Button>
+    </div>;
+  }
+  if (!running && !text && settled) {
+    return <div role="status" aria-live="polite" className={`${row} text-muted-foreground`}>
+      <Square className="size-3.5 shrink-0" aria-hidden="true" />
+      <span className="min-w-0 flex-1 font-medium">{t.interrupted}</span>
+    </div>;
+  }
+  if (!running && !text && notice) {
+    const tone = notice.level === "error" ? "text-destructive" : notice.level === "warning" ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground";
+    const Icon = notice.level === "info" ? Info : AlertTriangle;
+    // An extension's failure is said in the interface language; its own words
+    // are behind Details. A command's reply is the runtime's answer, shown as is.
+    const words = notice.extension ? t.extensionFailed : notice.text;
+    return <div role={notice.level === "info" ? "status" : "alert"} data-runtime-notice className={`${row} ${tone}`}>
+      <Icon className="size-3.5 shrink-0" aria-hidden="true" />
+      <span className="min-w-0 flex-1 truncate" title={words}>{words}</span>
+      {(notice.extension || notice.text.length > 80) && <DetailsPopover details={notice.text} />}
+      <Button type="button" variant="ghost" className="size-6 shrink-0 p-0" aria-label={t.dismiss} onClick={notice.onDismiss}><X className="size-3" /></Button>
+    </div>;
+  }
+  if (!running && !text) return <div aria-hidden="true" data-status-line-idle className="h-8" />;
+  if (!text) return <div role="status" aria-live="polite" className={`${row} text-muted-foreground`}>
     <LoaderCircle className="size-3.5 shrink-0 animate-spin" aria-hidden="true" />
     <span>{label}</span>
     {elapsed && <span className="tabular-nums">{elapsed}</span>}
   </div>;
   const last = text.split(/\r?\n/u).filter(line => line.trim()).at(-1) ?? "";
-  return <div className="px-1 pb-1">
-    <button type="button" className="flex w-full min-w-0 items-center gap-2 rounded-md px-1 py-1 text-left text-[11px] text-muted-foreground hover:bg-muted/40" aria-expanded={open} onClick={() => setOpen(value => !value)}>
+  return <div className="px-1">
+    <button type="button" className="flex h-8 w-full min-w-0 items-center gap-2 rounded-md px-1 text-left text-[11px] text-muted-foreground hover:bg-muted/40" aria-expanded={open} onClick={() => setOpen(value => !value)}>
       <Brain className="size-3.5 shrink-0" aria-hidden="true" />
-      <span className="shrink-0 font-medium text-foreground">Reasoning</span>
+      <span className="shrink-0 font-medium text-foreground">{t.reasoning}</span>
       <span className="min-w-0 flex-1 truncate">{last}</span>
       <ChevronDown className={`size-3.5 shrink-0 transition-transform ${open ? "rotate-180" : ""}`} aria-hidden="true" />
     </button>

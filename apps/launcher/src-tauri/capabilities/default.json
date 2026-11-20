@@ -28,10 +28,12 @@
         },
         {
           "url": "https://github.com/shisa-ai/jouzu-desktop/*"
+        },
+        {
+          "url": "http://127.0.0.1:*/pair*"
         }
       ]
     },
     "updater:default"
   ]
 }
-

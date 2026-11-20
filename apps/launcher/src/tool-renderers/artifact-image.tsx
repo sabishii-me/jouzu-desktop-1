@@ -5,6 +5,8 @@ import { Check, Copy, Download, FolderOpen, Maximize2, Quote } from "lucide-reac
 import { Button } from "../components/ui/button";
 import { ImageViewer, type ViewerAction } from "../components/image-viewer";
 import { MAX_TOOL_IMAGE_BYTES, MessageImage } from "../message-image";
+import { copyText } from "../secure-context";
+import { useChatText } from "../chat-text";
 
 export interface ArtifactImageData {
   mime: string;
@@ -26,6 +28,7 @@ const action = "size-7 shrink-0 p-0";
  * toolbar is the same action list as the inline one.
  */
 export function ArtifactImage({ image, caption, onUse }: { image: ArtifactImageData; caption?: string; onUse?: (path: string) => void }) {
+  const t = useChatText();
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const src = `data:${image.mime};base64,${image.data}`;
@@ -57,25 +60,25 @@ export function ArtifactImage({ image, caption, onUse }: { image: ArtifactImageD
   }
 
   const actions: (ViewerAction & { icon: ReactNode })[] = [
-    { id: "download", label: "Download", icon: <Download className="size-3.5" />, onSelect: () => { void download().catch(() => {}); } },
+    { id: "download", label: t.download, icon: <Download className="size-3.5" />, onSelect: () => { void download().catch(() => {}); } },
   ];
   if (image.path) {
     actions.push({
       id: "copy",
-      label: copied ? "Path copied" : "Copy path",
+      label: copied ? t.pathCopied : t.copyPath,
       icon: copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />,
-      onSelect: () => { void navigator.clipboard.writeText(image.path!).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200); }).catch(() => setCopied(false)); },
+      onSelect: () => { void copyText(image.path!).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200); }).catch(() => setCopied(false)); },
     });
-    actions.push({ id: "reveal", label: "Show in folder", icon: <FolderOpen className="size-3.5" />, onSelect: () => { void invoke("reveal_path", { path: image.path }).catch(() => {}); } });
+    actions.push({ id: "reveal", label: t.showInFolder, icon: <FolderOpen className="size-3.5" />, onSelect: () => { void invoke("reveal_path", { path: image.path }).catch(() => {}); } });
     actions.push({
       id: "use",
-      label: "Use as attachment",
+      label: t.useAsAttachment,
       icon: <Quote className="size-3.5" />,
       onSelect: () => { if (onUse) onUse(image.path!); else window.dispatchEvent(new CustomEvent("jouzu:use-artifact", { detail: image.path })); },
     });
   }
   const inline: ViewerAction[] = [
-    { id: "open", label: "Open large image", icon: <Maximize2 className="size-3.5" />, onSelect: () => setOpen(true) },
+    { id: "open", label: t.openLargeImage, icon: <Maximize2 className="size-3.5" />, onSelect: () => setOpen(true) },
     ...actions,
   ];
 
@@ -87,6 +90,6 @@ export function ArtifactImage({ image, caption, onUse }: { image: ArtifactImageD
         {inline.map(item => <Button key={item.id} variant="ghost" className={action} title={item.label} aria-label={item.label} onClick={item.onSelect}>{item.icon}</Button>)}
       </div>
     </figcaption>
-    {open && <ImageViewer src={src} alt={image.alt} title={image.path?.split(/[\\/]/u).pop() ?? "Image"} actions={actions} onClose={() => setOpen(false)} />}
+    {open && <ImageViewer src={src} alt={image.alt} title={image.path?.split(/[\\/]/u).pop() ?? t.image} actions={actions} onClose={() => setOpen(false)} />}
   </figure>;
 }

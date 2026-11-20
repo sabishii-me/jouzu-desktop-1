@@ -5,6 +5,17 @@ screen, a console entry point, the Jouzu application payload, and the runtime th
 `apps/launcher/` holds the application; everything in this directory builds, verifies, signs and
 publishes it.
 
+## Jouzu Desktop
+
+Jouzu Desktop ships only the app (shell, host and UI); its installer carries no runtime, and
+the jouzu runtime is installed from npm on first run. Of this directory the desktop build uses
+the NSIS installer (`installer.nsi`, `desktop-installer-hooks.nsh`), the desktop update feed and
+release guard (`desktop-feed.mjs`, `release-guard.mjs`, `verify-updater-signature.mjs`,
+`launcher-notes.mjs`), and the helpers the app installs beside the runtime (`bootstrap.mjs`,
+`control.mjs`, the Git, terminal and command-path scripts). Its release flow is described in
+[RELEASE-CHANNELS.md](RELEASE-CHANNELS.md). The rest of this document describes the full
+launcher packages, which bundle the Jouzu payload and runtime.
+
 ## Packages
 
 | Artifact | Contents | Purpose |
@@ -117,7 +128,8 @@ interface shows text that belongs to the published bytes and a recipe without no
 recipe is downloaded from `JOUZU_RECIPE_BASE_URL`, authenticated, staged into
 `<managed root>/updates/versions/<slot>` using the installed Node and pnpm, health-checked, and
 activated by writing `active.json`; a failed check restores the previous selection. Superseded slots
-are pruned after activation, and user data stays in `<managed root>/data`.
+are pruned after activation. User data is not touched by an update: it stays in the Jouzu home
+(`JOUZU_HOME`, else `<managed root>\data`), which never moves and is never copied (#112).
 
 The recipe workflow prepares the runtime once per npm version and uploads it for reuse, and a launcher
 build restores that qualified runtime instead of preparing the npm package a second time.

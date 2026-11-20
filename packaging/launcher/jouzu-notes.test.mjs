@@ -29,3 +29,11 @@ test('missing notes become an explicit marker instead of an empty description', 
 	const noCommit = await fetchReleaseNotes({ metadata: { repository: 'https://github.com/shisa-ai/jouzu' }, version: '0.1.18', fetchImpl: async () => ({ ok: true, text: async () => changelog }) });
 	assert.match(noCommit.notesSource, /^unavailable/);
 });
+
+test('a release candidate has its own notes, apart from the stable version (#109)', () => {
+	const text = `# Changelog\n\n## 1.1.3 - 2026-11-20\n\n- Stable notes.\n\n## 1.1.3-rc.1 - 2026-11-15\n\n- Candidate notes.\n\n## 1.1.2 - 2026-11-15\n\n- Older notes.\n`;
+	assert.equal(releaseNotesSection(text, '1.1.3-rc.1'), '- Candidate notes.');
+	assert.equal(releaseNotesSection(text, '1.1.3'), '- Stable notes.');
+	assert.equal(releaseNotesSection(text.replace(/## 1\.1\.3 - .*\n\n- Stable notes\.\n\n/, ''), '1.1.3'), null);
+	assert.throws(() => releaseNotesSection(text, '1.1.3-beta.1'), /Invalid release version/);
+});

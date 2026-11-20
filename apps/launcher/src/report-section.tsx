@@ -5,6 +5,8 @@ import { Button } from './components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from './components/ui/card';
 import { messages, type Locale } from './i18n';
 import { openReport } from './report';
+import { ErrorLine } from "./session-alerts-view";
+import { chatTexts } from "./chat-text";
 
 /** Reporting opens the project's own issue page, which is where a report is written and sent. */
 export function ReportSection({ locale }: { locale: Locale }) {
@@ -42,7 +44,7 @@ export function ReportSection({ locale }: { locale: Locale }) {
         </Button>
         <Button onClick={() => void openLogs()}>{t.logsOpen}</Button>
       </div>
-      {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+      {error && <ErrorLine raw={error} failed={chatTexts[locale].reportFailed} onDismiss={() => setError(null)} />}
     </CardContent>
   </Card>;
 }

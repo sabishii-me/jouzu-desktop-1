@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import { copyText } from "./secure-context";
+import { InputError } from "./input-error";
 
 /**
  * File actions for paths that appear in the transcript (0057). Revealing is a
@@ -22,8 +24,8 @@ export function revealMessage(reason: string | undefined): string {
 
 function failureReason(error: unknown): RevealFailure {
   const text = typeof error === "string" ? error : error instanceof Error ? error.message : "";
-  const normalized = text.toLowerCase().replace(/[\s_]+/gu, "-");
-  return (Object.keys(MESSAGES) as RevealFailure[]).find(key => normalized.includes(key)) ?? "reveal-failed";
+  // The native command answers with the failure's code itself (attachments.rs reveal_target).
+  return text in MESSAGES ? text as RevealFailure : "reveal-failed";
 }
 
 /** One in-flight reveal per path, so a double click cannot spawn two shells. */
@@ -35,7 +37,8 @@ export async function revealPath(path: string, workspace?: string): Promise<void
   try {
     await invoke("reveal_path", workspace ? { path, workspace } : { path });
   } catch (error) {
-    throw new Error(revealMessage(failureReason(error)));
+    const reason = failureReason(error);
+    throw new InputError(`reveal-${reason.replace(/^reveal-/u, "")}`, revealMessage(reason));
   } finally {
     pending.delete(path);
   }
@@ -43,7 +46,7 @@ export async function revealPath(path: string, workspace?: string): Promise<void
 
 export async function copyPath(path: string): Promise<boolean> {
   try {
-    await navigator.clipboard.writeText(path);
+    await copyText(path);
     return true;
   } catch {
     return false;

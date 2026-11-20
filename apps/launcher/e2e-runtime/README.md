@@ -38,4 +38,83 @@ call, steering while running, Stop/abort, New chat and continuation. Results are
 `ui-flow-result.json`.
 
 The native Resume file picker is not automatable through CDP; `switch_session` is covered by
-the RPC matrix and the picker has a manual acceptance checklist in the handoff.
+the RPC matrix and the picker is checked by hand during release acceptance.
+
+## Language settings
+
+```powershell
+$env:JOUZU_E2E_RUNTIME = '<extracted official setup>'
+node e2e-runtime/language-settings.mjs
+```
+
+Uses a throwaway `JOUZU_HOME`. Saves reply and artifact language through the desktop control
+adapter and checks that a new runtime's system prompt carries those instructions; then saves a
+change the way Jouzu's own Settings does and checks the desktop reads it and the next runtime
+uses it. Results are written to `language-settings-result.json`.
+
+## Entry session after a startup restart
+
+```powershell
+$env:JOUZU_E2E_HOST_HOME = '<home of a host started on a throwaway data folder>'
+$env:JOUZU_E2E_HOST_TOKEN = '<token from the first line that host printed>'
+node e2e-runtime/entry-restart.mjs
+```
+
+Needs a model-ready throwaway home (fixture provider) and the fixture server. Sends one
+message so the workspace has an entry session, then reopens the page while the first
+session lease is held for 4 s (#73; a catalog revision activated at startup no longer
+restarts the chat, so that half of the original order is gone). Passes when the loader is gone and the
+entry session was opened. Results are written to `entry-restart-result.json`.
+
+## Turn files stay with their session
+
+```powershell
+$env:JOUZU_E2E_HOST_HOME = '<home of a host started on a throwaway data folder>'
+$env:JOUZU_E2E_HOST_TOKEN = '<token from the first line that host printed>'
+$env:JOUZU_E2E_WS_A = '<workspace A>'; $env:JOUZU_E2E_WS_B = '<workspace B>'
+node e2e-runtime/turn-files-session.mjs
+```
+
+Needs the fixture provider and server, and both folders added as workspaces. Runs a turn in B,
+then a turn in A during which a file in A is written, then opens B's session: A's summary must
+list the file and B's must not (#79). Results are written to `turn-files-session-result.json`.
+
+## Model list follows settings
+
+```powershell
+$env:JOUZU_E2E_HOST_HOME = '<home of a host started on a throwaway data folder>'
+$env:JOUZU_E2E_HOST_TOKEN = '<token from the first line that host printed>'
+node e2e-runtime/model-list-fresh.mjs
+```
+
+Needs a model-ready throwaway home. Lists the models, adds a provider and its key through the
+control API, lists again (the provider must be there), removes the key and lists again (it must
+be gone), with no restart (#84). Results are written to `model-list-fresh-result.json`.
+
+## First new session after start has a model
+
+```powershell
+$env:JOUZU_E2E_HOST_HOME = '<home of a host JUST started on a throwaway data folder>'
+$env:JOUZU_E2E_HOST_TOKEN = '<token from the first line that host printed>'
+$env:JOUZU_E2E_WORKSPACE = '<workspace folder>'
+node e2e-runtime/first-session-model.mjs
+```
+
+Needs a model-ready throwaway home. Creates a new session, the order of the first app start: its
+model must go from "resolving" to "ready" with the model its runtime reports, without anything
+sent (#99). Results are written to `first-session-model-result.json`.
+## A refused image does not trap the session
+
+```powershell
+$env:JOUZU_E2E_HOST_HOME = '<home of a host started on a throwaway data folder>'
+$env:JOUZU_E2E_HOST_TOKEN = '<token from the first line that host printed>'
+$env:JOUZU_E2E_WORKSPACE = '<workspace folder, added as a workspace>'
+node e2e-runtime/rejected-image.mjs
+```
+
+Needs the fixture provider (model input `["text","image"]`) and the fixture server, which
+refuses any request carrying a PNG with a side of 10 px or less, with the provider text from
+#17. The model reads a 256×1 PNG with the read tool; the refusal must be shown above the
+composer with "Remove images" and "New session", a second message must fail the same way
+without hanging, and after "Remove images" the next message must get a reply. Results are
+written to `rejected-image-result.json`.

@@ -1,0 +1,529 @@
+// Fake pi RPC runtime for host tests. It speaks the real wire shapes:
+// {id,type:"response",...}, extension_ui_request, and agent/message events.
+import { spawn } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+import readline from "node:readline";
+
+// Like the runtime: it opens a blank session of its own at start, in its home,
+// for the folder it runs in, and reports it (get_state) until switched away.
+let sessionFile = null;
+if (process.env.JOUZU_HOME) {
+  try {
+    const directory = join(process.env.JOUZU_HOME, "state", "sessions");
+    mkdirSync(directory, { recursive: true });
+    const id = randomUUID();
+    sessionFile = join(directory, `${new Date().toISOString().replace(/[:.]/gu, "-")}_${id}.jsonl`);
+    writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd: process.cwd() })}\n`);
+  } catch { sessionFile = null; }
+}
+
+const delay = Number(process.env.FAKE_RUNTIME_DELAY_MS ?? 15);
+const startDelay = Number(process.env.FAKE_RUNTIME_START_DELAY_MS ?? 0);
+const exitOnStart = Number(process.env.FAKE_RUNTIME_EXIT_ON_START_MS ?? 0);
+const crashOnPrompt = process.env.FAKE_RUNTIME_CRASH_ON_PROMPT === "1";
+const tool = process.env.FAKE_RUNTIME_TOOL === "1";
+// Real runtimes answer "handled" when Flow keeps the input and no run starts.
+const handledPrompts = process.env.FAKE_RUNTIME_HANDLED === "1";
+// Like Flow after a crash: a reopened session announces its recovery hold, and
+// `/flow clear` replies with what it released before the command is answered.
+const flowNotices = process.env.FAKE_RUNTIME_FLOW_NOTICES === "1";
+const notify = (message, notifyType = "info") => out({ type: "extension_ui_request", id: `flow-${Math.random()}`, method: "notify", message, notifyType });
+if (flowNotices) setImmediate(() => notify("Flow control is holding automated work: a withheld request needs a decision. Run /flow for the control that releases it."));
+const garbage = process.env.FAKE_RUNTIME_GARBAGE === "1";
+const uiMethod = process.env.FAKE_RUNTIME_UI ?? "";
+const uiTimeout = Number(process.env.FAKE_RUNTIME_UI_TIMEOUT_MS ?? 0);
+// A run of several steps, each a model call (reasoning, words, a tool call) and
+// its tool, as the real runtime reports it. Optional: one provider retry before
+// step 2, and a last tool that never finishes (only an abort ends the run).
+const steps = Number(process.env.FAKE_RUNTIME_STEPS ?? 0);
+const stepRetry = process.env.FAKE_RUNTIME_STEP_RETRY === "1";
+const hangTool = process.env.FAKE_RUNTIME_HANG_TOOL === "1";
+// Like Flow refusing a session file it cannot own: every switch_session fails.
+// The same, decided when the switch arrives: while this file exists, its text is the refusal.
+const switchErrorFile = process.env.FAKE_RUNTIME_SWITCH_ERROR_FILE ?? "";
+const switchRefusal = () => {
+  if (process.env.FAKE_RUNTIME_SWITCH_ERROR) return process.env.FAKE_RUNTIME_SWITCH_ERROR;
+  try { return switchErrorFile ? readFileSync(switchErrorFile, "utf8").trim() : ""; } catch { return ""; }
+};
+// One line per runtime started, to count restarts.
+if (process.env.FAKE_RUNTIME_START_LOG) appendFileSync(process.env.FAKE_RUNTIME_START_LOG, `${process.pid}\n`);
+const out = value => process.stdout.write(`${JSON.stringify(value)}\n`);
+const response = (id, command, data) =>
+  out({ id, type: "response", command, success: true, data });
+const failure = (id, command, error) =>
+  out({ id, type: "response", command, success: false, error });
+
+let busy = false;
+let interrupted = false;
+let timer = null;
+let current = null;
+let pendingUi = null;
+const messages = [];
+// Messages the user sent while a run was going (the runtime's steering queue).
+// The real runtime delivers them one per step, before the next model call, and
+// keeps going until the queue is empty; abort leaves them queued.
+let steering = [];
+// Steers an extension took and holds (Flow): released into the queue after the run settles.
+let held = [];
+const queueUpdate = () => out({ type: "queue_update", steering: steering.map(item => item.text), followUp: [] });
+const promptLog = text => { if (process.env.FAKE_RUNTIME_PROMPT_LOG) appendFileSync(process.env.FAKE_RUNTIME_PROMPT_LOG, `${text}\n`); };
+function userMessage(text, images) {
+  const content = [{ type: "text", text }, ...(images ?? [])];
+  out({ type: "message_start", message: { role: "user", content } });
+  out({ type: "message_end", message: { role: "user", content } });
+  messages.push({ role: "user", content });
+}
+// Deliver the next steered message, as the runtime does at a step boundary.
+function deliverSteer() {
+  const next = steering.shift();
+  if (!next) return null;
+  queueUpdate();
+  userMessage(next.text, next.images);
+  return next;
+}
+
+if (startDelay > 0) {
+  await new Promise(resolve => setTimeout(resolve, startDelay));
+}
+
+if (garbage) {
+  process.stdout.write("this is not json\n");
+}
+
+if (exitOnStart > 0) {
+  setTimeout(() => process.exit(7), exitOnStart);
+}
+
+if (process.env.FAKE_RUNTIME_CHILD_PID_FILE) {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
+  });
+  writeFileSync(process.env.FAKE_RUNTIME_CHILD_PID_FILE, String(child.pid));
+}
+
+function settled(aborted) {
+  busy = false;
+  clearTimeout(timer);
+  current = null;
+  pendingUi = null;
+  out({ type: "agent_settled", aborted });
+  if (held.length) { steering.push(...held); held = []; queueUpdate(); }
+}
+
+function tick() {
+  if (!busy || !current) return;
+  if (interrupted) {
+    settled(true);
+    return;
+  }
+  const { parts, index } = current;
+  if (index < parts.length) {
+    out({
+      type: "message_update",
+      usage: {},
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: parts[index],
+      },
+    });
+    current.index += 1;
+    timer = setTimeout(tick, delay);
+    return;
+  }
+  // The provider refuses the request with this text while the file holds it.
+  const refusal = process.env.FAKE_RUNTIME_REPLY_ERROR_FILE && existsSync(process.env.FAKE_RUNTIME_REPLY_ERROR_FILE)
+    ? readFileSync(process.env.FAKE_RUNTIME_REPLY_ERROR_FILE, "utf8").trim()
+    : "";
+  if (refusal) {
+    out({ type: "message_end", message: { role: "assistant", content: [], model: "fixture-model", provider: "fixture", stopReason: "error", errorMessage: refusal } });
+    settled(false);
+    return;
+  }
+  out({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: parts.join("") }], model: "fixture-model", provider: "fixture" },
+  });
+  messages.push({
+    role: "assistant",
+    content: [{ type: "text", text: parts.join("") }],
+    model: "fixture-model",
+    provider: "fixture",
+  });
+  if (steering.length > 0) {
+    out({ type: "turn_end" });
+    out({ type: "turn_start" });
+    const next = deliverSteer();
+    out({ type: "message_start", message: { role: "assistant", content: [] } });
+    current = { parts: Array.from(next.text), index: 0 };
+    timer = setTimeout(tick, delay);
+    return;
+  }
+  settled(false);
+}
+
+function runSteps(text, images) {
+  const script = [{ type: "agent_start" }, { type: "echo", text, images }];
+  for (let n = 1; n <= steps; n += 1) {
+    const last = n === steps;
+    if (stepRetry && n === 2) {
+      script.push({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 10, errorMessage: "overloaded" });
+      script.push({ type: "auto_retry_end", success: true, attempt: 1 });
+    }
+    script.push({ type: "turn_start" });
+    if (n > 1) script.push({ type: "steer-point" });
+    script.push({ type: "message_start", message: { role: "assistant", content: [] } });
+    script.push({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: `think ${n}` } });
+    script.push({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: `say ${n}` } });
+    const content = [{ type: "thinking", thinking: `think ${n}` }, { type: "text", text: `say ${n}` }];
+    if (!last) {
+      script.push({ type: "message_update", assistantMessageEvent: { type: "toolcall_start", contentIndex: 2 } });
+      content.push({ type: "toolCall", id: `call-${n}`, name: "bash", arguments: { command: `echo ${n}` } });
+    }
+    const reply = { role: "assistant", content, model: "fixture-model", provider: "fixture", usage: { input: 10 * n, output: n }, stopReason: last ? "stop" : "toolUse" };
+    script.push({ type: "message_end", message: reply, record: reply });
+    if (!last) {
+      script.push({ type: "tool_execution_start", toolCallId: `call-${n}`, toolName: "bash", args: { command: `echo ${n}` } });
+      if (hangTool && n === steps - 1) { script.push({ type: "hang" }); break; }
+      const result = { content: [{ type: "text", text: `out ${n}` }] };
+      script.push({ type: "tool_execution_end", toolCallId: `call-${n}`, toolName: "bash", isError: false, result, record: { role: "toolResult", toolCallId: `call-${n}`, toolName: "bash", content: result.content, isError: false } });
+    }
+    script.push({ type: "turn_end" });
+  }
+  script.push({ type: "last-steer-point" });
+  script.push({ type: "agent_end" });
+  const next = () => {
+    if (!busy) return;
+    if (interrupted) { settled(true); return; }
+    const event = script.shift();
+    if (!event) { settled(false); return; }
+    if (event.type === "hang") return;
+    if (event.type === "echo") {
+      // The prompt, then anything steered before the run began.
+      userMessage(event.text, event.images);
+      deliverSteer();
+      timer = setTimeout(next, delay);
+      return;
+    }
+    if (event.type === "steer-point") { deliverSteer(); timer = setTimeout(next, delay); return; }
+    if (event.type === "last-steer-point") {
+      // The run would end, but steered messages remain: one more step answers them.
+      if (steering.length > 0) {
+        const answer = { role: "assistant", content: [{ type: "text", text: "ack" }], model: "fixture-model", provider: "fixture", usage: { input: 1, output: 1 }, stopReason: "stop" };
+        script.unshift(
+          { type: "turn_start" },
+          { type: "steer-point" },
+          { type: "message_start", message: { role: "assistant", content: [] } },
+          { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "ack" } },
+          { type: "message_end", message: answer, record: answer },
+          { type: "turn_end" },
+          { type: "last-steer-point" },
+        );
+      }
+      timer = setTimeout(next, delay);
+      return;
+    }
+    const { record, ...wire } = event;
+    if (record) messages.push(record);
+    out(wire);
+    timer = setTimeout(next, delay);
+  };
+  next();
+}
+
+function beginTurn(text) {
+  current = { parts: Array.from(String(text)), index: 0 };
+  tick();
+}
+
+function requestUi(text) {
+  const id = "ui-1";
+  pendingUi = { text };
+  const request = { type: "extension_ui_request", id };
+  if (uiMethod === "confirm") {
+    request.method = "confirm";
+    request.title = "Allow test?";
+    request.message = "Run the test tool?";
+  } else if (uiMethod === "select") {
+    request.method = "select";
+    request.title = "Pick one";
+    request.options = ["A", "B"];
+  } else if (uiMethod === "input") {
+    request.method = "input";
+    request.title = "Name";
+    request.placeholder = "type here";
+  } else if (uiMethod === "editor") {
+    request.method = "editor";
+    request.title = "Edit";
+    request.prefill = "seed";
+  }
+  if (uiTimeout > 0) request.timeout = uiTimeout;
+  out(request);
+}
+
+let inputPhase = false;
+function prompt(id, text, images) {
+  // "/refuse <text>": a slash command the runtime refuses with <text>.
+  if (String(text).startsWith("/refuse ")) { promptLog(text); failure(id, "prompt", String(text).slice(8)); return; }
+  if (handledPrompts || String(text).startsWith("/flow ")) {
+    promptLog(text);
+    if (flowNotices && String(text).trim() === "/flow clear") notify("Flow clear released 1 request hold. Receipt evidence was preserved. Continue with a new message.");
+    response(id, "prompt", { disposition: "handled" });
+    return;
+  }
+  promptLog(text);
+  // "REFUSE <text>": an input handler refuses the prompt with <text> (like Flow
+  // when its request history is full); no run starts.
+  if (String(text).startsWith("REFUSE ")) { failure(id, "prompt", String(text).slice(7)); return; }
+  // "EXTERR <text>" first reports an extension failure, like a real extension would.
+  if (String(text).startsWith("EXTERR ")) out({ type: "extension_error", extensionPath: "fake", event: "turn_start", error: String(text).slice(7) });
+  // Like the runtime: prompt() awaits the extensions' input handlers before the
+  // agent run exists, and an abort that lands in that window finds no run. It
+  // answers only after them: refused if a run started meanwhile, else "started"
+  // just before that run's agent_start.
+  const proceed = () => {
+    inputPhase = false;
+    if (busy) {
+      failure(id, "prompt", "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
+      return;
+    }
+    busy = true;
+    interrupted = false;
+    response(id, "prompt", { disposition: "started" });
+    // "NOSTART <text>": the run ends before the agent starts (a model call
+    // that throws first); the runtime still settles it.
+    if (String(text).startsWith("NOSTART ")) { settled(false); return; }
+    run(String(text), images);
+  };
+  const inputDelay = Number(process.env.FAKE_RUNTIME_INPUT_DELAY_MS ?? 0);
+  if (inputDelay > 0) {
+    inputPhase = true;
+    selfRunWhen("prompt");
+    setTimeout(proceed, inputDelay);
+    return;
+  }
+  proceed();
+}
+
+// Like Flow: the runtime starts a run of its own, with no prompt from the host.
+// FAKE_RUNTIME_SELF_RUN names when (once): "ready" (after the session opened),
+// "stop" (right after an aborted run settles), "prompt" (while a prompt is in
+// its input handlers). Its reply is FAKE_RUNTIME_SELF_RUN_TEXT.
+const selfRunAt = process.env.FAKE_RUNTIME_SELF_RUN ?? "";
+let selfRunDone = false;
+function selfRunWhen(moment) {
+  if (selfRunAt !== moment || selfRunDone) return;
+  selfRunDone = true;
+  const start = () => {
+    if (busy) return;
+    busy = true;
+    interrupted = false;
+    out({ type: "agent_start" });
+    out({ type: "turn_start" });
+    out({ type: "message_start", message: { role: "assistant", content: [] } });
+    beginTurn(process.env.FAKE_RUNTIME_SELF_RUN_TEXT ?? "flow continues its task list");
+  };
+  if (moment === "prompt") start();
+  else setTimeout(start, 20);
+}
+
+function run(text, images) {
+  if (crashOnPrompt) {
+    setTimeout(() => process.exit(8), 10);
+  }
+  if (steps > 0) {
+    runSteps(String(text), images);
+    return;
+  }
+  if (tool) {
+    out({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "thinking" } });
+    out({ type: "tool_execution_start", toolCallId: "call-1", toolName: "bash", args: { command: "echo hi" } });
+    out({ type: "tool_execution_end", toolCallId: "call-1", isError: false, result: { output: "hi" } });
+  }
+  out({ type: "agent_start" });
+  out({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+  userMessage(String(text), images);
+  out({ type: "message_start", message: { role: "assistant", content: [] } });
+  out({ type: "message_update", usage: {}, assistantMessageEvent: { type: "text_start", contentIndex: 0 } });
+  if (uiMethod === "noise") {
+    out({ type: "extension_ui_request", id: "noise-1", method: "setWidget", widgetKey: "x" });
+    out({ type: "extension_ui_request", id: "noise-2", method: "setStatus", statusKey: "x" });
+    beginTurn(text);
+    return;
+  }
+  if (uiMethod === "notices") {
+    out({ type: "extension_ui_request", id: "n-1", method: "notify", message: "Flow control is holding your message: test.", notifyType: "warning" });
+    out({ type: "extension_ui_request", id: "n-2", method: "setStatus", statusKey: "flow", statusText: "held 1" });
+    out({ type: "extension_ui_request", id: "n-3", method: "setWidget", widgetKey: "flow", widgetLines: ["line a", "line b"] });
+    beginTurn(text);
+    return;
+  }
+  if (uiMethod) {
+    requestUi(text);
+    return;
+  }
+  beginTurn(text);
+}
+
+// Like the runtime: the models it registered, the one it uses (none when
+// FAKE_RUNTIME_NO_MODEL is set: nothing is configured) and the level.
+const defaultModels = [
+  { name: "fixture-model", provider: "fixture", id: "model" },
+  { name: "Fixture Other", provider: "fixture", id: "other" },
+];
+// FAKE_RUNTIME_MODELS_FILE: the configured models, read at start and again when
+// a session is opened (like the runtime, which builds its model runtime anew).
+const readModels = () => {
+  const file = process.env.FAKE_RUNTIME_MODELS_FILE;
+  if (!file || !existsSync(file)) return defaultModels;
+  try { return JSON.parse(readFileSync(file, "utf8")); } catch { return defaultModels; }
+};
+let fixtureModels = readModels();
+let currentModel = process.env.FAKE_RUNTIME_NO_MODEL ? null : fixtureModels[0];
+let currentLevel = "off";
+
+const lines = readline.createInterface({ input: process.stdin });
+if (process.env.FAKE_RUNTIME_IGNORE_STDIN === "1") {
+  lines.pause();
+  process.stdin.pause();
+}
+lines.on("line", line => {
+  let value;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (value.type === "extension_ui_response") {
+    if (!pendingUi) return;
+    const pending = pendingUi;
+    pendingUi = null;
+    let label = "cancelled";
+    if (value.cancelled) label = "cancelled";
+    else if ("confirmed" in value) label = value.confirmed ? "approved" : "denied";
+    else if ("value" in value) label = String(value.value ?? "");
+    beginTurn(label);
+    return;
+  }
+  switch (value.type) {
+    case "get_messages":
+      response(value.id, "get_messages", { messages });
+      break;
+    case "get_state":
+      response(value.id, "get_state", { sessionId: "fixture", isStreaming: busy, model: currentModel, thinkingLevel: currentLevel, sessionFile });
+      selfRunWhen("ready");
+      break;
+    case "get_available_models":
+      response(value.id, "get_available_models", { models: process.env.FAKE_RUNTIME_NO_MODEL ? [] : fixtureModels });
+      break;
+    case "get_available_thinking_levels":
+      response(value.id, "get_available_thinking_levels", { levels: ["off", "low", "high"] });
+      break;
+    case "set_model":
+      if (typeof value.modelId !== "string") {
+        failure(value.id, "set_model", "set_model requires modelId");
+        break;
+      }
+      if (value.modelId === "missing") {
+        failure(value.id, "set_model", "Model not found: missing");
+        break;
+      }
+      currentModel = fixtureModels.find(model => model.provider === value.provider && model.id === value.modelId)
+        ?? { name: value.modelId, provider: String(value.provider ?? "fixture"), id: value.modelId };
+      // The runtime answers with the model itself.
+      response(value.id, "set_model", currentModel);
+      break;
+    case "set_thinking_level":
+      if (String(value.level) !== currentLevel) {
+        currentLevel = String(value.level ?? "off");
+        out({ type: "thinking_level_changed", level: currentLevel });
+      }
+      response(value.id, "set_thinking_level");
+      break;
+    case "switch_session":
+      // FAKE_RUNTIME_EXIT_ON_SWITCH_ONCE names a marker file: the first runtime to
+      // be switched to a session dies there (like a profile lock failure, #94).
+      if (process.env.FAKE_RUNTIME_EXIT_ON_SWITCH_ONCE && !existsSync(process.env.FAKE_RUNTIME_EXIT_ON_SWITCH_ONCE)) {
+        writeFileSync(process.env.FAKE_RUNTIME_EXIT_ON_SWITCH_ONCE, "exited");
+        process.exit(1);
+      }
+      const refusal = switchRefusal();
+      if (refusal) {
+        failure(value.id, "switch_session", refusal);
+        break;
+      }
+      if (process.env.FAKE_RUNTIME_MODELS_FILE) {
+        // Opening a session reads the configuration again; a file with no model
+        // recorded starts on the runtime's first model.
+        fixtureModels = readModels();
+        currentModel = fixtureModels[0] ?? null;
+      }
+      // Like the runtime: a saved conversation resumes on the model it last used.
+      try {
+        const changes = readFileSync(String(value.sessionPath), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.type === "model_change");
+        const last = changes.at(-1);
+        if (last) currentModel = { name: last.modelId, provider: last.provider, id: last.modelId };
+      } catch {}
+      sessionFile = String(value.sessionPath);
+      response(value.id, "switch_session", { cancelled: false });
+      break;
+    case "prompt":
+      // FAKE_RUNTIME_PROMPT_MODEL_LOG: which model each prompt arrived under.
+      if (process.env.FAKE_RUNTIME_PROMPT_MODEL_LOG) appendFileSync(process.env.FAKE_RUNTIME_PROMPT_MODEL_LOG, `${currentModel?.id ?? "none"}\n`);
+      // Refused (if a run is going) only once its input handlers are done.
+      prompt(value.id, String(value.message ?? ""), value.images);
+      break;
+    case "steer": {
+      const text = String(value.message ?? "");
+      if (process.env.FAKE_RUNTIME_STEER_LOG) appendFileSync(process.env.FAKE_RUNTIME_STEER_LOG, `${text}\n`);
+      if (handledPrompts || text.startsWith("/flow ")) {
+        response(value.id, "steer", { disposition: "handled" });
+        break;
+      }
+      if (text.startsWith("HOLD ")) {
+        held.push({ text, images: value.images });
+        response(value.id, "steer", { disposition: "handled" });
+        break;
+      }
+      if (text.startsWith("/ext ")) {
+        failure(value.id, "steer", `Extension command "${text}" cannot be queued`);
+        break;
+      }
+      // Like the runtime: a steer passes the extensions' input handlers (async)
+      // before it is queued, while later commands are already being handled.
+      const enqueue = () => {
+        steering.push({ text, images: value.images });
+        queueUpdate();
+        response(value.id, "steer", { disposition: "queued" });
+      };
+      const steerDelay = Number(process.env.FAKE_RUNTIME_STEER_DELAY_MS ?? 0);
+      if (steerDelay > 0) setTimeout(enqueue, steerDelay);
+      else enqueue();
+      break;
+    }
+    case "clear_queue": {
+      const cleared = steering.map(item => item.text);
+      steering = [];
+      queueUpdate();
+      response(value.id, "clear_queue", { steering: cleared, followUp: [] });
+      break;
+    }
+    case "abort":
+      // FAKE_RUNTIME_REFUSE_ABORT=1: the runtime refuses Stop and the run goes on.
+      if (process.env.FAKE_RUNTIME_REFUSE_ABORT === "1") { failure(value.id, "abort", "abort refused"); break; }
+      response(value.id, "abort", {});
+      if (busy && !inputPhase) {
+        interrupted = true;
+        if (current) clearTimeout(timer);
+        settled(true);
+        selfRunWhen("stop");
+      }
+      break;
+    default:
+      failure(value.id, String(value.type ?? "unknown"), "unsupported command");
+      break;
+  }
+});
+lines.on("close", () => process.exit(0));

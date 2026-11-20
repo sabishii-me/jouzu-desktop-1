@@ -1,0 +1,200 @@
+name: Desktop stable release
+
+# A stable release is a process (#86), never a QA package re-pointed:
+#   1. confirm the QA release candidate X.Y.Z-rc.N that passed QA;
+#   2. build the stable package X.Y.Z again from that candidate's commit, with the
+#      normal icon (QA packages carry the QA icon, #74);
+#   3. run the full user playbook on that build with a real model, on every platform
+#      the desktop ships (Windows today); every scenario and gate must pass;
+#   4. only then publish v<X.Y.Z> and replace the stable feed (desktop-update), with the
+#      CHANGELOG section for X.Y.Z as its notes (stable users may come from an older stable
+#      release, not from the candidate, so the candidate's notes are not enough);
+#   5. SmartScreen (Authenticode) signing goes into step 2 once the certificate exists.
+# Nothing here writes to the QA feed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: QA release candidate that passed QA (X.Y.Z-rc.N); stable is X.Y.Z
+        required: true
+        type: string
+      qa_result:
+        description: What passed on QA (goes into the release notes)
+        required: true
+        type: string
+      publish:
+        description: Publish v<X.Y.Z> and replace the stable feed after the exam passes
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      commit: ${{ steps.check.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24.22.2'
+      - name: Check the candidate and both feeds
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ inputs.candidate }}
+          QA_RESULT: ${{ inputs.qa_result }}
+        run: |
+          if [ -z "$(printf '%s' "$QA_RESULT" | tr -d '[:space:]')" ]; then
+            echo "::error::Describe what passed on QA"; exit 1
+          fi
+          release=-
+          if gh release view "v$CANDIDATE" --repo "$GITHUB_REPOSITORY" --json isPrerelease,body,targetCommitish > candidate.json 2>/dev/null; then
+            release=candidate.json
+          fi
+          version="$(node --input-type=module -e "import { stableVersionOf } from './packaging/launcher/release-guard.mjs'; console.log(stableVersionOf(process.env.CANDIDATE))")"
+          exists=-
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then exists=tag-exists; fi
+          node packaging/launcher/release-guard.mjs stable "$CANDIDATE" "$GITHUB_REPOSITORY" "$release" "$exists"
+          commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/v$CANDIDATE" --jq .sha)"
+          node packaging/launcher/launcher-notes.mjs CHANGELOG.md "$version" > /dev/null
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Stable $version from v$CANDIDATE ($commit)"
+
+  windows:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 120
+    environment: desktop-release
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24.22.2'
+      - name: Set the stable version
+        run: node packaging/launcher/set-version.mjs '${{ needs.prepare.outputs.version }}'
+      - name: Install frontend dependencies
+        run: npm ci --prefix apps/launcher
+      - name: Build the UI and the release host
+        working-directory: apps/launcher
+        run: |
+          npm run build
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run build:app
+      - name: Build the stable installer
+        working-directory: apps/launcher
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          # The normal icon (tauri.conf.json). SmartScreen signing (bundle.windows.signCommand)
+          # is added here once the certificate is available.
+          $overlay = Join-Path $env:RUNNER_TEMP 'stable-build.json'
+          '{"bundle":{"createUpdaterArtifacts":true}}' | Set-Content -LiteralPath $overlay -Encoding utf8NoBOM
+          npx tauri build --bundles nsis --config $overlay
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $version = '${{ needs.prepare.outputs.version }}'
+          $directory = 'src-tauri/target/release/bundle/nsis'
+          $built = Join-Path $directory "Jouzu Desktop_${version}_x64-setup.exe"
+          if (-not (Test-Path -LiteralPath $built) -or -not (Test-Path -LiteralPath "$built.sig")) { throw 'The installer or its updater signature was not produced' }
+          New-Item -ItemType Directory -Force ../../release | Out-Null
+          Copy-Item -LiteralPath $built -Destination "../../release/JouzuDesktop_${version}_x64-setup.exe"
+          Copy-Item -LiteralPath "$built.sig" -Destination "../../release/JouzuDesktop_${version}_x64-setup.exe.sig"
+      - name: Provision the official runtime for the exam
+        working-directory: apps/launcher/src-tauri
+        run: |
+          $env:JOUZU_EXAM_MANAGED = Join-Path $env:RUNNER_TEMP 'exam-runtime'
+          cargo test --locked --bins provisions_the_exam_runtime -- --ignored
+      - name: Install the browser test runner
+        working-directory: apps/launcher
+        run: npx playwright install chromium
+      - name: Stable exam (full playbook, real model)
+        working-directory: apps/launcher
+        env:
+          PLAYBOOK_SHISA_API_KEY: ${{ secrets.PLAYBOOK_SHISA_API_KEY }}
+          PLAYBOOK_OPENROUTER_API_KEY: ${{ secrets.PLAYBOOK_OPENROUTER_API_KEY }}
+        run: |
+          if (-not $env:PLAYBOOK_SHISA_API_KEY) { throw 'PLAYBOOK_SHISA_API_KEY is not configured for the desktop-release environment' }
+          $env:EXAM_MANAGED = Join-Path $env:RUNNER_TEMP 'exam-runtime'
+          $env:EXAM_HOST = (Resolve-Path 'host/target/package/jouzu-host.exe').Path
+          $env:EXAM_DIST = (Resolve-Path 'dist').Path
+          $env:EXAM_OUT = Join-Path (Resolve-Path ../..) 'release/stable-exam-windows.json'
+          node e2e-runtime/stable-exam.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: jouzu-desktop-stable-windows
+          path: release/
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, windows]
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-22.04
+    environment: desktop-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24.22.2'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: jouzu-desktop-stable-windows
+          path: release
+      - name: Check the exam and the updater signature
+        run: |
+          node -e "const r=require('./release/stable-exam-windows.json'); if (!r.pass) { console.error('The stable exam did not pass'); process.exit(1) }"
+          version='${{ needs.prepare.outputs.version }}'
+          asset="JouzuDesktop_${version}_x64-setup.exe"
+          public_key="$(node -p "require('./apps/launcher/src-tauri/tauri.conf.json').plugins.updater.pubkey")"
+          node packaging/launcher/verify-updater-signature.mjs "release/$asset" "release/$asset.sig" "$public_key"
+          (cd release && sha256sum "$asset" "$asset.sig" > SHA256SUMS.txt)
+      - name: Notes and feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ inputs.candidate }}
+          QA_RESULT: ${{ inputs.qa_result }}
+        run: |
+          version='${{ needs.prepare.outputs.version }}'
+          node packaging/launcher/launcher-notes.mjs CHANGELOG.md "$version" > notes.md
+          printf '\n\nQA (%s): %s\n' "$CANDIDATE" "$QA_RESULT" >> notes.md
+          node packaging/launcher/desktop-feed.mjs "$version" notes.md "$GITHUB_REPOSITORY" "JouzuDesktop_${version}_x64-setup.exe" "release/JouzuDesktop_${version}_x64-setup.exe.sig" latest.json
+          cat latest.json
+      - name: Publish the stable release and replace the stable feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version='${{ needs.prepare.outputs.version }}'
+          gh release create "v$version" --repo "$GITHUB_REPOSITORY" --target '${{ needs.prepare.outputs.commit }}' --latest \
+            --title "Jouzu Desktop $version" --notes-file notes.md
+          gh release upload "v$version" --repo "$GITHUB_REPOSITORY" \
+            "release/JouzuDesktop_${version}_x64-setup.exe" "release/JouzuDesktop_${version}_x64-setup.exe.sig" release/SHA256SUMS.txt
+          if ! gh release view desktop-update --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create desktop-update --repo "$GITHUB_REPOSITORY" --target '${{ needs.prepare.outputs.commit }}' --prerelease \
+              --title "Jouzu Desktop update feed" --notes "Signed desktop update feed. Do not delete."
+          fi
+          gh release upload desktop-update latest.json --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Verify the stable feed is anonymously readable
+        run: node packaging/launcher/verify-feed.mjs "https://github.com/${GITHUB_REPOSITORY}/releases/download/desktop-update/latest.json" latest.json 300

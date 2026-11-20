@@ -201,11 +201,14 @@ fn ensure_node(managed: &Path, progress: Progress) -> Result<PathBuf, String> {
     let node = managed.join("runtime").join("node");
     let executable = node_executable(managed);
     if executable.is_file() {
-        if node_version_ok(managed) {
+        // A Node folder is kept only when it is whole: the right version, and
+        // the npm it ships with (a cleanup can leave node.exe alone; the runtime
+        // could then never be installed again).
+        if node_version_ok(managed) && npm_cli(&executable).is_file() {
             return Ok(executable);
         }
         // A runtime provisioned by an older build keeps its Node; replace it so a
-        // security release is not left behind.
+        // security release is not left behind. An incomplete one is replaced too.
         std::fs::remove_dir_all(&node).map_err(|error| format!("Could not replace the old Node runtime: {error}"))?;
     }
     let name = archive_name();
@@ -253,8 +256,9 @@ fn installer_path(node: &Path, app: &Path) -> Result<std::ffi::OsString, String>
         .map_err(|error| format!("Could not prepare the package installer environment: {error}"))
 }
 
-fn npm_install(node: &Path, app: &Path, progress: Progress) -> Result<(), String> {
-    let npm = if cfg!(windows) {
+/// npm's entry point inside a Node distribution, beside its executable.
+fn npm_cli(node: &Path) -> PathBuf {
+    if cfg!(windows) {
         node.parent()
             .unwrap()
             .join("node_modules")
@@ -271,7 +275,11 @@ fn npm_install(node: &Path, app: &Path, progress: Progress) -> Result<(), String
             .join("npm")
             .join("bin")
             .join("npm-cli.js")
-    };
+    }
+}
+
+fn npm_install(node: &Path, app: &Path, progress: Progress) -> Result<(), String> {
+    let npm = npm_cli(node);
     if !npm.is_file() {
         return Err("The Node package does not carry npm.".into());
     }
@@ -349,7 +357,7 @@ fn installed_version(app: &Path) -> Result<String, String> {
 
 fn check_health(managed: &Path, node: &Path) -> Result<(), String> {
     let bootstrap = managed.join("app").join("bootstrap.mjs");
-    let home = managed.join("data");
+    let home = crate::runtime::effective_home()?;
     std::fs::create_dir_all(&home).map_err(|error| error.to_string())?;
     let mut command = Command::new(node);
     command
@@ -385,7 +393,7 @@ fn check_control(managed: &Path, node: &Path) -> Result<(), String> {
         .arg("--")
         .arg(managed)
         .arg(managed.join("app"))
-        .env("JOUZU_HOME", managed.join("data"))
+        .env("JOUZU_HOME", crate::runtime::effective_home()?)
         .env("JOUZU_NO_UPDATE", "1")
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_PATH")
@@ -471,7 +479,7 @@ pub fn install(managed: &Path, progress: Progress) -> Result<String, String> {
     };
     write_tool_scripts(managed)?;
     install_tools(managed, progress)?;
-    crate::image_tool::ensure(managed)?;
+    crate::image_tool::ensure(&crate::runtime::effective_home()?)?;
     Ok(version)
 }
 
@@ -555,6 +563,22 @@ mod tests {
         assert!(managed.path().join("app/bootstrap.mjs").is_file());
         assert!(managed.path().join("app/node_modules/jouzu/package.json").is_file());
         assert!(!version.is_empty(), "the installed package version is reported");
+    }
+
+    /// The stable release exam (#86) needs the official runtime in a folder of its
+    /// own: `JOUZU_EXAM_MANAGED` names it. Run with `--ignored` by the workflow only.
+    #[test]
+    #[ignore]
+    fn provisions_the_exam_runtime() {
+        let Some(managed) = std::env::var_os("JOUZU_EXAM_MANAGED") else {
+            eprintln!("skipped: JOUZU_EXAM_MANAGED is not set");
+            return;
+        };
+        let managed = std::path::PathBuf::from(managed);
+        std::fs::create_dir_all(&managed).unwrap();
+        install_runtime(&managed, &|_| {}).unwrap();
+        assert!(node_executable(&managed).is_file());
+        assert!(managed.join("app/bootstrap.mjs").is_file());
     }
 }
 

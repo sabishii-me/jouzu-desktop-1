@@ -1,0 +1,62 @@
+import source from "./chat-workspace.tsx?raw";
+import appSource from "./App.tsx?raw";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it } from "vitest";
+import { NoticeRow, SteerQueue } from "./session-alerts-view";
+
+const noop = () => {};
+
+describe("a notice in a panel", () => {
+  it("shows one sentence with its actions and keeps the raw text behind Details", () => {
+    const html = renderToStaticMarkup(<NoticeRow alert={{ id: "runtime", level: "error", text: "Something in this session failed.", details: "TypeError: boom", actions: [{ label: "Retry", run: noop }], dismiss: noop }} />);
+    expect(html).toContain("Something in this session failed.");
+    expect(html).toContain("Details");
+    expect(html).toContain("Retry");
+    expect(html).toContain("Dismiss");
+    // Collapsed until asked for.
+    expect(html).not.toContain("TypeError: boom");
+  });
+
+});
+
+describe("steer queue", () => {
+  it("lists waiting messages in order, each removable and editable", () => {
+    const html = renderToStaticMarkup(<SteerQueue items={[{ clientMessageId: "a", text: "first", state: "queued", images: 0 }, { clientMessageId: "b", text: "second", state: "queued", images: 2 }]} onEdit={noop} onRemove={noop} onContinue={noop} onDiscard={noop} />);
+    expect(html.indexOf("first")).toBeLessThan(html.indexOf("second"));
+    expect(html).toContain("2 image(s)");
+    expect(html.match(/Remove queued message/g)).toHaveLength(2);
+    expect(html.match(/Edit queued message/g)).toHaveLength(2);
+    expect(html).not.toContain("Continue");
+  });
+
+  it("after Stop offers Continue and Discard", () => {
+    const html = renderToStaticMarkup(<SteerQueue items={[{ clientMessageId: "a", text: "first", state: "returned", images: 0 }]} onEdit={noop} onRemove={noop} onContinue={noop} onDiscard={noop} />);
+    expect(html).toContain("waiting after the stopped reply");
+    expect(html).toContain("Continue");
+    expect(html).toContain("Discard");
+  });
+  it("shows a message Flow holds as held, with nothing that would pretend to remove it", () => {
+    const html = renderToStaticMarkup(<SteerQueue items={[{ clientMessageId: "a", text: "first", state: "held", images: 0 }]} onEdit={noop} onRemove={noop} onContinue={noop} onDiscard={noop} />);
+    expect(html).toContain("Held by Flow");
+    expect(html).not.toContain("Remove queued message");
+    expect(html).not.toContain("Edit queued message");
+  });
+  it("offers no edit or remove for a message the runtime already has", () => {
+    const html = renderToStaticMarkup(<SteerQueue items={[{ clientMessageId: "a", text: "first", state: "delivering", images: 0 }]} onEdit={noop} onRemove={noop} onContinue={noop} onDiscard={noop} />);
+    expect(html).toContain("first");
+    expect(html).not.toContain("Remove queued message");
+    expect(html).not.toContain("Edit queued message");
+  });
+});
+
+describe("the chat has one place for notices", () => {
+  it("has no floating toast or pop-up error", () => {
+    expect(source).not.toMatch(/setNotification|className="[^"]*\bfixed\b[^"]*top-16/u);
+  });
+  it("shows app failures where they happened, not in a floating banner", () => {
+    expect(appSource).not.toMatch(/errorBanner|className="[^"]*\bfixed\b[^"]*top-4[^"]*"[^>]*role="alert"|role="alert" className="fixed/u);
+  });
+  it("asks for nothing through browser dialogs", () => {
+    expect(source).not.toMatch(/window\.(prompt|alert)\(/u);
+  });
+});

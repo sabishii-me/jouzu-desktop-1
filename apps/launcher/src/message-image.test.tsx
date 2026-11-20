@@ -1,6 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { classifyImageSource, ImageFallbackCard, MessageImage, resolveWorkspacePath } from "./message-image";
+import { classifyImageSource, HostAttachmentImage, ImageFallbackCard, MessageImage, requestHostAttachment, resolveWorkspacePath } from "./message-image";
+import { ApiProvider } from "./api/context";
+import type { JouzuApi } from "./api/jouzu-api";
 
 describe("image source classification", () => {
   it("resolves a relative path inside the workspace", () => {
@@ -107,5 +109,39 @@ describe("transcript image rendering", () => {
       expect(html).toContain("Reveal");
       expect(html).toContain("Copy path");
     }
+  });
+});
+
+describe("images the host keeps for a message (#119)", () => {
+  const apiWith = (attachment: (sessionId: string, id: string) => Promise<{ mimeType: string; data: string }>) =>
+    ({ sessions: { attachment } }) as unknown as JouzuApi;
+
+  it("reads each image from the host once, by session and id", async () => {
+    const calls: string[] = [];
+    const api = apiWith(async (sessionId, id) => { calls.push(`${sessionId}/${id}`); return { mimeType: "image/png", data: "AAEC" }; });
+    const ref = { sessionId: "s-1", id: "att-1" };
+    const [first, second] = await Promise.all([requestHostAttachment(api, ref), requestHostAttachment(api, ref)]);
+    expect(first).toEqual({ mimeType: "image/png", data: "AAEC" });
+    expect(second).toBe(first);
+    await requestHostAttachment(api, ref);
+    expect(calls).toEqual(["s-1/att-1"]);
+  });
+
+  it("does not keep a failed read, so the next showing tries again", async () => {
+    let fail = true;
+    const api = apiWith(async () => { if (fail) throw new Error("offline"); return { mimeType: "image/png", data: "AAEC" }; });
+    const ref = { sessionId: "s-1", id: "att-retry" };
+    await expect(requestHostAttachment(api, ref)).rejects.toThrow("offline");
+    fail = false;
+    await expect(requestHostAttachment(api, ref)).resolves.toEqual({ mimeType: "image/png", data: "AAEC" });
+  });
+
+  it("shows a read image at once and a loading line before that", async () => {
+    const api = apiWith(async () => ({ mimeType: "image/png", data: "AAEC" }));
+    const loading = renderToStaticMarkup(<ApiProvider api={api}><HostAttachmentImage attachment={{ sessionId: "s-2", id: "att-2" }} alt="Conversation attachment" /></ApiProvider>);
+    expect(loading).toContain("Loading image");
+    await requestHostAttachment(api, { sessionId: "s-2", id: "att-2" });
+    const shown = renderToStaticMarkup(<ApiProvider api={api}><HostAttachmentImage attachment={{ sessionId: "s-2", id: "att-2" }} alt="Conversation attachment" /></ApiProvider>);
+    expect(shown).toContain('src="data:image/png;base64,AAEC"');
   });
 });

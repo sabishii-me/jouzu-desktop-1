@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
  * A platform without an entry simply gets no update. The URL and signature are the only fields
  * the client trusts, so both are validated here rather than assembled in a shell script. */
 export function desktopFeed({ version, notes, pubDate, repository, assetName, signature }) {
-	if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Invalid release version');
+	if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:-rc\.\d+)?$/.test(version)) throw new Error('Invalid release version');
 	if (typeof repository !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw new Error('Invalid release repository');
 	// A space would have to be percent-encoded in the URL; keep release asset names usable as-is.
 	if (typeof assetName !== 'string' || !/^[A-Za-z0-9._-]+\.exe$/.test(assetName)) throw new Error('Invalid update asset name');

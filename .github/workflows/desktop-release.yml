@@ -10,10 +10,14 @@ name: Desktop release
 # published feed. Runtime provisioning is still open (0065); until it lands a
 # shell-only release cannot start chat on a clean machine.
 #
-# Manual until the first release exists. `publish` is the only path that writes to
-# the repository: it creates `v<version>` and replaces the feed on the stable
-# `desktop-update` release. Without `publish`, the run only proves the build and
-# keeps a workflow artifact.
+# This workflow publishes QA release candidates (X.Y.Z-rc.N) with the QA icon. `publish`
+# is the only path that writes to the repository: it creates the prerelease `v<version>`
+# and replaces the QA feed on the `desktop-update-qa` release. It never touches the stable
+# feed; that is desktop-stable.yml, which builds X.Y.Z again from a candidate's commit and
+# runs the full playbook before publishing (#86).
+# Both feeds only move forward: release-guard.mjs refuses a version that is not newer
+# than what either feed serves, and a tag that already exists is never replaced.
+# Without `publish`, the run only proves the build and keeps a workflow artifact.
 
 on:
   workflow_dispatch:
@@ -29,7 +33,7 @@ on:
         type: string
         default: ''
       publish:
-        description: Create the version release and replace the desktop-update feed
+        description: Create the prerelease v<version> and replace the QA feed (desktop-update-qa)
         required: true
         type: boolean
         default: false
@@ -67,11 +71,40 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Refuse a release without notes
+        if: ${{ inputs.publish }}
+        shell: bash
+        env:
+          INPUT_NOTES: ${{ inputs.notes }}
+        run: |
+          # The QA release and its feed entry describe what changed: the notes input, or the
+          # CHANGELOG section for this exact version. Checked before the build, not after it.
+          if [ -z "$INPUT_NOTES" ]; then
+            node packaging/launcher/launcher-notes.mjs CHANGELOG.md '${{ steps.check.outputs.version }}' > /dev/null
+          fi
+      - name: Refuse a version that is not newer than both feeds
+        if: ${{ inputs.publish }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version='${{ steps.check.outputs.version }}'
+          exists=-
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then exists=tag-exists; fi
+          node packaging/launcher/release-guard.mjs qa "$version" "$GITHUB_REPOSITORY" "$exists"
+
+  audit:
+    uses: ./.github/workflows/dependency-audit.yml
+    with:
+      npm-scope: shipped
 
   windows:
-    needs: prepare
+    needs: [prepare, audit]
     runs-on: windows-latest
     timeout-minutes: 60
+    # The updater signing key lives in this environment, not in repository secrets, so only
+    # an approved run on an allowed branch can sign.
+    environment: desktop-release
     defaults:
       run:
         shell: pwsh
@@ -84,12 +117,15 @@ jobs:
           node-version: '24.22.2'
       - name: Install frontend dependencies
         run: npm ci --prefix apps/launcher
-      - name: Install the acceptance browser
+      - name: Frontend build and unit tests
+        run: |
+          npm --prefix apps/launcher run build
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm --prefix apps/launcher test
+      - name: Install the browser test runner
         working-directory: apps/launcher
         run: npx playwright install chromium
-      - name: Frontend build, unit tests and acceptance tests
-        run: npm --prefix apps/launcher run test:acceptance
-      - name: Mocked onboarding UI tests
+      - name: Mocked UI tests
         working-directory: apps/launcher
         run: |
           $vite = Start-Process node -ArgumentList 'node_modules/vite/bin/vite.js' -PassThru -NoNewWindow
@@ -99,10 +135,17 @@ jobs:
               try { Invoke-WebRequest http://localhost:1420 -TimeoutSec 2 | Out-Null; $ready = $true; break } catch { Start-Sleep 1 }
             }
             if (-not $ready) { throw 'Vite did not become ready' }
-            npx playwright test e2e/onboarding.spec.ts --reporter=line
+            npx playwright test e2e/control-center.spec.ts e2e/onboarding.spec.ts e2e/tools.spec.ts --reporter=line
             $code = $LASTEXITCODE
           } finally { if (-not $vite.HasExited) { Stop-Process -Id $vite.Id } }
           exit $code
+      - name: Release host build and tests
+        working-directory: apps/launcher
+        run: |
+          # build:app builds the release host and stages it where the shell bundles it from.
+          npm run build:app
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked --manifest-path host/Cargo.toml
       - name: Native tests
         working-directory: apps/launcher/src-tauri
         run: cargo test --locked --bins
@@ -125,16 +168,23 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          # This workflow builds QA packages, and a QA package carries the QA icon (#74):
+          # the executable, installer, window, taskbar and tray all show the badge. The
+          # icon is the only packaging difference; the update channel stays a setting.
+          $bundle = @{
+            icon = @('icons/qa/32x32.png', 'icons/qa/128x128.png', 'icons/qa/128x128@2x.png', 'icons/qa/icon.icns', 'icons/qa/icon.ico')
+            windows = @{ nsis = @{ installerIcon = 'icons/qa/icon.ico' } }
+          }
           if ('${{ inputs.publish }}' -eq 'true') {
             # createUpdaterArtifacts is a build-time overlay, so the release always
             # produces the .sig the feed points at.
-            $overlay = Join-Path $env:RUNNER_TEMP 'updater.json'
-            '{"bundle":{"createUpdaterArtifacts":true}}' | Set-Content -LiteralPath $overlay -Encoding utf8NoBOM
-            npx tauri build --bundles nsis --config $overlay
-          } else {
-            # A test build proves the installer without the signing key.
-            npx tauri build --bundles nsis
+            $bundle.createUpdaterArtifacts = $true
           }
+          $overlay = Join-Path $env:RUNNER_TEMP 'qa-build.json'
+          (@{ bundle = $bundle } | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $overlay -Encoding utf8NoBOM
+          Get-Content -LiteralPath $overlay
+          # A test build (publish=false) proves the installer without the signing key.
+          npx tauri build --bundles nsis --config $overlay
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Name and verify the installer
         working-directory: apps/launcher
@@ -207,49 +257,46 @@ jobs:
           asset="JouzuDesktop_${version}_x64-setup.exe"
           if [ -n "$INPUT_NOTES" ]; then
             printf '%s\n' "$INPUT_NOTES" > notes.md
-          elif node packaging/launcher/launcher-notes.mjs CHANGELOG.md "$version" > notes.md 2>/dev/null; then
-            :
           else
-            printf 'Jouzu Desktop %s\n' "$version" > notes.md
+            node packaging/launcher/launcher-notes.mjs CHANGELOG.md "$version" > notes.md
           fi
           node packaging/launcher/desktop-feed.mjs "$version" notes.md "$GITHUB_REPOSITORY" "$asset" "release/$asset.sig" latest.json
           cat latest.json
-      - name: Publish the version release
+      - name: Check the feeds again before writing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version='${{ needs.prepare.outputs.version }}'
+          exists=-
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then exists=tag-exists; fi
+          node packaging/launcher/release-guard.mjs qa "$version" "$GITHUB_REPOSITORY" "$exists"
+      - name: Publish the QA prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version='${{ needs.prepare.outputs.version }}'
           tag="v$version"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
-          else
-            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "Jouzu Desktop $version" --notes-file notes.md
-          fi
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Jouzu Desktop $version (QA)" --notes-file notes.md
           gh release upload "$tag" \
             "release/JouzuDesktop_${version}_x64-setup.exe" \
             "release/JouzuDesktop_${version}_x64-setup.exe.sig" \
             "release/SHA256SUMS.txt" \
             --repo "$GITHUB_REPOSITORY" --clobber
-      - name: Replace the update feed
+      - name: Replace the QA update feed
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! gh release view desktop-update --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release create desktop-update --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
-              --title "Jouzu Desktop update feed" --notes "Signed desktop update feed. Do not delete."
+          if ! gh release view desktop-update-qa --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create desktop-update-qa --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+              --title "Jouzu Desktop QA update feed" --notes "Signed QA update feed. Do not delete."
           fi
-          gh release upload desktop-update latest.json --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload desktop-update-qa latest.json --repo "$GITHUB_REPOSITORY" --clobber
       - name: Verify the feed and the asset are anonymously readable
+        # The release CDN can answer 404 or the previous feed for a while after the
+        # upload; verify-feed.mjs retries until the published feed is served (#81).
         run: |
-          endpoint="https://github.com/${GITHUB_REPOSITORY}/releases/download/desktop-update/latest.json"
-          for attempt in 1 2 3 4 5; do
-            if curl -fsSL "$endpoint" -o published.json; then break; fi
-            sleep 3
-          done
-          cmp latest.json published.json
-          asset="$(node -p "require('./published.json').platforms['windows-x86_64'].url")"
-          curl -fsSL -o /dev/null "$asset"
+          node packaging/launcher/verify-feed.mjs "https://github.com/${GITHUB_REPOSITORY}/releases/download/desktop-update-qa/latest.json" latest.json 300
 
 
 

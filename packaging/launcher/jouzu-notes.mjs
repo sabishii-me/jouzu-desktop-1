@@ -7,12 +7,13 @@ const MAX_SOURCE_BYTES = 256;
 
 /** Extract one version's section. Upstream headings look like `## 0.1.18 - 2026-09-30`. */
 export function releaseNotesSection(changelog, version) {
-	if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Invalid release version');
+	if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:-rc\.\d+)?$/.test(version)) throw new Error('Invalid release version');
 	const lines = changelog.split(/\r?\n/);
 	const start = lines.findIndex(line => {
 		const text = line.trim();
 		if (!text.startsWith(`## ${version}`)) return false;
-		return /^[\s-]|^$/.test(text.slice(3 + version.length));
+		// The version ends at a space or the line end, so 1.1.3 never picks up the 1.1.3-rc.1 section.
+		return /^(\s|$)/.test(text.slice(3 + version.length));
 	});
 	if (start === -1) return null;
 	const body = [];

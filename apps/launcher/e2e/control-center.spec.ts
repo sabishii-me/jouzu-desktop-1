@@ -1,5 +1,25 @@
 import { test, expect } from '@playwright/test';
+import { expect as expectBase, type Locator } from '@playwright/test';
+import { UI_BASE, stubHostControl } from './host-control';
+
+// An error reads as one sentence that says what failed; the raw text is behind Details.
+async function expectError(alert: Locator, sentence: string, raw: string) {
+  await expectBase(alert).toContainText(sentence);
+  await alert.getByRole('button', { name: 'Details', exact: true }).click();
+  await expectBase(alert).toContainText(raw);
+}
 const state = {schemaVersion:1,profile:'core',account:{signedIn:false},credentials:[],customProviders:[],providers:[{id:'openai',name:'OpenAI'}],models:[]};
+// The System rows for Git Bash and the terminal exist only on Windows, which the window reads from the user agent.
+test.use({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36' });
+const control = (legacy: boolean) => (body: any) => {
+  const result: any = { ...state };
+  if (body?.action === 'profile') result.profile = body.profile;
+  if (legacy) delete result.customProviders;
+  return result;
+};
+test.beforeEach(async ({page}, testInfo) => {
+  await stubHostControl(page, control(testInfo.title.includes('rejects old protocol')));
+});
 for (const legacy of [false,true]) {
  test(`control center ${legacy ? 'rejects old protocol without crashing' : 'opens all tabs'}`, async ({page}) => {
   const errors: string[]=[]; page.on('pageerror', error=>errors.push(error.message));
@@ -20,10 +40,10 @@ for (const legacy of [false,true]) {
     }
    };
   },{state,legacy});
-  await page.goto('http://localhost:1420');
+  await page.goto(UI_BASE);
   await page.getByRole('button',{name:'Settings',exact:true}).click();
   const dialog=page.getByRole('dialog');await expect(dialog).toBeVisible();
-  if(legacy) await expect(dialog.getByRole('alert')).toContainText('incompatible');
+  if(legacy) await expectError(dialog.getByRole('alert'), 'Something went wrong', 'incompatible');
   else { await dialog.getByRole('button',{name:'Add provider',exact:true}).click(); await expect(dialog.getByRole('combobox',{name:'Service',exact:true})).toBeVisible(); await expect(dialog.getByRole('button',{name:'Add provider',exact:true})).toHaveCount(0); await expect(dialog.getByRole('combobox')).toHaveCount(1); await dialog.getByRole('combobox',{name:'Service',exact:true}).click(); await page.getByRole('option',{name:'Custom provider',exact:true}).click(); await expect(dialog.getByRole('textbox',{name:'API base URL'})).toBeVisible(); }
   await dialog.getByRole('tab',{name:'Environment',exact:true}).click();
   await expect(dialog.getByRole('button',{name:'Add variable',exact:true})).toBeVisible();
@@ -37,7 +57,7 @@ for (const legacy of [false,true]) {
   await expect(dialog.getByLabel('Value',{exact:true})).toHaveValue('fixture-secret');
   await dialog.getByRole('tab',{name:'Language',exact:true}).click();
   await expect(dialog.getByRole('combobox',{name:'Launcher interface language'})).toBeVisible();
-  await expect(dialog.getByRole('combobox')).toHaveCount(1);
+  await expect(dialog.getByRole('combobox')).toHaveCount(3);
   const toggle=dialog.getByRole('switch',{name:'Japanese-first mode',exact:true});
   if(!legacy) {
    await expect(toggle).not.toBeChecked();
@@ -75,7 +95,7 @@ const updateStub = (config: {
         jouzu: config.jouzuVersion, launcher: config.launcherVersion, development: true,
         jouzuUpdaterConfigured: config.configured[0], launcherUpdaterConfigured: config.configured[1],
       };
-      if (command === 'control_request') return { schemaVersion: 1, profile: 'core', account: { signedIn: false }, credentials: [], customProviders: [], providers: [], models: [] };
+      if (command === 'control_request') return { schemaVersion: 1, profile: 'core', account: { signedIn: false }, credentials: [], customProviders: [], providers: [] };
       if (command === 'environment_read') return [];
       if (command === 'git_bash' || command === 'terminal') return 1;
       if (command === 'plugin:dialog|confirm' || command === 'plugin:dialog|message') return true;
@@ -86,13 +106,15 @@ const updateStub = (config: {
         return new Promise(resolve => { (window as any).__finishInstall = () => resolve({ version: config.jouzuTarget, available: false }); });
       }
       if (command === 'log_event') { (window as any).__logs.push(args.message); return null; }
-      if (command === 'plugin:updater|check') {
+      // The launcher's own update commands (src-tauri update_channel.rs), which pick the feed by channel.
+      if (command === 'update_channel' || command === 'update_channel_set') return args?.channel ?? 'stable';
+      if (command === 'update_check') {
         if (config.launcherCheckFails) throw new Error('network');
         return config.launcherAvailable
-        ? { rid: 1, currentVersion: config.launcherVersion, version: config.launcherTarget, body: 'Launcher only', date: null, rawJson: '{}' }
+        ? { version: config.launcherTarget, notes: 'Launcher only', channel: 'stable', downgrade: false }
         : null;
       }
-      if (command.startsWith('plugin:updater|')) return { rid: 1 };
+      if (command === 'update_install') return new Promise(() => {});
       if (command.includes('version')) return config.launcherVersion;
       return 1;
     },
@@ -100,7 +122,7 @@ const updateStub = (config: {
 };
 
 async function openSystem(page: any) {
-  await page.goto('http://localhost:1420');
+  await page.goto(UI_BASE);
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   const dialog = page.getByRole('dialog');
   await dialog.getByRole('tab', { name: 'System', exact: true }).click();
@@ -135,7 +157,7 @@ test('a failed update check is reported and recorded', async ({ page }) => {
   });
   const dialog = await openSystem(page);
   const launcher = dialog.locator('section[aria-label="Launcher"]');
-  await expect(launcher.getByRole('alert')).toContainText('Error: network');
+  await expectError(launcher.getByRole('alert'), 'Could not check for updates', 'network');
   const logs: string[] = await page.evaluate(() => (window as any).__logs);
   expect(logs.some(line => line.startsWith('launcher update check failed error='))).toBe(true);
 });
@@ -167,7 +189,7 @@ test('a failed install offers Retry and the launcher update confirms once', asyn
   const dialog = await openSystem(page);
   const jouzu = dialog.locator('section[aria-label="Jouzu"]');
   await jouzu.getByRole('button', { name: 'Update Jouzu', exact: true }).click();
-  await expect(jouzu.getByRole('alert')).toContainText('Your current version is unchanged');
+  await expectError(jouzu.getByRole('alert'), 'Could not install the update', 'Your current version is unchanged');
   // Retrying the same row installs without asking again.
   await jouzu.getByRole('button', { name: 'Retry', exact: true }).click();
   await page.waitForFunction(() => typeof (window as any).__finishInstall === 'function');
@@ -209,7 +231,7 @@ test('the System section names the copy in use and offers installing the ones Jo
    }
   };
  });
- await page.goto('http://localhost:1420');
+ await page.goto(UI_BASE);
  await page.getByRole('button',{name:'Settings',exact:true}).click();
  const dialog=page.getByRole('dialog');
  await dialog.getByRole('tab',{name:'System',exact:true}).click();
@@ -249,7 +271,7 @@ test('a component row keeps its height while an action runs', async ({page})=>{
    }
   };
  });
- await page.goto('http://localhost:1420');
+ await page.goto(UI_BASE);
  await page.getByRole('button',{name:'Settings',exact:true}).click();
  const dialog=page.getByRole('dialog');
  await dialog.getByRole('tab',{name:'System',exact:true}).click();
@@ -260,45 +282,6 @@ test('a component row keeps its height while an action runs', async ({page})=>{
  await page.waitForTimeout(600);
  const during=(await row.boundingBox())!.height;
  expect(during).toBe(before);
-});
-
-test('a console this machine cannot draw is repaired before Jouzu starts', async ({page})=>{
- await page.addInitScript(()=>{
-  (window as any).isTauri=true;
-  (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener:()=>{}};
-  localStorage.setItem('jouzu.ui.language','en');
-  (window as any).__calls={installs:0, launches:0};
-  const terminal={bundled:null,system:null,preferred:null,effective:null,archive:false,legacy:true,version:'1.25.2733.0'};
-  (window as any).__TAURI_INTERNALS__={
-   metadata:{currentWindow:{label:'main'},currentWebview:{label:'main'}},
-   transformCallback:()=>1,unregisterCallback:()=>{},
-   invoke:async(command:string)=>{(window as any).__invoked=((window as any).__invoked??[]).concat(command);if(command==='plugin:dialog|message')return 'Ok';
-    if(command==='console_repair_needed')return true;
-    if(command==='terminal')return {...terminal};
-    if(command==='terminal_install'){
-     (window as any).__calls.installs++;
-     return new Promise(resolve => { (window as any).__finishRepair = () => { terminal.bundled={path:'C:\Program Files\Jouzu\terminal\WindowsTerminal.exe',version:'1.25.2733.0'}; resolve({...terminal,effective:terminal.bundled.path}); }; });
-    }
-    if(command==='launch_jouzu'){(window as any).__calls.launches++;return null;}
-    if(command==='control_request')return {schemaVersion:1,profile:'core',account:{signedIn:true},credentials:[],customProviders:[],providers:[],models:[]};
-    if(command==='launcher_state')return {ready:true,bash:true,recent:[{id:'1',path:'E:\AI\ideas\jouzu',environment:{kind:'native'}}],platform:'windows'};
-    if(command==='component_versions')return {jouzu:'0.1.18',development:true};
-    if(command==='environment_read')return [];
-    if(command==='git_bash')return 1;
-    if(command.includes('version'))return '0.1.0';
-    return 1;
-   }
-  };
- });
- await page.goto('http://localhost:1420');
- await page.getByRole('button',{name:/Open Jouzu here/}).click();
- // The repair is shown while it runs, and Jouzu only starts once it is done.
- const dialog=page.getByRole('dialog');
- await expect(dialog).toBeVisible();
- expect(await page.evaluate(()=>(window as any).__calls.launches)).toBe(0);
- await page.evaluate(()=>(window as any).__finishRepair());
- await expect.poll(()=>page.evaluate(()=>(window as any).__calls.launches)).toBe(1);
- expect(await page.evaluate(()=>(window as any).__calls.installs)).toBe(1);
 });
 
 test('a component copy that is here but does not run is repaired, not installed', async ({page})=>{
@@ -323,7 +306,7 @@ test('a component copy that is here but does not run is repaired, not installed'
    }
   };
  });
- await page.goto('http://localhost:1420');
+ await page.goto(UI_BASE);
  await page.getByRole('button',{name:'Settings',exact:true}).click();
  const dialog=page.getByRole('dialog');
  await dialog.getByRole('tab',{name:'System',exact:true}).click();
@@ -358,7 +341,7 @@ test('the terminal command row names what answers and takes precedence only when
    }
   };
  });
- await page.goto('http://localhost:1420');
+ await page.goto(UI_BASE);
  await page.getByRole('button',{name:'Settings',exact:true}).click();
  const dialog=page.getByRole('dialog');
  await dialog.getByRole('tab',{name:'System',exact:true}).click();
@@ -370,35 +353,4 @@ test('the terminal command row names what answers and takes precedence only when
  // Putting the previous one back is offered as its own action.
  await row.getByRole('button').click();
  await expect(row.getByRole('button')).toBeVisible();
-});
-
-test('the header opens a terminal in a chosen folder and starts nothing', async ({page})=>{
- await page.addInitScript(()=>{
-  (window as any).isTauri=true;
-  (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener:()=>{}};
-  localStorage.setItem('jouzu.ui.language','en');
-  (window as any).__terminals=[];
-  (window as any).__dialogs=0;
-  (window as any).__TAURI_INTERNALS__={
-   metadata:{currentWindow:{label:'main'},currentWebview:{label:'main'}},
-   transformCallback:()=>1,unregisterCallback:()=>{},
-   invoke:async(command:string,args:any)=>{(window as any).__invoked=((window as any).__invoked??[]).concat(command);if(command==='plugin:dialog|message')return 'Ok';
-    if(command==='launcher_state')return {ready:true,bash:false,recent:[{id:'windows:C:/work/prts-web',path:'C:/work/prts-web',environment:{kind:'windows'}}],platform:'windows'};
-    if(command==='component_versions')return {jouzu:'0.1.18',development:true};
-    if(command==='environment_read')return [];
-    if(command==='plugin:dialog|open'){(window as any).__dialogs++;return 'C:/picked/other';}
-    if(command==='terminal_open'){(window as any).__terminals.push(args.path);return null;}
-    if(command.includes('version'))return '0.1.0';
-    return 1;
-   }
-  };
- });
- await page.goto('http://localhost:1420');
- await page.getByRole('button',{name:'Open a terminal',exact:true}).click();
- await page.waitForFunction(()=> (window as any).__terminals.length===1);
- // The folder the picker returned is the one the terminal opens in, and nothing else ran.
- expect(await page.evaluate(()=> (window as any).__terminals)).toEqual(['C:/work/prts-web']);
- // No folder dialog was used: the folder the launcher already works with is the one that opens.
- expect(await page.evaluate(()=> (window as any).__dialogs)).toBe(0);
- expect(await page.getByRole('button',{name:'Open a terminal',exact:true}).isEnabled()).toBe(true);
 });
