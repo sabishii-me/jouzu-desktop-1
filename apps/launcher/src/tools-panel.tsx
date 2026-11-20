@@ -21,7 +21,7 @@ interface ToolsSettings {
 }
 
 /** The lines the jouzu-attribution extension's hook adds to the agent's commits. */
-const COMMIT_LINES = "Co-authored-by: Jouzu Desktop (<model>) <noreply@shisa.ai>\nJouzu-Session: <session id>";
+const COMMIT_LINES = "Co-authored-by: Jouzu Desktop (<model>) <359074535+jouzu-desktop@users.noreply.github.com>\nJouzu-Session: <session id>";
 
 /** "Mark commits made by the agent": off unless turned on; applies at the next tool call. */
 function CommitMarkCard({ t, enabled, busy, onChange }: { t: ChatText; enabled: boolean; busy: boolean; onChange: (enabled: boolean) => void }) {

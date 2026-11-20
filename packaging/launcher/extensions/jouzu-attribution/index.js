@@ -7,7 +7,7 @@
 //   (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, appended after
 //   any git configuration the runtime started with). Each hook runs the
 //   repository's own hook first; `prepare-commit-msg` then adds
-//   `Co-authored-by: Jouzu Desktop (<model>) <noreply@shisa.ai>` and
+//   `Co-authored-by: Jouzu Desktop (<model>) <359074535+jouzu-desktop@users.noreply.github.com>` and
 //   `Jouzu-Session: <session id>` from the PI_MODEL / PI_SESSION_ID the shell
 //   tools give every command.
 // - the agent is asked to end pull request descriptions with a line naming

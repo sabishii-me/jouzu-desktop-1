@@ -30,13 +30,15 @@ grep -v '^#' "$1" | grep -q '[^[:space:]]' || exit 0
 model=${PI_MODEL:-} session=${PI_SESSION_ID:-}
 model=$(printf '%s' "$model" | tr -d '<>\r\n')
 session=$(printf '%s' "$session" | tr -d '<>\r\n')
+# The address is the jouzu-desktop GitHub account's own noreply address, so
+# GitHub shows that account (and its avatar) as the co-author.
 who="Jouzu Desktop"
 [ -n "$model" ] && who="Jouzu Desktop ($model)"
 # Amending: our earlier lines give way to the current ones, others' lines stay.
-sed -e '/^Co-authored-by: Jouzu Desktop.*<noreply@shisa\.ai>$/d' -e '/^Jouzu-Session: /d' "$1" > "$1.jouzu" && mv "$1.jouzu" "$1"
+sed -e '/^Co-authored-by: Jouzu Desktop.*<359074535+jouzu-desktop@users\.noreply\.github\.com>$/d' -e '/^Jouzu-Session: /d' "$1" > "$1.jouzu" && mv "$1.jouzu" "$1"
 # A message without a final newline (git merge -m) would get the trailer glued on.
 [ -n "$(tail -c 1 "$1")" ] && echo >> "$1"
-set -- "$1" --trailer "Co-authored-by: $who <noreply@shisa.ai>"
+set -- "$1" --trailer "Co-authored-by: $who <359074535+jouzu-desktop@users.noreply.github.com>"
 [ -n "$session" ] && set -- "$@" --trailer "Jouzu-Session: $session"
 file=$1; shift
 git interpret-trailers --in-place --if-exists addIfDifferent "$@" "$file" || true

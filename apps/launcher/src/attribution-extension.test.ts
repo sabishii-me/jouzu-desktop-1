@@ -85,7 +85,7 @@ describe("jouzu-attribution extension", () => {
     applyTo(agent, true, "1", hooks);
     const run = (env, ...args: string[]) => spawnSync("git", args, { cwd: repo, env, encoding: "utf8" });
     const message = () => run(base, "log", "-1", "--format=%B").stdout.trimEnd();
-    const plain = "Co-authored-by: Jouzu Desktop <noreply@shisa.ai>";
+    const plain = "Co-authored-by: Jouzu Desktop <359074535+jouzu-desktop@users.noreply.github.com>";
     expect(run(base, "init", "-q", "-b", "main").status).toBe(0);
 
     expect(run(agent, "commit", "-q", "--allow-empty", "-m", "first").status).toBe(0);
@@ -93,9 +93,9 @@ describe("jouzu-attribution extension", () => {
 
     const session = { ...agent, PI_MODEL: "model-<1>", PI_SESSION_ID: "s-1" };
     expect(run(session, "commit", "-q", "--amend", "--allow-empty", "-m", "again").status).toBe(0);
-    expect(message()).toBe("again\n\nCo-authored-by: Jouzu Desktop (model-1) <noreply@shisa.ai>\nJouzu-Session: s-1");
+    expect(message()).toBe("again\n\nCo-authored-by: Jouzu Desktop (model-1) <359074535+jouzu-desktop@users.noreply.github.com>\nJouzu-Session: s-1");
     expect(run({ ...session, PI_MODEL: "m-2" }, "commit", "-q", "--amend", "--allow-empty", "--no-edit").status).toBe(0);
-    expect(message()).toBe("again\n\nCo-authored-by: Jouzu Desktop (m-2) <noreply@shisa.ai>\nJouzu-Session: s-1");
+    expect(message()).toBe("again\n\nCo-authored-by: Jouzu Desktop (m-2) <359074535+jouzu-desktop@users.noreply.github.com>\nJouzu-Session: s-1");
 
     const other = "Co-authored-by: Someone <someone@example.com>";
     expect(run(agent, "commit", "-q", "--allow-empty", "-m", `both\n\n${other}`).status).toBe(0);
