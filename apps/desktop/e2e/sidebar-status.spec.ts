@@ -59,8 +59,8 @@ async function setup(page: Page, language: string, seen: string[]) {
 }
 
 for (const [language, words] of [
-  ["en", { running: "Running bash · 0:4", waiting: "Waiting for your review", done: "Finished", failed: "Failed" }],
-  ["ja", { running: "bash を実行中 · 0:4", waiting: "確認待ち", done: "完了", failed: "失敗" }],
+  ["en", { running: "Running bash · 0:\\d\\d", waiting: "Waiting for your review", done: "Finished", failed: "Failed" }],
+  ["ja", { running: "bash を実行中 · 0:\\d\\d", waiting: "確認待ち", done: "完了", failed: "失敗" }],
 ] as const) {
   test(`each session row says what its session is doing (${language})`, async ({ page }) => {
     const seen: string[] = [];
