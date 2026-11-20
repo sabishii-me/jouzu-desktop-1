@@ -143,6 +143,10 @@ jobs:
         env:
           PLAYBOOK_SHISA_API_KEY: ${{ secrets.PLAYBOOK_SHISA_API_KEY }}
           PLAYBOOK_OPENROUTER_API_KEY: ${{ secrets.PLAYBOOK_OPENROUTER_API_KEY }}
+          # First run with an API key provider (Shisa.AI connects by browser sign-in only).
+          PLAYBOOK_FIRST_RUN_API_KEY: ${{ secrets.PLAYBOOK_FIRST_RUN_API_KEY }}
+          PLAYBOOK_FIRST_RUN_PROVIDER: ${{ vars.PLAYBOOK_FIRST_RUN_PROVIDER }}
+          PLAYBOOK_FIRST_RUN_MODEL: ${{ vars.PLAYBOOK_FIRST_RUN_MODEL }}
         run: |
           if (-not $env:PLAYBOOK_SHISA_API_KEY) { throw 'PLAYBOOK_SHISA_API_KEY is not configured for the desktop-release environment' }
           $env:EXAM_MANAGED = Join-Path $env:RUNNER_TEMP 'exam-runtime'
