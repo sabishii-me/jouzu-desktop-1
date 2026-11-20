@@ -79,6 +79,28 @@ Assistant is idle. Task changes wake it only when idle, after a quiet period
 and acknowledges its inbox itself. `schedule_wake` lets it look again later.
 If the process ends it stays stopped until the user writes or turns it on.
 
+### What it hears and reads
+
+The person's own words travel unchanged. Each transcript row has a fixed id
+(`m<line>`) and a user message reaches the Assistant as `[user message mN]`.
+Its `start_task` and `send_task` take `quote` (ids of user messages): the host
+puts those messages in front of the brief word for word, each marked as the
+user's with its time, then `[Brief from the Assistant]`. Only user messages
+can be quoted. MCP agents have no `quote`; they have no such conversation.
+
+When the person writes in a task's session themselves (any message whose
+client message id is not the task's own), the task's client gets an inbox
+entry marked `userWrote`, kept until acknowledged whatever the state does
+next; the Assistant's wake says so. This is seen only while the host follows
+the task's session; a message in a session reopened later is not seen.
+
+Like a project coordinator, the Assistant reads every session: `list_sessions`
+(recent sessions in all folders, newest first, with task marks) and
+`read_session` (whole messages; only sessions the host lists). It writes only
+to its own tasks. MCP agents still see only their own tasks. The
+`catch-requests` skill has it look for requests the person made elsewhere on a
+scheduled wake, note them in the project, and ask before taking them on.
+
 ### Its pane
 
 The sidebar entry "Assistant" opens its pane. From the top: the task sessions
