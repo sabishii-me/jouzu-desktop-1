@@ -19,6 +19,7 @@ mod environment;
 pub mod events;
 mod files;
 pub mod known_models;
+pub mod mcp;
 pub mod policy;
 pub mod provider_answers;
 mod provider_error;
@@ -67,6 +68,7 @@ pub struct AppState {
     pub events: Arc<events::EventHub>,
     pub web: Arc<web_access::WebAccess>,
     pub tasks: Arc<tasks::TaskManager>,
+    pub mcp: Arc<mcp::McpServer>,
 }
 
 #[derive(Debug, Serialize)]
@@ -276,6 +278,9 @@ pub fn router(state: AppState) -> Router {
             "/workspaces/forget",
             axum::routing::post(forget_workspace),
         )
+        .route("/collaboration/mcp", get(mcp_server_snapshot).put(update_mcp_server))
+        .route("/collaboration/mcp/clients", axum::routing::post(create_mcp_client))
+        .route("/collaboration/mcp/clients/{id}", axum::routing::delete(revoke_mcp_client))
         .route("/tasks", get(list_tasks).post(start_task))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/messages", axum::routing::post(send_task))
@@ -380,6 +385,46 @@ pub fn router(state: AppState) -> Router {
             host_origin_guard,
         ))
         .with_state(state)
+}
+
+// ---- Collaboration > MCP: the user's switch and agent tokens ----
+
+async fn mcp_server_snapshot(State(state): State<AppState>) -> Json<Value> {
+    Json(state.mcp.snapshot().await)
+}
+
+#[derive(Deserialize)]
+struct McpServerUpdate {
+    enabled: Option<bool>,
+    port: Option<u16>,
+}
+
+async fn update_mcp_server(
+    State(state): State<AppState>,
+    Json(request): Json<McpServerUpdate>,
+) -> Result<Json<Value>, ApiError> {
+    state.mcp.update(request.enabled, request.port).await.map(Json)
+}
+
+#[derive(Deserialize)]
+struct McpClientRequest {
+    name: String,
+}
+
+async fn create_mcp_client(
+    State(state): State<AppState>,
+    Json(request): Json<McpClientRequest>,
+) -> Result<Response, ApiError> {
+    let created = state.mcp.create_client(&request.name)?;
+    Ok((StatusCode::CREATED, Json(created)).into_response())
+}
+
+async fn revoke_mcp_client(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    state.mcp.revoke_client(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---- Tasks (host token: Desktop itself; agents reach these through MCP) ----
@@ -2493,6 +2538,7 @@ mod tests {
 
     fn state(dist: PathBuf) -> AppState {
         let sessions = Arc::new(SessionManager::new(None, dist.clone(), dist.clone(), None, 10, None));
+        let tasks = tasks::TaskManager::new(sessions.clone(), tasks::DEFAULT_CAP);
         AppState {
             token: Arc::new("a".repeat(64)),
             port: 40123,
@@ -2503,7 +2549,8 @@ mod tests {
             control: control_manager(&dist),
             events: events::EventHub::new(),
             web: Arc::new(web_access::WebAccess::disabled()),
-            tasks: tasks::TaskManager::new(sessions, tasks::DEFAULT_CAP),
+            tasks: tasks.clone(),
+            mcp: mcp::McpServer::new(&dist, "0.1.0", tasks, sessions),
         }
     }
 
@@ -3101,6 +3148,7 @@ mod session_tests {
 
     fn app(manager: Arc<SessionManager>) -> Router {
         let home = std::env::temp_dir();
+        let tasks = tasks::TaskManager::new(manager.clone(), tasks::DEFAULT_CAP);
         AppState {
             token: Arc::new("a".repeat(64)),
             port: 40123,
@@ -3111,7 +3159,8 @@ mod session_tests {
             control: Arc::new(control::ControlManager::new(&home, &home, None, &home.join("data"), None).expect("control manager")),
             events: events::EventHub::new(),
             web: Arc::new(web_access::WebAccess::disabled()),
-            tasks: tasks::TaskManager::new(manager, tasks::DEFAULT_CAP),
+            tasks: tasks.clone(),
+            mcp: mcp::McpServer::new(manager.home(), "0.1.0", tasks, manager.clone()),
         }
         .pipe(router)
     }
