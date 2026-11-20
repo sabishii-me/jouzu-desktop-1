@@ -227,6 +227,14 @@ export function App() {
     try { setEnvRows(await api.settings.environment.read()); setEnvLoaded(true); setEditingEnv(null); }
     catch (error) { fail("settings", error); }
   }
+  const [commitMark, setCommitMark] = useState<{ enabled: boolean; trailer: string } | null>(null);
+  async function readCommitMark() {
+    try { setCommitMark(await api.settings.commitAttribution.read()); }
+    catch (error) { fail("settings", error); }
+  }
+  async function saveCommitMark(enabled: boolean) {
+    if (await configure("commit-attribution", { enabled })) await readCommitMark();
+  }
   async function saveEnvironment() {
     if (await configure("environment", { entries: envRows })) setEditingEnv(null);
   }
@@ -372,7 +380,7 @@ export function App() {
     } catch (error) { quiet(error); }
   }
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(null), 4000); return () => clearTimeout(timer); }, [notice]);
-  useEffect(() => { if (!settingsOpen) return; if (!setup && !pending("status")) void enqueueConfig("status").catch(error => quiet(error)); void readEnvironment(); }, [settingsOpen]);
+  useEffect(() => { if (!settingsOpen) return; if (!setup && !pending("status")) void enqueueConfig("status").catch(error => quiet(error)); void readEnvironment(); void readCommitMark(); }, [settingsOpen]);
   const workspaceState = (recent: unknown[]): LauncherState => ({
     platform: navigator.userAgent.includes("Windows") ? "windows" : navigator.userAgent.includes("Mac") ? "macos" : "linux",
     recent: recent as unknown as Workspace[], ready: true, bash: false, bundled_git: false,
@@ -656,7 +664,8 @@ export function App() {
                 <TabsContent value="environment" className="m-0 space-y-4"><Card className="border-border shadow-none"><CardHeader><CardTitle>{t.environment}</CardTitle><CardDescription>{t.envHint}</CardDescription></CardHeader><CardContent className="space-y-3">{cardNotice(["environment"])}
                   {envRows.map((row,index) => <div key={index} className="space-y-2 rounded-lg border border-border p-3"><div className="flex items-center gap-2">{editingEnv === index ? <Input aria-label={t.variableName} placeholder={t.variableName} value={row.name} disabled={environmentBusy} onChange={event => setEnvRows(rows => rows.map((r,i) => i === index ? {...r,name:event.target.value} : r))} /> : <span className="min-w-0 flex-1 truncate text-sm font-medium" title={row.name}>{row.name}</span>}<Button variant="ghost" disabled={environmentBusy} onClick={() => setEditingEnv(index)}>{t.editValue}</Button><Switch aria-label={t.enabled} checked={row.enabled} disabled={environmentBusy} onCheckedChange={enabled => setEnvRows(rows => rows.map((r,i) => i === index ? {...r,enabled} : r))} /><Button variant="ghost" disabled={environmentBusy} aria-label={t.deleteEntry} onClick={() => { setEnvRows(rows => rows.filter((_,i) => i !== index)); setEditingEnv(null); }}><X /></Button></div>{editingEnv === index && <Input type="password" autoComplete="off" aria-label={t.variableValue} placeholder={t.variableValue} value={row.value} disabled={environmentBusy} onChange={event => setEnvRows(rows => rows.map((r,i) => i === index ? {...r,value:event.target.value} : r))} />}</div>)}
                   <div className="flex gap-2"><Button variant="outline" disabled={!envLoaded || environmentBusy} onClick={() => { setEditingEnv(envRows.length); setEnvRows(rows => [...rows,{name:"",value:"",enabled:true}]); }}><Plus />{t.addEntry}</Button><Button className="ml-auto" disabled={!envLoaded || environmentBusy} onClick={saveEnvironment}>{t.save}</Button></div>
-                </CardContent></Card></TabsContent>
+                </CardContent></Card>
+                <Card className="border-border shadow-none">{cardNotice(["commit-attribution"])}<CardHeader><div className="flex items-center gap-3"><CardTitle className="flex-1"><Label htmlFor="commit-mark">{t.commitMark}</Label></CardTitle><Switch id="commit-mark" aria-label={t.commitMark} checked={commitMark?.enabled ?? false} disabled={!commitMark || pending("commit-attribution")} onCheckedChange={enabled => void saveCommitMark(enabled)} /></div><CardDescription>{t.commitMarkHint}</CardDescription></CardHeader>{commitMark?.trailer && <CardContent><code className="block break-all rounded-md bg-muted px-3 py-2 text-xs">{commitMark.trailer}</code></CardContent>}</Card></TabsContent>
                 <TabsContent value="appearance" className="m-0 space-y-4">
                   <Card className="border-border shadow-none"><CardHeader><CardTitle>{t.appearance}</CardTitle><CardDescription>{t.appearanceHint}</CardDescription></CardHeader><CardContent>
                     <Select value={theme} onValueChange={value => setTheme(value as Theme)}><SelectTrigger aria-label={t.appearance} className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="system">{t.themeSystem}</SelectItem><SelectItem value="dark">{t.themeDark}</SelectItem><SelectItem value="light">{t.themeLight}</SelectItem></SelectContent></Select>

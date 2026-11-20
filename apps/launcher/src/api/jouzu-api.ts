@@ -337,6 +337,13 @@ export interface WebAccessState {
   pairing: boolean;
 }
 
+/** "Mark commits made by the agent": off unless the person turned it on. */
+export interface CommitAttribution {
+  enabled: boolean;
+  /** The line added to the agent's commits, as the host writes it. */
+  trailer: string;
+}
+
 export interface WebAccessPairing {
   code: string;
   expiresInSeconds: number;
@@ -347,6 +354,10 @@ export interface SettingsApi {
   environment: {
     /** Saving goes through the configuration queue (`environment`). */
     read(): Promise<EnvironmentEntry[]>;
+  };
+  commitAttribution: {
+    /** Saving goes through the configuration queue (`commit-attribution`). */
+    read(): Promise<CommitAttribution>;
   };
   /** Only the desktop window may manage web access; web clients get `forbidden`. */
   webAccess: {

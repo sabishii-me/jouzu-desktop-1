@@ -13,6 +13,7 @@ use std::{
 };
 
 mod artifacts;
+mod commit_attribution;
 pub mod awake;
 pub mod control;
 mod environment;
@@ -248,6 +249,7 @@ pub fn router(state: AppState) -> Router {
         .route("/timing", axum::routing::post(record_ui_timing))
         .route("/runtime/warm", get(warm_runtime).post(aim_warm_runtime))
         .route("/environment", get(read_environment))
+        .route("/commit-attribution", get(read_commit_attribution))
         .route("/capabilities", get(capabilities))
         .route("/web-access", get(web_access_snapshot).put(update_web_access))
         .route(
@@ -1382,6 +1384,12 @@ async fn read_environment(
 ) -> Result<Json<Value>, ApiError> {
     environment::read(state.sessions.runtime_home())
         .map(|entries| Json(json!({ "entries": entries })))
+        .map_err(ApiError::bad_request)
+}
+
+async fn read_commit_attribution(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    commit_attribution::read(state.sessions.runtime_home())
+        .map(|setting| Json(json!({ "enabled": setting.enabled, "trailer": commit_attribution::TRAILER })))
         .map_err(ApiError::bad_request)
 }
 

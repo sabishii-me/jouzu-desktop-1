@@ -165,6 +165,9 @@ function hostGroups(client: HostClient) {
     environment: {
       read: () => client.environment(),
     },
+    commitAttribution: {
+      read: () => client.commitAttribution(),
+    },
     webAccess: {
       read: () => client.webAccess(),
       update: scope => client.updateWebAccess(scope),

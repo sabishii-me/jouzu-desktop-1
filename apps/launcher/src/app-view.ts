@@ -11,7 +11,7 @@ import { parseControlState, type ControlState, type HeldCatalog } from "./contro
 export type ConfigKind =
   | "status" | "profile" | "import" | "shisa-login" | "shisa-logout" | "refresh-catalogs"
   | "catalog-accept" | "catalog-reject" | "provider-oauth" | "provider-key" | "provider-remove"
-  | "custom-provider" | "default-model" | "language" | "environment";
+  | "custom-provider" | "default-model" | "language" | "environment" | "commit-attribution";
 
 export interface ConfigDevice { url: string; code: string; provider?: string }
 export interface ConfigRunning { operationId: string; kind: ConfigKind; startedAt: string; device?: ConfigDevice }

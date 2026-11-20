@@ -105,6 +105,9 @@ const KINDS: &[Kind] = &[
     // Saved environment variables: written by the host itself (`environment.rs`),
     // queued like the rest so a refresh queued after a save sees the new values.
     Kind { name: "environment", fields: &[], reads: false },
+    // "Mark commits made by the agent": written by the host itself
+    // (`commit_attribution.rs`); new runtimes start with it.
+    Kind { name: "commit-attribution", fields: &[("enabled", Field::Flag)], reads: false },
 ];
 
 const ENVIRONMENT_ENTRIES: usize = 256;
@@ -119,6 +122,7 @@ enum Payload {
     /// Forwarded to the control program: `action` plus the kind's own fields only.
     Adapter(Value),
     Environment(Vec<crate::environment::Entry>),
+    CommitAttribution(bool),
 }
 
 /// Check a request body against its kind. Unknown kinds, unknown fields, wrong
@@ -143,6 +147,12 @@ fn validate(kind: &str, body: &Value) -> Result<(&'static Kind, Payload), ApiErr
     }
     if let Some(unknown) = object.keys().find(|key| !spec.fields.iter().any(|(name, _)| name == key)) {
         return Err(invalid(format!("Unknown field `{unknown}` for `{kind}`")));
+    }
+    if spec.name == "commit-attribution" {
+        return match object.get("enabled") {
+            Some(Value::Bool(enabled)) => Ok((spec, Payload::CommitAttribution(*enabled))),
+            _ => Err(invalid("Invalid or missing field `enabled` for `commit-attribution`")),
+        };
     }
     let mut payload = Map::new();
     payload.insert("action".into(), Value::String(spec.name.into()));
@@ -439,7 +449,7 @@ impl ControlManager {
             }
             let provider = match &payload {
                 Payload::Adapter(fields) => fields.get("provider").and_then(Value::as_str).map(str::to_string),
-                Payload::Environment(_) => None,
+                Payload::Environment(_) | Payload::CommitAttribution(_) => None,
             };
             queue.queued.push_back(Operation { id: id.clone(), kind, payload, provider, queued_at: now() });
             // How many operations run before this one.
@@ -566,6 +576,13 @@ impl ControlManager {
                     Err(outcome) => (None, Some(outcome)),
                 };
                 Done { changed: true, settings, params: json!({}), outcome: Outcome::ok(), read_failure }
+            }
+            Payload::CommitAttribution(enabled) => {
+                let setting = crate::commit_attribution::Setting { enabled: *enabled };
+                if let Err(message) = crate::commit_attribution::save(&self.context.home, setting) {
+                    return Done::failed(Outcome { ok: false, code: Some("config-failed"), text: Some(message) });
+                }
+                Done { changed: true, settings: None, params: json!({ "enabled": enabled }), outcome: Outcome::ok(), read_failure: None }
             }
             Payload::Adapter(payload) => match self.run(&operation.id, payload, cancel).await {
                 Ok(answer) => {

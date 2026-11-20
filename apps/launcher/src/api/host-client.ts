@@ -10,6 +10,7 @@ import {
   type Artifact,
   type ArtifactBody,
   type Attachment,
+  type CommitAttribution,
   type EnvironmentEntry,
   type FileEntry,
   type HistoryPage,
@@ -259,6 +260,10 @@ export class HostClient {
 
   status(): Promise<RuntimeStatus> {
     return this.request<RuntimeStatus>("/v1/status");
+  }
+
+  commitAttribution(): Promise<CommitAttribution> {
+    return this.request<CommitAttribution>("/v1/commit-attribution");
   }
 
   environment(): Promise<EnvironmentEntry[]> {

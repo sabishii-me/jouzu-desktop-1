@@ -256,6 +256,12 @@ impl SessionConfig {
         for (key, value) in &self.spec.env {
             set(key, OsString::from(value));
         }
+        let attribution = crate::commit_attribution::variables(&self.runtime_home, &environment).map_err(|message| {
+            format!("commit attribution could not be prepared ({message}). Open Settings > Environment and set it again")
+        })?;
+        for (key, value) in attribution {
+            environment.insert(key.to_ascii_uppercase(), (OsString::from(key), value));
+        }
         Ok(environment.into_values().collect())
     }
 }
@@ -7704,6 +7710,22 @@ mod environment_tests {
         std::fs::write(home.path().join("launcher-environment.bin"), b"broken").unwrap();
         let error = config(home.path()).environment(None, None).unwrap_err();
         assert!(error.contains("saved environment variables could not be read"), "{error}");
+    }
+
+    /// Commit attribution is off until the person turns it on; on, the next
+    /// runtime's git uses the Desktop hooks after the git configuration it had.
+    #[test]
+    fn commit_attribution_reaches_the_next_runtime_only_when_on() {
+        let home = tempfile::tempdir().unwrap();
+        let config = config(home.path());
+        let off = config.environment(None, None).unwrap();
+        assert_eq!(value(&off, "JOUZU_GIT_HOOKS_INDEX"), None);
+        crate::commit_attribution::save(home.path(), crate::commit_attribution::Setting { enabled: true }).unwrap();
+        let on = config.environment(None, None).unwrap();
+        let before: usize = value(&off, "GIT_CONFIG_COUNT").map_or(0, |count| count.parse().unwrap());
+        assert_eq!(value(&on, "GIT_CONFIG_COUNT"), Some((before + 1).to_string()));
+        assert_eq!(value(&on, &format!("GIT_CONFIG_KEY_{before}")).as_deref(), Some("core.hooksPath"));
+        assert_eq!(value(&on, &format!("GIT_CONFIG_VALUE_{before}")), Some(home.path().join("git-hooks").to_string_lossy().into_owned()));
     }
 
     /// Issue #63: warm and session runtimes carry the variables saved in

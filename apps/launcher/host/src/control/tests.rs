@@ -50,6 +50,11 @@ fn a_request_is_checked_per_kind_before_it_reaches_the_service() {
     assert_eq!(code("custom-provider", json!({ "provider": "p", "url": "u", "model": "m", "maxTokens": 1.5 })), Some("config-invalid"));
     assert_eq!(code("environment", json!({ "entries": [{ "name": "A B", "value": "", "enabled": true }] })), Some("config-invalid"));
     assert_eq!(code("environment", json!({ "entries": [{ "name": "A", "value": "", "enabled": true, "x": 1 }] })), Some("config-invalid"));
+    assert_eq!(code("commit-attribution", json!({})), Some("config-invalid"));
+    assert_eq!(code("commit-attribution", json!({ "enabled": "yes" })), Some("config-invalid"));
+    assert_eq!(code("commit-attribution", json!({ "enabled": true, "trailer": "x" })), Some("config-invalid"));
+    let (_, payload) = validate("commit-attribution", &json!({ "enabled": true })).unwrap();
+    assert!(matches!(payload, Payload::CommitAttribution(true)));
     assert_eq!(code("status", json!({ "action": "provider-key" })), Some("config-invalid"));
 
     // Only the kind's own fields are forwarded, with the action set by the host.

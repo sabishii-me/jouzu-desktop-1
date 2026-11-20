@@ -1,0 +1,2 @@
+# Hook scripts run by sh, also from Git for Windows: never CRLF.
+apps/launcher/host/src/git_hooks/* text eol=lf
