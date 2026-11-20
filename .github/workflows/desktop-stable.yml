@@ -4,7 +4,8 @@ name: Desktop stable release
 #   1. confirm the QA release candidate X.Y.Z-rc.N that passed QA;
 #   2. build the stable package X.Y.Z again from that candidate's commit, with the
 #      normal icon (QA packages carry the QA icon, #74);
-#   3. run the full user playbook on that build with a real model, on every platform
+#   3. run the full user playbook (the exam from the commit this workflow runs from)
+#      on that build with a real model, on every platform
 #      the desktop ships (Windows today); every scenario and gate must pass;
 #   4. only then publish v<X.Y.Z> and replace the stable feed (desktop-update), with the
 #      CHANGELOG section for X.Y.Z as its notes (stable users may come from an older stable
@@ -126,6 +127,17 @@ jobs:
       - name: Install the browser test runner
         working-directory: apps/launcher
         run: npx playwright install chromium
+      - name: Take the exam from the release branch
+        # The package is built from the candidate's commit; the exam that judges it is
+        # release tooling and comes from the commit this workflow runs from, so a fault
+        # in the exam is fixed without a new candidate. Thresholds are part of the exam
+        # and change only in their own reviewed commits (0019).
+        run: |
+          git fetch --no-tags --depth=1 'https://github.com/${{ github.repository }}' '${{ github.sha }}'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git checkout FETCH_HEAD -- apps/launcher/e2e apps/launcher/e2e-runtime
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git log -1 --format='exam from %H' FETCH_HEAD
       - name: Stable exam (full playbook, real model)
         working-directory: apps/launcher
         env:
