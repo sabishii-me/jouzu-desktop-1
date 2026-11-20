@@ -121,7 +121,8 @@ const time = (value: unknown): number | undefined => {
   return Number.isFinite(parsed) ? parsed : undefined;
 };
 
-function activeTurnOf(value: unknown): ActiveTurn | null {
+/** The host's `activeTurn` (times as ISO strings or numbers) in the UI's form. */
+export function activeTurnOf(value: unknown): ActiveTurn | null {
   const turn = record(value);
   const turnId = text(turn?.turnId);
   if (!turn || !turnId) return null;

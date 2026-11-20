@@ -200,6 +200,8 @@ pub struct SessionConfig {
     pub known: Arc<KnownModels>,
     /// What replies said about each provider's sign-in (`provider_answers`).
     pub providers: Arc<crate::provider_answers::ProviderAnswers>,
+    /// Runs that ended while no client showed their session (`run_marks`).
+    pub runs: Arc<crate::run_marks::RunMarks>,
 }
 
 impl SessionConfig {
@@ -1868,6 +1870,9 @@ impl Session {
     fn publish(&self, event: &str, data: Value) -> SessionEvent {
         self.touch();
         self.record_timing(event, &data);
+        if event == "turn.end" {
+            self.note_run_end(&data);
+        }
         let stored = {
             let mut log_guard = self
                 .events
@@ -1880,6 +1885,67 @@ impl Session {
             hub.publish_session(&self.id, stored.id, event, stored.data.clone());
         }
         stored
+    }
+
+    /// How a run ended, from its `turn.end`, for the session list: `None` when
+    /// no run ended (the message went back to the queue, or an extension handled
+    /// a command), and `Some(None)` for a run someone stopped, which the list
+    /// shows like a session at rest.
+    fn run_outcome(&self, data: &Value) -> Option<Option<crate::run_marks::Outcome>> {
+        use crate::run_marks::Outcome;
+        let status = data.get("status").and_then(Value::as_str);
+        if matches!(status, Some("queued" | "handled")) {
+            return None;
+        }
+        if status == Some("failed") || data.get("reason").is_some_and(|reason| !reason.is_null()) {
+            return Some(Some(Outcome::Failed));
+        }
+        if status == Some("interrupted") || data.get("aborted").and_then(Value::as_bool) == Some(true) {
+            return Some(None);
+        }
+        // Completed: failed when its last reply did (the provider refused it
+        // and no retry answered).
+        let turn = data.get("turnId").and_then(Value::as_str)?;
+        let failed = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .rev()
+            .find(|row| {
+                row.get("kind").and_then(Value::as_str) == Some("assistant")
+                    && row.get("turnId").and_then(Value::as_str) == Some(turn)
+            })
+            .is_some_and(|row| row.get("errorMessage").is_some_and(|error| !error.is_null()));
+        Some(Some(if failed { Outcome::Failed } else { Outcome::Done }))
+    }
+
+    /// A run ended: marked for the session list unless a client shows the session (#212).
+    fn note_run_end(&self, data: &Value) {
+        let Some(outcome) = self.run_outcome(data) else { return };
+        let Some(path) = self.list_key() else { return };
+        match outcome {
+            Some(outcome) => {
+                let shown = self.viewers.load(Ordering::SeqCst) > 0;
+                self.config.runs.ended(&path, outcome, &Self::now_iso(), shown);
+            }
+            // Stopped: nothing to tell, and an older mark is out of date.
+            None => {
+                self.config.runs.seen(&path);
+            }
+        }
+    }
+
+    /// The session's file as the session list keys it.
+    fn list_key(&self) -> Option<String> {
+        self.saved_path().as_deref().map(canonical_path)
+    }
+
+    /// A run of this session that ended while no client showed it.
+    fn unseen_run(&self) -> Value {
+        self.list_key()
+            .map(|path| self.config.runs.view(&path))
+            .unwrap_or(Value::Null)
     }
 
     fn publish_summary(&self) {
@@ -4950,6 +5016,7 @@ impl Session {
             "running": self.run_guard().is_some(),
             "activeTurn": self.active_turn_view(),
             "runtimePid": self.runtime_pid(),
+            "unseenRun": self.unseen_run(),
             "model": self.model_view(),
             "runtimeParseErrors": self.runtime_parse_errors(),
             "cursor": self.cursor(),
@@ -5030,6 +5097,7 @@ impl Session {
             "sessionSeq": self.cursor(),
             "status": status.as_str(),
             "activeTurn": active_turn,
+            "unseenRun": self.unseen_run(),
             "pendingApprovals": self.pending_approvals(),
             "pendingQuestions": self.pending_questions(),
             "statuses": self.ui_statuses(),
@@ -5862,6 +5930,8 @@ fn same_session_file(left: &str, right: &str) -> bool {
 pub struct SessionManager {
     /// What replies said about each provider's sign-in, for Settings.
     providers: Arc<crate::provider_answers::ProviderAnswers>,
+    /// Runs that ended while no client showed their session (`run_marks`).
+    runs: Arc<crate::run_marks::RunMarks>,
     /// How runtimes are started. Kept from the moment the runtime is found; see
     /// `config()`.
     config: std::sync::OnceLock<SessionConfig>,
@@ -5992,6 +6062,7 @@ impl SessionManager {
         events: Option<Arc<crate::events::EventHub>>,
     ) -> Self {
         let providers = Arc::new(crate::provider_answers::ProviderAnswers::new());
+        let runs = Arc::new(crate::run_marks::RunMarks::new(Some(home.join("session-runs.json"))));
         let config = std::sync::OnceLock::new();
         if let Some(spec) = spec {
             let _ = config.set(SessionConfig {
@@ -6005,10 +6076,12 @@ impl SessionManager {
                 warm: Arc::new(std::sync::OnceLock::new()),
                 known: Arc::new(KnownModels::new()),
                 providers: providers.clone(),
+                runs: runs.clone(),
             });
         }
         Self {
             providers,
+            runs,
             config,
             managed: None,
             warm_wanted: AtomicBool::new(false),
@@ -6063,6 +6136,7 @@ impl SessionManager {
                 warm: Arc::new(std::sync::OnceLock::new()),
                 known: Arc::new(KnownModels::new()),
                 providers: self.providers.clone(),
+                runs: self.runs.clone(),
             }
         });
         if found {
@@ -6839,12 +6913,37 @@ impl SessionManager {
             .into_iter()
             .filter(|entry| entry.get("blank").and_then(Value::as_bool) != Some(true))
             .map(|mut entry| {
+                let unseen = entry
+                    .get("sessionPath")
+                    .and_then(Value::as_str)
+                    .map(|path| self.runs.view(path))
+                    .unwrap_or(Value::Null);
                 if let Some(object) = entry.as_object_mut() {
                     object.remove("blank");
+                    object.insert("unseenRun".to_string(), unseen);
                 }
                 entry
             })
             .collect()
+    }
+
+    /// A client shows the saved session at `session_path`, live or from its
+    /// file: a run that ended unseen is seen now (#212).
+    pub fn seen(&self, session_path: &str) -> Value {
+        let key = canonical_path(session_path);
+        if self.runs.seen(&key) {
+            let live = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .find(|session| session.list_key().as_deref() == Some(key.as_str()))
+                .cloned();
+            if let Some(session) = live {
+                session.publish_summary();
+            }
+        }
+        json!({ "sessionPath": key })
     }
 
     /// Every saved session file, blank ones included.
@@ -6931,6 +7030,9 @@ impl SessionManager {
             session.shown.store(true, Ordering::SeqCst);
             if before.as_deref() != Some(session_id) {
                 session.viewers.fetch_add(1, Ordering::SeqCst);
+            }
+            if session.list_key().is_some_and(|path| self.runs.seen(&path)) {
+                session.publish_summary();
             }
         }
         if let Some(left) = before.filter(|before| before != session_id).and_then(|before| self.get(&before)) {
@@ -7695,6 +7797,7 @@ mod environment_tests {
             warm: Arc::new(std::sync::OnceLock::new()),
             known: Arc::new(KnownModels::new()),
             providers: Arc::new(crate::provider_answers::ProviderAnswers::new()),
+            runs: Arc::new(crate::run_marks::RunMarks::new(None)),
         }
     }
 

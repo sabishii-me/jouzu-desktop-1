@@ -65,7 +65,16 @@ export interface SessionSummary {
   queued?: number;
   /** The host holds a failed message to retry. */
   hasFailedTurn?: boolean;
+  /** What the running turn is doing now (live sessions only). */
+  /** As the host sends it: times are ISO strings. */
+  activeTurn?: unknown;
+  pendingApprovalCount?: number;
+  pendingQuestionCount?: number;
+  /** A run that ended while no client showed this session, until one does (#212). */
+  unseenRun?: UnseenRun | null;
 }
+
+export interface UnseenRun { outcome: "done" | "failed"; endedAt: string }
 
 export interface SessionHandle {
   sessionId: string;
@@ -212,6 +221,8 @@ export interface SessionApi {
   queue(sessionId: string, action: "continue" | "discard" | "retry"): Promise<void>;
   stop(sessionId: string): Promise<void>;
   update(sessionPath: string, change: { pinned?: boolean; archived?: boolean; title?: string }): Promise<SessionSummary | unknown>;
+  /** This client shows the session now: a run that ended unseen is seen (#212). */
+  seen?(sessionPath: string): Promise<void>;
   /** Copy a saved session through user turn `turn` (1 = the first user message) into a new one. */
   branch(sessionPath: string, turn: number): Promise<string>;
   recover(sessionPath: string): Promise<string | null>;

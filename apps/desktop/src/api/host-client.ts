@@ -501,6 +501,13 @@ export class HostClient {
     });
   }
 
+  async seen(sessionPath: string): Promise<void> {
+    await this.request("/v1/sessions/seen", {
+      method: "POST",
+      body: JSON.stringify({ sessionPath }),
+    });
+  }
+
   branch(sessionPath: string, turn: number): Promise<string> {
     return this.request<{ sessionPath: string }>("/v1/sessions/branch", {
       method: "POST",
