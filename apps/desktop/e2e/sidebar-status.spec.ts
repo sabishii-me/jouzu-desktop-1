@@ -68,15 +68,15 @@ for (const [language, words] of [
     await setup(page, language, seen);
     const state = (name: string) => page.locator("[data-session-selected], div.group\\/session").filter({ hasText: `${name} session` }).locator("[data-session-state]");
     await expect(state("Running")).toHaveAttribute("data-session-state", "running");
-    await expect(state("Running")).toHaveAttribute("aria-label", new RegExp(words.running));
-    await expect(state("Waiting")).toHaveAttribute("aria-label", words.waiting);
-    await expect(state("Finished")).toHaveAttribute("aria-label", words.done);
-    await expect(state("Failed")).toHaveAttribute("aria-label", words.failed);
-    await expect(state("Stopped")).toHaveAttribute("aria-label", words.stopped);
+    await expect(state("Running")).toHaveAttribute("title", new RegExp(words.running));
+    await expect(state("Waiting")).toHaveAttribute("title", words.waiting);
+    await expect(state("Finished")).toHaveAttribute("title", words.done);
+    await expect(state("Failed")).toHaveAttribute("title", words.failed);
+    await expect(state("Stopped")).toHaveAttribute("title", words.stopped);
     await expect(state("Quiet")).toHaveCount(0);
     await page.locator("aside").screenshot({ path: `test-results/sidebar-status-${language}.png` });
     // Opening a session whose run ended unseen tells the host it has been seen.
-    await page.getByRole("button", { name: /^Finished session/ }).click();
+    await page.locator("button", { hasText: "Finished session" }).click();
     await expect.poll(() => seen).toEqual(["C:/s/Finished.jsonl"]);
   });
 }
