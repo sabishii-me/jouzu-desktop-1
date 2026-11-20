@@ -51,6 +51,11 @@ pub struct TaskRecord {
     /// model is whatever its runtime reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Value>,
+    /// The state the host last saw while following the session. Only for
+    /// when the session is not open: how it ended, or that the host went
+    /// away while it ran (then it is reported stopped on the next start).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_state: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,6 +97,8 @@ struct Live {
     state: Option<String>,
     /// A turn ran since the last message was sent: idle now means finished.
     ran: bool,
+    /// The last turn was stopped, not completed: idle now means stopped.
+    interrupted: bool,
     watching: bool,
 }
 
@@ -124,6 +131,14 @@ fn new_id(prefix: &str) -> String {
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("{prefix}{hex}")
+}
+
+/// Like `derive_state`, for a task whose last turn may have been stopped.
+fn task_state(summary: &Value, live: &Live) -> &'static str {
+    match derive_state(summary, live.ran) {
+        "finished" if live.interrupted => "stopped",
+        state => state,
+    }
 }
 
 /// The task's state from its session's summary, as the user would see it.
@@ -327,6 +342,7 @@ impl TaskManager {
             created_at: now(),
             pending_text: Some(text.to_string()),
             model,
+            last_state: None,
         };
         {
             let mut store = self.store();
@@ -371,7 +387,7 @@ impl TaskManager {
         let events = session.subscribe();
         self.live().insert(
             task_id.to_string(),
-            Live { state: Some("starting".into()), ran: false, watching: false },
+            Live { state: Some("starting".into()), ..Live::default() },
         );
         if let Err(error) = session.send_with_client(&new_id(TASK_MESSAGE), &text, Some(&record.client_id), &[]) {
             self.live().remove(task_id);
@@ -432,6 +448,13 @@ impl TaskManager {
                             if event.event == "turn.start" {
                                 if let Some(live) = manager.live().get_mut(&task_id) {
                                     live.ran = true;
+                                    live.interrupted = false;
+                                }
+                            }
+                            if event.event == "turn.end" {
+                                let stopped = event.data["status"] == "interrupted" || event.data["aborted"] == true;
+                                if let Some(live) = manager.live().get_mut(&task_id) {
+                                    live.interrupted = stopped;
                                 }
                             }
                             if event.event == "message.accepted"
@@ -484,7 +507,7 @@ impl TaskManager {
             if !summary["activeTurn"].is_null() {
                 entry.ran = true;
             }
-            let state = derive_state(&summary, entry.ran).to_string();
+            let state = task_state(&summary, entry).to_string();
             if entry.state.as_deref() == Some(state.as_str()) {
                 None
             } else {
@@ -493,6 +516,7 @@ impl TaskManager {
             }
         };
         if let Some(state) = changed {
+            self.remember(task_id, &state);
             self.changed(task_id);
             if reportable(&state) {
                 self.report(task_id, &state);
@@ -569,15 +593,42 @@ impl TaskManager {
                     self.save(&store);
                 }
                 self.live().insert(task_id.clone(), Live { state: Some("failed".into()), ..Live::default() });
+                self.remember(&task_id, "failed");
                 self.report(&task_id, "failed");
                 self.changed(&task_id);
             }
         }
     }
 
-    /// Resumes following tasks whose sessions are live, and starts waiting ones.
-    /// Called once after start-up.
+    /// Keeps the state the host saw, for when the session is no longer open.
+    fn remember(&self, task_id: &str, state: &str) {
+        let mut store = self.store();
+        if let Some(task) = store.tasks.iter_mut().find(|task| task.task_id == task_id) {
+            if task.last_state.as_deref() != Some(state) {
+                task.last_state = Some(state.to_string());
+                self.save(&store);
+            }
+        }
+    }
+
+    /// After start-up: a task whose session was running when the host went
+    /// away was stopped by that; its client is told so. Then waiting tasks
+    /// start. Called once.
     pub fn resume(self: &Arc<Self>) {
+        let cut: Vec<String> = self
+            .store()
+            .tasks
+            .iter()
+            .filter(|task| task.last_state.as_deref().is_some_and(active))
+            .filter(|task| task.session_id.as_deref().and_then(|id| self.sessions.get(id)).is_none())
+            .map(|task| task.task_id.clone())
+            .collect();
+        for task_id in cut {
+            crate::log(self.home(), "info", "task.cut_by_exit", json!({ "taskId": task_id }));
+            self.remember(&task_id, "stopped");
+            self.report(&task_id, "stopped");
+            self.changed(&task_id);
+        }
         self.fill_slots();
     }
 
@@ -586,14 +637,15 @@ impl TaskManager {
             return "waiting_to_start".into();
         }
         if let Some(session) = record.session_id.as_deref().and_then(|id| self.sessions.get(id)) {
-            let ran = self.live().get(&record.task_id).is_some_and(|live| live.ran);
-            return derive_state(&session.summary(), ran).to_string();
+            let live = self.live().get(&record.task_id).cloned().unwrap_or_default();
+            return task_state(&session.summary(), &live).to_string();
         }
         self.live()
             .get(&record.task_id)
             .and_then(|live| live.state.clone())
+            .or_else(|| record.last_state.clone())
             .filter(|state| !active(state))
-            // Not loaded: the conversation is in its file; read it for the result.
+            // Not loaded and never seen to end: the conversation is in its file.
             .unwrap_or_else(|| "unloaded".into())
     }
 
@@ -659,6 +711,7 @@ impl TaskManager {
                 self.save(&store);
             }
             self.live().insert(task_id.to_string(), Live { state: Some("stopped".into()), ..Live::default() });
+            self.remember(task_id, "stopped");
             self.report(task_id, "stopped");
             self.changed(task_id);
             return self.view(&self.record(task_id)?);
@@ -992,6 +1045,59 @@ mod flow_tests {
         // The mark stays when the state moves on, until the client acknowledges it.
         let after = wait_for(&tasks, "agent-a", &task_id, "finished").await;
         assert!(after.iter().filter(|entry| entry.seq > wrote.seq).all(|entry| entry.user_wrote), "{after:?}");
+    }
+
+    async fn until_state(tasks: &TaskManager, client: &str, task_id: &str, state: &str) {
+        for _ in 0..100 {
+            if tasks.get(client, task_id).unwrap()["state"] == state {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{task_id} never got to {state}: {}", tasks.get(client, task_id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_task_stopped_mid_turn_is_stopped_not_finished() {
+        let (manager, _home, workspace) = setup(&[("FAKE_RUNTIME_DELAY_MS", "4000")]);
+        let tasks = TaskManager::new(manager, DEFAULT_CAP);
+        let task = tasks.start("agent-a", &folder(&workspace), "a long job").unwrap();
+        let task_id = task["taskId"].as_str().unwrap().to_string();
+        until_state(&tasks, "agent-a", &task_id, "running").await;
+        tasks.stop("agent-a", &task_id).unwrap();
+        let seen = wait_for(&tasks, "agent-a", &task_id, "stopped").await;
+        assert!(seen.iter().all(|entry| entry.state != "finished"), "{seen:?}");
+        assert_eq!(tasks.get("agent-a", &task_id).unwrap()["state"], "stopped");
+    }
+
+    #[tokio::test]
+    async fn a_task_cut_off_by_the_host_going_away_is_reported_stopped() {
+        let (manager, home, workspace) = setup(&[("FAKE_RUNTIME_DELAY_MS", "8000")]);
+        let tasks = TaskManager::new(manager, DEFAULT_CAP);
+        let task = tasks.start("agent-a", &folder(&workspace), "a long job").unwrap();
+        let task_id = task["taskId"].as_str().unwrap().to_string();
+        until_state(&tasks, "agent-a", &task_id, "running").await;
+
+        // The host starts again on the same home: that session is gone.
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-runtime.mjs");
+        let again = Arc::new(SessionManager::new(
+            Some(RuntimeSpec::node_script(&fixture)),
+            home.path().to_path_buf(),
+            home.path().join("data"),
+            None,
+            50,
+            None,
+        ));
+        again.add_workspaces(&[folder(&workspace)]).unwrap();
+        let restarted = TaskManager::new(again, DEFAULT_CAP);
+        restarted.resume();
+        let entries: Vec<InboxEntry> = serde_json::from_value(restarted.inbox("agent-a", 0).unwrap()["entries"].clone()).unwrap();
+        assert!(entries.iter().any(|entry| entry.task_id == task_id && entry.state == "stopped"), "{entries:?}");
+        assert_eq!(restarted.get("agent-a", &task_id).unwrap()["state"], "stopped");
+        // Said once: another start does not say it again.
+        let seq = restarted.inbox("agent-a", 0).unwrap()["seq"].as_u64().unwrap();
+        restarted.resume();
+        assert_eq!(restarted.inbox("agent-a", 0).unwrap()["seq"].as_u64().unwrap(), seq);
     }
 
     #[tokio::test]

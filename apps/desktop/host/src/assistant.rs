@@ -141,6 +141,34 @@ struct Wake {
     note: String,
 }
 
+/// Scheduled wakes on disk, by wall-clock time, so a restart keeps them: the
+/// Assistant may already have told the user a reminder is set.
+fn load_wakes(dir: &Path) -> Vec<Wake> {
+    let now_ms = Utc::now().timestamp_millis();
+    std::fs::read(dir.join("wakes.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).ok())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|wake| {
+            let due = wake["dueMs"].as_i64()?;
+            let left = Duration::from_millis(due.saturating_sub(now_ms).max(0) as u64);
+            Some(Wake { at: Instant::now() + left, note: wake["note"].as_str().unwrap_or("").to_string() })
+        })
+        .collect()
+}
+
+fn save_wakes(dir: &Path, wakes: &[Wake]) {
+    let now = Instant::now();
+    let now_ms = Utc::now().timestamp_millis();
+    let rows: Vec<Value> = wakes
+        .iter()
+        .map(|wake| json!({ "dueMs": now_ms + wake.at.saturating_duration_since(now).as_millis() as i64, "note": wake.note }))
+        .collect();
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join("wakes.json"), serde_json::to_vec(&rows).unwrap_or_default());
+}
+
 struct State {
     phase: Phase,
     error: Option<String>,
@@ -231,6 +259,7 @@ impl Assistant {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Settings>(&bytes).ok())
             .unwrap_or_default();
+        let scheduled = load_wakes(&dir);
         Arc::new(Self {
             dir,
             paths,
@@ -246,7 +275,7 @@ impl Assistant {
                 woken_seq: 0,
                 changes_since: None,
                 last_wake: None,
-                scheduled: Vec::new(),
+                scheduled,
                 turn: 0,
                 memory_seen: String::new(),
             }),
@@ -733,6 +762,7 @@ impl Assistant {
             return None;
         }
         state.scheduled.retain(|wake| wake.at > now);
+        save_wakes(&self.dir, &state.scheduled);
         state.last_wake = Some(now);
         let mut text = String::from("[wake]");
         if inbox_wake {
@@ -784,6 +814,7 @@ impl Assistant {
                     return Err(ApiError::bad_request("At most 20 wakes can be scheduled"));
                 }
                 state.scheduled.push(Wake { at: Instant::now() + Duration::from_secs(seconds), note });
+                save_wakes(&self.dir, &state.scheduled);
                 Ok(json!({ "scheduled": state.scheduled.len() }))
             }
             "get_workflow" => self.workflow().read(),
@@ -1238,6 +1269,24 @@ mod tests {
         assert!(read["messages"].as_array().unwrap().iter().any(|row| row["text"].as_str().is_some_and(|text| text.contains("Safari only"))), "{read}");
         let outside = assistant.run_tool("read_session", &json!({ "sessionPath": "/etc/passwd" })).await.unwrap_err();
         assert!(outside.message.contains("No such session"));
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_wake_survives_a_restart() {
+        let fixture = setup(WakePolicy::default());
+        fixture.assistant.run_tool("schedule_wake", &json!({ "seconds": 3600, "note": "check the release" })).await.unwrap();
+        let again = Assistant::new(
+            fixture._home.path(),
+            Assistant::default_paths(fixture._home.path(), &fixture.assistant.sessions),
+            WakePolicy::default(),
+            fixture.assistant.sessions.clone(),
+            fixture.tasks.clone(),
+            fixture.assistant.projects.clone(),
+        );
+        let wakes = again.snapshot().await["scheduledWakes"].clone();
+        assert_eq!(wakes.as_array().map(Vec::len), Some(1), "{wakes}");
+        assert_eq!(wakes[0]["note"], "check the release");
+        assert!(wakes[0]["inSeconds"].as_u64().is_some_and(|left| (3590..=3600).contains(&left)), "{wakes}");
     }
 
     #[tokio::test]

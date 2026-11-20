@@ -601,6 +601,23 @@ pub(crate) async fn call_task_tool(
                 }
             }
             let model = arguments.get("model").filter(|model| !model.is_null()).cloned();
+            if let Some(model) = &model {
+                // A model the runtime does not offer is refused, never swapped
+                // for the default without a word.
+                let listed = sessions.runtime_models().await.unwrap_or_else(|| {
+                    Err(ApiError::unavailable("The runtime has not listed its models yet. Try again shortly."))
+                })?;
+                let offered = listed["models"].as_array().is_some_and(|models| {
+                    models.iter().any(|item| item["provider"] == model["provider"] && item["id"] == model["id"])
+                });
+                if !offered {
+                    return Err(ApiError::bad_request(format!(
+                        "No model {}/{} is available; list_models shows the ones that are",
+                        model["provider"].as_str().unwrap_or("?"),
+                        model["id"].as_str().unwrap_or("?")
+                    )));
+                }
+            }
             tasks.start_with(id, workspace, string_arg(arguments, "text")?, model)
         }
         "list_models" => {
@@ -764,6 +781,10 @@ mod tests {
         let slash = call(&server, &token, "start_task", json!({ "workspace": workspace.path(), "text": "/textguard off" })).await;
         assert_eq!(slash["isError"], true);
         assert_eq!(slash["structuredContent"]["error"]["code"], "command-not-allowed");
+        // A model nobody offers is refused, not swapped for the default.
+        let model = call(&server, &token, "start_task", json!({ "workspace": workspace.path(), "text": "hello", "model": { "provider": "nobody", "id": "no-such-model" } })).await;
+        assert_eq!(model["isError"], true, "{model}");
+        assert!(server.tasks.list("agent-1").map(|listed| listed["tasks"].as_array().unwrap().is_empty()).unwrap_or(true));
         let unknown = call(&server, &token, "approve", json!({})).await;
         assert_eq!(unknown["isError"], true);
         let (_, missing) = rpc(&server, &token, json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/list" })).await;
