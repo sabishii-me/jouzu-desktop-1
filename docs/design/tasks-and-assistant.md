@@ -184,11 +184,11 @@ scheduled wake, note them in the project, and ask before taking them on.
 
 The sidebar entry "Assistant" opens its pane. From the top: the task sessions
 waiting for the person (an approval or an answer; a click opens the session),
-then the person's projects, each expanding to its linked sessions and tasks
-with their state icons, then the conversation. Everything is read from the
-host (the session list with its task marks, `/v1/projects`, the Assistant's
-snapshot) and read again on `task.changed`, `project.changed` and
-`assistant.changed`; the remote web page shows the same.
+then the conversation. Projects are kept by the host and used by the Assistant
+but not shown in the pane for now; what to show is decided later. Everything
+is read from the host (the session list with its task marks, the Assistant's
+snapshot) and read again on `task.changed` and `assistant.changed`; the remote
+web page shows the same.
 
 The entry carries a dot while the Assistant said something (a reply or an
 error) the person has not seen, or while a task waits for them. The host keeps
