@@ -354,6 +354,17 @@ describe("SessionStore", () => {
     expect(store.snapshot.prompts).toEqual([]);
   });
 
+  it("keeps how the host says the last run ended (#214)", () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    session.emit(event(1, "session.updated", { lastRun: { outcome: "stopped", endedAt: "2026-11-21T00:00:00.000Z" } }));
+    expect(store.snapshot.lastRun).toEqual({ outcome: "stopped", endedAt: Date.parse("2026-11-21T00:00:00.000Z") });
+    session.emit(event(2, "session.updated", { lastRun: { outcome: "completed", endedAt: "2026-11-21T00:01:00.000Z" } }));
+    expect(store.snapshot.lastRun?.outcome).toBe("completed");
+    session.emit(event(3, "session.updated", { lastRun: null }));
+    expect(store.snapshot.lastRun).toBeNull();
+  });
+
   it("routes runtime notices to TextGuard, Flow, or the toast", () => {
     const session = fakeSession();
     const store = SessionStore.attach(session);

@@ -62,6 +62,11 @@ export interface ActiveTurn {
   /** The runtime refused the last Stop (its words); the run goes on. */
   stopError?: string;
 }
+/** How the session's last run ended, as the host reports it (`session.updated.lastRun`). */
+export interface LastRun {
+  outcome: "completed" | "failed" | "stopped";
+  endedAt?: number;
+}
 /** A message waiting for the running turn (steer) or, after Stop, for Continue. */
 /**
  * A message waiting for the run, as the host reports it: `queued` (handed to
@@ -121,6 +126,8 @@ export interface ChatSnapshot {
   status?: string;
   /** Host-owned; null when no turn is in progress. The only source of "running". */
   activeTurn?: ActiveTurn | null;
+  /** How the session's last run ended, as the host reports it (#214). */
+  lastRun?: LastRun | null;
   prompts?: PendingPrompt[];
   outbox?: OutboxItem[];
   model?: string;

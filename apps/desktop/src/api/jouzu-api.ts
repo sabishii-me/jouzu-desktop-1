@@ -72,6 +72,8 @@ export interface SessionSummary {
   pendingQuestionCount?: number;
   /** A run that ended while no client showed this session, until one does (#212). */
   unseenRun?: UnseenRun | null;
+  /** How the session's last run ended (#214), or null before one has. */
+  lastRun?: { outcome: "completed" | "failed" | "stopped"; endedAt: string } | null;
 }
 
 export interface UnseenRun { outcome: "done" | "failed"; endedAt: string }
