@@ -1866,13 +1866,20 @@ fn attribution_path(state: &AppState) -> PathBuf {
     state.sessions.runtime_home().join("agent").join("attribution.json")
 }
 
+/// `author` ("Commit as Jouzu Desktop") is kept as saved; the extension uses it
+/// only while `enabled` is on.
 fn read_attribution(path: &Path) -> Value {
-    let enabled = std::fs::read_to_string(path)
+    let saved = std::fs::read_to_string(path)
         .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.get("enabled").and_then(Value::as_bool))
-        .unwrap_or(false);
-    json!({ "enabled": enabled })
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let flag = |key: &str| {
+        saved
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    json!({ "enabled": flag("enabled"), "author": flag("author") })
 }
 
 async fn attribution_snapshot(State(state): State<AppState>) -> Json<Value> {
@@ -1883,17 +1890,29 @@ async fn update_attribution(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let enabled = body
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| ApiError::bad_request("enabled must be true or false"))?;
+    // Either switch may be saved alone; the other keeps its saved value.
     let path = attribution_path(&state);
+    let mut next = read_attribution(&path);
+    let mut changed = false;
+    for key in ["enabled", "author"] {
+        match body.get(key) {
+            None => {}
+            Some(Value::Bool(value)) => {
+                next[key] = json!(value);
+                changed = true;
+            }
+            Some(_) => return Err(ApiError::bad_request(format!("{key} must be true or false"))),
+        }
+    }
+    if !changed {
+        return Err(ApiError::bad_request("enabled or author must be true or false"));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| ApiError::internal(format!("Could not create the agent folder: {error}")))?;
     }
     let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, format!("{}\n", json!({ "enabled": enabled })))
+    std::fs::write(&temp, format!("{next}\n"))
         .and_then(|_| std::fs::rename(&temp, &path))
         .map_err(|error| ApiError::internal(format!("Could not save the setting: {error}")))?;
     Ok(Json(read_attribution(&path)))
@@ -4829,20 +4848,28 @@ mod session_tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
+        let both = |enabled: bool, author: bool| json!({ "enabled": enabled, "author": author }).to_string();
         let fresh = call(app.clone(), get()).await;
-        assert_eq!(fresh.2, json!({ "enabled": false }).to_string());
+        assert_eq!(fresh.2, both(false, false));
         let refused = call(app.clone(), put(json!({ "enabled": "yes" }))).await;
         assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{}", refused.2);
+        let empty = call(app.clone(), put(json!({}))).await;
+        assert_eq!(empty.0, StatusCode::BAD_REQUEST, "{}", empty.2);
         let on = call(app.clone(), put(json!({ "enabled": true }))).await;
         assert_eq!(on.0, StatusCode::OK, "{}", on.2);
-        let file: Value = serde_json::from_str(
-            &std::fs::read_to_string(home.path().join("data").join("agent").join("attribution.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(file, json!({ "enabled": true }));
-        assert_eq!(call(app.clone(), get()).await.2, json!({ "enabled": true }).to_string());
-        call(app.clone(), put(json!({ "enabled": false }))).await;
-        assert_eq!(call(app, get()).await.2, json!({ "enabled": false }).to_string());
+        let file = || -> Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(home.path().join("data").join("agent").join("attribution.json")).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(file(), json!({ "enabled": true, "author": false }));
+        // "Commit as Jouzu Desktop" is saved on its own and survives marking going off and on.
+        assert_eq!(call(app.clone(), put(json!({ "author": true }))).await.2, both(true, true));
+        assert_eq!(call(app.clone(), put(json!({ "enabled": false }))).await.2, both(false, true));
+        assert_eq!(file(), json!({ "enabled": false, "author": true }));
+        assert_eq!(call(app.clone(), put(json!({ "enabled": true, "author": false }))).await.2, both(true, false));
+        assert_eq!(call(app, get()).await.2, both(true, false));
     }
 
     #[tokio::test]
@@ -6368,6 +6395,8 @@ mod session_tests {
         let call = rows.iter().find(|row| row["blocks"][0]["type"] == "toolCall").unwrap();
         assert_eq!(call["blocks"][1]["type"], "toolResult", "{call}");
         assert_eq!(call["blocks"][1]["result"]["content"][0]["text"], "a.txt");
+        // The transcript's own last reply says how its last run ended (#214).
+        assert_eq!(session.summary()["lastRun"]["outcome"], json!("completed"));
         let info = session.info();
         assert_eq!(info["title"], "list the files");
         assert_eq!(
@@ -6409,6 +6438,27 @@ mod session_tests {
         assert_eq!(result["interrupted"], true);
         assert_eq!(result["ok"], false);
         assert_eq!(reply["stopReason"], "toolUse");
+        // A file cut off mid-turn keeps that fact when it is reopened (#214).
+        assert_eq!(session.summary()["lastRun"]["outcome"], json!("stopped"));
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_saved_file_waiting_for_a_reply_names_no_finished_run() {
+        // #214: a message with no reply behind it is not a run that ended; the
+        // status line must not call it stopped.
+        let (manager, _home, shown) = manager(50);
+        let own = tempfile::tempdir().unwrap();
+        let file = own.path().join("waiting.jsonl");
+        let lines = [
+            json!({ "type": "session", "version": 3, "id": "waiting", "timestamp": "2026-01-01T00:00:00Z", "cwd": own.path().to_string_lossy() }),
+            json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": "answer me" }] } }),
+        ];
+        std::fs::write(&file, lines.iter().map(|line| format!("{line}\n")).collect::<String>()).unwrap();
+        let session = manager
+            .create(shown.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+        assert!(session.summary()["lastRun"].is_null(), "{}", session.summary());
         manager.stop_all();
     }
 
@@ -6918,6 +6968,9 @@ mod session_tests {
         assert_eq!(deltas, "hello");
         reader.abort();
 
+        // The session view says how the run ended (#214).
+        assert_eq!(session.summary()["lastRun"]["outcome"], json!("completed"));
+
         assert_ne!(session.status(), Status::Stopped);
         session.send("client-2", "again").unwrap();
         wait_status(&session, Status::Idle).await;
@@ -6998,8 +7051,24 @@ mod session_tests {
         assert_eq!(done["stopReason"], "aborted");
         let end = next_event(&mut rx, "turn.end").await;
         assert_eq!(end["status"], "interrupted");
+        assert_eq!(session.summary()["lastRun"]["outcome"], json!("stopped"));
         wait_status(&session, Status::Idle).await;
         reader.abort();
+    }
+
+    #[tokio::test]
+    async fn a_multi_step_turn_that_used_tools_ends_completed() {
+        // #214: a normal turn is completed even when its last visible step was a
+        // tool call; the status line must not read that shape as a stop.
+        let (manager, _home, workspace) = manager_with_env(50, &[("FAKE_RUNTIME_STEPS", "2")]);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("client-1", "do it").unwrap();
+        wait_until(|| session.summary()["lastRun"]["outcome"] == json!("completed")).await;
+        assert_eq!(session.summary()["lastRun"]["outcome"], json!("completed"));
+        manager.stop_all();
     }
 
     #[tokio::test]

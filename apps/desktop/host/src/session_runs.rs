@@ -189,6 +189,15 @@ impl SessionRuns {
         self.lock().get(session).filter(|record| record.running.is_none()).and_then(|record| record.outcome)
     }
 
+    /// How and when the session's latest run ended, seen or not; None while
+    /// one runs or before any ended.
+    pub fn last_ended(&self, session: &str) -> Option<(Outcome, String)> {
+        self.lock()
+            .get(session)
+            .filter(|record| record.running.is_none())
+            .and_then(|record| Some((record.outcome?, record.ended_at.clone()?)))
+    }
+
     /// A run of the session is going on.
     pub fn running(&self, session: &str) -> bool {
         self.lock().get(session).is_some_and(|record| record.running.is_some())

@@ -27,6 +27,7 @@ import { clearDraft, draftKey, readDraft, writeDraft } from "./drafts";
 import { describeError, isCapacityError, isFlowHistoryError, isImageRefused } from "./runtime-errors";
 import { NoticeRow, SteerQueue } from "./session-alerts-view";
 import { fill, explain, failureText, useChatText, type ChatText } from "./chat-text";
+import { turnStopped } from "./turn-status";
 import type { ControlResult, SessionControl } from "./control-result";
 import { BackgroundMenu, deriveFlow, deriveSubagents, FlowMenu, latestFlowError, SubagentMenu } from "./tool-renderers";
 import { SessionStatsBar } from "./session-stats-bar";
@@ -1472,8 +1473,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const liveThinking = streamingBlock?.type === "thinking" ? streamingBlock.thinking ?? "" : "";
   const lastMessage = conversationProjection.messages.at(-1);
   // A failed reply says so on the reply; the status line only says a turn was stopped.
-  const settled = !conversationProjection.running
-    && (lastMessage?.role === "toolResult" || (lastMessage?.role === "assistant" && (lastMessage.stopReason === "aborted" || lastMessage.stopReason === "toolUse")))
+  // The host's last run is that fact (#214); only a saved file shown before the
+  // host opens its session is read for the reply's own stop record.
+  const settled = !conversationProjection.running && turnStopped(showsStore ? snapshot.lastRun : undefined, lastMessage)
     ? "interrupted" as const
     : undefined;
   const outputReferences = useMemo(

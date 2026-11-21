@@ -74,6 +74,8 @@ export interface SessionSummary {
   unseenRun?: UnseenRun | null;
   /** The task this session runs, and who started it: the Assistant or an agent. */
   task?: SessionTask | null;
+  /** How the session's last run ended (#214), or null before one has. */
+  lastRun?: { outcome: "completed" | "failed" | "stopped"; endedAt: string } | null;
 }
 
 export interface SessionTask { taskId: string; clientId: string; clientName?: string }
@@ -430,16 +432,21 @@ export interface AssistantTask {
   /** waiting_to_start, starting, running, waiting_user, held, finished, failed, stopped, unloaded. */
   state: string;
 }
+export interface AttributionSettings { enabled: boolean; author: boolean }
 
 export interface SettingsApi {
   environment: {
     /** Saving goes through the configuration queue (`environment`). */
     read(): Promise<EnvironmentEntry[]>;
   };
-  /** "Mark commits made by the agent" (Settings > Collaboration): off unless turned on. */
+  /**
+   * Settings > Collaboration, both off unless turned on: "Mark commits made by
+   * the agent" (`enabled`) and "Commit as Jouzu Desktop" (`author`, used only
+   * while `enabled` is on). Either may be saved alone.
+   */
   attribution: {
-    read(): Promise<{ enabled: boolean }>;
-    save(enabled: boolean): Promise<{ enabled: boolean }>;
+    read(): Promise<AttributionSettings>;
+    save(change: Partial<AttributionSettings>): Promise<AttributionSettings>;
   };
   /** Agent access over MCP (Settings > Collaboration). Desktop window only. */
   mcp: {

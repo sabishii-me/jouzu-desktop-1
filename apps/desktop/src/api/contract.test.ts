@@ -100,7 +100,7 @@ function bridge() {
   };
   const settings: SettingsApi = {
     environment: { read: vi.fn(async () => [] as EnvironmentEntry[]) },
-    attribution: { read: vi.fn(async () => ({ enabled: false })), save: vi.fn(async (enabled: boolean) => ({ enabled })) },
+    attribution: { read: vi.fn(async () => ({ enabled: false, author: false })), save: vi.fn(async (change: { enabled?: boolean; author?: boolean }) => ({ enabled: false, author: false, ...change })) },
     mcp: {
       read: vi.fn(async () => { throw new Error('unused'); }),
       update: vi.fn(async () => { throw new Error('unused'); }),

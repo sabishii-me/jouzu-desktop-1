@@ -4,6 +4,7 @@
  */
 
 import {
+  type AttributionSettings,
   ApiError,
   type ApiCapabilities,
   type ApiEvent,
@@ -387,12 +388,12 @@ export class HostClient {
     return this.request("/v1/tools", { method: "PUT", body: JSON.stringify({ image }) });
   }
 
-  attribution(): Promise<{ enabled: boolean }> {
+  attribution(): Promise<AttributionSettings> {
     return this.request("/v1/attribution");
   }
 
-  saveAttribution(enabled: boolean): Promise<{ enabled: boolean }> {
-    return this.request("/v1/attribution", { method: "PUT", body: JSON.stringify({ enabled }) });
+  saveAttribution(change: Partial<AttributionSettings>): Promise<AttributionSettings> {
+    return this.request("/v1/attribution", { method: "PUT", body: JSON.stringify(change) });
   }
 
   async mcpServer(): Promise<McpServerState> {

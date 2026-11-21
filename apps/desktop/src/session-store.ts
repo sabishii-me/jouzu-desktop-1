@@ -18,6 +18,7 @@ import {
   type ActiveTurn,
   type ChatImage,
   type ChatModel,
+  type LastRun,
   type ModelState,
   type ChatSnapshot,
   type OutboxItem,
@@ -120,6 +121,14 @@ const time = (value: unknown): number | undefined => {
   const parsed = typeof value === "string" ? Date.parse(value) : NaN;
   return Number.isFinite(parsed) ? parsed : undefined;
 };
+
+/** How the session's last run ended (#214), or null when the host reports none. */
+export function lastRunOf(value: unknown): LastRun | null {
+  const run = record(value);
+  const outcome = run?.outcome;
+  if (!run || (outcome !== "completed" && outcome !== "failed" && outcome !== "stopped")) return null;
+  return { outcome, endedAt: time(run.endedAt) };
+}
 
 /** The host's `activeTurn` (times as ISO strings or numbers) in the UI's form. */
 export function activeTurnOf(value: unknown): ActiveTurn | null {
@@ -756,6 +765,7 @@ export class SessionStore {
       ...(text(data.thinkingLevel) ? { thinkingLevel: text(data.thinkingLevel) } : {}),
       ...(record(data.firstOutput) ? { firstOutput: firstOutputOf(record(data.firstOutput)!) } : {}),
       ...("queue" in data ? { queue: queueOf(data.queue) } : {}),
+      ...("lastRun" in data ? { lastRun: lastRunOf(data.lastRun) } : {}),
       ...("failedTurn" in data ? { failedTurn: failed && text(failed.clientMessageId) ? { clientMessageId: text(failed.clientMessageId)!, text: text(failed.text) ?? "", ...(failedError ? { error: { code: text(failedError.code) ?? "", text: text(failedError.text) ?? "" } } : {}) } : null } : {}),
       ...("failure" in data ? { failure: failure ? { code: text(failure.code) ?? "", text: text(failure.text) ?? "" } : null } : {}),
       ...("modelListError" in data ? { modelListError: text(data.modelListError) ?? null } : {}),

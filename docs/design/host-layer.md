@@ -226,6 +226,7 @@ succeed, the response says so. Examples:
 | `models[]` | The runtime's `get_available_models`, unchanged |
 | `thinkingLevel`, `thinkingLevels[]` | The runtime's current value and allowed values |
 | `failedTurn` | The last message that got no reply, with the runtime's reason when it refused it |
+| `lastRun` | How the last run ended: `outcome` (`completed` / `failed` / `stopped`) and `endedAt`; null before one has. A conversation reopened from its file takes it from its last message: a reply's own outcome, or `stopped` when the file ends after a tool call or a tool result (the turn was cut off); a file that ends waiting for a reply has none |
 | `lastAction` | Result of the last in-session command |
 | `failure` | Why the session ended: `code`, the runtime's original `text`, and the recovery (`restart`). `remove-images` and `clear-flow` wait for the runtime to report those states (runtime G6, jouzu#54) |
 | `flow`, `textguard` | Their own state |
@@ -243,6 +244,12 @@ The host keeps that mark in its home (`session-runs.json`) so it outlives the
 session's place in the table and a restart, and drops it when any client shows
 the session (holding it live, or `POST /v1/sessions/seen` for one shown from its
 file). It is one mark for all clients, not one per client.
+
+The same run outcome is the session view's `lastRun` (#214): the status line
+says a turn was stopped from `outcome: "stopped"`, whether or not its reply was
+written. The two differ in lifetime and in what they keep: the mark exists until
+a client shows the session and is never left for a stopped run, while `lastRun`
+stays with the session and records every outcome, `stopped` included.
 
 ### 7.2 AppView (global)
 
