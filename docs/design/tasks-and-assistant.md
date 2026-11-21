@@ -8,13 +8,23 @@ except the agent-access card in Settings > Collaboration.
 A task is an ordinary session started on a client's behalf
 (`apps/desktop/host/src/tasks.rs`). The host keeps only what links the task
 to its session: task id, session id, session file, folder, client, creation
-time. The task's state is derived from the live session every time it is
-read (decision 0018). The record also keeps the last state the host saw, used
-only when the session is not open: how it ended, or that it was still running
-when the host went away. Such a task is reported `stopped` once, on the next
-start, so its client is not left waiting. A turn the user or client stopped
-is `stopped`, never `finished`. A model a client asks for that the runtime
-does not list is refused, never replaced by the default.
+time, and, for a task that never got a session, why (failed to start, or
+stopped while it waited). It keeps no state: the task's state is derived every
+time it is read (decision 0018), from the live session while it is open, and
+from the session's run record otherwise.
+
+How a session's latest run went is owned by one host record per session
+(`session_runs.rs`, `session-runs.json` in the host home, keyed by session
+file): when it started, when it ended, its outcome (done, failed, stopped, or
+cut off) and whether a client has seen it since. The host writes it as runs
+start and end, for every session, task or not. A run still marked running when
+the host starts was cut off by the host going away; it is recorded so before
+anything reads it, and a task in such a session is reported `stopped` once, so
+its client is not left waiting. A stopped run is `stopped`, never `finished`.
+The sidebar's unseen marks (#212) read the same record and show only done and
+failed; a stopped or cut-off run lists like a session at rest. A model a client
+asks for that the runtime does not list is refused, never replaced by the
+default.
 
 | State | Meaning |
 |---|---|
@@ -22,8 +32,8 @@ does not list is refused, never replaced by the default.
 | `starting`, `running` | as the session |
 | `waiting_user` | an approval or question waits for the user |
 | `held` | a message is held for the user (Flow) |
-| `finished`, `failed`, `stopped` | the last turn ended so |
-| `unloaded` | the session is not open now; its file still answers `read_task` |
+| `finished`, `failed`, `stopped` | the session's latest run ended so (cut off counts as stopped) |
+| `unloaded` | the session is not open and no run of it is recorded; its file still answers `read_task` |
 
 Operations return at once. Changes reach the client's inbox: one entry per
 task (its latest state), increasing `seq`, read / ack / wait (long poll, at
@@ -91,13 +101,18 @@ when it is next idle.
 
 The person's own words travel unchanged. Each transcript row has a fixed id
 (`m<line>`) and a user message reaches the Assistant as `[user message mN]`.
-Its `start_task` and `send_task` take `quote` (ids of user messages): the host
-adds those messages after the brief word for word, each marked as the user's
-with its time, under a note that they are background and not instructions to
-the task. The brief comes first because it is what the task must do, and the
-session's title comes from it. (Quoted words first made a task act on the
-user's request to the Assistant, and became the title.) Only user messages
-can be quoted. MCP agents have no `quote`; they have no such conversation.
+A project keeps the ids of the person's messages that ask for its work
+(`requestIds`; only user messages are accepted), and `list_projects` gives
+them back word for word as `requests`. The Assistant checks results against
+those words, not its retelling of them.
+
+A task gets only the Assistant's brief, which must stand on its own: what to
+do, why, and what done means. Nothing is added to it. (Adding the person's
+words to the brief, even marked as background, made tasks act on requests
+that were addressed to the Assistant, and made those words the title.) A
+message type that carries a cited user message with its own meaning, which
+the runtime would show and treat as context rather than instructions, is a
+runtime need, not something the host imitates in text.
 
 When the person writes in a task's session themselves (any message whose
 client message id is not the task's own), the task's client gets an inbox
