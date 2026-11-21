@@ -28,7 +28,7 @@ default.
 
 | State | Meaning |
 |---|---|
-| `waiting_to_start` | above the cap (4 running tasks, one runtime each, #93); starts when a slot frees |
+| `waiting_to_start` | above the limit the user set in Settings > Collaboration (none by default; each running task holds one runtime, #93); starts when one ends |
 | `starting`, `running` | as the session |
 | `waiting_user` | an approval or question waits for the user |
 | `held` | a message is held for the user (Flow) |
@@ -36,8 +36,15 @@ default.
 | `unloaded` | the session is not open and no run of it is recorded; its file still answers `read_task` |
 
 Operations return at once. Changes reach the client's inbox: one entry per
-task (its latest state), increasing `seq`, read / ack / wait (long poll, at
-most 60 s). Many tasks ending together are one short read.
+task (its latest state), increasing `seq`, read / ack / wait (long poll, as
+long as the caller asks). Many tasks ending together are one short read.
+
+The host sets no numbers of its own here (decision on invented limits): how
+many tasks run at once is the user's setting (`GET/PUT
+/v1/collaboration/tasks`, desktop window only), how many messages to read or
+how long to wait is the caller's argument, and nothing has a size or count
+cap. The host follows a task's session by its events and summary changes
+only; nothing is polled.
 
 Every window hears of these changes on the host's global event stream, the
 same one the session list already follows: `task.changed` (task id, client,
@@ -84,14 +91,17 @@ process reads jouzu's `auth.json` and `models.json` for the model.
 
 The host owns the prompt (`prompt.md`), the skills (`skills/*.md`), the tools
 (run on the host as client `assistant`), the Assistant's memory
-(`assistant/memory`, one file per subject, at most 4 KB) and its transcript.
+(`assistant/memory`, one file per subject, no size of the host's own: the
+model's context and the runtime's compaction bound it) and its transcript.
 The process turns host messages into model turns and tool calls into host
 requests; the line protocol is described at the top of `assistant.mjs`.
 
 Turns are decoupled from events. A user message is delivered as soon as the
-Assistant is idle. Task changes wake it only when idle, after a quiet period
-(3 s) and no sooner than 30 s after the last wake, with a summary; it reads
-and acknowledges its inbox itself. `schedule_wake` lets it look again later.
+Assistant is idle. Task changes wake it as soon as it is idle, with a
+one-line summary (how many tasks, by state); it reads and acknowledges its
+inbox itself. Changes that arrive while it works are one wake when it is
+done. There is no timer and no poll: the loop runs on a user message, the
+Assistant going idle, an inbox entry, or a scheduled wake coming due. `schedule_wake` lets it look again later.
 If the process ends it stays stopped until the user writes or turns it on.
 Scheduled wakes are kept on disk by wall-clock time, so a restart keeps a
 reminder the Assistant already promised; one that came due meanwhile fires
@@ -151,15 +161,13 @@ falls back to jouzu's default or to whatever model has a key, and it never
 switches: if that model is unusable it stops and shows why. Turning it on
 without a model is refused.
 
-Until a model is saved, Settings fills in a recommendation from
-`packaging/desktop/assistant/recommended-models.json`, matched by model id
-against the models the runtime lists. The recommendation is for planning
-work, so its evidence is the closest orchestration benchmark (WorkflowArena,
-arXiv 2611.12856), not a coding one. That benchmark delegates to worker
-processes within one run, while the Assistant starts and follows separate
-sessions, so it supports the choice rather than proving it: GPT-6.1 Sol at low effort by default,
-GPT-6 Astra at xhigh as the stronger, costlier choice. Models for workflow
-roles (the workers) are a separate choice, recommended from COSPA
+Desktop recommends no model of its own: a list baked into the package goes
+stale and is a number Desktop made up. Which models suit planning is a fact
+about models, so it belongs in the runtime's signed model catalog, next to
+their limits and prices; that is a runtime need. Until the catalog carries
+it, the user picks the model. (The earlier evidence, for the record:
+WorkflowArena, arXiv 2611.12856, favoured GPT-6.1 Sol at low effort.) Models
+for workflow roles (the workers) are a separate choice, recommended from COSPA
 (github.com/shisa-ai/cospa), a coding cost-performance benchmark.
 
 ### Views
