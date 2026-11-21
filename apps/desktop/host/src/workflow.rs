@@ -19,7 +19,6 @@ use crate::session::ApiError;
 const AGENT_TOOLS: [&str; 8] = ["read", "grep", "find", "ls", "write", "edit", "bash", "powershell"];
 const READ_TOOLS: [&str; 4] = ["read", "grep", "find", "ls"];
 const THINKING: [&str; 8] = ["same", "off", "minimal", "low", "medium", "high", "xhigh", "max"];
-const MAX_VERSIONS: usize = 50;
 
 pub struct Workflow {
     file: PathBuf,
@@ -173,10 +172,6 @@ impl Workflow {
         std::fs::create_dir_all(&self.versions).map_err(|error| ApiError::internal(error.to_string()))?;
         let name = format!("{}-{}.json", Utc::now().format("%Y%m%dT%H%M%S%.3fZ"), by);
         std::fs::write(self.versions.join(name), bytes).map_err(|error| ApiError::internal(error.to_string()))?;
-        let mut kept = self.version_names();
-        while kept.len() > MAX_VERSIONS {
-            let _ = std::fs::remove_file(self.versions.join(kept.remove(0)));
-        }
         Ok(())
     }
 

@@ -107,10 +107,13 @@ function bridge() {
       addAgent: vi.fn(async () => { throw new Error('unused'); }),
       removeAgent: vi.fn(async () => undefined),
     },
+    tasks: {
+      read: vi.fn(async () => ({ maxRunning: null })),
+      update: vi.fn(async (maxRunning: number | null) => ({ maxRunning })),
+    },
     assistant: {
       read: vi.fn(async () => { throw new Error('unused'); }),
       update: vi.fn(async () => { throw new Error('unused'); }),
-      recommended: vi.fn(async () => { throw new Error('unused'); }),
       messages: vi.fn(async () => []),
       send: vi.fn(async () => { throw new Error('unused'); }),
       seen: vi.fn(async () => { throw new Error('unused'); }),

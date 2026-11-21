@@ -761,6 +761,8 @@ pub struct Session {
     updated_at: Mutex<Option<String>>,
     handshake: Mutex<Handshake>,
     ready: tokio::sync::Notify,
+    /// Woken whenever the summary may have changed (`publish_summary`).
+    summary_changed: tokio::sync::Notify,
     pending_approvals: Mutex<HashMap<String, PendingApproval>>,
     pending_questions: Mutex<HashMap<String, PendingQuestion>>,
     /// Extension status lines (`setStatus`), keyed by the extension's status key.
@@ -1955,7 +1957,14 @@ impl Session {
             .unwrap_or(Value::Null)
     }
 
+    /// Resolves the next time the summary may have changed. Create it before
+    /// reading the summary, so a change in between is not missed.
+    pub fn summary_changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.summary_changed.notified()
+    }
+
     fn publish_summary(&self) {
+        self.summary_changed.notify_waiters();
         if let Some(hub) = &self.config.events {
             hub.publish_session(&self.id, self.cursor(), "session.updated", self.summary());
         }
@@ -5209,6 +5218,7 @@ impl Session {
             updated_at: Mutex::new(None),
             handshake: Mutex::new(Handshake::Messages),
             ready: tokio::sync::Notify::new(),
+            summary_changed: tokio::sync::Notify::new(),
             pending_approvals: Mutex::new(HashMap::new()),
             pending_questions: Mutex::new(HashMap::new()),
             ui_statuses: Mutex::new(BTreeMap::new()),
@@ -6777,6 +6787,8 @@ impl SessionManager {
         for id in stale {
             if let Some(session) = sessions.remove(&id) {
                 session.discard();
+                // Whoever follows it learns it left the table.
+                session.summary_changed.notify_waiters();
                 left = true;
             }
         }
@@ -7267,6 +7279,7 @@ impl SessionManager {
                     .clone();
                 existing.stop();
                 sessions.remove(&existing.id);
+                existing.summary_changed.notify_waiters();
             }
         }
         let config = self.config().cloned().ok_or_else(|| {

@@ -22,7 +22,7 @@ Views (one JSON object per block; "title" is optional everywhere):
 Use a view when it says more than a sentence: more than three tasks, dependencies, or dates. Keep one view per message unless asked.
 
 For anything these views cannot show, draw an `svg` block:
-- A viewBox, no fixed width/height; at most 64 KB.
+- A viewBox, no fixed width/height.
 - No script, foreignObject, event handlers (on...), external links or images, or CSS imports. Desktop removes them.
 - Use currentColor for lines and text so it works in light and dark themes; at most three accent colours.
 - Text at least 12 units high; label things directly instead of using a legend.

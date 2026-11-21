@@ -176,10 +176,13 @@ function hostGroups(client: HostClient) {
       addAgent: name => client.addMcpAgent(name),
       removeAgent: id => client.removeMcpAgent(id),
     },
+    tasks: {
+      read: () => client.taskSettings(),
+      update: maxRunning => client.updateTaskSettings(maxRunning),
+    },
     assistant: {
       read: () => client.assistant(),
       update: change => client.updateAssistant(change),
-      recommended: () => client.assistantRecommended(),
       messages: limit => client.assistantMessages(limit),
       send: text => client.sendAssistant(text),
       seen: () => client.assistantSeen(),

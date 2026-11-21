@@ -7,8 +7,10 @@
 //! latest), so a hundred tasks finishing together are one short read, not a
 //! hundred wakes.
 //!
-//! Each running task holds one runtime process (#93). Above the cap a task
-//! waits to start; it is not refused and nothing is retried.
+//! Each running task holds one runtime process (#93). Tasks start at once,
+//! like any session, unless the user set how many may run at once (Settings >
+//! Collaboration); above that a task waits to start. It is not refused and
+//! nothing is retried. The host sets no number of its own.
 
 use std::{
     collections::HashMap,
@@ -28,10 +30,6 @@ use crate::{
     session_runs::Outcome,
 };
 
-/// Running tasks allowed at once unless the host is told otherwise.
-pub const DEFAULT_CAP: usize = 4;
-/// Longest a client may wait on its inbox in one call.
-pub const MAX_WAIT: Duration = Duration::from_secs(60);
 
 /// What the host keeps about a task. No state: that lives in the session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,6 +87,9 @@ struct Store {
     tasks: Vec<TaskRecord>,
     #[serde(default)]
     inboxes: HashMap<String, Inbox>,
+    /// How many tasks may run at once, when the user set it. None: no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_running: Option<usize>,
 }
 
 /// What the host knows right now about a running task's session. Memory only.
@@ -106,10 +107,9 @@ pub struct TaskManager {
     store: Mutex<Store>,
     live: Mutex<HashMap<String, Live>>,
     notify: Notify,
-    cap: usize,
 }
 
-/// States a task counts against the cap in: its runtime is in use.
+/// States a task counts against the user's limit in: its runtime is in use.
 fn active(state: &str) -> bool {
     matches!(state, "starting" | "running" | "waiting_user" | "held")
 }
@@ -191,7 +191,7 @@ pub fn derive_state(summary: &Value, ran: bool) -> &'static str {
 }
 
 impl TaskManager {
-    pub fn new(sessions: Arc<SessionManager>, cap: usize) -> Arc<Self> {
+    pub fn new(sessions: Arc<SessionManager>) -> Arc<Self> {
         let file = sessions.home().join("tasks.json");
         let store = std::fs::read(&file)
             .ok()
@@ -203,8 +203,33 @@ impl TaskManager {
             store: Mutex::new(store),
             live: Mutex::new(HashMap::new()),
             notify: Notify::new(),
-            cap: cap.max(1),
         })
+    }
+
+    /// `{ maxRunning }`: how many tasks may run at once; null is no limit.
+    pub fn settings(&self) -> Value {
+        json!({ "maxRunning": self.store().max_running })
+    }
+
+    /// The user sets how many tasks may run at once (None: no limit). Waiting
+    /// tasks start at once when there is room now.
+    pub fn set_max_running(self: &Arc<Self>, max_running: Option<usize>) -> Result<Value, ApiError> {
+        if max_running == Some(0) {
+            return Err(ApiError::bad_request("maxRunning is at least 1, or null for no limit"));
+        }
+        {
+            let mut store = self.store();
+            store.max_running = max_running;
+            self.save(&store);
+        }
+        self.fill_slots();
+        Ok(self.settings())
+    }
+
+    /// Room for one more running task under the user's limit, if any.
+    fn has_room(&self) -> bool {
+        let limit = self.store().max_running;
+        limit.is_none_or(|limit| self.running() < limit)
     }
 
     fn home(&self) -> &Path {
@@ -325,7 +350,7 @@ impl TaskManager {
         Ok(())
     }
 
-    /// Starts a task and returns at once. Above the cap it waits to start.
+    /// Starts a task and returns at once. Above the user's limit it waits to start.
     pub fn start(self: &Arc<Self>, client: &str, workspace: &str, text: &str) -> Result<Value, ApiError> {
         self.start_with(client, workspace, text, None)
     }
@@ -363,7 +388,7 @@ impl TaskManager {
             store.tasks.push(record);
             self.save(&store);
         }
-        let launched = if self.running() < self.cap {
+        let launched = if self.has_room() {
             self.launch(&task_id)
         } else {
             Ok(())
@@ -455,7 +480,15 @@ impl TaskManager {
         let manager = Arc::clone(self);
         let task_id = task_id.to_string();
         tokio::spawn(async move {
+            // Event-driven only: the session's own events, and every change of
+            // its summary. Nothing is polled.
             loop {
+                let changed = session.summary_changed();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if !manager.refresh(&task_id, &session) {
+                    break;
+                }
                 let open = tokio::select! {
                     event = events.recv() => match event {
                         Ok(event) => {
@@ -474,9 +507,9 @@ impl TaskManager {
                         Err(broadcast::error::RecvError::Lagged(_)) => true,
                         Err(broadcast::error::RecvError::Closed) => false,
                     },
-                    _ = tokio::time::sleep(Duration::from_secs(2)) => true,
+                    _ = &mut changed => true,
                 };
-                if !open || !manager.refresh(&task_id, &session) {
+                if !open {
                     break;
                 }
             }
@@ -574,7 +607,7 @@ impl TaskManager {
     /// Starts waiting tasks, oldest first, while slots are free.
     fn fill_slots(self: &Arc<Self>) {
         loop {
-            if self.running() >= self.cap {
+            if !self.has_room() {
                 return;
             }
             let next = self
@@ -756,7 +789,7 @@ impl TaskManager {
     }
 
     fn conversation(&self, session_id: Option<&str>, session_path: Option<&str>, limit: usize) -> Result<Vec<Value>, ApiError> {
-        let limit = limit.clamp(1, 200);
+        let limit = limit.max(1);
         let live = session_id.and_then(|id| self.sessions.get(id));
         let messages: Vec<Value> = if let Some(session) = live {
             // Newest first; a streaming reply has cursor 0 and is the newest.
@@ -798,6 +831,12 @@ impl TaskManager {
 
     /// The host's own view of a client's inbox (for wake decisions); not a
     /// client operation, so no policy check and no log line.
+    /// Resolves the next time any inbox gets an entry. Create it before
+    /// reading the inbox, so an entry in between is not missed.
+    pub fn inbox_changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
     pub fn peek_inbox(&self, client: &str) -> Value {
         let store = self.store();
         let entries = store.inboxes.get(client).map(|inbox| inbox.entries.clone()).unwrap_or_default();
@@ -824,7 +863,7 @@ impl TaskManager {
 
     /// Waits until the inbox has entries after `after`, or the time is up.
     pub async fn wait(&self, client: &str, after: u64, timeout: Duration) -> Result<Value, ApiError> {
-        let deadline = tokio::time::Instant::now() + timeout.min(MAX_WAIT);
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -984,7 +1023,7 @@ mod flow_tests {
             Some(hub.clone()),
         ));
         manager.add_workspaces(&[folder(&workspace)]).unwrap();
-        let tasks = TaskManager::new(manager.clone(), DEFAULT_CAP);
+        let tasks = TaskManager::new(manager.clone());
         let task = tasks.start("agent-a", &folder(&workspace), "write a haiku").unwrap();
         let task_id = task["taskId"].as_str().unwrap().to_string();
         wait_for(&tasks, "agent-a", &task_id, "finished").await;
@@ -1020,7 +1059,7 @@ mod flow_tests {
     #[tokio::test]
     async fn the_client_hears_when_the_person_writes_in_its_task() {
         let (manager, _home, workspace) = setup(&[]);
-        let tasks = TaskManager::new(manager.clone(), DEFAULT_CAP);
+        let tasks = TaskManager::new(manager.clone());
         let task = tasks.start("agent-a", &folder(&workspace), "write a haiku").unwrap();
         let task_id = task["taskId"].as_str().unwrap().to_string();
         let seen = wait_for(&tasks, "agent-a", &task_id, "finished").await;
@@ -1058,7 +1097,7 @@ mod flow_tests {
     #[tokio::test]
     async fn a_task_stopped_mid_turn_is_stopped_not_finished() {
         let (manager, _home, workspace) = setup(&[("FAKE_RUNTIME_DELAY_MS", "4000")]);
-        let tasks = TaskManager::new(manager, DEFAULT_CAP);
+        let tasks = TaskManager::new(manager);
         let task = tasks.start("agent-a", &folder(&workspace), "a long job").unwrap();
         let task_id = task["taskId"].as_str().unwrap().to_string();
         until_state(&tasks, "agent-a", &task_id, "running").await;
@@ -1071,7 +1110,7 @@ mod flow_tests {
     #[tokio::test]
     async fn a_task_cut_off_by_the_host_going_away_is_reported_stopped() {
         let (manager, home, workspace) = setup(&[("FAKE_RUNTIME_DELAY_MS", "8000")]);
-        let tasks = TaskManager::new(manager, DEFAULT_CAP);
+        let tasks = TaskManager::new(manager);
         let task = tasks.start("agent-a", &folder(&workspace), "a long job").unwrap();
         let task_id = task["taskId"].as_str().unwrap().to_string();
         until_state(&tasks, "agent-a", &task_id, "running").await;
@@ -1088,7 +1127,7 @@ mod flow_tests {
                 None,
             ));
             again.add_workspaces(&[folder(&workspace)]).unwrap();
-            let restarted = TaskManager::new(again, DEFAULT_CAP);
+            let restarted = TaskManager::new(again);
             restarted.resume();
             restarted
         };
@@ -1107,7 +1146,7 @@ mod flow_tests {
     #[tokio::test]
     async fn a_task_returns_at_once_and_its_end_reaches_the_inbox() {
         let (manager, _home, workspace) = setup(&[]);
-        let tasks = TaskManager::new(manager, DEFAULT_CAP);
+        let tasks = TaskManager::new(manager);
         let task = tasks.start("agent-a", &folder(&workspace), "write a haiku").unwrap();
         // It returned before the work ran: the end arrives later, in the inbox.
         assert_ne!(task["state"], "finished", "{task}");
@@ -1134,7 +1173,7 @@ mod flow_tests {
     async fn a_read_returns_whole_messages_however_long() {
         // The fake runtime echoes the text back one character per tick.
         let (manager, _home, workspace) = setup(&[("FAKE_RUNTIME_DELAY_MS", "0")]);
-        let tasks = TaskManager::new(manager, DEFAULT_CAP);
+        let tasks = TaskManager::new(manager);
         let long = format!("{}END", "x".repeat(6_000));
         let task = tasks.start("agent-a", &folder(&workspace), &long).unwrap();
         let task_id = task["taskId"].as_str().unwrap().to_string();
@@ -1147,7 +1186,7 @@ mod flow_tests {
     #[tokio::test]
     async fn slash_commands_and_unknown_folders_are_refused() {
         let (manager, _home, workspace) = setup(&[]);
-        let tasks = TaskManager::new(manager, DEFAULT_CAP);
+        let tasks = TaskManager::new(manager);
         let refused = tasks.start("agent-a", &folder(&workspace), "/flow clear").unwrap_err();
         assert_eq!(refused.code, "command-not-allowed");
         let elsewhere = tempfile::tempdir().unwrap();
@@ -1159,7 +1198,7 @@ mod flow_tests {
     #[tokio::test]
     async fn one_client_never_sees_another_clients_task() {
         let (manager, _home, workspace) = setup(&[]);
-        let tasks = TaskManager::new(manager, DEFAULT_CAP);
+        let tasks = TaskManager::new(manager);
         let task = tasks.start("agent-a", &folder(&workspace), "hello").unwrap();
         let task_id = task["taskId"].as_str().unwrap();
         assert_eq!(tasks.get("agent-b", task_id).unwrap_err().code, "task-not-found");
@@ -1170,7 +1209,8 @@ mod flow_tests {
     #[tokio::test]
     async fn above_the_cap_a_task_waits_and_starts_when_a_slot_frees() {
         let (manager, _home, workspace) = setup(&[("FAKE_RUNTIME_DELAY_MS", "200")]);
-        let tasks = TaskManager::new(manager, 1);
+        let tasks = TaskManager::new(manager);
+        tasks.set_max_running(Some(1)).unwrap();
         let first = tasks.start("agent-a", &folder(&workspace), "first").unwrap();
         let second = tasks.start("agent-a", &folder(&workspace), "second").unwrap();
         assert_eq!(second["state"], "waiting_to_start");
@@ -1184,9 +1224,25 @@ mod flow_tests {
     }
 
     #[tokio::test]
+    async fn tasks_start_at_once_unless_the_user_set_a_limit() {
+        let (manager, _home, workspace) = setup(&[("FAKE_RUNTIME_DELAY_MS", "400")]);
+        let tasks = TaskManager::new(manager);
+        assert_eq!(tasks.settings(), json!({ "maxRunning": null }));
+        assert!(tasks.set_max_running(Some(0)).is_err());
+        tasks.set_max_running(Some(1)).unwrap();
+        tasks.start("agent-a", &folder(&workspace), "first").unwrap();
+        let second = tasks.start("agent-a", &folder(&workspace), "second").unwrap();
+        assert_eq!(second["state"], "waiting_to_start");
+        // Lifting the limit starts the waiting task now.
+        assert_eq!(tasks.set_max_running(None).unwrap(), json!({ "maxRunning": null }));
+        let second_id = second["taskId"].as_str().unwrap();
+        assert!(tasks.get("agent-a", second_id).unwrap()["sessionId"].is_string());
+    }
+
+    #[tokio::test]
     async fn many_tasks_ending_together_are_one_entry_each() {
         let (manager, _home, workspace) = setup(&[]);
-        let tasks = TaskManager::new(manager, 8);
+        let tasks = TaskManager::new(manager);
         let mut ids = Vec::new();
         for n in 0..6 {
             ids.push(tasks.start("agent-a", &folder(&workspace), &format!("job {n}")).unwrap()["taskId"].as_str().unwrap().to_string());
@@ -1202,12 +1258,12 @@ mod flow_tests {
     #[tokio::test]
     async fn tasks_and_the_inbox_survive_a_host_restart() {
         let (manager, _home, workspace) = setup(&[]);
-        let tasks = TaskManager::new(manager.clone(), DEFAULT_CAP);
+        let tasks = TaskManager::new(manager.clone());
         let task = tasks.start("agent-a", &folder(&workspace), "remember me").unwrap();
         let task_id = task["taskId"].as_str().unwrap().to_string();
         wait_for(&tasks, "agent-a", &task_id, "finished").await;
         drop(tasks);
-        let again = TaskManager::new(manager, DEFAULT_CAP);
+        let again = TaskManager::new(manager);
         let listed = again.list("agent-a").unwrap();
         assert_eq!(listed["tasks"][0]["taskId"], task_id.as_str());
         assert!(again.inbox("agent-a", 0).unwrap()["entries"].as_array().unwrap().iter().any(|entry| entry["taskId"] == task_id.as_str()));
@@ -1218,7 +1274,8 @@ mod flow_tests {
     #[tokio::test]
     async fn stopping_a_waiting_task_takes_it_out_of_the_queue() {
         let (manager, _home, workspace) = setup(&[("FAKE_RUNTIME_DELAY_MS", "300")]);
-        let tasks = TaskManager::new(manager, 1);
+        let tasks = TaskManager::new(manager);
+        tasks.set_max_running(Some(1)).unwrap();
         tasks.start("agent-a", &folder(&workspace), "first").unwrap();
         let second = tasks.start("agent-a", &folder(&workspace), "second").unwrap();
         let second_id = second["taskId"].as_str().unwrap();

@@ -17,7 +17,6 @@ import {
   type McpServerState,
   type AssistantMessage,
   type AssistantModel,
-  type AssistantRecommendation,
   type AssistantState,
   type ProjectsSnapshot,
   type SavedMessagesPage,
@@ -416,8 +415,12 @@ export class HostClient {
     return this.request("/v1/assistant", { method: "PUT", body: JSON.stringify(change) });
   }
 
-  assistantRecommended(): Promise<{ about: string; models: AssistantRecommendation[] }> {
-    return this.request("/v1/assistant/recommended");
+  taskSettings(): Promise<{ maxRunning: number | null }> {
+    return this.request("/v1/collaboration/tasks");
+  }
+
+  updateTaskSettings(maxRunning: number | null): Promise<{ maxRunning: number | null }> {
+    return this.request("/v1/collaboration/tasks", { method: "PUT", body: JSON.stringify({ maxRunning }) });
   }
 
   async assistantMessages(limit = 200): Promise<AssistantMessage[]> {

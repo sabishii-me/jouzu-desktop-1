@@ -22,7 +22,6 @@ use crate::{
     tasks::TaskManager,
 };
 
-const MAX_PROJECTS: usize = 200;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Store {
@@ -214,9 +213,6 @@ fn commit_project(
         project.id = id.to_string();
         *existing = project.clone();
     } else {
-        if store.projects.len() >= MAX_PROJECTS {
-            return Err(ApiError::bad_request("Project limit reached"));
-        }
         project.id = format!("project-{}", &crate::new_token()[..16]);
         candidate.projects.push(project.clone());
     }
@@ -267,7 +263,7 @@ mod tests {
             .and_then(|value| value["id"].as_str())
             .unwrap()
             .to_string();
-        let tasks = TaskManager::new(sessions.clone(), 4);
+        let tasks = TaskManager::new(sessions.clone());
         let store = ProjectStore::new(sessions, tasks);
         let good: Project = serde_json::from_value(json!({ "name": "Desktop", "workspaceIds": [workspace_id] })).unwrap();
         let saved = store.save_project("desktop", good, None).unwrap();

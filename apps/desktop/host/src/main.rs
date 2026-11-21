@@ -200,7 +200,7 @@ async fn main() -> ExitCode {
     // The token is handed to whoever started the host, here and nowhere else (#130).
     println!("{}", jouzu_host::ready_line(port, &token));
 
-    let tasks = jouzu_host::tasks::TaskManager::new(sessions.clone(), jouzu_host::tasks::DEFAULT_CAP);
+    let tasks = jouzu_host::tasks::TaskManager::new(sessions.clone());
     let projects = jouzu_host::projects::ProjectStore::new(sessions.clone(), tasks.clone());
     let state = AppState {
         token: std::sync::Arc::new(token.clone()),
@@ -218,7 +218,6 @@ async fn main() -> ExitCode {
         assistant: jouzu_host::assistant::Assistant::new(
             &home,
             jouzu_host::assistant::Assistant::default_paths(&home, &sessions),
-            jouzu_host::assistant::WakePolicy::default(),
             sessions.clone(),
             tasks.clone(),
             projects,

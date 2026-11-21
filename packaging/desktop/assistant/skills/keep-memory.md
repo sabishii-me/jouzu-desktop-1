@@ -13,6 +13,6 @@ Remember what you would otherwise have to ask the user again:
 
 Do not remember live state (task states, what is running), what the code or git history already records, or anything only this conversation needs. Never store secrets.
 
-Before writing, memory_search for an existing memory on the subject and update it instead of adding a near-duplicate. One subject per memory, at most 4 KB; split or summarize when it grows. Delete a memory when it turns out wrong.
+Before writing, memory_search for an existing memory on the subject and update it instead of adding a near-duplicate. One subject per memory, kept short; split or summarize when it grows. Delete a memory when it turns out wrong.
 
 Body: the fact first, then "Why:" and "How to apply:" lines. Dates absolute (2026-11-21), never "yesterday".

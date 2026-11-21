@@ -515,11 +515,11 @@ pub(crate) fn task_tools() -> Vec<Value> {
         }),
         json!({
             "name": "read_task",
-            "description": "A task's latest messages, oldest first, each in full. limit is how many messages.",
+            "description": "A task's latest messages, oldest first, each in full. limit is how many of the latest messages you want.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "taskId": task_id, "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 } },
-                "required": ["taskId"],
+                "properties": { "taskId": task_id, "limit": { "type": "integer", "minimum": 1 } },
+                "required": ["taskId", "limit"],
             },
         }),
         json!({
@@ -529,13 +529,14 @@ pub(crate) fn task_tools() -> Vec<Value> {
         }),
         json!({
             "name": "wait_inbox",
-            "description": "Like read_inbox, but waits until something arrives or the time is up (at most 60 seconds).",
+            "description": "Like read_inbox, but waits until something arrives or timeoutSeconds (your choice) is up.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "after": { "type": "integer", "minimum": 0 },
-                    "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 60, "default": 25 },
+                    "timeoutSeconds": { "type": "integer", "minimum": 1 },
                 },
+                "required": ["timeoutSeconds"],
             },
         }),
         json!({
@@ -646,12 +647,14 @@ pub(crate) async fn call_task_tool(
         "get_task" => tasks.get(id, string_arg(arguments, "taskId")?),
         "list_tasks" => tasks.list(id),
         "read_task" => {
-            let limit = arguments["limit"].as_u64().unwrap_or(20) as usize;
+            let limit = arguments["limit"].as_u64().ok_or_else(|| ApiError::bad_request("limit is required"))? as usize;
             tasks.read(id, string_arg(arguments, "taskId")?, limit)
         }
         "read_inbox" => tasks.inbox(id, arguments["after"].as_u64().unwrap_or(0)),
         "wait_inbox" => {
-            let seconds = arguments["timeoutSeconds"].as_u64().unwrap_or(25).clamp(1, 60);
+            let seconds = arguments["timeoutSeconds"]
+                .as_u64()
+                .ok_or_else(|| ApiError::bad_request("timeoutSeconds is required"))?;
             tasks
                 .wait(id, arguments["after"].as_u64().unwrap_or(0), Duration::from_secs(seconds))
                 .await
@@ -689,7 +692,7 @@ mod tests {
             None,
         ));
         sessions.add_workspaces(&[workspace.path().to_string_lossy().into_owned()]).unwrap();
-        let tasks = TaskManager::new(sessions.clone(), 4);
+        let tasks = TaskManager::new(sessions.clone());
         (McpServer::new(home.path(), "9.9.9", tasks, sessions), home, workspace)
     }
 
@@ -768,7 +771,7 @@ mod tests {
             }
         }
         assert!(finished);
-        let read = call(&server, &token, "read_task", json!({ "taskId": task_id })).await;
+        let read = call(&server, &token, "read_task", json!({ "taskId": task_id, "limit": 20 })).await;
         assert!(!read["structuredContent"]["messages"].as_array().unwrap().is_empty());
         let acked = call(&server, &token, "ack_inbox", json!({ "seq": after })).await;
         assert_eq!(acked["structuredContent"]["left"], 0);

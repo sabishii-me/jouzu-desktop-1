@@ -6,10 +6,10 @@
 //! built-in client `assistant`), its memory, and when it takes a turn.
 //!
 //! Turns are decoupled from events. A user message is delivered as soon as
-//! the Assistant is idle. Task changes wake it only when it is idle, after a
-//! short quiet period and no sooner than a minimum interval after the last
-//! wake, with a summary; it reads and acknowledges the details itself. A
-//! hundred tasks ending together are one wake.
+//! the Assistant is idle. Task changes wake it as soon as it is idle, with a
+//! short summary; it reads and acknowledges the details itself. Changes that
+//! arrive while it works are one wake when it is done. Nothing waits on a
+//! timer and nothing is polled: the loop runs when something happens.
 //!
 //! Nothing restarts it silently: if the process ends, it stays stopped until
 //! the user sends a message or turns it on again.
@@ -58,9 +58,7 @@ pub const SKILLS: &[(&str, &str)] = &[
     ("catch-requests", include_str!("../../../../packaging/desktop/assistant/skills/catch-requests.md")),
 ];
 
-const MEMORY_LIMIT: usize = 4096;
 const MEMORY_TYPES: [&str; 5] = ["user", "feedback", "project", "decision", "reference"];
-const WAKE_ENTRIES: usize = 20;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModelPick {
@@ -71,8 +69,6 @@ pub struct ModelPick {
     pub thinking: Option<String>,
 }
 
-/// Models recommended for the Assistant, with the evidence behind each.
-const RECOMMENDED: &str = include_str!("../../../../packaging/desktop/assistant/recommended-models.json");
 const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -82,21 +78,6 @@ struct Settings {
     enabled: bool,
     #[serde(default)]
     model: Option<ModelPick>,
-}
-
-/// How often task changes may wake the Assistant.
-#[derive(Clone, Copy, Debug)]
-pub struct WakePolicy {
-    /// Changes wait this long for more to arrive.
-    pub quiet: Duration,
-    /// No wake sooner than this after the last one.
-    pub min_interval: Duration,
-}
-
-impl Default for WakePolicy {
-    fn default() -> Self {
-        Self { quiet: Duration::from_secs(3), min_interval: Duration::from_secs(30) }
-    }
 }
 
 /// Where things are. Tests point these at fixtures.
@@ -176,9 +157,6 @@ struct State {
     queue: VecDeque<String>,
     /// Inbox seq the last wake covered.
     woken_seq: u64,
-    /// When new inbox entries were first seen, for the quiet period.
-    changes_since: Option<Instant>,
-    last_wake: Option<Instant>,
     scheduled: Vec<Wake>,
     turn: u64,
     /// The memory index as the Assistant last saw it.
@@ -193,7 +171,6 @@ struct Process {
 pub struct Assistant {
     dir: PathBuf,
     paths: AssistantPaths,
-    policy: WakePolicy,
     sessions: Arc<SessionManager>,
     tasks: Arc<TaskManager>,
     projects: Arc<ProjectStore>,
@@ -205,26 +182,6 @@ pub struct Assistant {
     generation: std::sync::atomic::AtomicU64,
 }
 
-/// Each recommended model with the listed models that share its id (any
-/// provider); `offeredBy` is null while nothing is listed yet.
-fn recommend(data: &str, listed: Option<&[Value]>) -> Value {
-    let data: Value = serde_json::from_str(data).unwrap_or(Value::Null);
-    let entries = data["assistant"].as_array().cloned().unwrap_or_default();
-    json!({
-        "about": data["about"],
-        "models": entries.into_iter().map(|mut entry| {
-            let id = entry["id"].as_str().unwrap_or_default().to_string();
-            entry["offeredBy"] = match listed {
-                Some(models) => Value::Array(models.iter()
-                    .filter(|model| model["id"].as_str() == Some(id.as_str()))
-                    .map(|model| json!({ "provider": model["provider"], "id": model["id"], "name": model["name"] }))
-                    .collect()),
-                None => Value::Null,
-            };
-            entry
-        }).collect::<Vec<_>>(),
-    })
-}
 
 fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -249,7 +206,6 @@ impl Assistant {
     pub fn new(
         home: &Path,
         paths: AssistantPaths,
-        policy: WakePolicy,
         sessions: Arc<SessionManager>,
         tasks: Arc<TaskManager>,
         projects: Arc<ProjectStore>,
@@ -263,7 +219,6 @@ impl Assistant {
         Arc::new(Self {
             dir,
             paths,
-            policy,
             sessions,
             tasks,
             projects,
@@ -273,8 +228,6 @@ impl Assistant {
                 error: None,
                 queue: VecDeque::new(),
                 woken_seq: 0,
-                changes_since: None,
-                last_wake: None,
                 scheduled,
                 turn: 0,
                 memory_seen: String::new(),
@@ -365,17 +318,6 @@ impl Assistant {
         })
     }
 
-    /// The recommended models, each with the runtime's matching models (by id,
-    /// any provider). Empty matches: this runtime does not offer that model.
-    /// `null` while the runtime has not listed its models yet.
-    pub async fn recommended(&self) -> Value {
-        let listed = match self.sessions.runtime_models().await {
-            Some(Ok(answer)) => Some(answer["models"].as_array().cloned().unwrap_or_default()),
-            _ => None,
-        };
-        recommend(RECOMMENDED, listed.as_deref())
-    }
-
     pub async fn update(self: &Arc<Self>, enabled: Option<bool>, model: Option<Option<ModelPick>>) -> Result<Value, ApiError> {
         let (before, after) = {
             let mut settings = self.settings.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -417,8 +359,8 @@ impl Assistant {
     /// stopped: the user asked.
     pub async fn send(self: &Arc<Self>, text: &str) -> Result<Value, ApiError> {
         let text = text.trim();
-        if text.is_empty() || text.len() > 16_000 {
-            return Err(ApiError::bad_request("Enter a message of at most 16000 bytes"));
+        if text.is_empty() {
+            return Err(ApiError::bad_request("Enter a message"));
         }
         if !self.settings().enabled {
             return Err(ApiError::new(axum::http::StatusCode::CONFLICT, "assistant-off", "Turn the Assistant on first", false));
@@ -698,14 +640,32 @@ impl Assistant {
         self.set_phase(phase, error);
     }
 
-    /// Delivers what is due whenever the Assistant is idle.
+    /// Delivers what is due whenever the Assistant is idle. Runs when
+    /// something happens: a user message, the Assistant going idle, a task
+    /// change, or a scheduled wake coming due.
     async fn schedule_loop(self: Arc<Self>) {
         loop {
-            tokio::select! {
-                _ = self.kick.notified() => {}
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            let inbox = self.tasks.inbox_changed();
+            tokio::pin!(inbox);
+            inbox.as_mut().enable();
+            let due = self.state().scheduled.iter().map(|wake| wake.at).min();
+            let next = self.next_turn();
+            if next.is_none() {
+                let kicked = self.kick.notified();
+                match due {
+                    Some(at) => tokio::select! {
+                        _ = kicked => {}
+                        _ = inbox => {}
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => {}
+                    },
+                    None => tokio::select! {
+                        _ = kicked => {}
+                        _ = inbox => {}
+                    },
+                }
+                continue;
             }
-            if let Some(text) = self.next_turn() {
+            if let Some(text) = next {
                 let turn = {
                     let mut state = self.state();
                     state.turn += 1;
@@ -745,29 +705,21 @@ impl Assistant {
             .and_then(|inbox| inbox["entries"].as_array().cloned())
             .unwrap_or_default();
         let newest = entries.iter().filter_map(|entry| entry["seq"].as_u64()).max().unwrap_or(0);
-        let changed = newest > state.woken_seq;
-        if changed && state.changes_since.is_none() {
-            state.changes_since = Some(now);
-        }
-        let quiet = state.changes_since.is_some_and(|since| now.duration_since(since) >= self.policy.quiet);
-        let spaced = state.last_wake.is_none_or(|last| now.duration_since(last) >= self.policy.min_interval);
+        let inbox_wake = newest > state.woken_seq;
         let due: Vec<String> = state
             .scheduled
             .iter()
             .filter(|wake| wake.at <= now)
             .map(|wake| wake.note.clone())
             .collect();
-        let inbox_wake = changed && quiet && spaced;
         if !inbox_wake && due.is_empty() {
             return None;
         }
         state.scheduled.retain(|wake| wake.at > now);
         save_wakes(&self.dir, &state.scheduled);
-        state.last_wake = Some(now);
         let mut text = String::from("[wake]");
         if inbox_wake {
             state.woken_seq = newest;
-            state.changes_since = None;
             text.push_str(&wake_summary(&entries));
         }
         for note in due {
@@ -811,20 +763,18 @@ impl Assistant {
             "memory_write" => self.memory_write(arguments),
             "memory_delete" => self.memory_delete(string(arguments, "name")?),
             "memory_search" => self.memory_search(string(arguments, "query")?),
-            "history_search" => Ok(self.history_search(string(arguments, "query")?, arguments["limit"].as_u64().unwrap_or(20) as usize)),
+            "history_search" => Ok(self.history_search(string(arguments, "query")?, arguments["limit"].as_u64().map(|limit| limit as usize))),
             "schedule_wake" => {
                 let seconds = arguments["seconds"].as_u64().ok_or_else(|| ApiError::bad_request("seconds is required"))?;
-                if !(60..=86_400).contains(&seconds) {
-                    return Err(ApiError::bad_request("seconds must be from 60 to 86400"));
-                }
-                let note = cut(arguments["note"].as_str().unwrap_or(""), 500);
+                let note = arguments["note"].as_str().unwrap_or("").to_string();
                 let mut state = self.state();
-                if state.scheduled.len() >= 20 {
-                    return Err(ApiError::bad_request("At most 20 wakes can be scheduled"));
-                }
                 state.scheduled.push(Wake { at: Instant::now() + Duration::from_secs(seconds), note });
                 save_wakes(&self.dir, &state.scheduled);
-                Ok(json!({ "scheduled": state.scheduled.len() }))
+                let scheduled = state.scheduled.len();
+                drop(state);
+                // The loop sleeps until the earliest wake: it must hear of this one.
+                self.kick.notify_one();
+                Ok(json!({ "scheduled": scheduled }))
             }
             "get_workflow" => self.workflow().read(),
             "save_workflow" => {
@@ -841,8 +791,11 @@ impl Assistant {
                     .map(|(_, text)| json!({ "skill": text }))
                     .ok_or_else(|| ApiError::bad_request(format!("No skill named {wanted}")))
             }
-            "list_sessions" => Ok(self.list_sessions(arguments["limit"].as_u64().unwrap_or(30) as usize)),
-            "read_session" => self.tasks.read_session(string(arguments, "sessionPath")?, arguments["limit"].as_u64().unwrap_or(30) as usize),
+            "list_sessions" => Ok(self.list_sessions(arguments["limit"].as_u64().map(|limit| limit as usize))),
+            "read_session" => {
+                let limit = arguments["limit"].as_u64().ok_or_else(|| ApiError::bad_request("limit is required"))?;
+                self.tasks.read_session(string(arguments, "sessionPath")?, limit as usize)
+            }
             _ => mcp::call_task_tool(&self.tasks, &self.sessions, &client, name, arguments).await,
         }
     }
@@ -869,7 +822,8 @@ impl Assistant {
     }
 
     /// Recent sessions in every folder, newest first, with which are tasks.
-    fn list_sessions(&self, limit: usize) -> Value {
+    /// Recent sessions, newest first: the newest `limit`, or all.
+    fn list_sessions(&self, limit: Option<usize>) -> Value {
         let mut sessions = self.sessions.persisted(None, false);
         let live = self.sessions.list();
         let key = |value: &Value| value["sessionPath"].as_str().map(|path| path.replace('\\', "/").to_lowercase());
@@ -882,7 +836,9 @@ impl Assistant {
         }
         self.tasks.mark_sessions(&mut sessions);
         sessions.sort_by(|a, b| b["updatedAt"].as_str().unwrap_or("").cmp(a["updatedAt"].as_str().unwrap_or("")));
-        sessions.truncate(limit.clamp(1, 200));
+        if let Some(limit) = limit {
+            sessions.truncate(limit);
+        }
         let rows: Vec<Value> = sessions
             .iter()
             .map(|session| json!({
@@ -924,10 +880,9 @@ impl Assistant {
 
     fn memory_path(&self, name: &str) -> Result<PathBuf, ApiError> {
         let valid = !name.is_empty()
-            && name.len() <= 64
             && name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
         if !valid {
-            return Err(ApiError::bad_request("A memory name is 1-64 characters of a-z, 0-9 and -"));
+            return Err(ApiError::bad_request("A memory name is a-z, 0-9 and -"));
         }
         Ok(self.memory_dir().join(format!("{name}.md")))
     }
@@ -947,18 +902,9 @@ impl Assistant {
         let description = string(arguments, "description")?.replace('\n', " ");
         let body = string(arguments, "body")?;
         let text = format!("---\nname: {name}\ndescription: {description}\ntype: {kind}\nupdated: {}\n---\n{body}\n", now_iso());
-        if text.len() > MEMORY_LIMIT {
-            return Err(ApiError::bad_request(format!(
-                "A memory is at most {MEMORY_LIMIT} bytes; split it by subject or summarize"
-            )));
-        }
         let path = self.memory_path(name)?;
         std::fs::create_dir_all(self.memory_dir()).map_err(io)?;
         let existed = path.is_file();
-        let count = std::fs::read_dir(self.memory_dir()).map(|entries| entries.count()).unwrap_or(0);
-        if !existed && count >= 200 {
-            return Err(ApiError::bad_request("At most 200 memories; merge or delete some first"));
-        }
         std::fs::write(path, text).map_err(io)?;
         Ok(json!({ "name": name, "created": !existed }))
     }
@@ -982,7 +928,8 @@ impl Assistant {
         Ok(json!({ "hits": hits }))
     }
 
-    fn history_search(&self, query: &str, limit: usize) -> Value {
+    /// Transcript rows containing `query`: the newest `limit`, or all.
+    fn history_search(&self, query: &str, limit: Option<usize>) -> Value {
         let query = query.to_lowercase();
         let rows: Vec<Value> = std::fs::read_to_string(self.transcript())
             .unwrap_or_default()
@@ -990,7 +937,7 @@ impl Assistant {
             .filter(|line| line.to_lowercase().contains(&query))
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .collect();
-        let start = rows.len().saturating_sub(limit.clamp(1, 50));
+        let start = limit.map_or(0, |limit| rows.len().saturating_sub(limit));
         json!({ "hits": rows[start..] })
     }
 }
@@ -1002,7 +949,8 @@ fn string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, ApiError> {
         .ok_or_else(|| ApiError::bad_request(format!("{name} is required")))
 }
 
-/// What changed, in a few lines: counts by state, then the newest entries.
+/// What changed, in one line: how many tasks, by state. The entries
+/// themselves are read with read_inbox.
 fn wake_summary(entries: &[Value]) -> String {
     let mut counts: Vec<(String, usize)> = Vec::new();
     for entry in entries {
@@ -1014,20 +962,11 @@ fn wake_summary(entries: &[Value]) -> String {
     }
     let counts: Vec<String> = counts.iter().map(|(state, count)| format!("{state} {count}")).collect();
     let mut text = format!(" Inbox: {} task(s) changed ({}).", entries.len(), counts.join(", "));
-    let shown = entries.len().min(WAKE_ENTRIES);
-    for entry in &entries[entries.len() - shown..] {
-        text.push_str(&format!(
-            "\n- seq {} {} {}{}",
-            entry["seq"],
-            entry["taskId"].as_str().unwrap_or("?"),
-            entry["state"].as_str().unwrap_or("?"),
-            if entry["userWrote"] == true { " (the user wrote in this task: read_task it)" } else { "" }
-        ));
+    let wrote = entries.iter().filter(|entry| entry["userWrote"] == true).count();
+    if wrote > 0 {
+        text.push_str(&format!(" The user wrote in {wrote} of them."));
     }
-    if entries.len() > shown {
-        text.push_str(&format!("\n({} older entries: read_inbox)", entries.len() - shown));
-    }
-    text.push_str("\nHandle them, then ack_inbox with the highest seq you handled.");
+    text.push_str("\nread_inbox for the entries, handle them, then ack_inbox with the highest seq you handled.");
     text
 }
 
@@ -1035,7 +974,7 @@ fn wake_summary(entries: &[Value]) -> String {
 /// projects, memory, history, wakes and skills.
 pub fn tool_definitions() -> Vec<Value> {
     let mut tools = mcp::task_tools();
-    let name = json!({ "type": "string", "description": "kebab-case, a-z 0-9 -, at most 64" });
+    let name = json!({ "type": "string", "description": "kebab-case, a-z 0-9 -" });
     tools.extend([
         json!({ "name": "list_projects", "description": "The user's projects (name, description, linked folders, sessions, tasks, and requests: the user's own messages the project was asked with, word for word) and the sessions that exist.", "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "save_project", "description": "Create a project (no id) or replace one (with its id). Omitted lists become empty. Links must name existing workspaces (ids from list_workspaces are paths; use list_projects for workspace ids), sessions and your tasks.", "inputSchema": { "type": "object", "properties": {
@@ -1044,16 +983,16 @@ pub fn tool_definitions() -> Vec<Value> {
             "sessionIds": { "type": "array", "items": { "type": "string" } },
             "taskIds": { "type": "array", "items": { "type": "string" } },
             "requestIds": { "type": "array", "items": { "type": "string" }, "description": "Ids of the user's messages (the m… in [user message m…]) that ask for this project's work. Kept so you check results against the user's own words, not your retelling." } }, "required": ["name"] } }),
-        json!({ "name": "list_sessions", "description": "Recent sessions in all the user's folders, newest first: path, title, folder, time, status, and task (who started it) when it is a task. Read only.", "inputSchema": { "type": "object", "properties": { "limit": { "type": "integer", "minimum": 1, "maximum": 200 } } } }),
-        json!({ "name": "read_session", "description": "Read any session's latest messages, each whole. Read only: you can write only to your own tasks.", "inputSchema": { "type": "object", "properties": { "sessionPath": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "maximum": 200 } }, "required": ["sessionPath"] } }),
+        json!({ "name": "list_sessions", "description": "Recent sessions in all the user's folders, newest first: path, title, folder, time, status, and task (who started it) when it is a task. Read only.", "inputSchema": { "type": "object", "properties": { "limit": { "type": "integer", "minimum": 1, "description": "The newest this many; all when left out." } } } }),
+        json!({ "name": "read_session", "description": "Read any session's latest messages, each whole. Read only: you can write only to your own tasks.", "inputSchema": { "type": "object", "properties": { "sessionPath": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "description": "How many of the latest messages." } }, "required": ["sessionPath", "limit"] } }),
         json!({ "name": "memory_index", "description": "One line per memory: name (type): description.", "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "memory_read", "description": "Read one memory.", "inputSchema": { "type": "object", "properties": { "name": name }, "required": ["name"] } }),
         json!({ "name": "memory_write", "description": "Create or replace one memory (one subject per memory, at most 4 KB). type: user, feedback, project, decision or reference. The body says the fact, why it matters and what it does not mean. Never store live task state.", "inputSchema": { "type": "object", "properties": {
             "name": name, "type": { "type": "string", "enum": MEMORY_TYPES }, "description": { "type": "string", "description": "One line, used to decide relevance" }, "body": { "type": "string" } }, "required": ["name", "type", "description", "body"] } }),
         json!({ "name": "memory_delete", "description": "Delete a memory that is wrong or no longer true.", "inputSchema": { "type": "object", "properties": { "name": name }, "required": ["name"] } }),
         json!({ "name": "memory_search", "description": "Find memories containing a text.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } }),
-        json!({ "name": "history_search", "description": "Find earlier messages, replies and wakes of your conversation containing a text.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "maximum": 50 } }, "required": ["query"] } }),
-        json!({ "name": "schedule_wake", "description": "Be woken after some seconds (60 to 86400) with a note to yourself.", "inputSchema": { "type": "object", "properties": { "seconds": { "type": "integer", "minimum": 60, "maximum": 86400 }, "note": { "type": "string" } }, "required": ["seconds"] } }),
+        json!({ "name": "history_search", "description": "Find earlier messages, replies and wakes of your conversation containing a text.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "description": "The newest this many; all when left out." } }, "required": ["query"] } }),
+        json!({ "name": "schedule_wake", "description": "Be woken after some seconds with a note to yourself.", "inputSchema": { "type": "object", "properties": { "seconds": { "type": "integer", "minimum": 1 }, "note": { "type": "string" } }, "required": ["seconds"] } }),
         json!({ "name": "get_workflow", "description": "jouzu's workflow definitions (agents.json): roles, their model tier, tools, instructions, maxConcurrent. config is null while the runtime uses its defaults. Load the configure-workflow skill first.", "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "save_workflow", "description": "Replace the workflow definitions. Pass the revision get_workflow returned; a change since then is refused. The replaced version is kept and can be restored.", "inputSchema": { "type": "object", "properties": { "config": { "type": "object" }, "revision": { "type": "string" } }, "required": ["config", "revision"] } }),
         json!({ "name": "list_workflow_versions", "description": "Earlier workflow definitions kept on each save, oldest first.", "inputSchema": { "type": "object", "properties": {} } }),
@@ -1073,7 +1012,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_assistant_never_turns_on_without_a_chosen_model() {
-        let fixture = setup(WakePolicy::default());
+        let fixture = setup();
         let refused = fixture.assistant.update(Some(true), None).await.unwrap_err();
         assert!(refused.message.contains("Choose a model"), "{}", refused.message);
         assert_eq!(fixture.assistant.snapshot().await["enabled"], false);
@@ -1082,22 +1021,6 @@ mod tests {
         assert_eq!(fixture.assistant.snapshot().await["enabled"], false);
     }
 
-    #[test]
-    fn recommendations_name_the_providers_that_offer_each_model() {
-        let listed = vec![
-            json!({ "provider": "openai-codex", "id": "gpt-6.1-sol", "name": "GPT-6.1 Sol" }),
-            json!({ "provider": "shisa", "id": "glm-5.3-flash", "name": "GLM 5.3 Flash" }),
-        ];
-        let answer = recommend(RECOMMENDED, Some(&listed));
-        let models = answer["models"].as_array().unwrap();
-        assert_eq!(models[0]["id"], "gpt-6.1-sol");
-        assert_eq!(models[0]["thinking"], "low");
-        assert_eq!(models[0]["offeredBy"][0]["provider"], "openai-codex");
-        assert_eq!(models[1]["id"], "gpt-6-astra");
-        assert_eq!(models[1]["offeredBy"], json!([]));
-        assert!(models.iter().all(|model| THINKING_LEVELS.contains(&model["thinking"].as_str().unwrap())));
-        assert_eq!(recommend(RECOMMENDED, None)["models"][0]["offeredBy"], Value::Null);
-    }
     use crate::session::RuntimeSpec;
 
     struct Fixture {
@@ -1122,7 +1045,7 @@ mod tests {
             .find(|path| path.is_file())
     }
 
-    fn setup(policy: WakePolicy) -> Fixture {
+    fn setup() -> Fixture {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let sessions = Arc::new(SessionManager::new(
@@ -1134,7 +1057,7 @@ mod tests {
             None,
         ));
         sessions.add_workspaces(&[workspace.path().to_string_lossy().into_owned()]).unwrap();
-        let tasks = TaskManager::new(sessions.clone(), 8);
+        let tasks = TaskManager::new(sessions.clone());
         let projects = ProjectStore::new(sessions.clone(), tasks.clone());
         // The fake writes it in its working folder, the Assistant's agent folder.
         let log = home.path().join("assistant").join("agent").join("turns.log");
@@ -1145,7 +1068,7 @@ mod tests {
             script: Some(fixtures().join("fake-assistant.mjs")),
             faux: Some(json!([])),
         };
-        let assistant = Assistant::new(home.path(), paths, policy, sessions, tasks.clone(), projects);
+        let assistant = Assistant::new(home.path(), paths, sessions, tasks.clone(), projects);
         Fixture { assistant, tasks, workspace, log, _home: home }
     }
 
@@ -1179,7 +1102,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_user_message_gets_a_reply_and_tools_run_on_the_host() {
-        let fixture = setup(WakePolicy::default());
+        let fixture = setup();
         fixture.assistant.launch();
         let refused = fixture.assistant.send("hello").await.unwrap_err();
         assert_eq!(refused.code, "assistant-off");
@@ -1196,7 +1119,7 @@ mod tests {
 
     #[tokio::test]
     async fn what_the_assistant_said_is_unseen_until_its_pane_is_seen() {
-        let fixture = setup(WakePolicy::default());
+        let fixture = setup();
         let assistant = &fixture.assistant;
         assert_eq!(assistant.snapshot().await["unseen"], false);
         assistant.record("user", "hello");
@@ -1211,7 +1134,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_project_keeps_the_users_own_words_and_the_assistant_reads_any_session() {
-        let fixture = setup(WakePolicy::default());
+        let fixture = setup();
         let assistant = &fixture.assistant;
         let said = assistant.record("user", "Please fix the login bug.\nIt fails on Safari only.");
         let id = said["id"].as_str().unwrap().to_string();
@@ -1246,25 +1169,24 @@ mod tests {
         // It sees every session, with which are tasks, and reads one whole.
         let mut path = None;
         until(|| {
-            let listed = assistant.list_sessions(10);
+            let listed = assistant.list_sessions(Some(10));
             path = listed["sessions"].as_array().unwrap().iter().find(|row| row["task"]["taskId"] == task_id.as_str()).and_then(|row| row["sessionPath"].as_str().map(str::to_string));
             path.is_some()
         })
         .await;
-        let read = assistant.run_tool("read_session", &json!({ "sessionPath": path.unwrap() })).await.unwrap();
+        let read = assistant.run_tool("read_session", &json!({ "sessionPath": path.unwrap(), "limit": 30 })).await.unwrap();
         assert!(read["messages"].as_array().unwrap().iter().any(|row| row["text"].as_str().is_some_and(|text| text.contains("Safari only"))), "{read}");
-        let outside = assistant.run_tool("read_session", &json!({ "sessionPath": "/etc/passwd" })).await.unwrap_err();
+        let outside = assistant.run_tool("read_session", &json!({ "sessionPath": "/etc/passwd", "limit": 30 })).await.unwrap_err();
         assert!(outside.message.contains("No such session"));
     }
 
     #[tokio::test]
     async fn a_scheduled_wake_survives_a_restart() {
-        let fixture = setup(WakePolicy::default());
+        let fixture = setup();
         fixture.assistant.run_tool("schedule_wake", &json!({ "seconds": 3600, "note": "check the release" })).await.unwrap();
         let again = Assistant::new(
             fixture._home.path(),
             Assistant::default_paths(fixture._home.path(), &fixture.assistant.sessions),
-            WakePolicy::default(),
             fixture.assistant.sessions.clone(),
             fixture.tasks.clone(),
             fixture.assistant.projects.clone(),
@@ -1276,8 +1198,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn many_tasks_ending_together_wake_the_assistant_once() {
-        let fixture = setup(WakePolicy { quiet: Duration::from_millis(1500), min_interval: Duration::from_secs(60) });
+    async fn task_changes_wake_the_assistant_when_idle_and_none_is_lost() {
+        let fixture = setup();
         fixture.assistant.launch();
         fixture.assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
         until(|| fixture.assistant.state().phase == Phase::Idle).await;
@@ -1285,22 +1207,24 @@ mod tests {
         for n in 0..5 {
             fixture.tasks.start(CLIENT, &folder, &format!("job {n}")).unwrap();
         }
-        until(|| replies(&fixture.assistant).iter().any(|reply| reply.starts_with("handled"))).await;
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let handled = || -> usize {
+            replies(&fixture.assistant)
+                .iter()
+                .filter_map(|reply| reply.strip_prefix("handled ").and_then(|n| n.parse::<usize>().ok()))
+                .sum()
+        };
+        // Each wake hands over what arrived since the last; it acknowledges
+        // every entry it handled, so all five end up handled and none is left.
+        until(|| handled() >= 5 && fixture.tasks.inbox(CLIENT, 0).unwrap()["entries"].as_array().unwrap().is_empty()).await;
         let wakes: Vec<String> = turns(&fixture.log).into_iter().filter(|text| text.starts_with("[wake]")).collect();
-        assert_eq!(wakes.len(), 1, "{wakes:?}");
-        // The Assistant acknowledged what it handled.
-        let left = fixture.tasks.inbox(CLIENT, 0).unwrap()["entries"].as_array().unwrap().len();
-        let handled: usize = replies(&fixture.assistant)
-            .iter()
-            .find_map(|reply| reply.strip_prefix("handled ").and_then(|n| n.parse().ok()))
-            .unwrap();
-        assert_eq!(handled + left, 5, "one entry per task, none lost");
+        // Changes that arrive while it works are one wake: never one per change.
+        assert!(!wakes.is_empty() && wakes.len() <= 5, "{wakes:?}");
+        assert!(wakes.iter().all(|wake| wake.contains("Inbox:")), "no wake without news: {wakes:?}");
     }
 
     #[tokio::test]
     async fn a_stopped_assistant_stays_stopped_until_the_user_writes() {
-        let fixture = setup(WakePolicy::default());
+        let fixture = setup();
         fixture.assistant.launch();
         fixture.assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
         fixture.assistant.send("exit").await.unwrap();
@@ -1313,7 +1237,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_assistant_that_is_off_reads_and_logs_nothing() {
-        let fixture = setup(WakePolicy::default());
+        let fixture = setup();
         fixture.assistant.launch();
         tokio::time::sleep(Duration::from_millis(1600)).await;
         let log = std::fs::read_to_string(fixture._home.path().join("logs").join("host.log")).unwrap_or_default();
@@ -1321,8 +1245,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_is_one_bounded_file_per_subject() {
-        let fixture = setup(WakePolicy::default());
+    async fn memory_is_one_file_per_subject() {
+        let fixture = setup();
         let assistant = &fixture.assistant;
         let write = |name: &str, body: &str| {
             assistant.memory_write(&json!({ "name": name, "type": "decision", "description": "why we do it", "body": body }))
@@ -1330,7 +1254,8 @@ mod tests {
         write("release-gates", "Only regressions block a candidate.").unwrap();
         assert!(write("../escape", "x").is_err());
         assert!(write("Upper", "x").is_err());
-        assert!(write("too-long", &"x".repeat(MEMORY_LIMIT)).is_err());
+        assert!(write("long", &"x".repeat(64 * 1024)).is_ok(), "no size of its own: the model's context is the bound");
+        assistant.memory_delete("long").unwrap();
         assert!(assistant.memory_write(&json!({ "name": "x", "type": "secret", "description": "d", "body": "b" })).is_err());
         assert_eq!(assistant.memory_index_text(), "- release-gates (decision): why we do it");
         assert!(assistant.memory_read("release-gates").unwrap()["text"].as_str().unwrap().contains("regressions"));
@@ -1345,7 +1270,7 @@ mod tests {
     #[ignore]
     async fn the_real_bridge_runs_host_tools_on_the_pinned_sdk() {
         let sdk = PathBuf::from(std::env::var("JOUZU_ASSISTANT_SDK").expect("JOUZU_ASSISTANT_SDK"));
-        let fixture = setup(WakePolicy::default());
+        let fixture = setup();
         let paths = AssistantPaths {
             node: Some(node()),
             sdk,
@@ -1356,7 +1281,6 @@ mod tests {
         let real = Assistant::new(
             fixture._home.path(),
             paths,
-            WakePolicy::default(),
             fixture.assistant.sessions.clone(),
             fixture.tasks.clone(),
             fixture.assistant.projects.clone(),
@@ -1373,13 +1297,12 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn installs_the_pinned_sdk_with_the_bundled_npm() {
-        let fixture = setup(WakePolicy::default());
+        let fixture = setup();
         let mut paths = Assistant::default_paths(fixture._home.path(), &fixture.assistant.sessions);
         paths.node = Some(node());
         let assistant = Assistant::new(
             fixture._home.path(),
             paths,
-            WakePolicy::default(),
             fixture.assistant.sessions.clone(),
             fixture.tasks.clone(),
             fixture.assistant.projects.clone(),
@@ -1391,7 +1314,7 @@ mod tests {
 
     #[tokio::test]
     async fn skills_are_listed_in_the_prompt_and_load_by_name() {
-        let fixture = setup(WakePolicy::default());
+        let fixture = setup();
         let prompt = fixture.assistant.system_prompt();
         for (name, text) in SKILLS {
             // Line by line: a Windows checkout may have CRLF endings.

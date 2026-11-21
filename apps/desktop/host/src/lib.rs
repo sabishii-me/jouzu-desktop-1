@@ -286,10 +286,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(forget_workspace),
         )
         .route("/collaboration/mcp", get(mcp_server_snapshot).put(update_mcp_server))
+        .route("/collaboration/tasks", get(task_settings).put(update_task_settings))
         .route("/collaboration/mcp/clients", axum::routing::post(create_mcp_client))
         .route("/collaboration/mcp/clients/{id}", axum::routing::delete(revoke_mcp_client))
         .route("/assistant", get(assistant_snapshot).put(update_assistant))
-        .route("/assistant/recommended", get(assistant_recommended))
         .route("/assistant/messages", get(assistant_messages).post(send_assistant))
         .route("/assistant/seen", axum::routing::post(assistant_seen))
         .route("/workflow", get(read_workflow).put(save_workflow))
@@ -447,6 +447,38 @@ async fn update_mcp_server(
     }
 }
 
+/// How many tasks may run at once. The user's control: the desktop window only.
+async fn task_settings(
+    State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
+) -> Response {
+    if let Err(response) = desktop_window_only(listener) {
+        return response;
+    }
+    Json(state.tasks.settings()).into_response()
+}
+
+#[derive(Deserialize)]
+struct TaskSettingsUpdate {
+    /// null: no limit.
+    #[serde(rename = "maxRunning")]
+    max_running: Option<usize>,
+}
+
+async fn update_task_settings(
+    State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
+    Json(request): Json<TaskSettingsUpdate>,
+) -> Response {
+    if let Err(response) = desktop_window_only(listener) {
+        return response;
+    }
+    match state.tasks.set_max_running(request.max_running) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 struct McpClientRequest {
     name: String,
@@ -516,10 +548,6 @@ async fn update_assistant(
         Ok(value) => Json(value).into_response(),
         Err(error) => error.into_response(),
     }
-}
-
-async fn assistant_recommended(State(state): State<AppState>) -> Json<Value> {
-    Json(state.assistant.recommended().await)
 }
 
 async fn assistant_messages(State(state): State<AppState>, Query(query): Query<TaskQuery>) -> Json<Value> {
@@ -698,7 +726,11 @@ async fn read_task(
 ) -> Result<Json<Value>, ApiError> {
     state
         .tasks
-        .read(&task_client(query.client_id.as_deref()), &id, query.limit.unwrap_or(20))
+        .read(
+            &task_client(query.client_id.as_deref()),
+            &id,
+            query.limit.ok_or_else(|| ApiError::bad_request("limit is required"))?,
+        )
         .map(Json)
 }
 
@@ -714,7 +746,7 @@ async fn ack_inbox(State(state): State<AppState>, Json(request): Json<AckRequest
 }
 
 async fn wait_inbox(State(state): State<AppState>, Query(query): Query<TaskQuery>) -> Result<Json<Value>, ApiError> {
-    let timeout = Duration::from_millis(query.timeout_ms.unwrap_or(30_000));
+    let timeout = Duration::from_millis(query.timeout_ms.ok_or_else(|| ApiError::bad_request("timeoutMs is required"))?);
     state
         .tasks
         .wait(&task_client(query.client_id.as_deref()), query.after.unwrap_or(0), timeout)
@@ -2785,7 +2817,7 @@ mod tests {
 
     fn state(dist: PathBuf) -> AppState {
         let sessions = Arc::new(SessionManager::new(None, dist.clone(), dist.clone(), None, 10, None));
-        let tasks = tasks::TaskManager::new(sessions.clone(), tasks::DEFAULT_CAP);
+        let tasks = tasks::TaskManager::new(sessions.clone());
         let projects = projects::ProjectStore::new(sessions.clone(), tasks.clone());
         AppState {
             token: Arc::new("a".repeat(64)),
@@ -2800,7 +2832,7 @@ mod tests {
             tasks: tasks.clone(),
             mcp: mcp::McpServer::new(&dist, "0.1.0", tasks.clone(), sessions.clone()),
             projects: projects.clone(),
-            assistant: assistant::Assistant::new(&dist, assistant::Assistant::default_paths(&dist, &sessions), assistant::WakePolicy::default(), sessions.clone(), tasks, projects),
+            assistant: assistant::Assistant::new(&dist, assistant::Assistant::default_paths(&dist, &sessions), sessions.clone(), tasks, projects),
         }
     }
 
@@ -3398,7 +3430,7 @@ mod session_tests {
 
     fn app(manager: Arc<SessionManager>) -> Router {
         let home = std::env::temp_dir();
-        let tasks = tasks::TaskManager::new(manager.clone(), tasks::DEFAULT_CAP);
+        let tasks = tasks::TaskManager::new(manager.clone());
         let projects = projects::ProjectStore::new(manager.clone(), tasks.clone());
         AppState {
             token: Arc::new("a".repeat(64)),
@@ -3413,7 +3445,7 @@ mod session_tests {
             tasks: tasks.clone(),
             mcp: mcp::McpServer::new(manager.home(), "0.1.0", tasks.clone(), manager.clone()),
             projects: projects.clone(),
-            assistant: assistant::Assistant::new(manager.home(), assistant::Assistant::default_paths(manager.home(), &manager), assistant::WakePolicy::default(), manager.clone(), tasks, projects),
+            assistant: assistant::Assistant::new(manager.home(), assistant::Assistant::default_paths(manager.home(), &manager), manager.clone(), tasks, projects),
         }
         .pipe(router)
     }

@@ -422,15 +422,6 @@ export interface AssistantMessage {
   text: string;
 }
 
-export interface AssistantRecommendation {
-  id: string;
-  thinking: string;
-  label: string;
-  evidence: string;
-  /** Listed models with this id; null while the runtime has not listed yet. */
-  offeredBy: Array<{ provider: string; id: string; name: string }> | null;
-}
-
 export interface SettingsApi {
   environment: {
     /** Saving goes through the configuration queue (`environment`). */
@@ -449,11 +440,15 @@ export interface SettingsApi {
     addAgent(name: string): Promise<{ agent: McpAgent; token: string }>;
     removeAgent(id: string): Promise<void>;
   };
+  /** How many tasks may run at once (Settings > Collaboration); null is no limit. Desktop window only. */
+  tasks: {
+    read(): Promise<{ maxRunning: number | null }>;
+    update(maxRunning: number | null): Promise<{ maxRunning: number | null }>;
+  };
   /** The Assistant (Settings > Collaboration): off until the user turns it on with a model. */
   assistant: {
     read(): Promise<AssistantState>;
     update(change: { enabled?: boolean; model?: AssistantModel | null }): Promise<AssistantState>;
-    recommended(): Promise<{ about: string; models: AssistantRecommendation[] }>;
     messages(limit?: number): Promise<AssistantMessage[]>;
     send(text: string): Promise<AssistantState>;
     /** The person looked at the pane: what it said so far is read (one mark for every window). */

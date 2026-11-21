@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useApi } from "./api/context";
-import type { AssistantModel, AssistantRecommendation, AssistantState, McpServerState, Model } from "./api/jouzu-api";
+import type { AssistantModel, AssistantState, McpServerState, Model } from "./api/jouzu-api";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
 import { Input } from "./components/ui/input";
@@ -18,6 +18,7 @@ const COMMIT_LINES = "Co-authored-by: Jouzu Desktop (<model>) <359074535+jouzu-d
 export function CollaborationPanel() {
   return <>
     <AssistantCard />
+    <TasksCard />
     <AgentAccessCard />
     <CommitMarkCard />
   </>;
@@ -34,27 +35,20 @@ async function copy(text: string): Promise<boolean> {
 
 const modelKey = (model: { provider: string; id: string }) => `${model.provider}\n${model.id}`;
 
-/** A recommendation as a model to save: the first provider offering it, with its effort. */
-export function offeredModel(entry: AssistantRecommendation): AssistantModel | null {
-  const match = entry.offeredBy?.[0];
-  return match ? { provider: match.provider, id: match.id, thinking: entry.thinking } : null;
-}
-
-/** What the form shows: the saved model, else the user's unsaved pick, else the first recommendation on offer. */
-export function shownModel(saved: AssistantModel | null, draft: AssistantModel | null, recommended: AssistantRecommendation[]): AssistantModel | null {
-  return saved ?? draft ?? recommended.map(offeredModel).find(Boolean) ?? null;
+/** What the form shows: the saved model, else the user's unsaved pick. */
+export function shownModel(saved: AssistantModel | null, draft: AssistantModel | null): AssistantModel | null {
+  return saved ?? draft;
 }
 
 /**
- * The Assistant runs only on the model chosen here. Until one is saved, the
- * recommended model is filled in, and turning the Assistant on saves it.
+ * The Assistant runs only on the model chosen here: the user picks it, and
+ * turning the Assistant on saves it. Desktop recommends none of its own.
  */
 function AssistantCard() {
   const api = useApi();
   const t = useChatText();
   const [state, setState] = useState<AssistantState | null>(null);
   const [models, setModels] = useState<Model[]>([]);
-  const [recommended, setRecommended] = useState<AssistantRecommendation[]>([]);
   const [draft, setDraft] = useState<AssistantModel | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -62,10 +56,9 @@ function AssistantCard() {
   useEffect(() => {
     void api.settings.assistant.read().then(setState, setError);
     void api.models.list("").then(setModels, () => setModels([]));
-    void api.settings.assistant.recommended().then(value => setRecommended(value.models), () => setRecommended([]));
   }, [api]);
 
-  const shown = shownModel(state?.model ?? null, draft, recommended);
+  const shown = shownModel(state?.model ?? null, draft);
 
   async function save(change: { enabled?: boolean; model?: AssistantModel | null }) {
     setBusy(true);
@@ -117,25 +110,58 @@ function AssistantCard() {
           </Select>
         </div>
       </div>
-      {recommended.length > 0 && <ul className="space-y-2">
-        {recommended.map(entry => {
-          const model = offeredModel(entry);
-          const current = !!model && !!shown && modelKey(model) === modelKey(shown) && model.thinking === shown.thinking;
-          return <li key={entry.id} className="rounded-lg border border-border p-3 text-sm">
-            <div className="flex items-center justify-between gap-2">
-              <span className="font-medium">{entry.label === "default" ? t.assistantRecommended : t.assistantStronger}: {entry.id} · {entry.thinking}</span>
-              {model && !current && <Button variant="outline" disabled={busy} onClick={() => choose(model)}>{t.assistantUse}</Button>}
-            </div>
-            <p className="text-muted-foreground">{entry.evidence}</p>
-            {entry.offeredBy && entry.offeredBy.length === 0 && <p className="text-muted-foreground">{t.assistantNotOffered}</p>}
-          </li>;
-        })}
-      </ul>}
       {state.enabled && <p className="text-sm text-muted-foreground">{fill(t.assistantPhase, { phase: state.phase })}</p>}
       {state.error && <p className="text-sm text-destructive">{state.error}</p>}
       {error != null && <ErrorLine raw={error} failed={t.assistantFailed} onDismiss={() => setError(null)} />}
     </CardContent>}
     {!state && error != null && <CardContent><p className="text-sm text-muted-foreground">{explain(t, error, t.assistantFailed).text}</p></CardContent>}
+  </Card>;
+}
+
+/** How many tasks (the Assistant's and other agents') may run at once. Empty: no limit. */
+function TasksCard() {
+  const api = useApi();
+  const t = useChatText();
+  const [saved, setSaved] = useState<number | null | undefined>(undefined);
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+
+  useEffect(() => {
+    void api.settings.tasks.read().then(state => { setSaved(state.maxRunning); setValue(state.maxRunning == null ? "" : String(state.maxRunning)); }, setError);
+  }, [api]);
+
+  const wanted = value === "" ? null : Number(value);
+  const valid = wanted === null || (Number.isInteger(wanted) && wanted >= 1);
+  const changed = saved !== undefined && valid && wanted !== saved;
+
+  async function save() {
+    setBusy(true);
+    setError(null);
+    try {
+      const state = await api.settings.tasks.update(wanted);
+      setSaved(state.maxRunning);
+      setValue(state.maxRunning == null ? "" : String(state.maxRunning));
+    } catch (failure) {
+      setError(failure);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <Card className="border-border shadow-none">
+    <CardHeader>
+      <CardTitle><Label htmlFor="tasks-max-running">{t.tasksMaxRunning}</Label></CardTitle>
+      <CardDescription>{t.tasksMaxRunningHint}</CardDescription>
+    </CardHeader>
+    <CardContent className="space-y-2">
+      <div className="flex items-end gap-2">
+        <Input id="tasks-max-running" className="w-32" inputMode="numeric" placeholder={t.tasksNoLimit} value={value} disabled={busy || saved === undefined}
+          onChange={event => setValue(event.target.value.replace(/[^0-9]/g, ""))} />
+        {changed && <Button variant="outline" disabled={busy} onClick={() => void save()}>{t.agentAccessSave}</Button>}
+      </div>
+      {error != null && <ErrorLine raw={error} failed={t.tasksSettingsFailed} onDismiss={() => setError(null)} />}
+    </CardContent>
   </Card>;
 }
 
