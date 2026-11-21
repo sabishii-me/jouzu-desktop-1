@@ -50,6 +50,12 @@ import { copyText } from "./secure-context";
 interface ShellState { platform: "windows" | "macos" | "linux"; recent: Workspace[]; ready: boolean; bash: boolean; bundled_git: boolean }
 interface Components { jouzu: string | null; development: boolean; desktopUpdaterConfigured?: boolean; jouzuUpdaterConfigured?: boolean; build?: string; commit?: string }
 interface RuntimeReport { status?: string; version: string | null; expectedVersion?: string; versionCurrent?: boolean; minimumVersion?: string; verifiedVersions?: string[]; mandatory?: boolean; root: string | null; app: string | null; node: boolean; nodeVersion: string | null; nodeCurrent: boolean; git: boolean; terminal: boolean }
+/** The prepare screen runs when the runtime must be updated, its Node is not the
+ * pinned one, or Jouzu's own Git Bash is gone (#158: a reinstall deletes it and
+ * nothing else puts it back). The install restores Git from the shipped archive. */
+function needsPrepare(report: RuntimeReport | null | undefined): boolean {
+  return report?.mandatory === true || report?.nodeCurrent === false || report?.git === false;
+}
 type Theme = "dark" | "light" | "system";
 
 export function App() {
@@ -331,7 +337,7 @@ export function App() {
     try {
       await invoke<string>("runtime_install");
       const report = await invoke<RuntimeReport>("runtime_report");
-      if (report?.mandatory === true || report?.nodeCurrent === false) throw new Error(`The runtime update did not finish (${report?.version ?? "unknown"}).`);
+      if (needsPrepare(report)) throw new Error(`The runtime update did not finish (${report?.version ?? "unknown"}).`);
       setRuntimePresent(true);
       // First run uses Core, as Jouzu's does: the interface language never selects the
       // Japanese-first profile. A profile already chosen (a repair, a reinstall) is kept.
@@ -409,7 +415,7 @@ export function App() {
       void refreshDiagnostics();
       getVersion().then(setVersion).catch(error => fail("settings", error));
       void invoke<RuntimeReport>("runtime_report").then(report => {
-        if (report?.mandatory === true || report?.nodeCurrent === false) { setRuntimePresent(false); return; }
+        if (needsPrepare(report)) { setRuntimePresent(false); return; }
         setRuntimePresent(true);
         void (async () => { try { await invoke("image_tool_ensure"); } catch { /* the tool is optional on a fixture */ } })();
         void loadComponents();
