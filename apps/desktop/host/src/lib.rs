@@ -5934,6 +5934,8 @@ mod session_tests {
         let call = rows.iter().find(|row| row["blocks"][0]["type"] == "toolCall").unwrap();
         assert_eq!(call["blocks"][1]["type"], "toolResult", "{call}");
         assert_eq!(call["blocks"][1]["result"]["content"][0]["text"], "a.txt");
+        // The transcript's own last reply says how its last run ended (#214).
+        assert_eq!(session.summary()["lastRun"]["outcome"], json!("completed"));
         let info = session.info();
         assert_eq!(info["title"], "list the files");
         assert_eq!(
@@ -5975,6 +5977,27 @@ mod session_tests {
         assert_eq!(result["interrupted"], true);
         assert_eq!(result["ok"], false);
         assert_eq!(reply["stopReason"], "toolUse");
+        // A file cut off mid-turn keeps that fact when it is reopened (#214).
+        assert_eq!(session.summary()["lastRun"]["outcome"], json!("stopped"));
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_saved_file_waiting_for_a_reply_names_no_finished_run() {
+        // #214: a message with no reply behind it is not a run that ended; the
+        // status line must not call it stopped.
+        let (manager, _home, shown) = manager(50);
+        let own = tempfile::tempdir().unwrap();
+        let file = own.path().join("waiting.jsonl");
+        let lines = [
+            json!({ "type": "session", "version": 3, "id": "waiting", "timestamp": "2026-01-01T00:00:00Z", "cwd": own.path().to_string_lossy() }),
+            json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": "answer me" }] } }),
+        ];
+        std::fs::write(&file, lines.iter().map(|line| format!("{line}\n")).collect::<String>()).unwrap();
+        let session = manager
+            .create(shown.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+        assert!(session.summary()["lastRun"].is_null(), "{}", session.summary());
         manager.stop_all();
     }
 
@@ -6484,6 +6507,9 @@ mod session_tests {
         assert_eq!(deltas, "hello");
         reader.abort();
 
+        // The session view says how the run ended (#214).
+        assert_eq!(session.summary()["lastRun"]["outcome"], json!("completed"));
+
         assert_ne!(session.status(), Status::Stopped);
         session.send("client-2", "again").unwrap();
         wait_status(&session, Status::Idle).await;
@@ -6564,8 +6590,24 @@ mod session_tests {
         assert_eq!(done["stopReason"], "aborted");
         let end = next_event(&mut rx, "turn.end").await;
         assert_eq!(end["status"], "interrupted");
+        assert_eq!(session.summary()["lastRun"]["outcome"], json!("stopped"));
         wait_status(&session, Status::Idle).await;
         reader.abort();
+    }
+
+    #[tokio::test]
+    async fn a_multi_step_turn_that_used_tools_ends_completed() {
+        // #214: a normal turn is completed even when its last visible step was a
+        // tool call; the status line must not read that shape as a stop.
+        let (manager, _home, workspace) = manager_with_env(50, &[("FAKE_RUNTIME_STEPS", "2")]);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("client-1", "do it").unwrap();
+        wait_until(|| session.summary()["lastRun"]["outcome"] == json!("completed")).await;
+        assert_eq!(session.summary()["lastRun"]["outcome"], json!("completed"));
+        manager.stop_all();
     }
 
     #[tokio::test]

@@ -704,6 +704,33 @@ struct PendingQuestion {
     options: std::collections::HashMap<String, Vec<String>>,
 }
 
+/// How a run ended, as the session view's `lastRun` reports it (#214). A run
+/// someone stopped is an outcome of its own: the session list leaves it at rest,
+/// the status line says the turn was stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunEnd {
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl RunEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// The last run that ended, and when.
+#[derive(Clone, Debug)]
+struct LastRun {
+    outcome: RunEnd,
+    ended_at: String,
+}
+
 pub struct Session {
     pub id: String,
     pub workspace_path: String,
@@ -744,6 +771,9 @@ pub struct Session {
     next_message: AtomicU64,
     next_request: AtomicU64,
     run: Mutex<Option<Run>>,
+    /// How the last run ended, from its `turn.end` or, for a reopened saved
+    /// conversation, from its last reply (#214).
+    last_run: Mutex<Option<LastRun>>,
     /// A model request was cut off by a runtime exit. The runtime's Flow control
     /// withholds it (and any new input) until someone decides; the host already
     /// decided (the turn failed), so recovery releases the hold before going idle.
@@ -1887,21 +1917,18 @@ impl Session {
         stored
     }
 
-    /// How a run ended, from its `turn.end`, for the session list: `None` when
-    /// no run ended (the message went back to the queue, or an extension handled
-    /// a command), and `Some(None)` for a run someone stopped, which the list
-    /// shows like a session at rest.
-    fn run_outcome(&self, data: &Value) -> Option<Option<crate::run_marks::Outcome>> {
-        use crate::run_marks::Outcome;
+    /// How a run ended, from its `turn.end`: `None` when no run ended (the
+    /// message went back to the queue, or an extension handled a command).
+    fn run_outcome(&self, data: &Value) -> Option<RunEnd> {
         let status = data.get("status").and_then(Value::as_str);
         if matches!(status, Some("queued" | "handled")) {
             return None;
         }
         if status == Some("failed") || data.get("reason").is_some_and(|reason| !reason.is_null()) {
-            return Some(Some(Outcome::Failed));
+            return Some(RunEnd::Failed);
         }
         if status == Some("interrupted") || data.get("aborted").and_then(Value::as_bool) == Some(true) {
-            return Some(None);
+            return Some(RunEnd::Stopped);
         }
         // Completed: failed when its last reply did (the provider refused it
         // and no retry answered).
@@ -1917,20 +1944,30 @@ impl Session {
                     && row.get("turnId").and_then(Value::as_str) == Some(turn)
             })
             .is_some_and(|row| row.get("errorMessage").is_some_and(|error| !error.is_null()));
-        Some(Some(if failed { Outcome::Failed } else { Outcome::Done }))
+        Some(if failed { RunEnd::Failed } else { RunEnd::Completed })
     }
 
-    /// A run ended: marked for the session list unless a client shows the session (#212).
+    /// A run ended: the session view keeps its outcome, and the session list
+    /// marks it unless a client shows the session (#212, #214).
     fn note_run_end(&self, data: &Value) {
         let Some(outcome) = self.run_outcome(data) else { return };
+        {
+            let mut last = self.last_run.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *last = Some(LastRun { outcome, ended_at: Self::now_iso() });
+        }
         let Some(path) = self.list_key() else { return };
         match outcome {
-            Some(outcome) => {
+            RunEnd::Completed | RunEnd::Failed => {
+                let outcome = if outcome == RunEnd::Failed {
+                    crate::run_marks::Outcome::Failed
+                } else {
+                    crate::run_marks::Outcome::Done
+                };
                 let shown = self.viewers.load(Ordering::SeqCst) > 0;
                 self.config.runs.ended(&path, outcome, &Self::now_iso(), shown);
             }
             // Stopped: nothing to tell, and an older mark is out of date.
-            None => {
+            RunEnd::Stopped => {
                 self.config.runs.seen(&path);
             }
         }
@@ -1945,6 +1982,16 @@ impl Session {
     fn unseen_run(&self) -> Value {
         self.list_key()
             .map(|path| self.config.runs.view(&path))
+            .unwrap_or(Value::Null)
+    }
+
+    /// How the session's last run ended (#214), or null before one has.
+    fn last_run_view(&self) -> Value {
+        self.last_run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|run| json!({ "outcome": run.outcome.as_str(), "endedAt": run.ended_at }))
             .unwrap_or(Value::Null)
     }
 
@@ -2570,6 +2617,37 @@ impl Session {
         );
     }
 
+    /// The last run a saved conversation records, from its own messages (#214):
+    /// the last reply's outcome, or a turn cut off after a tool call or result.
+    /// A file that ends waiting for a reply leaves no run to name.
+    fn saved_last_run(messages: &[Value]) -> Option<LastRun> {
+        let message = messages.last()?;
+        let role = message.get("role").and_then(Value::as_str)?;
+        let stop = message.get("stopReason").and_then(Value::as_str);
+        let failed = message.get("errorMessage").is_some_and(|error| !error.is_null());
+        // A trailing tool result or tool-using reply has no reply after it: the
+        // file was cut off mid-turn, the same cut-off its closed calls show.
+        let cut_off = role == "toolResult"
+            || stop == Some("toolUse")
+            || message.get("interrupted").and_then(Value::as_bool) == Some(true)
+            || stop == Some("aborted");
+        let outcome = match role {
+            "assistant" if cut_off => RunEnd::Stopped,
+            "assistant" if failed => RunEnd::Failed,
+            "assistant" => RunEnd::Completed,
+            "toolResult" => RunEnd::Stopped,
+            _ => return None,
+        };
+        Some(LastRun {
+            outcome,
+            ended_at: message
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(Self::now_iso),
+        })
+    }
+
     fn import_history(&self, data: &Value) {
         let messages = data
             .as_array()
@@ -2693,6 +2771,24 @@ impl Session {
             let mut attachments = self.attachments.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             attachments.retain(|_, source| matches!(source, AttachmentSource::File { .. }));
             attachments.extend(saved_attachments);
+        }
+        // Reopening a saved conversation keeps how its last run ended, which no
+        // event will say after a host restart (#214). A live run's own
+        // `turn.end` is newer and is kept.
+        if self.run_guard().is_none() {
+            let seeded = Self::saved_last_run(messages);
+            let changed = {
+                let mut last = self.last_run.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if last.is_none() {
+                    *last = seeded;
+                    last.is_some()
+                } else {
+                    false
+                }
+            };
+            if changed {
+                self.publish_summary();
+            }
         }
         // A saved conversation is at rest: a tool call with no result was cut off
         // (the app closed, the runtime stopped). While a turn runs, its own calls
@@ -5097,6 +5193,7 @@ impl Session {
             "sessionSeq": self.cursor(),
             "status": status.as_str(),
             "activeTurn": active_turn,
+            "lastRun": self.last_run_view(),
             "unseenRun": self.unseen_run(),
             "pendingApprovals": self.pending_approvals(),
             "pendingQuestions": self.pending_questions(),
@@ -5188,6 +5285,7 @@ impl Session {
             next_message: AtomicU64::new(0),
             next_request: AtomicU64::new(0),
             run: Mutex::new(None),
+            last_run: Mutex::new(None),
             release_flow_hold: AtomicBool::new(false),
             commands: Mutex::new(Vec::new()),
             cancelled: Mutex::new(HashMap::new()),
