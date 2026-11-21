@@ -7,6 +7,8 @@ import { createContext, useContext } from "react";
 import type { Locale } from "./i18n";
 
 const en = {
+  /** The interface language as a BCP 47 tag, for dates and numbers. */
+  locale: "en",
   details: "Details",
   hideDetails: "Hide details",
   dismiss: "Dismiss",
@@ -507,6 +509,7 @@ const en = {
 export type ChatText = typeof en;
 
 const ja: ChatText = {
+  locale: "ja",
   details: "詳細",
   hideDetails: "詳細を隠す",
   dismiss: "閉じる",
@@ -999,6 +1002,7 @@ const ja: ChatText = {
 };
 
 const hans: ChatText = {
+  locale: "zh-Hans",
   details: "详情",
   hideDetails: "隐藏详情",
   dismiss: "关闭",
@@ -1491,6 +1495,7 @@ const hans: ChatText = {
 };
 
 const hant: ChatText = {
+  locale: "zh-Hant",
   details: "詳細資訊",
   hideDetails: "隱藏詳細資訊",
   dismiss: "關閉",

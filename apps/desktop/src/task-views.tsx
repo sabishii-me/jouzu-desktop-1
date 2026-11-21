@@ -125,10 +125,11 @@ function Graph({ view }: { view: Extract<TaskView, { view: "graph" }> }) {
 }
 
 function Timeline({ view }: { view: Extract<TaskView, { view: "timeline" }> }) {
+  const t = useChatText();
   return <ol className="relative ml-2 border-l border-border">
     {timelineOrder(view.items).map((item, index) => <li key={index} className="relative flex min-w-0 items-start gap-3 py-1 pl-4">
       <span aria-hidden="true" className="absolute -left-[5px] top-3 size-2.5 rounded-full border-2 border-background bg-primary" />
-      <time className="shrink-0 whitespace-nowrap pt-1 text-xs tabular-nums text-muted-foreground" dateTime={item.at} title={item.at}>{timelineWhen(item.at, document.documentElement.lang || undefined)}</time>
+      <time className="shrink-0 whitespace-nowrap pt-1 text-xs tabular-nums text-muted-foreground" dateTime={item.at} title={item.at}>{timelineWhen(item.at, t.locale)}</time>
       <div className="min-w-0 flex-1">{item.taskId ? <TaskChip taskId={item.taskId} label={item.label} wide /> : <p className="flex items-center gap-2 px-2 py-1 text-sm"><span aria-hidden="true" className="size-3.5 shrink-0" />{item.label}</p>}</div>
     </li>)}
   </ol>;

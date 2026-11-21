@@ -104,6 +104,8 @@ for (const [language, theme, width] of [["en", "dark", 1280], ["en", "light", 12
     await expect(message.locator('[data-jouzu-view="table"]').getByRole("button", { name: new RegExp(w.waiting) })).toBeVisible();
     await expect(message.locator('[data-jouzu-view="graph"] [data-graph-node]')).toHaveCount(4);
     await expect(message.locator('[data-jouzu-view="timeline"] time').first()).toHaveAttribute("datetime", "2026-11-21");
+    // Dates follow the interface language, not the browser's.
+    await expect(message.locator('[data-jouzu-view="timeline"] time').first()).toHaveText(language === "ja" ? "2026/11/21" : "Nov 21, 2026");
     await expect(message.locator('[data-jouzu-view="progress"] [data-progress-done]')).toHaveText(w.progress);
     // The SVG is drawn without what the skill forbids, and nothing in it ran.
     const svg = message.locator("[data-svg-view] svg");
