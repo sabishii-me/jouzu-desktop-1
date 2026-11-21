@@ -116,9 +116,17 @@ The jouzu-assistant extension only bridges: it registers the tools the host
 lists (`tools.json`) and sends each call to `/v1/assistant/bridge` with a
 token the host makes for that runtime alone (in its environment). That route
 takes no other token, the host's included, and only on the internal listener.
-A user message or wake is a `prompt`; each assistant message's text is a
-reply in the transcript, a failed model call an error; `agent_settled` makes
-the Assistant idle again. A question an extension asks is declined at once:
+A user message or wake is a `prompt`; a failed model call is an error in the
+transcript; `agent_settled` makes the Assistant idle again.
+
+The Assistant speaks only with the `say` tool: one or two sentences per call,
+each shown at once as a chat message, several calls when there is more. The
+model's own text, the turn's last message included, is never shown: it is its
+thinking aloud. When the user writes during a turn, the host aborts the turn
+(the runtime's `abort`), and a `say` after that answers `interrupted` with the
+words that were not said, which never reach the transcript; the user's message
+is the next turn. Commands to the runtime have no deadline of the host's:
+they end when the runtime answers, exits or is stopped. A question an extension asks is declined at once:
 nobody sits at the Assistant's runtime to answer it.
 
 What jouzu 0.2.5 still adds that the Assistant cannot turn off (runtime
