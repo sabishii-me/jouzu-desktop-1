@@ -8,7 +8,10 @@ name=${0##*/}
 here=$(cd "${0%/*}" && pwd -P)
 
 # The repository's own hooks folder: what git resolves without our override.
-own=$(env "GIT_CONFIG_KEY_${JOUZU_GIT_HOOKS_INDEX:-0}=jouzu.inactive" git rev-parse --git-path hooks 2>/dev/null)
+# Exported inside the command substitution's subshell only. Not `env`: the
+# first `env` on PATH is not always coreutils (uv puts a script of that name in
+# ~/.local/bin), and a wrong answer here would skip the repository's hooks.
+own=$(export "GIT_CONFIG_KEY_${JOUZU_GIT_HOOKS_INDEX:-0}=jouzu.inactive"; git rev-parse --git-path hooks 2>/dev/null)
 hook=
 if [ -n "$own" ] && [ -x "$own/$name" ] && [ "$(cd "$own" 2>/dev/null && pwd -P)" != "$here" ]; then
   hook=$own/$name

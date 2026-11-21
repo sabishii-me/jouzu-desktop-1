@@ -129,6 +129,13 @@ describe("jouzu-attribution extension", () => {
     chmodSync(join(repo, ".hooks", "commit-msg"), 0o755);
     expect(run(base, "config", "core.hooksPath", ".hooks").status).toBe(0);
     expect(run(agent, "commit", "-q", "--allow-empty", "-m", "BLOCK this").status).not.toBe(0);
+    // Also when the first `env` on PATH is not coreutils (uv's ~/.local/bin/env).
+    const fakeBin = temp("jouzu-attr-bin-");
+    writeFileSync(join(fakeBin, "env"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(fakeBin, "env"), 0o755);
+    const sep = process.platform === "win32" ? ";" : ":";
+    const pathKey = Object.keys(agent).find(key => key.toUpperCase() === "PATH") ?? "PATH";
+    expect(run({ ...agent, [pathKey]: `${fakeBin}${sep}${agent[pathKey]}` }, "commit", "-q", "--allow-empty", "-m", "BLOCK this").status).not.toBe(0);
     expect(run(agent, "commit", "-q", "--allow-empty", "-m", "allowed").status).toBe(0);
     expect(message()).toBe(`allowed\n\n${plain}`);
 
