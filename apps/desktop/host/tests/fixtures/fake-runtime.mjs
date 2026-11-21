@@ -20,6 +20,10 @@ if (process.env.JOUZU_HOME) {
 }
 
 const delay = Number(process.env.FAKE_RUNTIME_DELAY_MS ?? 15);
+// A delay of 0 is the next turn of the event loop: setTimeout(0) waits for the
+// timer resolution (about 15 ms on Windows), which made a long echo take minutes.
+const later = fn => (delay > 0 ? setTimeout(fn, delay) : { immediate: setImmediate(fn) });
+const cancel = handle => (handle?.immediate ? clearImmediate(handle.immediate) : clearTimeout(handle));
 const startDelay = Number(process.env.FAKE_RUNTIME_START_DELAY_MS ?? 0);
 const exitOnStart = Number(process.env.FAKE_RUNTIME_EXIT_ON_START_MS ?? 0);
 const crashOnPrompt = process.env.FAKE_RUNTIME_CRASH_ON_PROMPT === "1";
@@ -105,7 +109,7 @@ if (process.env.FAKE_RUNTIME_CHILD_PID_FILE) {
 
 function settled(aborted) {
   busy = false;
-  clearTimeout(timer);
+  cancel(timer);
   current = null;
   pendingUi = null;
   out({ type: "agent_settled", aborted });
@@ -130,7 +134,7 @@ function tick() {
       },
     });
     current.index += 1;
-    timer = setTimeout(tick, delay);
+    timer = later(tick);
     return;
   }
   // The provider refuses the request with this text while the file holds it.
@@ -158,7 +162,7 @@ function tick() {
     const next = deliverSteer();
     out({ type: "message_start", message: { role: "assistant", content: [] } });
     current = { parts: Array.from(next.text), index: 0 };
-    timer = setTimeout(tick, delay);
+    timer = later(tick);
     return;
   }
   settled(false);
@@ -204,10 +208,10 @@ function runSteps(text, images) {
       // The prompt, then anything steered before the run began.
       userMessage(event.text, event.images);
       deliverSteer();
-      timer = setTimeout(next, delay);
+      timer = later(next);
       return;
     }
-    if (event.type === "steer-point") { deliverSteer(); timer = setTimeout(next, delay); return; }
+    if (event.type === "steer-point") { deliverSteer(); timer = later(next); return; }
     if (event.type === "last-steer-point") {
       // The run would end, but steered messages remain: one more step answers them.
       if (steering.length > 0) {
@@ -222,13 +226,13 @@ function runSteps(text, images) {
           { type: "last-steer-point" },
         );
       }
-      timer = setTimeout(next, delay);
+      timer = later(next);
       return;
     }
     const { record, ...wire } = event;
     if (record) messages.push(record);
     out(wire);
-    timer = setTimeout(next, delay);
+    timer = later(next);
   };
   next();
 }
@@ -516,7 +520,7 @@ lines.on("line", line => {
       response(value.id, "abort", {});
       if (busy && !inputPhase) {
         interrupted = true;
-        if (current) clearTimeout(timer);
+        if (current) cancel(timer);
         settled(true);
         selfRunWhen("stop");
       }

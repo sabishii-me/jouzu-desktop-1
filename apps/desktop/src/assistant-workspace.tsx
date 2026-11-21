@@ -89,6 +89,8 @@ export function AssistantWorkspace({ overview, rows = [], onOpen = () => {} }: {
         ? <article key={index} aria-label="user message" className="rounded-xl bg-muted p-4"><ChatMarkdown text={message.text} /></article>
         : message.kind === "assistant"
           ? <article key={index} aria-label="assistant message" className="min-w-0 px-1"><ChatMarkdown text={message.text} renderBlock={renderViewBlock} /></article>
+          : message.kind === "show"
+            ? <article key={index} aria-label="assistant details" className="min-w-0 rounded-xl border border-border bg-card p-4"><ChatMarkdown text={message.text} renderBlock={renderViewBlock} /></article>
           : message.kind === "error"
             ? <p key={index} role="alert" className="px-1 text-sm text-destructive">{message.text}</p>
             : <p key={index} className="px-1 text-xs text-muted-foreground">{fill(t.assistantWoken, { text: message.text })}</p>)}

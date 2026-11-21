@@ -430,7 +430,7 @@ impl Assistant {
             .lines()
             .rev()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .find(|row| matches!(row["kind"].as_str(), Some("assistant" | "error")))
+            .find(|row| matches!(row["kind"].as_str(), Some("assistant" | "show" | "error")))
             .and_then(|row| row["at"].as_str().map(str::to_string))
     }
 
@@ -706,6 +706,19 @@ impl Assistant {
         json!({ "status": "said" })
     }
 
+    /// Details attached to the conversation (lists, tables, views, drawings):
+    /// shown, never read aloud. Withheld like say once the user wrote.
+    fn show(&self, content: &str) -> Value {
+        let content = content.trim();
+        if self.state().interrupted {
+            return json!({ "status": "interrupted" });
+        }
+        if !content.is_empty() {
+            self.record("show", content);
+        }
+        json!({ "status": "shown" })
+    }
+
     pub async fn bridge(&self, token: &str, name: &str, arguments: &Value) -> Result<Value, ApiError> {
         let allowed = self.runtime_guard().as_ref().is_some_and(|runtime| same(&runtime.token, token));
         if !allowed {
@@ -861,6 +874,7 @@ impl Assistant {
                 self.projects.save_project(CLIENT, project, id.as_deref())
             }
             "say" => Ok(self.say(string(arguments, "text")?)),
+            "show" => Ok(self.show(string(arguments, "content")?)),
             "memory_index" => Ok(json!({ "index": self.memory_index_text() })),
             "memory_read" => self.memory_read(string(arguments, "name")?),
             "memory_write" => self.memory_write(arguments),
@@ -1134,7 +1148,8 @@ pub fn tool_definitions() -> Vec<Value> {
             "requestIds": { "type": "array", "items": { "type": "string" }, "description": "Ids of the user's messages (the m… in [user message m…]) that ask for this project's work. Kept so you check results against the user's own words, not your retelling." } }, "required": ["name"] } }),
         json!({ "name": "list_sessions", "description": "Recent sessions in all the user's folders, newest first: path, title, folder, time, status, and task (who started it) when it is a task. Read only.", "inputSchema": { "type": "object", "properties": { "limit": { "type": "integer", "minimum": 1, "description": "The newest this many; all when left out." } } } }),
         json!({ "name": "read_session", "description": "Read any session's latest messages, each whole. Read only: you can write only to your own tasks.", "inputSchema": { "type": "object", "properties": { "sessionPath": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "description": "How many of the latest messages." } }, "required": ["sessionPath", "limit"] } }),
-        json!({ "name": "say", "description": "Say something to the user: one or two sentences, shown at once as a chat message. Call it again for more; nothing else you write reaches the user. status said: it was said. status interrupted: the user wrote meanwhile, so it was not said and your turn is ending; their message comes next.", "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] } }),
+        json!({ "name": "say", "description": "Say something to the user: one or two short spoken sentences in plain words, shown at once as a chat message and later read aloud. No Markdown, lists, tables, code or views: attach those with show. Call it again for more; nothing else you write reaches the user. status said: it was said. status interrupted: the user wrote meanwhile, so it was not said and your turn is ending; their message comes next.", "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] } }),
+        json!({ "name": "show", "description": "Attach details to the conversation: Markdown (lists, tables, links), jouzu-view blocks and svg drawings (see the draw-task-views skill). Shown, never read aloud; say what it is with say. status interrupted: the user wrote meanwhile, so it was not shown.", "inputSchema": { "type": "object", "properties": { "content": { "type": "string" } }, "required": ["content"] } }),
         json!({ "name": "memory_index", "description": "One line per memory: name (type): description.", "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "memory_read", "description": "Read one memory.", "inputSchema": { "type": "object", "properties": { "name": name }, "required": ["name"] } }),
         json!({ "name": "memory_write", "description": "Create or replace one memory (one subject per memory, at most 4 KB). type: user, feedback, project, decision or reference. The body says the fact, why it matters and what it does not mean. Never store live task state.", "inputSchema": { "type": "object", "properties": {
@@ -1479,6 +1494,20 @@ mod tests {
         until(|| fixture.assistant.state().phase == Phase::Idle).await;
         // The turn's final text, the same words, is not a second reply.
         assert_eq!(replies(&fixture.assistant), vec!["ok: hello".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn details_are_shown_apart_from_what_is_said_and_withheld_once_the_user_wrote() {
+        let fixture = setup();
+        let assistant = &fixture.assistant;
+        assert_eq!(assistant.run_tool("show", &json!({ "content": "| a | b |" })).await.unwrap()["status"], "shown");
+        let rows: Vec<Value> = std::fs::read_to_string(assistant.transcript()).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.last().unwrap()["kind"], "show");
+        assert!(replies(assistant).is_empty(), "a show is not something said");
+        assistant.state().interrupted = true;
+        assert_eq!(assistant.run_tool("show", &json!({ "content": "later" })).await.unwrap()["status"], "interrupted");
+        assert_eq!(assistant.run_tool("say", &json!({ "text": "later" })).await.unwrap()["status"], "interrupted");
+        assert_eq!(std::fs::read_to_string(assistant.transcript()).unwrap().lines().count(), rows.len());
     }
 
     #[tokio::test]

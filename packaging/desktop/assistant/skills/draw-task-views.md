@@ -4,7 +4,7 @@ description: Show task boards, tables, dependency graphs, timelines and progress
 ---
 # Draw task views
 
-Desktop draws a fenced block with the language `jouzu-view` from JSON. Name tasks by taskId only: Desktop fills in each task's live state and title when it draws the view, so the view is never out of date. Never write a task's state into a view yourself.
+Views go in show, never in say. Desktop draws a fenced block with the language `jouzu-view` from JSON. Name tasks by taskId only: Desktop fills in each task's live state and title when it draws the view, so the view is never out of date. Never write a task's state into a view yourself.
 
 Views (one JSON object per block; "title" is optional everywhere):
 
@@ -19,7 +19,7 @@ Views (one JSON object per block; "title" is optional everywhere):
 - progress: how much of a set is done; Desktop counts from live states.
   {"view":"progress","title":"Issues in 1.1.5","taskIds":["task-a","task-b","task-c"]}
 
-Use a view when it says more than a sentence: more than three tasks, dependencies, or dates. Keep one view per message unless asked.
+Use a view when it says more than a sentence: more than three tasks, dependencies, or dates. Keep one view per show unless asked, and say in a sentence what it shows.
 
 For anything these views cannot show, draw an `svg` block:
 - A viewBox, no fixed width/height.
