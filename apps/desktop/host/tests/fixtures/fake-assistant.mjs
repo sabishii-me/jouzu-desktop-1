@@ -3,11 +3,13 @@
 // abort) and loads the extension it is given with --extension (the real
 // jouzu-assistant), the way the runtime would, through a minimal `pi`; tool
 // calls go through that extension to the host's bridge. No model. Turns:
-//   "[wake]..."          -> read_inbox, ack_inbox(highest seq), reply "handled N"
+//   "[wake]..."          -> read_inbox, ack_inbox(highest seq), say "handled N"
 //   "tool <name> <json>" -> call that tool, reply with its result
 //   "fail <text>"        -> the model call fails with that text
 //   "exit"               -> the process ends
-//   anything else        -> reply "ok: <text>"
+//   "slow <text>"        -> say "working", wait for abort, then say <text>
+//   anything else        -> say "ok: <text>"
+// Each say goes through the say tool; the turn's final plain text is not a reply.
 // A user message's "[user message mN]" first line is read past, as a model would.
 // In its working folder: turns.log (each turn's text, one JSON line each) and
 // args.json (the arguments and Assistant variables it started with).
@@ -36,6 +38,7 @@ const out = record => process.stdout.write(`${JSON.stringify(record)}\n`);
 const respond = (id, command, data) => out({ id, type: "response", command, success: true, data });
 const refuse = (id, command, error) => out({ id, type: "response", command, success: false, error });
 let model = null;
+let aborted = () => {};
 let turns = Promise.resolve();
 
 async function call(name, args) {
@@ -45,10 +48,17 @@ async function call(name, args) {
   return { ok: result.isError !== true, result: JSON.parse(result.content[0].text) };
 }
 
-function say(text, extra = {}) {
+function message(text, extra = {}) {
   const message = { role: "assistant", content: [{ type: "text", text }], stopReason: "stop", ...extra };
   out({ type: "message_start", message });
   out({ type: "message_end", message });
+}
+
+// Speaks through the say tool, as the Assistant must, then ends the turn with
+// the same words as plain text, which the host must not show.
+async function say(text) {
+  await call("say", { text });
+  message(`(final text) ${text}`);
 }
 
 async function turn(raw) {
@@ -61,17 +71,24 @@ async function turn(raw) {
     const entries = inbox.result?.entries ?? [];
     const seq = Math.max(0, ...entries.map(entry => entry.seq));
     await call("ack_inbox", { seq });
-    say(`handled ${entries.length}`);
+    await say(`handled ${entries.length}`);
   } else if (text.startsWith("tool ")) {
     const [, name, ...rest] = text.split("\n")[0].split(" ");
-    say(JSON.stringify(await call(name, rest.length ? JSON.parse(rest.join(" ")) : {})));
+    await say(JSON.stringify(await call(name, rest.length ? JSON.parse(rest.join(" ")) : {})));
   } else if (text.startsWith("fail ")) {
-    say("", { stopReason: "error", errorMessage: text.slice(5).split("\n")[0] });
+    message("", { stopReason: "error", errorMessage: text.slice(5).split("\n")[0] });
+  } else if (text.startsWith("slow ")) {
+    await call("say", { text: "working" });
+    await new Promise(resolve => { aborted = resolve; });
+    const result = await call("say", { text: text.slice(5).split("\n")[0] });
+    appendFileSync("said.log", `${JSON.stringify(result.result)}\n`);
+    out({ type: "agent_settled", aborted: true });
+    return;
   } else if (text.startsWith("exit")) {
     process.stderr.write("fake runtime: asked to exit\n");
     process.exit(3);
   } else {
-    say(`ok: ${text.split("\n")[0]}`);
+    await say(`ok: ${text.split("\n")[0]}`);
   }
   out({ type: "agent_settled", aborted: false });
 }
@@ -90,7 +107,7 @@ createInterface({ input: process.stdin }).on("line", line => {
       respond(command.id, "prompt");
       turns = turns.then(() => turn(String(command.message ?? "")));
       break;
-    case "abort": respond(command.id, "abort"); break;
+    case "abort": respond(command.id, "abort"); aborted(); break;
     default: refuse(command.id, String(command.type), "unsupported command");
   }
 }).on("close", () => process.exit(0));

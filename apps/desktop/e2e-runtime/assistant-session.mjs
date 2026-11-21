@@ -41,7 +41,8 @@ const model = createServer((request, response) => {
     const system = messages.filter(message => message.role === 'system' || message.role === 'developer').map(text).join('\n');
     const tools = (data.tools ?? []).map(tool => tool.function?.name ?? tool.name);
     const user = [...messages].reverse().find(message => message.role === 'user');
-    const toolResult = messages.find(message => message.role === 'tool');
+    const toolResult = messages.find(message => message.role === 'tool' && message.tool_call_id === 'e2e-call');
+    const said = messages.some(message => message.role === 'tool' && message.tool_call_id === 'e2e-say');
     requests.push({ system, tools, user: user ? text(user) : '' });
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const chunk = (delta, finish = null) => response.write(`data: ${JSON.stringify({ id: 'e2e', object: 'chat.completion.chunk', created: 1, model: 'deterministic', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
@@ -49,8 +50,14 @@ const model = createServer((request, response) => {
     if (user && text(user).includes('CALL list_workspaces') && !toolResult) {
       chunk({ tool_calls: [{ index: 0, id: 'e2e-call', type: 'function', function: { name: 'list_workspaces', arguments: '{}' } }] });
       chunk({}, 'tool_calls');
+    } else if (!said) {
+      // It speaks through say, as the Assistant must.
+      const words = toolResult ? `tool said: ${text(toolResult).slice(0, 300)}` : 'hello from the fixture';
+      chunk({ tool_calls: [{ index: 0, id: 'e2e-say', type: 'function', function: { name: 'say', arguments: JSON.stringify({ text: words }) } }] });
+      chunk({}, 'tool_calls');
     } else {
-      chunk({ content: toolResult ? `tool said: ${text(toolResult).slice(0, 300)}` : 'hello from the fixture' });
+      // The turn's final text is not a reply: the host must not show it.
+      chunk({ content: 'FINAL TEXT NOT A REPLY' });
       chunk({}, 'stop');
     }
     response.end('data: [DONE]\n\n');
@@ -109,9 +116,12 @@ try {
     return body?.messages?.find(row => row.kind === 'assistant' || row.kind === 'error');
   }, 120);
   check('a tool call goes through the extension to the host', reply.kind === 'assistant' && reply.text.includes('work'), reply.text.slice(0, 200));
+  await until('turn ends', async () => (await api('GET', '/assistant')).body?.phase === 'idle', 60);
+  const shown = (await api('GET', '/assistant/messages?limit=20')).body?.messages ?? [];
+  check('only what it says reaches the user', shown.filter(row => row.kind === 'assistant').length === 1 && !shown.some(row => row.text?.includes('FINAL TEXT')), JSON.stringify(shown.map(row => row.text)).slice(0, 300));
 
   const offered = new Set(requests[0]?.tools ?? []);
-  check('offered its own tools', ['list_workspaces', 'start_task', 'read_inbox', 'memory_write', 'list_projects'].every(name => offered.has(name)), [...offered].join(','));
+  check('offered its own tools', ['say', 'list_workspaces', 'start_task', 'read_inbox', 'memory_write', 'list_projects'].every(name => offered.has(name)), [...offered].join(','));
   check('offered read-only tools', offered.has('read'), '');
   const coder = ['bash', 'write', 'edit', 'powershell'].filter(name => offered.has(name));
   check('offered nothing that runs commands or writes files', coder.length === 0, coder.join(','));

@@ -176,6 +176,9 @@ struct State {
     turn: u64,
     /// The memory index as the Assistant last saw it.
     memory_seen: String,
+    /// The user wrote during this turn: what is not said yet stays unsaid,
+    /// and the turn ends so the Assistant hears the user first.
+    interrupted: bool,
 }
 
 /// The Assistant's runtime while it lives.
@@ -250,6 +253,7 @@ impl Assistant {
                 scheduled,
                 turn: 0,
                 memory_seen: String::new(),
+                interrupted: false,
             }),
             runtime: Mutex::new(None),
             kick: Notify::new(),
@@ -384,12 +388,22 @@ impl Assistant {
             return Err(ApiError::new(axum::http::StatusCode::CONFLICT, "assistant-off", "Turn the Assistant on first", false));
         }
         let row = self.record("user", text);
-        let restart = {
+        let (restart, interrupt) = {
             let mut state = self.state();
             // The id lets a project keep these exact words (requestIds).
             state.queue.push_back(format!("[user message {}]\n{text}", row["id"].as_str().unwrap_or("")));
-            matches!(state.phase, Phase::Stopped | Phase::Off)
+            let interrupt = state.phase == Phase::Running && !state.interrupted;
+            if interrupt {
+                state.interrupted = true;
+            }
+            (matches!(state.phase, Phase::Stopped | Phase::Off), interrupt)
         };
+        // The user speaks while it works or talks: it stops and listens.
+        if interrupt {
+            if let Some(supervisor) = self.supervisor() {
+                let _ = supervisor.enqueue(command::abort());
+            }
+        }
         if restart {
             let assistant = Arc::clone(self);
             tokio::spawn(async move { assistant.start().await });
@@ -640,10 +654,8 @@ impl Assistant {
                     self.record("error", error);
                     return;
                 }
-                let text = pi::content_text(&message["content"]);
-                if !text.trim().is_empty() {
-                    self.record("assistant", text.trim());
-                }
+                // The model's own text is its thinking aloud, not a reply:
+                // the Assistant speaks only through say.
             }
             Record::AgentSettled => {
                 if self.state().phase == Phase::Running {
@@ -680,6 +692,20 @@ impl Assistant {
 
     /// A call from the Assistant's runtime, through its extension. Only the
     /// token made for the runtime now running opens it.
+    /// One or two sentences to the user, shown at once. After the user wrote
+    /// during the turn nothing more is said: the answer says so, and the turn
+    /// is already ending.
+    fn say(&self, text: &str) -> Value {
+        let text = text.trim();
+        if self.state().interrupted {
+            return json!({ "status": "interrupted", "said": "", "unsaid": text });
+        }
+        if !text.is_empty() {
+            self.record("assistant", text);
+        }
+        json!({ "status": "said" })
+    }
+
     pub async fn bridge(&self, token: &str, name: &str, arguments: &Value) -> Result<Value, ApiError> {
         let allowed = self.runtime_guard().as_ref().is_some_and(|runtime| same(&runtime.token, token));
         if !allowed {
@@ -721,6 +747,7 @@ impl Assistant {
                     let mut state = self.state();
                     state.turn += 1;
                     state.phase = Phase::Running;
+                    state.interrupted = false;
                     state.turn
                 };
                 crate::log(self.sessions.home(), "info", "assistant.turn", json!({ "turn": turn }));
@@ -833,6 +860,7 @@ impl Assistant {
                 self.user_messages(&project.request_ids)?;
                 self.projects.save_project(CLIENT, project, id.as_deref())
             }
+            "say" => Ok(self.say(string(arguments, "text")?)),
             "memory_index" => Ok(json!({ "index": self.memory_index_text() })),
             "memory_read" => self.memory_read(string(arguments, "name")?),
             "memory_write" => self.memory_write(arguments),
@@ -1106,6 +1134,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "requestIds": { "type": "array", "items": { "type": "string" }, "description": "Ids of the user's messages (the m… in [user message m…]) that ask for this project's work. Kept so you check results against the user's own words, not your retelling." } }, "required": ["name"] } }),
         json!({ "name": "list_sessions", "description": "Recent sessions in all the user's folders, newest first: path, title, folder, time, status, and task (who started it) when it is a task. Read only.", "inputSchema": { "type": "object", "properties": { "limit": { "type": "integer", "minimum": 1, "description": "The newest this many; all when left out." } } } }),
         json!({ "name": "read_session", "description": "Read any session's latest messages, each whole. Read only: you can write only to your own tasks.", "inputSchema": { "type": "object", "properties": { "sessionPath": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "description": "How many of the latest messages." } }, "required": ["sessionPath", "limit"] } }),
+        json!({ "name": "say", "description": "Say something to the user: one or two sentences, shown at once as a chat message. Call it again for more; nothing else you write reaches the user. status said: it was said. status interrupted: the user wrote meanwhile, so it was not said and your turn is ending; their message comes next.", "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] } }),
         json!({ "name": "memory_index", "description": "One line per memory: name (type): description.", "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "memory_read", "description": "Read one memory.", "inputSchema": { "type": "object", "properties": { "name": name }, "required": ["name"] } }),
         json!({ "name": "memory_write", "description": "Create or replace one memory (one subject per memory, at most 4 KB). type: user, feedback, project, decision or reference. The body says the fact, why it matters and what it does not mean. Never store live task state.", "inputSchema": { "type": "object", "properties": {
@@ -1438,6 +1467,36 @@ mod tests {
         for coder in ["bash", "write", "edit", "powershell", "agent", "subagent", "background", "skill_read"] {
             assert!(!tools.iter().any(|tool| tool == coder), "{coder}");
         }
+    }
+
+    #[tokio::test]
+    async fn only_what_it_says_reaches_the_user() {
+        let fixture = setup();
+        fixture.assistant.launch();
+        fixture.assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
+        fixture.assistant.send("hello").await.unwrap();
+        until(|| replies(&fixture.assistant).iter().any(|reply| reply == "ok: hello")).await;
+        until(|| fixture.assistant.state().phase == Phase::Idle).await;
+        // The turn's final text, the same words, is not a second reply.
+        assert_eq!(replies(&fixture.assistant), vec!["ok: hello".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn the_user_writing_mid_turn_stops_it_and_what_was_not_said_stays_unsaid() {
+        let fixture = setup();
+        fixture.assistant.launch();
+        fixture.assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
+        fixture.assistant.send("slow all done").await.unwrap();
+        until(|| replies(&fixture.assistant).iter().any(|reply| reply == "working")).await;
+        fixture.assistant.send("wait, stop").await.unwrap();
+        let dir = fixture._home.path().join("assistant");
+        until(|| std::fs::read_to_string(dir.join("said.log")).is_ok_and(|text| !text.is_empty())).await;
+        let said: Value = serde_json::from_str(std::fs::read_to_string(dir.join("said.log")).unwrap().trim()).unwrap();
+        assert_eq!(said["status"], "interrupted", "{said}");
+        assert_eq!(said["unsaid"], "all done");
+        // The user's message is the next turn, and the unsaid words never show.
+        until(|| replies(&fixture.assistant).iter().any(|reply| reply == "ok: wait, stop")).await;
+        assert!(!replies(&fixture.assistant).iter().any(|reply| reply == "all done"));
     }
 
     #[tokio::test]
