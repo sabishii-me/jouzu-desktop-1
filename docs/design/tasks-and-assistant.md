@@ -43,8 +43,10 @@ The host sets no numbers of its own here (decision on invented limits): how
 many tasks run at once is the user's setting (`GET/PUT
 /v1/collaboration/tasks`, desktop window only), how many messages to read or
 how long to wait is the caller's argument, and nothing has a size or count
-cap. The host follows a task's session by its events and summary changes
-only; nothing is polled.
+cap. A task takes its place under the limit when it is chosen to start, in
+the same step that checks for room, so tasks started together (a client's
+parallel calls) never pass the limit. The host follows a task's session by
+its events and summary changes only; nothing is polled.
 
 Every window hears of these changes on the host's global event stream, the
 same one the session list already follows: `task.changed` (task id, client,
@@ -184,7 +186,8 @@ teaches (`src/task-views.tsx`, layout in `src/task-views-model.ts`):
   its session; one with no session yet shows its id and state.
 - board: columns of tasks; table: the Assistant's cells plus a State column;
   graph: layered by the longest chain of dependencies, every edge pointing
-  forward (a cycle is still drawn); timeline: in date order; progress: counts
+  forward (a cycle is still drawn); timeline: in date order, dates shown in
+  the interface language's format; progress: counts
   from live states (finished, failed or stopped, waiting for you, under way).
 - `svg` is drawn at its viewBox scale, narrowed to fit, after removing
   scripts, event handlers, `foreignObject`, links, images, references outside
