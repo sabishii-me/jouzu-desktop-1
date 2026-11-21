@@ -226,10 +226,23 @@ impl TaskManager {
         Ok(self.settings())
     }
 
-    /// Room for one more running task under the user's limit, if any.
-    fn has_room(&self) -> bool {
+    /// Takes a place for the task under the user's limit, if there is room:
+    /// the task counts as starting from here on. Checking and taking happen
+    /// under one lock, so tasks started together (a client's parallel calls,
+    /// or a slot freeing while one starts) can never pass the limit, and one
+    /// waiting task is never launched twice.
+    fn claim(&self, task_id: &str) -> bool {
         let limit = self.store().max_running;
-        limit.is_none_or(|limit| self.running() < limit)
+        let mut live = self.live();
+        if live.get(task_id).is_some_and(|entry| entry.state.as_deref().is_some_and(active)) {
+            return false;
+        }
+        let running = live.values().filter(|entry| entry.state.as_deref().is_some_and(active)).count();
+        if limit.is_some_and(|limit| running >= limit) {
+            return false;
+        }
+        live.entry(task_id.to_string()).or_default().state = Some("starting".into());
+        true
     }
 
     fn home(&self) -> &Path {
@@ -388,7 +401,7 @@ impl TaskManager {
             store.tasks.push(record);
             self.save(&store);
         }
-        let launched = if self.has_room() {
+        let launched = if self.claim(&task_id) {
             self.launch(&task_id)
         } else {
             Ok(())
@@ -403,17 +416,20 @@ impl TaskManager {
         self.view(&self.record(&task_id)?)
     }
 
-    fn running(&self) -> usize {
-        self.live()
-            .values()
-            .filter(|live| live.state.as_deref().is_some_and(active))
-            .count()
+    /// Opens the task's session and hands it the waiting request. The task
+    /// has claimed its place; if it cannot launch, it gives the place back.
+    fn launch(self: &Arc<Self>, task_id: &str) -> Result<(), ApiError> {
+        let launched = self.try_launch(task_id);
+        if launched.is_err() {
+            self.live().remove(task_id);
+        }
+        launched
     }
 
-    /// Opens the task's session and hands it the waiting request.
-    fn launch(self: &Arc<Self>, task_id: &str) -> Result<(), ApiError> {
+    fn try_launch(self: &Arc<Self>, task_id: &str) -> Result<(), ApiError> {
         let record = self.record(task_id)?;
         let Some(text) = record.pending_text.clone() else {
+            self.live().remove(task_id);
             return Ok(());
         };
         let session = self.sessions.create_pending(&record.workspace, None, None)?;
@@ -424,12 +440,7 @@ impl TaskManager {
         }
         session.attach_early();
         let events = session.subscribe();
-        self.live().insert(
-            task_id.to_string(),
-            Live { state: Some("starting".into()), ..Live::default() },
-        );
         if let Err(error) = session.send_with_client(&new_id(TASK_MESSAGE), &text, Some(&record.client_id), &[]) {
-            self.live().remove(task_id);
             session.stop();
             return Err(error);
         }
@@ -607,16 +618,15 @@ impl TaskManager {
     /// Starts waiting tasks, oldest first, while slots are free.
     fn fill_slots(self: &Arc<Self>) {
         loop {
-            if !self.has_room() {
-                return;
-            }
-            let next = self
+            let waiting: Vec<String> = self
                 .store()
                 .tasks
                 .iter()
-                .find(|task| task.pending_text.is_some() && task.session_id.is_none())
-                .map(|task| task.task_id.clone());
-            let Some(task_id) = next else { return };
+                .filter(|task| task.pending_text.is_some() && task.session_id.is_none())
+                .map(|task| task.task_id.clone())
+                .collect();
+            // The first waiting task that is not already starting elsewhere.
+            let Some(task_id) = waiting.into_iter().find(|task_id| self.claim(task_id)) else { return };
             if let Err(error) = self.launch(&task_id) {
                 crate::log(
                     self.home(),
@@ -1237,6 +1247,30 @@ mod flow_tests {
         assert_eq!(tasks.set_max_running(None).unwrap(), json!({ "maxRunning": null }));
         let second_id = second["taskId"].as_str().unwrap();
         assert!(tasks.get("agent-a", second_id).unwrap()["sessionId"].is_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tasks_started_together_never_pass_the_limit() {
+        let (manager, _home, workspace) = setup(&[("FAKE_RUNTIME_DELAY_MS", "400")]);
+        let tasks = TaskManager::new(manager);
+        tasks.set_max_running(Some(1)).unwrap();
+        let starts: Vec<_> = (0..4)
+            .map(|n| {
+                let tasks = Arc::clone(&tasks);
+                let workspace = folder(&workspace);
+                tokio::task::spawn_blocking(move || tasks.start("agent-a", &workspace, &format!("job {n}")).unwrap())
+            })
+            .collect();
+        let mut started = Vec::new();
+        for start in starts {
+            started.push(start.await.unwrap());
+        }
+        let running = started.iter().filter(|task| task["sessionId"].is_string()).count();
+        assert_eq!(running, 1, "{started:?}");
+        // The rest start one at a time as places free.
+        for task in &started {
+            wait_for(&tasks, "agent-a", task["taskId"].as_str().unwrap(), "finished").await;
+        }
     }
 
     #[tokio::test]

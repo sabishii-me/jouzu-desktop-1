@@ -168,3 +168,19 @@ export function timelineOrder<T extends { at: string }>(items: T[]): T[] {
     .sort((a, b) => a.item.at.localeCompare(b.item.at) || a.index - b.index)
     .map(entry => entry.item);
 }
+
+/**
+ * How a timeline item's `at` reads: a date or a date and time in the
+ * person's own format; anything else (a week, "Q1") as written.
+ */
+export function timelineWhen(at: string, locale?: string): string {
+  if (/^\d{4}-\d{2}-\d{2}$/u.test(at)) {
+    const day = new Date(`${at}T00:00:00Z`);
+    if (!Number.isNaN(day.getTime())) return new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeZone: "UTC" }).format(day);
+  }
+  if (/^\d{4}-\d{2}-\d{2}T/u.test(at)) {
+    const moment = new Date(at);
+    if (!Number.isNaN(moment.getTime())) return new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(moment);
+  }
+  return at;
+}

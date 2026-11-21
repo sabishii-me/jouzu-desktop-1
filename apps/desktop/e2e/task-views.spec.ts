@@ -103,7 +103,7 @@ for (const [language, theme, width] of [["en", "dark", 1280], ["en", "light", 12
     await expect(message.locator('[data-jouzu-view="table"] th').last()).toHaveText(w.state);
     await expect(message.locator('[data-jouzu-view="table"]').getByRole("button", { name: new RegExp(w.waiting) })).toBeVisible();
     await expect(message.locator('[data-jouzu-view="graph"] [data-graph-node]')).toHaveCount(4);
-    await expect(message.locator('[data-jouzu-view="timeline"] time').first()).toHaveText("2026-11-21");
+    await expect(message.locator('[data-jouzu-view="timeline"] time').first()).toHaveAttribute("datetime", "2026-11-21");
     await expect(message.locator('[data-jouzu-view="progress"] [data-progress-done]')).toHaveText(w.progress);
     // The SVG is drawn without what the skill forbids, and nothing in it ran.
     const svg = message.locator("[data-svg-view] svg");
@@ -121,7 +121,7 @@ for (const [language, theme, width] of [["en", "dark", 1280], ["en", "light", 12
     await page.setViewportSize({ width, height: 2600 });
     await message.screenshot({ path: info.outputPath(`message-${language}-${theme}-${width}.png`) });
     await page.setViewportSize({ width, height: 900 });
-    for (const kind of ["board", "graph", "progress"]) await message.locator(`[data-jouzu-view="${kind}"]`).screenshot({ path: info.outputPath(`view-${kind}-${language}-${theme}-${width}.png`) });
+    for (const kind of ["board", "graph", "timeline", "progress"]) await message.locator(`[data-jouzu-view="${kind}"]`).screenshot({ path: info.outputPath(`view-${kind}-${language}-${theme}-${width}.png`) });
     // A task opens its session.
     await board.getByRole("button", { name: /Fix export session/ }).click();
     await expect(pane).toBeHidden();

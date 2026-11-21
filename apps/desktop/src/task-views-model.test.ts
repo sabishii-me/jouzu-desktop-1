@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import skill from "../../../packaging/desktop/assistant/skills/draw-task-views.md?raw";
-import { layoutGraph, parseView, progressCounts, timelineOrder } from "./task-views-model";
+import { layoutGraph, parseView, progressCounts, timelineOrder, timelineWhen } from "./task-views-model";
 
 // The Assistant is taught the format by its skill; every example there must read.
 const examples = [...skill.matchAll(/^\s+(\{"view":.*\})\s*$/gmu)].map(match => match[1]);
@@ -40,5 +40,11 @@ describe("the Assistant's views", () => {
 
   it("orders a timeline by date, keeping the order of the same date", () => {
     expect(timelineOrder([{ at: "2026-11-24", label: "b" }, { at: "2026-11-21", label: "a" }, { at: "2026-11-24", label: "c" }]).map(item => item.label)).toEqual(["a", "b", "c"]);
+  });
+  it("shows a timeline's dates in the person's format, and other marks as written", () => {
+    expect(timelineWhen("2026-11-24", "en-US")).toBe("Nov 24, 2026");
+    expect(timelineWhen("2026-11-24", "ja-JP")).toBe("2026/11/24");
+    expect(timelineWhen("2026-11-24T09:30:00Z", "en-US")).toMatch(/^Nov 2[45], 2026, \d{1,2}:30\s?[AP]M$/u);
+    expect(timelineWhen("Q1", "en-US")).toBe("Q1");
   });
 });

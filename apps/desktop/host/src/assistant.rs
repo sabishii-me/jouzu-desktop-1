@@ -919,7 +919,7 @@ impl Assistant {
         let mut hits = Vec::new();
         for entry in std::fs::read_dir(self.memory_dir()).into_iter().flatten().filter_map(Result::ok) {
             let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
-            let lines: Vec<&str> = text.lines().filter(|line| line.to_lowercase().contains(&query)).take(5).collect();
+            let lines: Vec<&str> = text.lines().filter(|line| line.to_lowercase().contains(&query)).collect();
             if !lines.is_empty() {
                 let name = entry.file_name().to_string_lossy().trim_end_matches(".md").to_string();
                 hits.push(json!({ "name": name, "lines": lines }));

@@ -1,7 +1,7 @@
 import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
 import { CalendarDays, ChartNoAxesColumn, CircleCheck, CircleDashed, CircleQuestionMark, CircleStop, CircleX, Clock, Code, Hand, LayoutGrid, LoaderCircle, Network, Table2 } from "lucide-react";
 import { fill, useChatText, type ChatText } from "./chat-text";
-import { layoutGraph, parseView, progressCounts, timelineOrder, type ProgressGroup, type TaskView, type ViewProblem } from "./task-views-model";
+import { layoutGraph, parseView, progressCounts, timelineOrder, timelineWhen, type ProgressGroup, type TaskView, type ViewProblem } from "./task-views-model";
 
 /** A task as a view shows it: its live title and state, and how to open it. */
 export interface ViewTask { taskId: string; title?: string; state?: string; sessionPath?: string }
@@ -128,7 +128,7 @@ function Timeline({ view }: { view: Extract<TaskView, { view: "timeline" }> }) {
   return <ol className="relative ml-2 border-l border-border">
     {timelineOrder(view.items).map((item, index) => <li key={index} className="relative flex min-w-0 items-start gap-3 py-1 pl-4">
       <span aria-hidden="true" className="absolute -left-[5px] top-3 size-2.5 rounded-full border-2 border-background bg-primary" />
-      <time className="w-24 shrink-0 pt-1 font-mono text-xs text-muted-foreground" dateTime={item.at}>{item.at}</time>
+      <time className="shrink-0 whitespace-nowrap pt-1 text-xs tabular-nums text-muted-foreground" dateTime={item.at} title={item.at}>{timelineWhen(item.at, document.documentElement.lang || undefined)}</time>
       <div className="min-w-0 flex-1">{item.taskId ? <TaskChip taskId={item.taskId} label={item.label} wide /> : <p className="flex items-center gap-2 px-2 py-1 text-sm"><span aria-hidden="true" className="size-3.5 shrink-0" />{item.label}</p>}</div>
     </li>)}
   </ol>;
