@@ -300,7 +300,10 @@ fn runtime_report(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         "node": crate::runtime_install::node_executable(&root).is_file(),
         "nodeVersion": hidden_node_version(&crate::runtime_install::node_executable(&root)),
         "nodeCurrent": crate::runtime_install::node_version_ok(&root),
-        "git": root.join("runtime/git").exists(),
+        // Jouzu's own Git Bash, not just its folder: a reinstall over an older
+        // version runs the old uninstaller, which deletes `installed` but leaves
+        // the archive and the folder behind (#158). Elsewhere the system bash is used.
+        "git": !cfg!(windows) || root.join("runtime/git/installed/bin/bash.exe").is_file(),
         "terminal": root.join("runtime/terminal").exists(),
     }))
 }

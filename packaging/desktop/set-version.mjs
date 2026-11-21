@@ -7,18 +7,40 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseVersion } from './release-guard.mjs';
 
+// Paths are relative to the repository root, as git names them.
+export const VERSION_FILES = [
+	{ path: 'apps/desktop/package.json', pattern: /("version":\s*")[^"]+(")/ },
+	{ path: 'apps/desktop/src-tauri/Cargo.toml', pattern: /(^\[package\][\s\S]*?^version\s*=\s*")[^"]+(")/m },
+	{ path: 'apps/desktop/src-tauri/Cargo.lock', pattern: /(name = "jouzu-desktop"\r?\nversion = ")[^"]+(")/ },
+];
+
+function stamp(text, pattern, version, path) {
+	if (!pattern.test(text)) throw new Error(`No version found in ${path}`);
+	return text.replace(pattern, `$1${version}$2`);
+}
+
 export function setVersion(root, version) {
 	parseVersion(version);
-	const app = join(root, 'apps', 'desktop');
-	const edit = (file, pattern, replacement) => {
-		const text = readFileSync(file, 'utf8');
-		const next = text.replace(pattern, replacement);
-		if (next === text && !text.match(pattern)) throw new Error(`No version found in ${file}`);
-		writeFileSync(file, next);
-	};
-	edit(join(app, 'package.json'), /("version":\s*")[^"]+(")/, `$1${version}$2`);
-	edit(join(app, 'src-tauri', 'Cargo.toml'), /(^\[package\][\s\S]*?^version\s*=\s*")[^"]+(")/m, `$1${version}$2`);
-	edit(join(app, 'src-tauri', 'Cargo.lock'), /(name = "jouzu-desktop"\r?\nversion = ")[^"]+(")/, `$1${version}$2`);
+	for (const { path, pattern } of VERSION_FILES) {
+		const file = join(root, path);
+		writeFileSync(file, stamp(readFileSync(file, 'utf8'), pattern, version, path));
+	}
+}
+
+// True when every changed file is one of VERSION_FILES and differs from the commit only
+// by `version`, i.e. the tree is the commit as setVersion stamped it (#205). `changed`
+// lists the tracked files that differ from the commit; `committed(path)` and
+// `working(path)` read a file as committed and as it is now.
+export function onlyVersionStamped(changed, version, committed, working) {
+	const lines = (text) => text.replace(/\r\n/g, '\n');
+	return changed.every((path) => {
+		const entry = VERSION_FILES.find((file) => file.path === path);
+		if (!entry) return false;
+		const before = committed(path);
+		const now = working(path);
+		if (before == null || now == null || !entry.pattern.test(before)) return false;
+		return lines(stamp(before, entry.pattern, version, path)) === lines(now);
+	});
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

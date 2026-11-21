@@ -8,9 +8,10 @@
 // different id, instead of running a mixed install.
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { onlyVersionStamped } from "../../../packaging/desktop/set-version.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const buildId = `${new Date().toISOString().replace(/[-:.]/gu, "")}-${randomBytes(4).toString("hex")}`;
@@ -18,7 +19,18 @@ writeFileSync(join(root, ".build-id"), `${buildId}\n`);
 // The commit goes in beside the id, so every report names the exact source.
 const git = (args) => spawnSync(`git ${args}`, { cwd: root, shell: true, encoding: "utf8" });
 const head = git("rev-parse --short=12 HEAD").stdout?.trim() || "unknown";
-const dirty = git("status --porcelain --untracked-files=no").stdout?.trim() ? "-dirty" : "";
+// A stable release is built from the candidate's commit with its version stamped by
+// packaging/desktop/set-version.mjs (#86). That stamp is the release, not a local
+// change, so only a difference beyond it marks the build dirty (#205).
+const top = git("rev-parse --show-toplevel").stdout?.trim() ?? "";
+const changed = (git("diff --name-only HEAD").stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
+const version = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
+const committed = (path) => {
+  const shown = git(`show HEAD:${path}`);
+  return shown.status === 0 ? shown.stdout : null;
+};
+const working = (path) => (existsSync(join(top, path)) ? readFileSync(join(top, path), "utf8") : null);
+const dirty = changed.length && !onlyVersionStamped(changed, version, committed, working) ? "-dirty" : "";
 writeFileSync(join(root, ".build-commit"), `${head}${dirty}\n`);
 console.log(`Jouzu Desktop build ${buildId} commit ${head}${dirty}`);
 

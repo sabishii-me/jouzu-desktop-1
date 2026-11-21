@@ -2,6 +2,33 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+/** Changelog notes are hard-wrapped Markdown. Versions up to 1.1.4 show each line of the feed's
+ * notes as its own item (#206), so the feed carries each paragraph, heading and list item on one
+ * line; it is still the same Markdown. The GitHub release keeps the changelog text as written. */
+export function unwrapNotes(notes) {
+	const blocks = [];
+	let open = null;
+	for (const raw of notes.split(/\r?\n/)) {
+		const line = raw.trim();
+		if (!line) {
+			if (open) blocks.push(open);
+			open = null;
+			continue;
+		}
+		const starts = /^(#{1,6}|[-*])\s/.test(line);
+		if (starts || !open) {
+			if (open) blocks.push(open);
+			open = { line, list: /^[-*]\s/.test(line), heading: /^#/.test(line) };
+			if (open.heading) { blocks.push(open); open = null; }
+			continue;
+		}
+		open.line = `${open.line} ${line}`;
+	}
+	if (open) blocks.push(open);
+	// Consecutive list items stay one list; everything else is its own paragraph.
+	return blocks.map((block, index) => (index && !(block.list && blocks[index - 1].list) ? `\n${block.line}` : block.line)).join('\n');
+}
+
 /** The update feed is read by the Tauri updater, which looks a platform up by its target key.
  * A platform without an entry simply gets no update. The URL and signature are the only fields
  * the client trusts, so both are validated here rather than assembled in a shell script. */
@@ -15,7 +42,7 @@ export function desktopFeed({ version, notes, pubDate, repository, assetName, si
 	if (Number.isNaN(date.getTime())) throw new Error('Invalid publication date');
 	return {
 		version,
-		notes: typeof notes === 'string' ? notes : '',
+		notes: typeof notes === 'string' ? unwrapNotes(notes) : '',
 		pub_date: date.toISOString(),
 		platforms: {
 			'windows-x86_64': {

@@ -78,6 +78,8 @@ ${StrLoc}
 
 Var PassiveMode
 Var UpdateMode
+; Set in the uninstaller when Setup runs it to replace this installation (#158).
+Var ReinstallMode
 Var NoShortcutMode
 Var WixMode
 Var OldMainBinaryName
@@ -366,6 +368,8 @@ Function PageLeaveReinstall
       ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
       ${IfThen} $UpdateMode = 1 ${|} StrCpy $R1 "$R1 /UPDATE" ${|} ; append /UPDATE
       ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|} ; append /P
+      ; Setup replaces the app, not the runtime Desktop installed beside it (#158).
+      StrCpy $R1 "$R1 /REINSTALL"
       StrCpy $R1 "$R1 _?=$4" ; append uninstall directory
       ExecWait '$R1' $0
     ${EndIf}
@@ -666,6 +670,20 @@ Section WebView2
   ${EndIf}
 SectionEnd
 
+;; The folders inside $INSTDIR that come from the package itself: host\ and dist\ are
+;; resources (tauri.conf.json bundle.resources) and are rebuilt by every build, and icons\
+;; held icons\jouzu-qa.ico, which only builds with fd585b2 shipped (#207). Every
+;; environment installs the same files under the same names; its icon is baked into the
+;; executable. An install only ever added files, so a file an earlier package shipped
+;; and this one does not (an icon, an old dist\assets bundle) stayed for good. Install
+;; removes these folders before copying the package, and uninstall removes them whole.
+;; Everything else in $INSTDIR (app\, runtime\, updates\, data\) is not the package's.
+!macro RemovePackageFolders
+  RmDir /r "$INSTDIR\host"
+  RmDir /r "$INSTDIR\dist"
+  RmDir /r "$INSTDIR\icons"
+!macroend
+
 Section Install
   SetOutPath $INSTDIR
 
@@ -677,6 +695,9 @@ Section Install
 
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
+
+  ; Replace the package's own folders whole, so nothing an earlier package shipped stays (#207)
+  !insertmacro RemovePackageFolders
 
   ; Copy resources
   {{#each resources_dirs}}
@@ -806,6 +827,11 @@ Function un.onInit
   ${IfNot} ${Errors}
     StrCpy $UpdateMode 1
   ${EndIf}
+
+  ${GetOptions} $CMDLINE "/REINSTALL" $ReinstallMode
+  ${IfNot} ${Errors}
+    StrCpy $ReinstallMode 1
+  ${EndIf}
 FunctionEnd
 
 Section Uninstall
@@ -816,8 +842,10 @@ Section Uninstall
 
   !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
-  ; Downloaded program versions are not user settings. Keep during upgrade only.
+  ; Downloaded runtime versions are not user settings. They belong to the runtime, so an
+  ; update or a Setup run over this installation keeps them, like the rest of it (#158).
   ${If} $UpdateMode <> 1
+  ${AndIf} $ReinstallMode <> 1
       RmDir /r "\\?\$LOCALAPPDATA\Shisa.ai\JouzuDesktop\updates"
     ${If} ${FileExists} "$LOCALAPPDATA\Shisa.ai\JouzuDesktop\updates"
       SetErrorLevel 1
@@ -846,13 +874,23 @@ Section Uninstall
       ${EndIf}
     ${EndIf}
 
-  ; Git extracted during installation is not part of the bundled file manifest.
-  RmDir /r "\\?\$INSTDIR\runtime\git\installed"
-  ${If} ${FileExists} "$INSTDIR\runtime\git\installed"
-    SetErrorLevel 1
-    IfSilent +2
-    MessageBox MB_OK|MB_ICONSTOP "$(jouzuRemoveFailed)"
-    Abort
+  ; This package carries no runtime (ADR 0003): Desktop installs Node, jouzu, Git Bash and
+  ; Windows Terminal into its managed root on first run. They are still part of this
+  ; installation, so they are handled as one unit (#158). An uninstall removes all of them;
+  ; an update or a Setup run over this installation keeps all of them, and the app checks
+  ; each component when it starts. Removing only a part left Desktop with no Git Bash of its
+  ; own and nothing that noticed.
+  ${If} $UpdateMode <> 1
+  ${AndIf} $ReinstallMode <> 1
+    RmDir /r "\\?\$LOCALAPPDATA\Shisa.ai\JouzuDesktop\app"
+    RmDir /r "\\?\$LOCALAPPDATA\Shisa.ai\JouzuDesktop\runtime"
+    ${If} ${FileExists} "$LOCALAPPDATA\Shisa.ai\JouzuDesktop\app\*.*"
+    ${OrIf} ${FileExists} "$LOCALAPPDATA\Shisa.ai\JouzuDesktop\runtime\*.*"
+      SetErrorLevel 1
+      IfSilent +2
+      MessageBox MB_OK|MB_ICONSTOP "$(jouzuRemoveFailed)"
+      Abort
+    ${EndIf}
   ${EndIf}
 
   ; Delete the app directory and its content from disk
@@ -863,6 +901,7 @@ Section Uninstall
   {{#each resources}}
     Delete "$INSTDIR\\{{this.[1]}}"
   {{/each}}
+  !insertmacro RemovePackageFolders
 
   ; Delete external binaries
   {{#each binaries}}

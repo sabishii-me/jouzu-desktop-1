@@ -79,6 +79,7 @@ const KINDS: &[Kind] = &[
     Kind { name: "provider-oauth", fields: &[("provider", Field::Text(64))], reads: false },
     Kind { name: "provider-key", fields: &[("provider", Field::Text(64)), ("token", Field::Text(8192))], reads: false },
     Kind { name: "provider-remove", fields: &[("provider", Field::Text(64))], reads: false },
+    Kind { name: "custom-provider-remove", fields: &[("provider", Field::Text(64))], reads: false },
     Kind {
         name: "custom-provider",
         fields: &[
@@ -532,7 +533,7 @@ impl ControlManager {
                                 providers.forget(&id);
                             }
                         }
-                        ("provider-oauth" | "provider-key" | "provider-remove", Some(provider)) => providers.forget(provider),
+                        ("provider-oauth" | "provider-key" | "provider-remove" | "custom-provider-remove", Some(provider)) => providers.forget(provider),
                         _ => {}
                     }
                 }

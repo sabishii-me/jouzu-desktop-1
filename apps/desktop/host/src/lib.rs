@@ -4136,6 +4136,63 @@ mod session_tests {
         manager.stop_all();
     }
 
+    /// #173: a process keeps the environment it was started with. After the
+    /// saved environment changes, an open idle session runs in a new runtime
+    /// with the new values, on the same session file; a change that is not to
+    /// the environment keeps its runtime.
+    /// Saved variables live in the Windows protected store, so this runs on Windows.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_environment_change_gives_an_open_session_a_runtime_with_the_new_values() {
+        let starts = tempfile::NamedTempFile::new().unwrap();
+        let starts_path = starts.path().to_string_lossy().into_owned();
+        let (manager, _home, workspace) = manager_with_env(
+            50,
+            &[("FAKE_RUNTIME_START_LOG", &starts_path), ("FAKE_RUNTIME_LOG_VAR", "JOUZU_TEST_SAVED")],
+        );
+        let save = |value: &str, enabled: bool| {
+            crate::environment::save(
+                manager.runtime_home(),
+                &[crate::environment::Entry { name: "JOUZU_TEST_SAVED".into(), value: value.into(), enabled }],
+            )
+            .unwrap();
+        };
+        save("before", true);
+        let session = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &session.id);
+        wait_status(&session, Status::Idle).await;
+        let first = session.runtime_pid().unwrap();
+        let file = session.summary()["sessionFile"].clone();
+
+        // Not an environment change: the runtime re-reads its files and stays.
+        manager.reload_configuration();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        wait_status(&session, Status::Idle).await;
+        assert_eq!(session.runtime_pid(), Some(first), "a reload without an environment change keeps the runtime");
+
+        save("after", true);
+        manager.reload_configuration();
+        wait_until(|| session.status() == Status::Idle && session.runtime_pid().is_some_and(|pid| pid != first)).await;
+        let lines: Vec<String> = std::fs::read_to_string(starts.path()).unwrap().lines().map(str::to_string).collect();
+        assert!(lines.first().is_some_and(|line| line.ends_with(" before")), "{lines:?}");
+        assert!(lines.last().is_some_and(|line| line.ends_with(" after")), "{lines:?}");
+        assert_eq!(session.summary()["sessionFile"], file, "the same conversation continues");
+        assert!(session.summary()["failure"].is_null(), "{}", session.summary());
+
+        // Turned off: the next runtime no longer receives it.
+        let second = session.runtime_pid().unwrap();
+        save("after", false);
+        manager.reload_configuration();
+        wait_until(|| session.status() == Status::Idle && session.runtime_pid().is_some_and(|pid| pid != second)).await;
+        let last = std::fs::read_to_string(starts.path()).unwrap().lines().last().unwrap().to_string();
+        assert!(!last.contains("after"), "{last}");
+        // A message still gets its answer.
+        session.send("after-restart", "hello").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.summary()["activeTurn"].is_null()).await;
+        manager.stop_all();
+    }
+
     #[tokio::test]
     async fn a_runtime_that_keeps_dying_while_starting_fails_the_session() {
         let (session, manager, _home, _workspace, _path) =
@@ -4310,6 +4367,70 @@ mod session_tests {
         .unwrap();
         let listed = manager.persisted(None, true);
         assert!(listed.iter().any(|entry| entry["sessionPath"].as_str().is_some_and(|path| path.ends_with("cut.jsonl"))), "{listed:?}");
+    }
+
+    /// A saved session whose folder was deleted (#174) stays in its own folder:
+    /// the list says the folder is missing, its history can be read, and opening
+    /// it is refused instead of starting a runtime in the folder the client shows.
+    #[tokio::test]
+    async fn a_saved_session_whose_folder_is_gone_is_refused_and_keeps_its_folder() {
+        let (manager, _home, workspace) = manager(50);
+        let gone = tempfile::tempdir().unwrap();
+        let folder = gone.path().join("ui-test");
+        std::fs::create_dir_all(&folder).unwrap();
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let header = json!({ "type": "session", "version": 3, "id": "gone", "timestamp": "2026-01-01T00:00:00Z", "cwd": folder.to_string_lossy() });
+        let user = json!({ "type": "message", "message": { "role": "user", "content": "remember this" } });
+        let file = directory.join("gone.jsonl");
+        std::fs::write(&file, format!("{header}\n{user}\n")).unwrap();
+        let app = app(manager.clone());
+        let listed: Value = serde_json::from_str(
+            &call(app.clone(), request(Method::GET, "/v1/sessions/persisted").body(Body::empty()).unwrap()).await.2,
+        )
+        .unwrap();
+        assert_eq!(listed["sessions"][0]["folderMissing"], false, "{listed}");
+
+        std::fs::remove_dir_all(&folder).unwrap();
+        // Read from the cached index: the folder is checked when listed.
+        let listed: Value = serde_json::from_str(
+            &call(app.clone(), request(Method::GET, "/v1/sessions/persisted").body(Body::empty()).unwrap()).await.2,
+        )
+        .unwrap();
+        let entry = &listed["sessions"][0];
+        assert_eq!(entry["folderMissing"], true, "{listed}");
+        assert_eq!(entry["workspacePath"], json!(crate::session::canonical_path(&folder.to_string_lossy())), "{listed}");
+
+        let opened = call(
+            app.clone(),
+            request(Method::POST, "/v1/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "workspacePath": workspace.path(), "sessionPath": file, "clientId": "window" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(opened.0, StatusCode::CONFLICT, "{}", opened.2);
+        assert!(opened.2.contains("session-folder-missing"), "{}", opened.2);
+        // Nothing was started for it, in any folder.
+        let live: Value = serde_json::from_str(
+            &call(app.clone(), request(Method::GET, "/v1/sessions").body(Body::empty()).unwrap()).await.2,
+        )
+        .unwrap();
+        assert_eq!(live["sessions"].as_array().map(Vec::len), Some(0), "{live}");
+        // Its history is still there to read.
+        let query = format!("/v1/sessions/history?sessionPath={}", urlencoding_path(&file));
+        let history = call(app, request(Method::GET, &query).body(Body::empty()).unwrap()).await;
+        assert!(history.2.contains("remember this"), "{}", history.2);
+        manager.stop_all();
+    }
+
+    fn urlencoding_path(path: &std::path::Path) -> String {
+        path.to_string_lossy().bytes().map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (byte as char).to_string(),
+            other => format!("%{other:02X}"),
+        }).collect()
     }
 
     #[tokio::test]

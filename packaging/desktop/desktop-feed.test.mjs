@@ -59,3 +59,33 @@ test('a release candidate version is accepted', () => {
 	assert.equal(feed.version, '1.1.3-rc.1');
 	assert.equal(feed.platforms['windows-x86_64'].url, 'https://github.com/shisa-ai/jouzu-desktop/releases/download/v1.1.3-rc.1/JouzuDesktop_1.1.3-rc.1_x64-setup.exe');
 });
+
+// #206: older versions show each line of the notes as an item, so the feed has no wrapped lines.
+test('the feed carries each paragraph and list item on one line', () => {
+	const notes = [
+		'Stable release. It follows 1.0.23 on the stable channel and contains everything from 1.1.0',
+		'to 1.1.4-rc.1.',
+		'',
+		'- Chats keep running on their own. Closing or reloading the window no longer stops a reply,',
+		'  and a window that reconnects catches up.',
+		'- A new session can send at once.',
+		'',
+		'### Fixed',
+		'- One',
+		'',
+		'QA (1.1.4-rc.1): passed',
+	].join('\n');
+	assert.equal(desktopFeed({ ...base, notes }).notes, [
+		'Stable release. It follows 1.0.23 on the stable channel and contains everything from 1.1.0 to 1.1.4-rc.1.',
+		'',
+		'- Chats keep running on their own. Closing or reloading the window no longer stops a reply, and a window that reconnects catches up.',
+		'- A new session can send at once.',
+		'',
+		'### Fixed',
+		'',
+		'- One',
+		'',
+		'QA (1.1.4-rc.1): passed',
+	].join('\n'));
+	assert.equal(desktopFeed(base).notes, '- Desktop-only release');
+});

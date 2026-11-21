@@ -6,6 +6,7 @@ import { Progress } from './components/ui/progress';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './components/ui/select';
 import type { Locale } from './i18n';
 import { ErrorLine } from "./session-alerts-view";
+import { noteBlocks } from "./release-notes";
 
 /** The two update rows: Jouzu first, then Jouzu Desktop that carries it. */
 const labels: Record<Locale, {
@@ -75,12 +76,12 @@ export interface UpdateViewState {
   repair?: { label: string; run: () => void };
 }
 
-const noteItems = (value: string) => value.split('\n').map(line => line.trim()).filter(Boolean).map((line, index) =>
-  line.startsWith('### ')
-    ? <li key={index} className="text-xs font-medium text-muted-foreground">{line.slice(4)}</li>
-    : line.startsWith('- ')
-      ? <li key={index} className="flex gap-2 text-xs text-muted-foreground"><span aria-hidden="true">•</span><span>{line.slice(2)}</span></li>
-      : <li key={index} className="text-xs text-muted-foreground">{line}</li>);
+const noteItems = (value: string) => noteBlocks(value).map((block, index) =>
+  block.kind === 'heading'
+    ? <li key={index} className="text-xs font-medium text-muted-foreground">{block.text}</li>
+    : block.kind === 'item'
+      ? <li key={index} className="flex gap-2 text-xs text-muted-foreground"><span aria-hidden="true">•</span><span>{block.text}</span></li>
+      : <li key={index} className="text-xs text-muted-foreground">{block.text}</li>);
 
 /** The update rows, driven by the state the shell reports. */
 export function UpdatePreview({ locale, live, focusIndex }: { locale: Locale; live: UpdateViewState; focusIndex?: number | null }) {

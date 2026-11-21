@@ -43,8 +43,7 @@ fn session_header_id(session_path: &str) -> Option<String> {
 
 fn session_header_cwd(session_path: &str) -> Option<String> {
     let header = session_header(session_path)?;
-    let cwd = header.get("cwd").and_then(Value::as_str)?.to_string();
-    Path::new(&cwd).is_dir().then_some(cwd)
+    Some(header.get("cwd").and_then(Value::as_str)?.to_string())
 }
 
 /// The messages a saved session file holds, in the order they were written.
@@ -212,6 +211,20 @@ impl SessionConfig {
     /// (read from disk now, so a saved key reaches the next runtime without a
     /// host restart), then the variables the host manages, which always win.
     /// A saved file that cannot be read is an error, never an empty list.
+    /// A digest of the saved environment variables a runtime starts with, or
+    /// `None` when they cannot be read (then nothing is restarted for them).
+    pub(crate) fn environment_fingerprint(&self) -> Option<String> {
+        let saved = crate::environment::enabled(&self.runtime_home).ok()?;
+        let mut digest = Sha256::new();
+        for (name, value) in saved {
+            digest.update(name.as_bytes());
+            digest.update([0]);
+            digest.update(value.as_bytes());
+            digest.update([0]);
+        }
+        Some(format!("{:x}", digest.finalize()))
+    }
+
     fn environment(
         &self,
         session_id: Option<&str>,
@@ -841,6 +854,13 @@ pub struct Session {
     reload_due: AtomicBool,
     /// That re-read is under way: its answers refresh the model lists.
     reloading: AtomicBool,
+    /// The saved environment the current runtime was started with (#173).
+    /// A process keeps its environment for life, so a change to it needs a new
+    /// runtime, not a reload of the session file.
+    started_environment: Mutex<Option<String>>,
+    /// The next runtime is started fresh, not taken from the warm pool: the pool
+    /// may still hold one started with the environment being replaced.
+    cold_start_next: AtomicBool,
     /// The configuration generation the current runtime started under: its
     /// answers about models are kept only while that is still current.
     known_generation: AtomicU64,
@@ -1199,6 +1219,21 @@ impl Session {
                 }
             }
         }
+        // The saved environment changed since this runtime started (#173): the
+        // process keeps the environment it was started with, and opening the
+        // file again would not read it. A new runtime takes over the session
+        // file; it reads configuration, models and environment as at start.
+        let current = self.config.environment_fingerprint();
+        let started = self
+            .started_environment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if current.is_some() && current != started {
+            log(&self.home, "info", "session.restart_for_environment", json!({ "session": self.id }));
+            self.restart_for_environment();
+            return;
+        }
         self.reloading.store(true, Ordering::SeqCst);
         self.known_generation
             .store(self.config.known.generation(), Ordering::SeqCst);
@@ -1214,6 +1249,31 @@ impl Session {
         {
             self.fail(error.code, &error.message, error.retryable);
         }
+    }
+
+    /// Replaces an idle session's runtime with a new process on the same file.
+    /// The old runtime's events stop counting before it is ended, so its exit
+    /// is not taken for a crash; the model it had is handed to the new one.
+    fn restart_for_environment(self: &Arc<Self>) {
+        self.runtime_generation.fetch_add(1, Ordering::SeqCst);
+        let previous = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.runtime_gone();
+        self.set_status(Status::Starting);
+        self.cold_start_next.store(true, Ordering::SeqCst);
+        let session = self.clone();
+        tokio::spawn(async move {
+            if let Some(previous) = previous {
+                previous.terminate();
+            }
+            // The Job Object must be gone before the replacement starts: Flow
+            // allows one live attachment per session file.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            session.spawn_runtime(true);
+        });
     }
 
     fn clear_runtime_queue(&self) {
@@ -5322,6 +5382,8 @@ impl Session {
             saved_model: Mutex::new(None),
             reload_due: AtomicBool::new(false),
             reloading: AtomicBool::new(false),
+            started_environment: Mutex::new(None),
+            cold_start_next: AtomicBool::new(false),
             known_generation: AtomicU64::new(0),
             thinking_levels: Mutex::new(Vec::new()),
             first_output: Mutex::new(FirstOutput::default()),
@@ -5425,7 +5487,8 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some();
-        if let Some(pool) = self.config.warm.get() {
+        let cold = self.cold_start_next.swap(false, Ordering::SeqCst);
+        if let Some(pool) = self.config.warm.get().filter(|_| !cold) {
             let before = pool.status();
             if let Some(crate::runtime::warm::Taken { runtime, matched, attaching, state }) =
                 pool.take(event_tx.clone(), Path::new(&self.runtime_cwd()), !has_file)
@@ -5582,6 +5645,10 @@ impl Session {
             self.pick_pending.store(true, Ordering::SeqCst);
         }
         self.known_generation.store(self.config.known.generation(), Ordering::SeqCst);
+        *self
+            .started_environment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.config.environment_fingerprint();
         self.set_list(&self.models, Vec::new());
         self.set_list(&self.thinking_levels, Vec::new());
         *self
@@ -7049,6 +7116,20 @@ impl SessionManager {
             }
             cache.clone().unwrap_or_default()
         };
+        // Whether each session's folder is still there is read now, not when the
+        // index was built: a folder deleted or moved since then makes the session
+        // readable but not runnable, and the list says so (#174).
+        let entries: Vec<Value> = entries
+            .into_iter()
+            .map(|mut entry| {
+                let missing = entry
+                    .get("workspacePath")
+                    .and_then(Value::as_str)
+                    .is_some_and(|folder| !Path::new(folder).is_dir());
+                entry["folderMissing"] = Value::Bool(missing);
+                entry
+            })
+            .collect();
         let Some(wanted) = workspace else {
             return entries;
         };
@@ -7244,11 +7325,18 @@ impl SessionManager {
     ) -> Result<Arc<Session>, ApiError> {
         // A saved conversation belongs to the folder its file names, whatever
         // folder the client happens to be showing: the runtime works there and
-        // the sidebar must file it there.
-        let workspace = session_path
-            .as_deref()
-            .and_then(session_header_cwd)
-            .unwrap_or_else(|| workspace.to_string());
+        // the sidebar must file it there. When that folder is gone the session
+        // cannot run anywhere else, so it is refused, never moved (#174).
+        let saved_folder = session_path.as_deref().and_then(session_header_cwd);
+        if let Some(folder) = saved_folder.as_deref().filter(|folder| !Path::new(folder).is_dir()) {
+            return Err(ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "session-folder-missing",
+                format!("The session's folder no longer exists: {folder}"),
+                false,
+            ));
+        }
+        let workspace = saved_folder.unwrap_or_else(|| workspace.to_string());
         let workspace = std::fs::canonicalize(&workspace)
             .map_err(|_| ApiError::bad_request("workspacePath is unavailable"))?;
         if !workspace.is_dir() {
