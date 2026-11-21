@@ -79,8 +79,10 @@ ever appears in the composer's place, and only one at a time.
   "Reconnecting…" and the composer is dimmed. The session keeps running in the
   host and the window catches up on reconnect. This is not a session error.
 - The sidebar row shows whether a session is running or has ended; nothing else.
-  The row and the status line both read the host's run state; the shape of the
-  transcript is never read as a state.
+  The row and the status line both read the host's run state; the UI never
+  infers run state from the shape of the transcript. Only a saved transcript shown
+  before the host has opened its session is read, for its reply's own stop record
+  (`stopReason: "aborted"`).
 - The session on screen is a host session. Opening a saved session from the
   sidebar opens it in the host at once (no runtime until a message needs one);
   its saved transcript may fill the screen meanwhile, but the composer never
