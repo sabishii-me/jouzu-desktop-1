@@ -119,8 +119,11 @@ takes no other token, the host's included, and only on the internal listener.
 A user message or wake is a `prompt`; a failed model call is an error in the
 transcript; `agent_settled` makes the Assistant idle again.
 
-The Assistant speaks only with the `say` tool: one or two sentences per call,
-each shown at once as a chat message, several calls when there is more. The
+The Assistant speaks only with the `say` tool: one or two short sentences in
+plain spoken words per call (no Markdown, since they will be read aloud), each
+shown at once as a chat message, several calls when there is more. Details
+(lists, tables, views, drawings) are attached with `show`: drawn in the pane
+in a card, never read aloud. The
 model's own text, the turn's last message included, is never shown: it is its
 thinking aloud. When the user writes during a turn, the host aborts the turn
 (the runtime's `abort`), and a `say` after that answers `interrupted` with the
@@ -213,7 +216,7 @@ for workflow roles (the workers) are a separate choice, recommended from COSPA
 ### Views
 
 The Assistant shows boards, tables, graphs, timelines and progress as fenced
-`jouzu-view` JSON blocks, and anything else as `svg` blocks. The format the
+`jouzu-view` JSON blocks, and anything else as `svg` blocks, always in `show`. The format the
 Assistant is taught is `skills/draw-task-views.md`, the one source of it; a
 UI test reads every example there. Its pane draws every view the skill
 teaches (`src/task-views.tsx`, layout in `src/task-views-model.ts`):
