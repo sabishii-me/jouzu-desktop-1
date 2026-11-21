@@ -670,6 +670,20 @@ Section WebView2
   ${EndIf}
 SectionEnd
 
+;; The folders inside $INSTDIR that come from the package itself: host\ and dist\ are
+;; resources (tauri.conf.json bundle.resources) and are rebuilt by every build, and icons\
+;; held icons\jouzu-qa.ico, which only builds with fd585b2 shipped (#207). Every
+;; environment installs the same files under the same names; its icon is baked into the
+;; executable. An install only ever added files, so a file an earlier package shipped
+;; and this one does not (an icon, an old dist\assets bundle) stayed for good. Install
+;; removes these folders before copying the package, and uninstall removes them whole.
+;; Everything else in $INSTDIR (app\, runtime\, updates\, data\) is not the package's.
+!macro RemovePackageFolders
+  RmDir /r "$INSTDIR\host"
+  RmDir /r "$INSTDIR\dist"
+  RmDir /r "$INSTDIR\icons"
+!macroend
+
 Section Install
   SetOutPath $INSTDIR
 
@@ -681,6 +695,9 @@ Section Install
 
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
+
+  ; Replace the package's own folders whole, so nothing an earlier package shipped stays (#207)
+  !insertmacro RemovePackageFolders
 
   ; Copy resources
   {{#each resources_dirs}}
@@ -884,6 +901,7 @@ Section Uninstall
   {{#each resources}}
     Delete "$INSTDIR\\{{this.[1]}}"
   {{/each}}
+  !insertmacro RemovePackageFolders
 
   ; Delete external binaries
   {{#each binaries}}
