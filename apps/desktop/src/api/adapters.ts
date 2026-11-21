@@ -168,7 +168,7 @@ function hostGroups(client: HostClient) {
     },
     attribution: {
       read: () => client.attribution(),
-      save: enabled => client.saveAttribution(enabled),
+      save: change => client.saveAttribution(change),
     },
     webAccess: {
       read: () => client.webAccess(),

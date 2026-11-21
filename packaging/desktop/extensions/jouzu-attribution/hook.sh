@@ -2,12 +2,16 @@
 # Jouzu Desktop: "Mark commits made by the agent" (Settings > Collaboration).
 # While that is on, git started by the agent uses this folder as its hooks
 # folder (index.js sets it). Every hook here first runs the repository's own
-# hook of the same name, unchanged; then prepare-commit-msg adds the trailers.
+# hook of the same name, unchanged; then prepare-commit-msg adds the trailers
+# (and, with "Commit as Jouzu Desktop", the person as co-author).
 name=${0##*/}
 here=$(cd "${0%/*}" && pwd -P)
 
 # The repository's own hooks folder: what git resolves without our override.
-own=$(env "GIT_CONFIG_KEY_${JOUZU_GIT_HOOKS_INDEX:-0}=jouzu.inactive" git rev-parse --git-path hooks 2>/dev/null)
+# Exported inside the command substitution's subshell only. Not `env`: the
+# first `env` on PATH is not always coreutils (uv puts a script of that name in
+# ~/.local/bin), and a wrong answer here would skip the repository's hooks.
+own=$(export "GIT_CONFIG_KEY_${JOUZU_GIT_HOOKS_INDEX:-0}=jouzu.inactive"; git rev-parse --git-path hooks 2>/dev/null)
 hook=
 if [ -n "$own" ] && [ -x "$own/$name" ] && [ "$(cd "$own" 2>/dev/null && pwd -P)" != "$here" ]; then
   hook=$own/$name
@@ -38,7 +42,19 @@ who="Jouzu Desktop"
 sed -e '/^Co-authored-by: Jouzu Desktop.*<359074535+jouzu-desktop@users\.noreply\.github\.com>$/d' -e '/^Jouzu-Session: /d' "$1" > "$1.jouzu" && mv "$1.jouzu" "$1"
 # A message without a final newline (git merge -m) would get the trailer glued on.
 [ -n "$(tail -c 1 "$1")" ] && echo >> "$1"
-set -- "$1" --trailer "Co-authored-by: $who <359074535+jouzu-desktop@users.noreply.github.com>"
+set -- "$1"
+# "Commit as Jouzu Desktop": a commit authored by Jouzu Desktop (git commit
+# exports the author it is using, also an amended commit's own) names the
+# person whose git identity commits it as co-author, first, where an amend
+# leaves it.
+if [ "${GIT_AUTHOR_EMAIL:-}" = 359074535+jouzu-desktop@users.noreply.github.com ]; then
+  person=$(git var GIT_COMMITTER_IDENT 2>/dev/null | sed -n 's/^\(.*>\) [0-9][0-9]* [-+][0-9]*$/\1/p')
+  case $person in
+    ""|*"<359074535+jouzu-desktop@users.noreply.github.com>") ;;
+    *) set -- "$@" --trailer "Co-authored-by: $person" ;;
+  esac
+fi
+set -- "$@" --trailer "Co-authored-by: $who <359074535+jouzu-desktop@users.noreply.github.com>"
 [ -n "$session" ] && set -- "$@" --trailer "Jouzu-Session: $session"
 file=$1; shift
 git interpret-trailers --in-place --if-exists addIfDifferent "$@" "$file" || true

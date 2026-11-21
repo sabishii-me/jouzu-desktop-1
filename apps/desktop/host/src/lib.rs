@@ -1467,13 +1467,20 @@ fn attribution_path(state: &AppState) -> PathBuf {
     state.sessions.runtime_home().join("agent").join("attribution.json")
 }
 
+/// `author` ("Commit as Jouzu Desktop") is kept as saved; the extension uses it
+/// only while `enabled` is on.
 fn read_attribution(path: &Path) -> Value {
-    let enabled = std::fs::read_to_string(path)
+    let saved = std::fs::read_to_string(path)
         .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.get("enabled").and_then(Value::as_bool))
-        .unwrap_or(false);
-    json!({ "enabled": enabled })
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let flag = |key: &str| {
+        saved
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    json!({ "enabled": flag("enabled"), "author": flag("author") })
 }
 
 async fn attribution_snapshot(State(state): State<AppState>) -> Json<Value> {
@@ -1484,17 +1491,29 @@ async fn update_attribution(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let enabled = body
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| ApiError::bad_request("enabled must be true or false"))?;
+    // Either switch may be saved alone; the other keeps its saved value.
     let path = attribution_path(&state);
+    let mut next = read_attribution(&path);
+    let mut changed = false;
+    for key in ["enabled", "author"] {
+        match body.get(key) {
+            None => {}
+            Some(Value::Bool(value)) => {
+                next[key] = json!(value);
+                changed = true;
+            }
+            Some(_) => return Err(ApiError::bad_request(format!("{key} must be true or false"))),
+        }
+    }
+    if !changed {
+        return Err(ApiError::bad_request("enabled or author must be true or false"));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| ApiError::internal(format!("Could not create the agent folder: {error}")))?;
     }
     let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, format!("{}\n", json!({ "enabled": enabled })))
+    std::fs::write(&temp, format!("{next}\n"))
         .and_then(|_| std::fs::rename(&temp, &path))
         .map_err(|error| ApiError::internal(format!("Could not save the setting: {error}")))?;
     Ok(Json(read_attribution(&path)))
@@ -4395,20 +4414,28 @@ mod session_tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
+        let both = |enabled: bool, author: bool| json!({ "enabled": enabled, "author": author }).to_string();
         let fresh = call(app.clone(), get()).await;
-        assert_eq!(fresh.2, json!({ "enabled": false }).to_string());
+        assert_eq!(fresh.2, both(false, false));
         let refused = call(app.clone(), put(json!({ "enabled": "yes" }))).await;
         assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{}", refused.2);
+        let empty = call(app.clone(), put(json!({}))).await;
+        assert_eq!(empty.0, StatusCode::BAD_REQUEST, "{}", empty.2);
         let on = call(app.clone(), put(json!({ "enabled": true }))).await;
         assert_eq!(on.0, StatusCode::OK, "{}", on.2);
-        let file: Value = serde_json::from_str(
-            &std::fs::read_to_string(home.path().join("data").join("agent").join("attribution.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(file, json!({ "enabled": true }));
-        assert_eq!(call(app.clone(), get()).await.2, json!({ "enabled": true }).to_string());
-        call(app.clone(), put(json!({ "enabled": false }))).await;
-        assert_eq!(call(app, get()).await.2, json!({ "enabled": false }).to_string());
+        let file = || -> Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(home.path().join("data").join("agent").join("attribution.json")).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(file(), json!({ "enabled": true, "author": false }));
+        // "Commit as Jouzu Desktop" is saved on its own and survives marking going off and on.
+        assert_eq!(call(app.clone(), put(json!({ "author": true }))).await.2, both(true, true));
+        assert_eq!(call(app.clone(), put(json!({ "enabled": false }))).await.2, both(false, true));
+        assert_eq!(file(), json!({ "enabled": false, "author": true }));
+        assert_eq!(call(app.clone(), put(json!({ "enabled": true, "author": false }))).await.2, both(true, false));
+        assert_eq!(call(app, get()).await.2, both(true, false));
     }
 
     #[tokio::test]

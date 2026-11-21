@@ -356,15 +356,21 @@ export interface WebAccessPairing {
   links: Array<{ network: string; url: string }>;
 }
 
+export interface AttributionSettings { enabled: boolean; author: boolean }
+
 export interface SettingsApi {
   environment: {
     /** Saving goes through the configuration queue (`environment`). */
     read(): Promise<EnvironmentEntry[]>;
   };
-  /** "Mark commits made by the agent" (Settings > Collaboration): off unless turned on. */
+  /**
+   * Settings > Collaboration, both off unless turned on: "Mark commits made by
+   * the agent" (`enabled`) and "Commit as Jouzu Desktop" (`author`, used only
+   * while `enabled` is on). Either may be saved alone.
+   */
   attribution: {
-    read(): Promise<{ enabled: boolean }>;
-    save(enabled: boolean): Promise<{ enabled: boolean }>;
+    read(): Promise<AttributionSettings>;
+    save(change: Partial<AttributionSettings>): Promise<AttributionSettings>;
   };
   /** Only the desktop window may manage web access; web clients get `forbidden`. */
   webAccess: {
