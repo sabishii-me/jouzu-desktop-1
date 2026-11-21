@@ -51,8 +51,9 @@ interface ShellState { platform: "windows" | "macos" | "linux"; recent: Workspac
 interface Components { jouzu: string | null; development: boolean; desktopUpdaterConfigured?: boolean; jouzuUpdaterConfigured?: boolean; build?: string; commit?: string }
 interface RuntimeReport { status?: string; version: string | null; expectedVersion?: string; versionCurrent?: boolean; minimumVersion?: string; verifiedVersions?: string[]; mandatory?: boolean; root: string | null; app: string | null; node: boolean; nodeVersion: string | null; nodeCurrent: boolean; git: boolean; terminal: boolean }
 /** The prepare screen runs when the runtime must be updated, its Node is not the
- * pinned one, or Jouzu's own Git Bash is gone (#158: a reinstall deletes it and
- * nothing else puts it back). The install restores Git from the shipped archive. */
+ * pinned one, or Jouzu's own Git Bash is gone (#158: Setup run over an install
+ * from 1.1.4 or earlier deletes it). The install extracts Git again from the
+ * archive it downloaded on first run, or downloads the pinned release. */
 function needsPrepare(report: RuntimeReport | null | undefined): boolean {
   return report?.mandatory === true || report?.nodeCurrent === false || report?.git === false;
 }
