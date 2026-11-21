@@ -41,9 +41,12 @@ test("marking is one switch, and author or co-author is chosen only while it is 
   expect(saves.at(-1)).toEqual({ enabled: false });
 });
 
-test("screenshot: Collaboration in Chinese, on, as author", async ({ page }) => {
+test.describe("screenshot", () => {
+  test.use({ deviceScaleFactor: 2 });
+  test("Collaboration in Chinese, on, as author", async ({ page }) => {
   const { dialog } = await openCollaboration(page, { enabled: true, author: true }, "zh-Hans");
   await expect(dialog.getByRole("radio", { name: /^作者/ })).toBeChecked();
   await page.setViewportSize({ width: 1100, height: 760 });
   await dialog.screenshot({ path: process.env.SHOT ?? "test-results/collaboration-zh.png" });
+});
 });
