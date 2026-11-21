@@ -200,8 +200,8 @@ pub struct SessionConfig {
     pub known: Arc<KnownModels>,
     /// What replies said about each provider's sign-in (`provider_answers`).
     pub providers: Arc<crate::provider_answers::ProviderAnswers>,
-    /// Runs that ended while no client showed their session (`run_marks`).
-    pub runs: Arc<crate::run_marks::RunMarks>,
+    /// Runs that ended while no client showed their session (`session_runs`).
+    pub runs: Arc<crate::session_runs::SessionRuns>,
 }
 
 impl SessionConfig {
@@ -1870,6 +1870,11 @@ impl Session {
     fn publish(&self, event: &str, data: Value) -> SessionEvent {
         self.touch();
         self.record_timing(event, &data);
+        if event == "turn.start" {
+            if let Some(turn) = data.get("turnId").and_then(Value::as_str) {
+                self.note_run_start(turn);
+            }
+        }
         if event == "turn.end" {
             self.note_run_end(&data);
         }
@@ -1887,21 +1892,19 @@ impl Session {
         stored
     }
 
-    /// How a run ended, from its `turn.end`, for the session list: `None` when
-    /// no run ended (the message went back to the queue, or an extension handled
-    /// a command), and `Some(None)` for a run someone stopped, which the list
-    /// shows like a session at rest.
-    fn run_outcome(&self, data: &Value) -> Option<Option<crate::run_marks::Outcome>> {
-        use crate::run_marks::Outcome;
+    /// How a run ended, from its `turn.end`: `None` when no run ended (the
+    /// message went back to the queue, or an extension handled a command).
+    fn run_outcome(&self, data: &Value) -> Option<crate::session_runs::Outcome> {
+        use crate::session_runs::Outcome;
         let status = data.get("status").and_then(Value::as_str);
         if matches!(status, Some("queued" | "handled")) {
             return None;
         }
         if status == Some("failed") || data.get("reason").is_some_and(|reason| !reason.is_null()) {
-            return Some(Some(Outcome::Failed));
+            return Some(Outcome::Failed);
         }
         if status == Some("interrupted") || data.get("aborted").and_then(Value::as_bool) == Some(true) {
-            return Some(None);
+            return Some(Outcome::Stopped);
         }
         // Completed: failed when its last reply did (the provider refused it
         // and no retry answered).
@@ -1917,23 +1920,27 @@ impl Session {
                     && row.get("turnId").and_then(Value::as_str) == Some(turn)
             })
             .is_some_and(|row| row.get("errorMessage").is_some_and(|error| !error.is_null()));
-        Some(Some(if failed { Outcome::Failed } else { Outcome::Done }))
+        Some(if failed { Outcome::Failed } else { Outcome::Done })
     }
 
-    /// A run ended: marked for the session list unless a client shows the session (#212).
-    fn note_run_end(&self, data: &Value) {
-        let Some(outcome) = self.run_outcome(data) else { return };
+    /// A run started: recorded, so a host that goes away while it runs finds
+    /// it cut off on its next start (`session_runs`).
+    fn note_run_start(&self, turn: &str) {
         let Some(path) = self.list_key() else { return };
-        match outcome {
-            Some(outcome) => {
-                let shown = self.viewers.load(Ordering::SeqCst) > 0;
-                self.config.runs.ended(&path, outcome, &Self::now_iso(), shown);
-            }
-            // Stopped: nothing to tell, and an older mark is out of date.
-            None => {
-                self.config.runs.seen(&path);
-            }
-        }
+        self.config.runs.started(&path, turn, &Self::now_iso());
+    }
+
+    /// A run ended: recorded with how it went, and marked for the session list
+    /// unless a client shows the session (#212).
+    fn note_run_end(&self, data: &Value) {
+        let Some(path) = self.list_key() else { return };
+        let turn = data.get("turnId").and_then(Value::as_str).unwrap_or_default();
+        let Some(outcome) = self.run_outcome(data) else {
+            self.config.runs.did_not_run(&path, turn);
+            return;
+        };
+        let shown = self.viewers.load(Ordering::SeqCst) > 0;
+        self.config.runs.ended(&path, outcome, &Self::now_iso(), shown);
     }
 
     /// The session's file as the session list keys it.
@@ -2196,6 +2203,10 @@ impl Session {
                     moved
                 });
                 if let Some(path) = moved {
+                    // A run that started before the file was known is recorded now.
+                    if let Some(turn) = self.run_id() {
+                        self.note_run_start(&turn);
+                    }
                     // The first snapshot can precede the runtime's session file.
                     // Publish the attach once the path exists so every client can
                     // refresh its session index instead of waiting for a reload.
@@ -5930,8 +5941,8 @@ fn same_session_file(left: &str, right: &str) -> bool {
 pub struct SessionManager {
     /// What replies said about each provider's sign-in, for Settings.
     providers: Arc<crate::provider_answers::ProviderAnswers>,
-    /// Runs that ended while no client showed their session (`run_marks`).
-    runs: Arc<crate::run_marks::RunMarks>,
+    /// Runs that ended while no client showed their session (`session_runs`).
+    runs: Arc<crate::session_runs::SessionRuns>,
     /// How runtimes are started. Kept from the moment the runtime is found; see
     /// `config()`.
     config: std::sync::OnceLock<SessionConfig>,
@@ -6062,7 +6073,7 @@ impl SessionManager {
         events: Option<Arc<crate::events::EventHub>>,
     ) -> Self {
         let providers = Arc::new(crate::provider_answers::ProviderAnswers::new());
-        let runs = Arc::new(crate::run_marks::RunMarks::new(Some(home.join("session-runs.json"))));
+        let runs = Arc::new(crate::session_runs::SessionRuns::new(Some(home.join("session-runs.json"))));
         let config = std::sync::OnceLock::new();
         if let Some(spec) = spec {
             let _ = config.set(SessionConfig {
@@ -6925,6 +6936,21 @@ impl SessionManager {
                 entry
             })
             .collect()
+    }
+
+    /// How the latest run of the session saved at `session_path` went:
+    /// `Err(())` while one runs, `Ok(None)` when none ever ended.
+    pub fn last_run(&self, session_path: &str) -> Result<Option<crate::session_runs::Outcome>, ()> {
+        let key = canonical_path(session_path);
+        if self.runs.running(&key) {
+            return Err(());
+        }
+        Ok(self.runs.last(&key))
+    }
+
+    /// Sessions whose run the host's last exit cut off, keyed like the list.
+    pub fn cut_off_runs(&self) -> Vec<String> {
+        self.runs.cut_off().to_vec()
     }
 
     /// A client shows the saved session at `session_path`, live or from its
@@ -7797,7 +7823,7 @@ mod environment_tests {
             warm: Arc::new(std::sync::OnceLock::new()),
             known: Arc::new(KnownModels::new()),
             providers: Arc::new(crate::provider_answers::ProviderAnswers::new()),
-            runs: Arc::new(crate::run_marks::RunMarks::new(None)),
+            runs: Arc::new(crate::session_runs::SessionRuns::new(None)),
         }
     }
 

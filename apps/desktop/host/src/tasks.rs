@@ -25,6 +25,7 @@ use tokio::sync::{broadcast, Notify};
 use crate::{
     policy::{self, Action},
     session::{ApiError, Session, SessionEvent, SessionManager},
+    session_runs::Outcome,
 };
 
 /// Running tasks allowed at once unless the host is told otherwise.
@@ -51,11 +52,10 @@ pub struct TaskRecord {
     /// model is whatever its runtime reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Value>,
-    /// The state the host last saw while following the session. Only for
-    /// when the session is not open: how it ended, or that the host went
-    /// away while it ran (then it is reported stopped on the next start).
+    /// Why the task never got a session ("failed" to start, or "stopped"
+    /// while it waited). A task with a session reads its state there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_state: Option<String>,
+    pub not_started: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -95,10 +95,8 @@ struct Store {
 #[derive(Default, Clone)]
 struct Live {
     state: Option<String>,
-    /// A turn ran since the last message was sent: idle now means finished.
+    /// A turn ran since the last message was sent: idle now means its run ended.
     ran: bool,
-    /// The last turn was stopped, not completed: idle now means stopped.
-    interrupted: bool,
     watching: bool,
 }
 
@@ -133,10 +131,26 @@ fn new_id(prefix: &str) -> String {
     format!("{prefix}{hex}")
 }
 
-/// Like `derive_state`, for a task whose last turn may have been stopped.
-fn task_state(summary: &Value, live: &Live) -> &'static str {
+/// The task's state once its session's latest run ended, from the session's
+/// run record (`session_runs`), the one place that says how a run went.
+fn ended_state(outcome: Option<Outcome>) -> &'static str {
+    match outcome {
+        Some(Outcome::Done) => "finished",
+        Some(Outcome::Failed) => "failed",
+        Some(Outcome::Stopped | Outcome::CutOff) => "stopped",
+        None => "unloaded",
+    }
+}
+
+/// Like `derive_state`, with how the run ended taken from its record.
+fn task_state(summary: &Value, live: &Live, last_run: Result<Option<Outcome>, ()>) -> &'static str {
     match derive_state(summary, live.ran) {
-        "finished" if live.interrupted => "stopped",
+        "finished" => match last_run {
+            // The session is at rest but the record has not heard the end yet.
+            Err(()) => "running",
+            Ok(None) => "finished",
+            Ok(outcome) => ended_state(outcome),
+        },
         state => state,
     }
 }
@@ -342,7 +356,7 @@ impl TaskManager {
             created_at: now(),
             pending_text: Some(text.to_string()),
             model,
-            last_state: None,
+            not_started: None,
         };
         {
             let mut store = self.store();
@@ -448,13 +462,6 @@ impl TaskManager {
                             if event.event == "turn.start" {
                                 if let Some(live) = manager.live().get_mut(&task_id) {
                                     live.ran = true;
-                                    live.interrupted = false;
-                                }
-                            }
-                            if event.event == "turn.end" {
-                                let stopped = event.data["status"] == "interrupted" || event.data["aborted"] == true;
-                                if let Some(live) = manager.live().get_mut(&task_id) {
-                                    live.interrupted = stopped;
                                 }
                             }
                             if event.event == "message.accepted"
@@ -501,13 +508,14 @@ impl TaskManager {
             }
         }
         let summary = session.summary();
+        let last_run = self.last_run(session.saved_path().as_deref());
         let changed = {
             let mut live = self.live();
             let entry = live.entry(task_id.to_string()).or_default();
             if !summary["activeTurn"].is_null() {
                 entry.ran = true;
             }
-            let state = task_state(&summary, entry).to_string();
+            let state = task_state(&summary, entry, last_run).to_string();
             if entry.state.as_deref() == Some(state.as_str()) {
                 None
             } else {
@@ -516,7 +524,6 @@ impl TaskManager {
             }
         };
         if let Some(state) = changed {
-            self.remember(task_id, &state);
             self.changed(task_id);
             if reportable(&state) {
                 self.report(task_id, &state);
@@ -585,47 +592,46 @@ impl TaskManager {
                     json!({ "taskId": task_id, "code": error.code, "message": error.message }),
                 );
                 // Say so once, and leave it out of the queue: no retry.
-                {
-                    let mut store = self.store();
-                    if let Some(task) = store.tasks.iter_mut().find(|task| task.task_id == task_id) {
-                        task.pending_text = None;
-                    }
-                    self.save(&store);
-                }
-                self.live().insert(task_id.clone(), Live { state: Some("failed".into()), ..Live::default() });
-                self.remember(&task_id, "failed");
+                self.never_started(&task_id, "failed");
                 self.report(&task_id, "failed");
                 self.changed(&task_id);
             }
         }
     }
 
-    /// Keeps the state the host saw, for when the session is no longer open.
-    fn remember(&self, task_id: &str, state: &str) {
+    /// The task leaves the queue without a session: `state` says why.
+    fn never_started(&self, task_id: &str, state: &str) {
         let mut store = self.store();
         if let Some(task) = store.tasks.iter_mut().find(|task| task.task_id == task_id) {
-            if task.last_state.as_deref() != Some(state) {
-                task.last_state = Some(state.to_string());
-                self.save(&store);
-            }
+            task.pending_text = None;
+            task.not_started = Some(state.to_string());
+        }
+        self.save(&store);
+    }
+
+    /// How the latest run of the task's session went (`SessionManager::last_run`).
+    fn last_run(&self, session_path: Option<&str>) -> Result<Option<Outcome>, ()> {
+        match session_path {
+            Some(path) => self.sessions.last_run(path),
+            None => Ok(None),
         }
     }
 
-    /// After start-up: a task whose session was running when the host went
-    /// away was stopped by that; its client is told so. Then waiting tasks
-    /// start. Called once.
+    /// After start-up: a task whose run the host's exit cut off is reported
+    /// stopped, once (the run record says so; `session_runs`). Then waiting
+    /// tasks start. Called once.
     pub fn resume(self: &Arc<Self>) {
-        let cut: Vec<String> = self
+        let cut = self.sessions.cut_off_runs();
+        let key = |path: &str| crate::session::canonical_path(path);
+        let tasks: Vec<String> = self
             .store()
             .tasks
             .iter()
-            .filter(|task| task.last_state.as_deref().is_some_and(active))
-            .filter(|task| task.session_id.as_deref().and_then(|id| self.sessions.get(id)).is_none())
+            .filter(|task| task.session_path.as_deref().is_some_and(|path| cut.contains(&key(path))))
             .map(|task| task.task_id.clone())
             .collect();
-        for task_id in cut {
+        for task_id in tasks {
             crate::log(self.home(), "info", "task.cut_by_exit", json!({ "taskId": task_id }));
-            self.remember(&task_id, "stopped");
             self.report(&task_id, "stopped");
             self.changed(&task_id);
         }
@@ -636,17 +642,17 @@ impl TaskManager {
         if record.pending_text.is_some() && record.session_id.is_none() {
             return "waiting_to_start".into();
         }
+        if let Some(state) = &record.not_started {
+            return state.clone();
+        }
         if let Some(session) = record.session_id.as_deref().and_then(|id| self.sessions.get(id)) {
             let live = self.live().get(&record.task_id).cloned().unwrap_or_default();
-            return task_state(&session.summary(), &live).to_string();
+            let last_run = self.last_run(session.saved_path().as_deref());
+            return task_state(&session.summary(), &live, last_run).to_string();
         }
-        self.live()
-            .get(&record.task_id)
-            .and_then(|live| live.state.clone())
-            .or_else(|| record.last_state.clone())
-            .filter(|state| !active(state))
-            // Not loaded and never seen to end: the conversation is in its file.
-            .unwrap_or_else(|| "unloaded".into())
+        // Not open: as its latest run ended, or, with none recorded, unloaded
+        // (the conversation is in its file).
+        ended_state(self.last_run(record.session_path.as_deref()).ok().flatten()).into()
     }
 
     fn view(&self, record: &TaskRecord) -> Result<Value, ApiError> {
@@ -703,15 +709,7 @@ impl TaskManager {
         let record = self.owned(client, task_id)?;
         policy::authorize(self.home(), client, Some(&record.workspace), Action::StopTask)?;
         if record.session_id.is_none() && record.pending_text.is_some() {
-            {
-                let mut store = self.store();
-                if let Some(task) = store.tasks.iter_mut().find(|task| task.task_id == task_id) {
-                    task.pending_text = None;
-                }
-                self.save(&store);
-            }
-            self.live().insert(task_id.to_string(), Live { state: Some("stopped".into()), ..Live::default() });
-            self.remember(task_id, "stopped");
+            self.never_started(task_id, "stopped");
             self.report(task_id, "stopped");
             self.changed(task_id);
             return self.view(&self.record(task_id)?);
@@ -1079,25 +1077,31 @@ mod flow_tests {
         until_state(&tasks, "agent-a", &task_id, "running").await;
 
         // The host starts again on the same home: that session is gone.
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-runtime.mjs");
-        let again = Arc::new(SessionManager::new(
-            Some(RuntimeSpec::node_script(&fixture)),
-            home.path().to_path_buf(),
-            home.path().join("data"),
-            None,
-            50,
-            None,
-        ));
-        again.add_workspaces(&[folder(&workspace)]).unwrap();
-        let restarted = TaskManager::new(again, DEFAULT_CAP);
-        restarted.resume();
+        let start_again = || {
+            let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-runtime.mjs");
+            let again = Arc::new(SessionManager::new(
+                Some(RuntimeSpec::node_script(&fixture)),
+                home.path().to_path_buf(),
+                home.path().join("data"),
+                None,
+                50,
+                None,
+            ));
+            again.add_workspaces(&[folder(&workspace)]).unwrap();
+            let restarted = TaskManager::new(again, DEFAULT_CAP);
+            restarted.resume();
+            restarted
+        };
+        let restarted = start_again();
         let entries: Vec<InboxEntry> = serde_json::from_value(restarted.inbox("agent-a", 0).unwrap()["entries"].clone()).unwrap();
         assert!(entries.iter().any(|entry| entry.task_id == task_id && entry.state == "stopped"), "{entries:?}");
         assert_eq!(restarted.get("agent-a", &task_id).unwrap()["state"], "stopped");
         // Said once: another start does not say it again.
         let seq = restarted.inbox("agent-a", 0).unwrap()["seq"].as_u64().unwrap();
-        restarted.resume();
-        assert_eq!(restarted.inbox("agent-a", 0).unwrap()["seq"].as_u64().unwrap(), seq);
+        drop(restarted);
+        let third = start_again();
+        assert_eq!(third.inbox("agent-a", 0).unwrap()["seq"].as_u64().unwrap(), seq);
+        assert_eq!(third.get("agent-a", &task_id).unwrap()["state"], "stopped");
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ description: Decide whether a finished task really did what was asked.
 ---
 # Accept with evidence
 
-A task saying "done" is a claim. Accept it only on evidence you read in read_task:
+A task saying "done" is a claim. First read what the user asked: the project's requests in list_projects, in their own words. Accept only what meets those words, on evidence you read in read_task:
 - What changed: files, commits, branch, pull request link.
 - What was run: the exact test or build command and its result (counts, not "tests pass").
 - For a bug: the root cause, and a check that shows the problem is gone (the failing case now passes).

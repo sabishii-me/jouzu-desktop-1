@@ -44,6 +44,10 @@ pub struct Project {
     pub session_ids: Vec<String>,
     #[serde(default)]
     pub task_ids: Vec<String>,
+    /// The person's messages to the Assistant that ask for this work (their
+    /// transcript ids): results are checked against these words.
+    #[serde(default)]
+    pub request_ids: Vec<String>,
 }
 
 pub struct ProjectStore {

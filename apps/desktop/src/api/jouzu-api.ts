@@ -403,6 +403,8 @@ export interface Project {
   /** Saved sessions by file id (`sessionIndex` maps them to files). */
   sessionIds: string[];
   taskIds: string[];
+  /** The person's messages to the Assistant that ask for this work (transcript ids). */
+  requestIds?: string[];
 }
 
 export interface ProjectsSnapshot {
@@ -412,7 +414,7 @@ export interface ProjectsSnapshot {
 }
 
 export interface AssistantMessage {
-  /** Fixed id (`m<n>`); the Assistant quotes the person's messages to tasks by it. */
+  /** Fixed id (`m<n>`); a project keeps the person's requests by it. */
   id?: string;
   at: string;
   /** user, assistant, wake (what woke it, from the host), error. */
