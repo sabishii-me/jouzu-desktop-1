@@ -85,18 +85,48 @@ and web-access settings, adding folders, deleting sessions, slash commands.
 
 ## The Assistant
 
-`apps/desktop/host/src/assistant.rs`, `packaging/desktop/assistant/`.
-A project coordinator that is its own Node process on the Pi SDK's public
-API, not a jouzu session: no jouzu extensions, Flow, TextGuard or jouzu
-system prompt. Desktop installs a pinned copy of the SDK on first use and the
-process reads jouzu's `auth.json` and `models.json` for the model.
+`apps/desktop/host/src/assistant.rs`, `packaging/desktop/assistant/`,
+`packaging/desktop/extensions/jouzu-assistant/`.
+A project coordinator that is a jouzu session with its own configuration, not
+the coder's. The host starts a jouzu runtime for it the way it starts one for
+any session (same program, environment and process job, after any runtime
+booting beside it has done its start-up work), in the Assistant's own folder,
+with:
+
+- `--system-prompt prompt.md`: the Assistant's prompt instead of the coder's
+  (jouzu still adds its own sections, such as the reply language);
+- `--session-dir`, `--session-id assistant`: its own conversation, continued
+  after a restart;
+- `--tools`: its own tools plus `read`, `grep`, `find`, `ls`, and nothing
+  else (no shell, no writing files, no subagents, no background jobs);
+- `--no-extensions -e jouzu-assistant`, `--no-skills --skill` for each of its
+  skills, `--no-context-files`, `--no-mcp`, `--no-prompt-templates`;
+- Flow off (`JOUZU_FLOW_CONTROL=0`) and TextGuard off (`--jouzu-textguard-off`).
+
+Its models and sign-ins are jouzu's: after the runtime answers, the host sets
+the model the user chose with `set_model` (and the reasoning effort), exactly
+as for a session. A model the runtime refuses stops the Assistant with the
+runtime's own words; it never runs on another model.
 
 The host owns the prompt (`prompt.md`), the skills (`skills/*.md`), the tools
 (run on the host as client `assistant`), the Assistant's memory
 (`assistant/memory`, one file per subject, no size of the host's own: the
 model's context and the runtime's compaction bound it) and its transcript.
-The process turns host messages into model turns and tool calls into host
-requests; the line protocol is described at the top of `assistant.mjs`.
+The jouzu-assistant extension only bridges: it registers the tools the host
+lists (`tools.json`) and sends each call to `/v1/assistant/bridge` with a
+token the host makes for that runtime alone (in its environment). That route
+takes no other token, the host's included, and only on the internal listener.
+A user message or wake is a `prompt`; each assistant message's text is a
+reply in the transcript, a failed model call an error; `agent_settled` makes
+the Assistant idle again. A question an extension asks is declined at once:
+nobody sits at the Assistant's runtime to answer it.
+
+What jouzu 0.2.5 still adds that the Assistant cannot turn off (runtime
+gaps, recorded, not worked around): the release extensions are always passed
+by jouzu itself, so their skills (for example multiloop) are listed in the
+prompt, and the workflow extension's subagents section says subagents are
+enabled. Neither gives the Assistant a tool: `--tools` declares only its own
+and the read-only ones, and Pi refuses any other call.
 
 Turns are decoupled from events. A user message is delivered as soon as the
 Assistant is idle. Task changes wake it as soon as it is idle, with a
@@ -104,7 +134,7 @@ one-line summary (how many tasks, by state); it reads and acknowledges its
 inbox itself. Changes that arrive while it works are one wake when it is
 done. There is no timer and no poll: the loop runs on a user message, the
 Assistant going idle, an inbox entry, or a scheduled wake coming due. `schedule_wake` lets it look again later.
-If the process ends it stays stopped until the user writes or turns it on.
+If the runtime ends it stays stopped, with the reason, until the user writes or turns it on.
 Scheduled wakes are kept on disk by wall-clock time, so a restart keeps a
 reminder the Assistant already promised; one that came due meanwhile fires
 when it is next idle.
@@ -210,7 +240,19 @@ restored. Routes: `GET/PUT /v1/workflow`, `GET /v1/workflow/versions`,
 `POST /v1/workflow/restore`. The Assistant has the same operations as tools.
 Agents over MCP do not.
 
-`start_task` takes an optional `model` (`{provider, id}`, from `list_models`)
-for the task's session; the host relays it like a model picked in Desktop.
+`start_task` requires a `model` (`{provider, id}`, from `list_models`) for the
+task's session; there is no default, so every task runs on a model someone
+chose. A model `list_models` does not show is refused. The host relays it like
+a model picked in Desktop. `send_task` takes an optional `model`, set on the
+task's session before the message is sent.
+
+A task carries its `model`, and a failed task carries `failure`
+(`{code, text, provider, model}`): the code is the host's provider error code
+(quota, auth, model-unavailable, rate-limit, unavailable, image, other), the
+text is the provider's own words. Both are in the inbox entry and in
+`get_task`. The Assistant tells the user which task failed, on which model and
+why, offers models from `list_models`, and waits: it never switches models or
+retries on its own. The Assistant's own model failing is shown in its
+workspace as an error; the user handles that.
 Turning Workflow on or off per task is not offered yet: it is a runtime
 command that has to be checked against the runtime first.
