@@ -4136,6 +4136,63 @@ mod session_tests {
         manager.stop_all();
     }
 
+    /// #173: a process keeps the environment it was started with. After the
+    /// saved environment changes, an open idle session runs in a new runtime
+    /// with the new values, on the same session file; a change that is not to
+    /// the environment keeps its runtime.
+    /// Saved variables live in the Windows protected store, so this runs on Windows.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_environment_change_gives_an_open_session_a_runtime_with_the_new_values() {
+        let starts = tempfile::NamedTempFile::new().unwrap();
+        let starts_path = starts.path().to_string_lossy().into_owned();
+        let (manager, _home, workspace) = manager_with_env(
+            50,
+            &[("FAKE_RUNTIME_START_LOG", &starts_path), ("FAKE_RUNTIME_LOG_VAR", "JOUZU_TEST_SAVED")],
+        );
+        let save = |value: &str, enabled: bool| {
+            crate::environment::save(
+                manager.runtime_home(),
+                &[crate::environment::Entry { name: "JOUZU_TEST_SAVED".into(), value: value.into(), enabled }],
+            )
+            .unwrap();
+        };
+        save("before", true);
+        let session = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &session.id);
+        wait_status(&session, Status::Idle).await;
+        let first = session.runtime_pid().unwrap();
+        let file = session.summary()["sessionFile"].clone();
+
+        // Not an environment change: the runtime re-reads its files and stays.
+        manager.reload_configuration();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        wait_status(&session, Status::Idle).await;
+        assert_eq!(session.runtime_pid(), Some(first), "a reload without an environment change keeps the runtime");
+
+        save("after", true);
+        manager.reload_configuration();
+        wait_until(|| session.status() == Status::Idle && session.runtime_pid().is_some_and(|pid| pid != first)).await;
+        let lines: Vec<String> = std::fs::read_to_string(starts.path()).unwrap().lines().map(str::to_string).collect();
+        assert!(lines.first().is_some_and(|line| line.ends_with(" before")), "{lines:?}");
+        assert!(lines.last().is_some_and(|line| line.ends_with(" after")), "{lines:?}");
+        assert_eq!(session.summary()["sessionFile"], file, "the same conversation continues");
+        assert!(session.summary()["failure"].is_null(), "{}", session.summary());
+
+        // Turned off: the next runtime no longer receives it.
+        let second = session.runtime_pid().unwrap();
+        save("after", false);
+        manager.reload_configuration();
+        wait_until(|| session.status() == Status::Idle && session.runtime_pid().is_some_and(|pid| pid != second)).await;
+        let last = std::fs::read_to_string(starts.path()).unwrap().lines().last().unwrap().to_string();
+        assert!(!last.contains("after"), "{last}");
+        // A message still gets its answer.
+        session.send("after-restart", "hello").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.summary()["activeTurn"].is_null()).await;
+        manager.stop_all();
+    }
+
     #[tokio::test]
     async fn a_runtime_that_keeps_dying_while_starting_fails_the_session() {
         let (session, manager, _home, _workspace, _path) =

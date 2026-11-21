@@ -48,7 +48,10 @@ const switchRefusal = () => {
   try { return switchErrorFile ? readFileSync(switchErrorFile, "utf8").trim() : ""; } catch { return ""; }
 };
 // One line per runtime started, to count restarts.
-if (process.env.FAKE_RUNTIME_START_LOG) appendFileSync(process.env.FAKE_RUNTIME_START_LOG, `${process.pid}\n`);
+// With FAKE_RUNTIME_LOG_VAR, each start line also carries that variable's value
+// as this process received it.
+const loggedVar = process.env.FAKE_RUNTIME_LOG_VAR;
+if (process.env.FAKE_RUNTIME_START_LOG) appendFileSync(process.env.FAKE_RUNTIME_START_LOG, `${process.pid}${loggedVar ? ` ${process.env[loggedVar] ?? ""}` : ""}\n`);
 const out = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 const response = (id, command, data) =>
   out({ id, type: "response", command, success: true, data });
