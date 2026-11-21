@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -62,3 +62,56 @@ for (const [language, sentence] of [
     await expect(page.getByText(/Connecting to Jouzu/i)).toHaveCount(0);
   });
 }
+
+// Issue #87: the runtime is put in place while the app runs (the first-run
+// preparation finishing late, or a repair). Retry at the start page must ask the
+// host again and open a session, not wait for a connection that never comes.
+test("Retry after the runtime is put in place opens a session", async ({ page }) => {
+  scratch = mkdtempSync(join(tmpdir(), "jouzu-runtime-missing-"));
+  const home = join(scratch, "home");
+  const node = join(scratch, "node", "bin", "node");
+  host = spawn(hostBin, ["--dist", dist, "--home", home, "--runtime-home", join(scratch, "runtime")], {
+    env: { ...process.env, HOME: scratch, USERPROFILE: scratch, JOUZU_HOST_NODE: node },
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  const ready = await new Promise<{ port: number; token: string }>((done, fail) => {
+    let text = "";
+    const timer = setTimeout(() => fail(new Error("the host did not start")), 20_000);
+    host!.stdout!.on("data", chunk => {
+      text += chunk;
+      const end = text.indexOf("\n");
+      if (end < 0) return;
+      clearTimeout(timer);
+      host!.stdout!.removeAllListeners("data");
+      host!.stdout!.resume();
+      done(JSON.parse(text.slice(0, end)));
+    });
+  });
+  const base = `http://127.0.0.1:${ready.port}`;
+  await page.addInitScript(([url, value]) => {
+    (window as unknown as { __JOUZU_HOST__?: unknown }).__JOUZU_HOST__ = { baseUrl: url, token: value };
+    localStorage.setItem("jouzu.ui.language", "en");
+  }, [base, ready.token]);
+  await page.goto(base);
+  const alert = page.locator("[data-session-blocked]");
+  await expect(alert).toBeVisible({ timeout: 15_000 });
+  // Still missing: Retry asks again and says so again, instead of hanging.
+  await alert.getByRole("button", { name: "Retry" }).click();
+  await expect(alert).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/Connecting/i).filter({ visible: true })).toHaveCount(0);
+
+  // The runtime arrives: Node and the app entry under the managed home.
+  mkdirSync(join(scratch, "node", "bin"), { recursive: true });
+  symlinkSync(process.execPath, node);
+  mkdirSync(join(home, "app"), { recursive: true });
+  copyFileSync(join(root, "host", "tests", "fixtures", "fake-runtime.mjs"), join(home, "app", "bootstrap.mjs"));
+
+  await alert.getByRole("button", { name: "Retry" }).click();
+  await expect(alert).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.getByText(/Connecting/i).filter({ visible: true })).toHaveCount(0, { timeout: 15_000 });
+  const composer = page.getByRole("textbox").first();
+  await composer.fill("hello");
+  await composer.press("Enter");
+  await expect(page.getByText("hello").first()).toBeVisible({ timeout: 15_000 });
+  await page.screenshot({ path: test.info().outputPath("after-retry.png") });
+});
