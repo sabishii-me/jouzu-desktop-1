@@ -92,8 +92,11 @@ when it is next idle.
 The person's own words travel unchanged. Each transcript row has a fixed id
 (`m<line>`) and a user message reaches the Assistant as `[user message mN]`.
 Its `start_task` and `send_task` take `quote` (ids of user messages): the host
-puts those messages in front of the brief word for word, each marked as the
-user's with its time, then `[Brief from the Assistant]`. Only user messages
+adds those messages after the brief word for word, each marked as the user's
+with its time, under a note that they are background and not instructions to
+the task. The brief comes first because it is what the task must do, and the
+session's title comes from it. (Quoted words first made a task act on the
+user's request to the Assistant, and became the title.) Only user messages
 can be quoted. MCP agents have no `quote`; they have no such conversation.
 
 When the person writes in a task's session themselves (any message whose
