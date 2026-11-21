@@ -7,19 +7,6 @@ import { ErrorLine } from "./session-alerts-view";
 import { explain, useChatText } from "./chat-text";
 import type { AttributionSettings } from "./api/jouzu-api";
 
-const JOUZU = "Jouzu Desktop <359074535+jouzu-desktop@users.noreply.github.com>";
-
-/** What the jouzu-attribution extension makes of the agent's new commits. */
-function commitLines(author: boolean) {
-  const lines = [
-    "Co-authored-by: Jouzu Desktop (<model>) <359074535+jouzu-desktop@users.noreply.github.com>",
-    "Jouzu-Session: <session id>",
-  ];
-  return author
-    ? [`Author: ${JOUZU}`, "Committer: <your git user.name> <your git user.email>", "", ...lines, "Co-authored-by: <your git user.name> <your git user.email>"].join("\n")
-    : lines.join("\n");
-}
-
 /** Settings > Collaboration: how work the agent does shows up to the people it works with. */
 export function CollaborationPanel() {
   const api = useApi();
@@ -33,37 +20,42 @@ export function CollaborationPanel() {
   }, []);
 
   async function save(change: Partial<AttributionSettings>) {
+    const before = saved;
     setBusy(true);
     setError(null);
+    // Shown at once; what the host saved replaces it, a failure takes it back.
+    if (before) setSaved({ ...before, ...change });
     try {
       setSaved(await api.settings.attribution.save(change));
     } catch (failure) {
+      setSaved(before);
       setError(failure);
     } finally {
       setBusy(false);
     }
   }
 
+  const on = saved?.enabled === true;
   return <Card className="border-border shadow-none">
     <CardHeader>
       <div className="flex items-center justify-between gap-4">
         <CardTitle><Label htmlFor="commit-mark">{t.commitMark}</Label></CardTitle>
-        <Switch id="commit-mark" aria-label={t.commitMark} checked={saved?.enabled === true} disabled={busy || saved === null} onCheckedChange={next => void save({ enabled: next })} />
+        <Switch id="commit-mark" aria-label={t.commitMark} checked={on} disabled={busy || saved === null} onCheckedChange={next => void save({ enabled: next })} />
       </div>
       <CardDescription>{t.commitMarkHint}</CardDescription>
     </CardHeader>
-    <CardContent className="space-y-3">
-      {/* Only a choice while marking is on; its saved value is kept while off. */}
-      {saved?.enabled === true && <div className="space-y-1 border-l-2 border-border pl-3">
-        <div className="flex items-center justify-between gap-4">
-          <Label htmlFor="commit-author">{t.commitAuthor}</Label>
-          <Switch id="commit-author" aria-label={t.commitAuthor} checked={saved.author} disabled={busy} onCheckedChange={next => void save({ author: next })} />
-        </div>
-        <p className="text-sm text-muted-foreground">{t.commitAuthorHint}</p>
-      </div>}
-      <code className="block whitespace-pre-wrap break-all rounded-md bg-muted px-3 py-2 text-xs">{commitLines(saved?.enabled === true && saved.author)}</code>
+    {(on || error != null) && <CardContent className="space-y-3">
+      {/* Second level: only a choice while marking is on; the saved choice is kept while off. */}
+      {on && <fieldset className="space-y-2" disabled={busy}>
+        <legend className="sr-only">{t.commitMarkAs}</legend>
+        {([[false, t.commitAsCoauthor, t.commitAsCoauthorHint], [true, t.commitAsAuthor, t.commitAsAuthorHint]] as const).map(([author, label, hint]) =>
+          <label key={String(author)} className="flex cursor-pointer items-start gap-3 rounded-md border border-border px-3 py-2 has-[:checked]:border-primary">
+            <input type="radio" name="commit-mark-as" className="mt-1 accent-primary" checked={saved.author === author} onChange={() => void save({ author })} />
+            <span><span className="block text-sm font-medium">{label}</span><span className="block text-sm text-muted-foreground">{hint}</span></span>
+          </label>)}
+      </fieldset>}
       {error != null && saved === null && <p className="text-sm text-muted-foreground">{explain(t, error, t.commitMarkFailed).text}</p>}
       {error != null && saved !== null && <ErrorLine raw={error} failed={t.commitMarkFailed} onDismiss={() => setError(null)} />}
-    </CardContent>
+    </CardContent>}
   </Card>;
 }
