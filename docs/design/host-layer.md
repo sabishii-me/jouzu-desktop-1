@@ -60,6 +60,11 @@ describes no screens; what a person sees is in the UI document.
   and has not answered; it can no longer be edited or removed), `held` (an
   extension took it and delivers it itself), `returned` (after Stop).
 - A message leaves the queue only after the runtime confirms it used it.
+- A saved session's queue is kept in the host home (`waiting-messages.json`,
+  keyed by the session file) whenever it changes. A session opened for that file
+  again, after a host restart or in place of one that ended, gets its waiting
+  messages back as `returned`: the runtime that had any of them is gone, so the
+  user continues or discards them. Nothing is sent again on its own (#162).
 - The session owns its messages whatever its runtime does. While the runtime is
   starting or being replaced after it exited (`recovering`), a message is
   accepted and waits for it. A stopped session starts a runtime again for the

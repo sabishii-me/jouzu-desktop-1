@@ -23,6 +23,7 @@ pub mod provider_answers;
 mod provider_error;
 pub mod runtime;
 pub mod run_marks;
+pub mod waiting_messages;
 pub mod sessions_repair;
 pub mod session;
 pub mod web_access;
@@ -3661,6 +3662,56 @@ mod session_tests {
         while let Ok((event, data)) = rx.try_recv() {
             assert_ne!(event, "error", "the refusal is not an error: {data}");
         }
+    }
+
+    /// #162: messages waiting when the host exits come back with the session,
+    /// paused, and are sent once when the user continues.
+    #[tokio::test]
+    async fn waiting_messages_come_back_paused_after_a_host_restart() {
+        let mut spec = RuntimeSpec::node_script(&fixture());
+        spec.env.push(("FAKE_RUNTIME_DELAY_MS".to_string(), "60".to_string()));
+        let (manager, home, workspace) = manager_with_spec(spec.clone(), 200);
+        let folder = workspace.path().to_str().unwrap().to_string();
+        let session = manager.create(&folder, None, None).unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("one", "first").unwrap();
+        wait_until(|| session.saved_path().is_some() && session.status() == Status::Idle).await;
+        session.send("two", "a long message that is still being answered when the next one arrives").unwrap();
+        wait_until(|| session.status() == Status::Running).await;
+        session.send("three", "waiting").unwrap();
+        session.interrupt().unwrap();
+        wait_until(|| session.status() == Status::Idle).await;
+        assert_eq!(queue_texts(&session), vec!["waiting"], "{}", session.summary());
+        let path = session.saved_path().unwrap();
+        manager.shutdown();
+        drop(manager);
+
+        let restarted = Arc::new(SessionManager::new(
+            Some(spec),
+            home.path().to_path_buf(),
+            home.path().join("data"),
+            None,
+            200,
+            None,
+        ));
+        let session = restarted.create(&folder, Some(path), None).unwrap();
+        wait_status(&session, Status::Idle).await;
+        let summary = session.summary();
+        assert_eq!(queue_texts(&session), vec!["waiting"], "{summary}");
+        assert_eq!(summary["queue"][0]["clientMessageId"], "three", "{summary}");
+        assert_eq!(summary["queue"][0]["state"], "returned", "nothing is sent on its own: {summary}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(queue_texts(&session), vec!["waiting"]);
+        // Sending the same message again is the same message.
+        assert_eq!(session.send("three", "waiting").unwrap()["receipt"], "queued");
+        session.continue_queue().unwrap();
+        wait_until(|| queue_texts(&session).is_empty() && session.status() == Status::Idle).await;
+        let rows = conversation(&session);
+        assert_eq!(rows.iter().filter(|row| *row == "user:waiting").count(), 1, "{rows:?}");
+        // Nothing is waiting any more, so nothing comes back the next time.
+        restarted.shutdown();
+        let again = crate::waiting_messages::WaitingMessages::new(Some(home.path().join("waiting-messages.json")));
+        assert!(again.get(&crate::session::canonical_path(&session.saved_path().unwrap())).is_empty());
     }
 
     /// Stop works on a run the runtime started; what it did not use is back in
