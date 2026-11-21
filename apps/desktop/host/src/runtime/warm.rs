@@ -655,12 +655,15 @@ impl WarmPool {
         }
     }
 
-    /// Whether a session that found no runtime to take must wait before it
-    /// starts its own: no runtime has answered yet and another one is booting
-    /// (the pool's, still being spawned, or one a session is attaching to).
+    /// Whether a runtime started outside the pool (a session that found none
+    /// to take, the Assistant's) must wait before it starts: no runtime has
+    /// answered yet and another one is booting (the pool's, being spawned or
+    /// spawned and not answered yet, or one a session is attaching to).
     pub fn must_wait(&self) -> bool {
         let inner = self.lock();
-        !inner.converged && !inner.stopped && (inner.spawning.is_some() || inner.attaching > 0)
+        !inner.converged
+            && !inner.stopped
+            && (inner.spawning.is_some() || inner.attaching > 0 || inner.slots.iter().any(|slot| slot.ready_ms.is_none()))
     }
 
     /// Wait until `must_wait` is false, up to `timeout`.

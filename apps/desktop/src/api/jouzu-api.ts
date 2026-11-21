@@ -381,7 +381,7 @@ export interface McpServerState {
 export interface AssistantModel {
   provider: string;
   id: string;
-  /** Reasoning effort as the SDK names it; absent: the model's own. */
+  /** Reasoning effort as jouzu names it; absent: the model's own. */
   thinking?: string;
 }
 
@@ -431,6 +431,10 @@ export interface AssistantTask {
   title?: string | null;
   /** waiting_to_start, starting, running, waiting_user, held, finished, failed, stopped, unloaded. */
   state: string;
+  /** The model the task runs on: the one its client named. */
+  model?: { provider: string; id: string } | null;
+  /** Why it failed, when it did: the host's code and the provider's own text. */
+  failure?: { code: string; text: string; provider?: string | null; model?: string | null } | null;
 }
 export interface AttributionSettings { enabled: boolean; author: boolean }
 

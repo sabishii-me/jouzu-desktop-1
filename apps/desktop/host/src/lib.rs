@@ -392,6 +392,13 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/pair", get(pair_device))
+        // The Assistant's runtime calls its tools here with its own token: not
+        // the host's, and only on the internal listener.
+        .nest(
+            "/v1/assistant/bridge",
+            assistant::bridge_router(state.assistant.clone())
+                .route_layer(axum::middleware::from_fn(internal_listener_only)),
+        )
         .nest("/v1", api)
         .fallback(get(static_file))
         .layer(axum::middleware::from_fn_with_state(
@@ -2214,6 +2221,14 @@ async fn require_auth(State(state): State<AppState>, request: Request, next: Nex
         next.run(request).await
     } else {
         unauthorized("A valid host token is required").into_response()
+    }
+}
+
+async fn internal_listener_only(request: Request, next: Next) -> Response {
+    if matches!(listener_of(&request), web_access::Listener::Internal) {
+        next.run(request).await
+    } else {
+        forbidden("Not available on this listener").into_response()
     }
 }
 

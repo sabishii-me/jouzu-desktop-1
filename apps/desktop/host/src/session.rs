@@ -182,6 +182,24 @@ impl RuntimeSpec {
     }
 }
 
+/// A runtime started outside the pool, while it boots (`runtime_launch`).
+pub struct RuntimeLaunch {
+    pub spec: RuntimeSpec,
+    pub environment: Vec<(OsString, OsString)>,
+    booting: Option<crate::runtime::warm::Attaching>,
+    pool: Option<Arc<WarmPool>>,
+}
+
+impl RuntimeLaunch {
+    /// The runtime answered: its start-up work is done, others may start beside it.
+    pub fn answered(mut self) {
+        if let Some(pool) = &self.pool {
+            pool.converged();
+        }
+        self.booting.take();
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionConfig {
     pub spec: RuntimeSpec,
@@ -2007,6 +2025,21 @@ impl Session {
     }
 
     /// How the session's last run ended (#214), or null before one has.
+    /// Why the latest reply failed, when it did: the host's code for the
+    /// provider's text, that text, and the model that answered. `None` when
+    /// the latest reply did not fail.
+    pub fn latest_reply_failure(&self) -> Option<Value> {
+        let history = self.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let row = history.iter().rev().find(|row| row.get("kind").and_then(Value::as_str) == Some("assistant"))?;
+        let text = row.get("errorMessage").and_then(Value::as_str)?;
+        Some(json!({
+            "code": row.get("errorCode").cloned().unwrap_or_else(|| json!(crate::provider_error::code(text))),
+            "text": text,
+            "provider": row.get("provider").cloned().unwrap_or(Value::Null),
+            "model": row.get("model").cloned().unwrap_or(Value::Null),
+        }))
+    }
+
     fn last_run_view(&self) -> Value {
         // The run record is the one place a run's end is kept; a saved
         // conversation it never saw run falls back to what its file says.
@@ -6281,6 +6314,26 @@ impl SessionManager {
             }
         }
         Some(config)
+    }
+
+    /// How the Assistant's runtime starts: the same program, arguments and
+    /// environment every session's runtime gets (it adds its own after them).
+    /// Like a session's own runtime, it starts once no other runtime is doing
+    /// its start-up work, and the pool starts nothing beside it until it has
+    /// answered (#94): call `RuntimeLaunch::answered` then, or drop it on failure.
+    /// `None` while the runtime is not installed.
+    pub async fn runtime_launch(&self) -> Option<Result<RuntimeLaunch, String>> {
+        let config = self.config()?;
+        let pool = config.warm.get().cloned();
+        if let Some(pool) = &pool {
+            pool.wait_turn(Duration::from_secs(300)).await;
+        }
+        Some(config.environment(None, None).map(|environment| RuntimeLaunch {
+            spec: config.spec.clone(),
+            environment,
+            booting: pool.as_ref().map(|pool| pool.booting()),
+            pool,
+        }))
     }
 
     pub fn runtime_home(&self) -> &Path {

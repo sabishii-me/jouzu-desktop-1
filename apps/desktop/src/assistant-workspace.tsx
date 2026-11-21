@@ -32,7 +32,7 @@ function useTaskLookup(rows: SessionRow[], onOpen: (path: string) => void): Task
         const task = byTask.get(taskId);
         if (!task) return undefined;
         const row = task.sessionPath ? byPath.get(task.sessionPath.toLowerCase()) : rows.find(candidate => candidate.task?.taskId === taskId);
-        return { taskId, state: task.state, title: row?.title ?? task.title ?? undefined, sessionPath: row?.path ?? task.sessionPath ?? undefined };
+        return { taskId, state: task.state, title: row?.title ?? task.title ?? undefined, sessionPath: row?.path ?? task.sessionPath ?? undefined, model: task.model ?? null };
       },
       open: onOpen,
     };
@@ -81,7 +81,7 @@ export function AssistantWorkspace({ overview, rows = [], onOpen = () => {} }: {
     }
   }
 
-  const working = state?.phase === "running" || state?.phase === "starting" || state?.phase === "installing";
+  const working = state?.phase === "running" || state?.phase === "starting";
   return <div className="flex min-h-0 flex-1 flex-col">
     {overview}
     {messages.length ? <TaskLookupProvider value={lookup}><div className="min-h-0 flex-1 overflow-y-auto px-4 py-5"><div className="mx-auto max-w-3xl space-y-5">

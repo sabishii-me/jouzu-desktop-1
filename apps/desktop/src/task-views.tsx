@@ -4,7 +4,7 @@ import { fill, useChatText, type ChatText } from "./chat-text";
 import { layoutGraph, parseView, progressCounts, timelineOrder, timelineWhen, type ProgressGroup, type TaskView, type ViewProblem } from "./task-views-model";
 
 /** A task as a view shows it: its live title and state, and how to open it. */
-export interface ViewTask { taskId: string; title?: string; state?: string; sessionPath?: string }
+export interface ViewTask { taskId: string; title?: string; state?: string; sessionPath?: string; model?: { provider: string; id: string } | null }
 
 /** What the pane knows about tasks now. Views read it each time they draw. */
 export interface TaskLookup { task(taskId: string): ViewTask | undefined; open(sessionPath: string): void }
@@ -50,11 +50,13 @@ function TaskChip({ taskId, label, wide, whole }: { taskId: string; label?: stri
   const words = stateText(task ? state : "unknown", t);
   const name = label ?? task?.title ?? taskId;
   const path = task?.sessionPath;
+  // The model the task runs on is always the one its client chose: shown with it.
+  const hint = [name, words, task?.model ? `${task.model.provider}/${task.model.id}` : ""].filter(Boolean).join(" · ");
   const body = <><StateIcon state={task ? state : "unknown"} /><span className={whole ? "whitespace-nowrap" : "min-w-0 flex-1 truncate"}>{name}</span>{wide && <span className="shrink-0 text-xs text-muted-foreground">{words}</span>}</>;
   const className = "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1 text-left text-sm";
   return path
-    ? <button type="button" title={`${name} · ${words}`} data-task-state={state ?? "unknown"} className={`${className} hover:bg-muted`} onClick={() => lookup.open(path)}>{body}</button>
-    : <span title={`${name} · ${words}`} data-task-state={task ? state ?? "unknown" : "unknown"} className={className}>{body}</span>;
+    ? <button type="button" title={hint} data-task-state={state ?? "unknown"} className={`${className} hover:bg-muted`} onClick={() => lookup.open(path)}>{body}</button>
+    : <span title={hint} data-task-state={task ? state ?? "unknown" : "unknown"} className={className}>{body}</span>;
 }
 
 function Board({ view }: { view: Extract<TaskView, { view: "board" }> }) {

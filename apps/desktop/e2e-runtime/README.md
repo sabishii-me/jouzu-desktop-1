@@ -118,3 +118,18 @@ refuses any request carrying a PNG with a side of 10 px or less, with the provid
 composer with "Remove images" and "New session", a second message must fail the same way
 without hanging, and after "Remove images" the next message must get a reply. Results are
 written to `rejected-image-result.json`.
+
+## The Assistant as a jouzu session
+
+```powershell
+$env:JOUZU_E2E_RUNTIME = '<folder with bootstrap.mjs and node_modules/jouzu>'
+node e2e-runtime/assistant-session.mjs
+```
+
+Starts a host (`JOUZU_E2E_HOST_BIN`, default the debug build) on throwaway folders with a
+loopback OpenAI-compatible model added through `models.json`, turns the Assistant on with that
+model and checks that the runtime accepts the Assistant's arguments, that the model is offered
+the Assistant's tools and read-only ones and nothing that runs commands or writes files, that it
+runs on the Assistant's prompt with its skills, that a tool call goes through the jouzu-assistant
+extension to the host and back, and that the bridge refuses the host's token. Results, with the
+system prompt the model received, are written to `assistant-session-result.json`.

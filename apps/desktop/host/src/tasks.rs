@@ -67,6 +67,12 @@ pub struct InboxEntry {
     /// last acknowledged it. Kept until then, whatever the state does.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub user_wrote: bool,
+    /// The model the task ran on, so a failure can be read against it.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub model: Value,
+    /// Why it failed, when it did (see `task_failure`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Value>,
 }
 
 /// Messages a task's client sends carry this id prefix; any other message in
@@ -153,6 +159,26 @@ fn task_state(summary: &Value, live: &Live, last_run: Result<Option<Outcome>, ()
         },
         state => state,
     }
+}
+
+/// The model the task runs on: its session's, as the runtime reports it, else
+/// the one the client asked for.
+fn task_model(record: &TaskRecord, summary: Option<&Value>) -> Value {
+    summary
+        .map(|summary| &summary["model"])
+        .filter(|model| model["provider"].is_string() && model["id"].is_string())
+        .map(|model| json!({ "provider": model["provider"], "id": model["id"] }))
+        .or_else(|| record.model.clone())
+        .unwrap_or(Value::Null)
+}
+
+/// Why the task's turn or its session failed, as the session's summary has
+/// it: the host's code and the runtime's own text.
+fn task_failure(summary: &Value) -> Option<Value> {
+    [&summary["failedTurn"]["error"], &summary["failure"]]
+        .into_iter()
+        .find(|error| error.is_object())
+        .map(|error| json!({ "code": error["code"], "text": error["text"] }))
 }
 
 /// The task's state from its session's summary, as the user would see it.
@@ -595,6 +621,8 @@ impl TaskManager {
 
     fn post(&self, task_id: &str, state: &str, user_wrote: bool) {
         let Ok(record) = self.record(task_id) else { return };
+        let view = self.view(&record).unwrap_or(Value::Null);
+        let failure = (state == "failed").then(|| view["failure"].clone()).filter(Value::is_object);
         {
             let mut store = self.store();
             let inbox = store.inboxes.entry(record.client_id.clone()).or_default();
@@ -608,6 +636,8 @@ impl TaskManager {
                 state: state.to_string(),
                 at: now(),
                 user_wrote: user_wrote || wrote_before,
+                model: view["model"].clone(),
+                failure,
             });
             self.save(&store);
             self.sessions.publish_control("inbox.changed", json!({ "clientId": record.client_id, "seq": seq }));
@@ -700,15 +730,29 @@ impl TaskManager {
 
     fn view(&self, record: &TaskRecord) -> Result<Value, ApiError> {
         let session = record.session_id.as_deref().and_then(|id| self.sessions.get(id));
-        let title = session.as_ref().and_then(|session| session.summary()["title"].as_str().map(str::to_string));
+        let summary = session.as_ref().map(|session| session.summary());
+        let title = summary.as_ref().and_then(|summary| summary["title"].as_str().map(str::to_string));
+        let state = self.state_of(record);
+        // Why it failed, as the session has it: its latest reply's error, else
+        // a failed turn or the session's own failure. Nothing is added.
+        let failure = (state == "failed")
+            .then(|| {
+                session
+                    .as_ref()
+                    .and_then(|session| session.latest_reply_failure())
+                    .or_else(|| summary.as_ref().and_then(task_failure))
+            })
+            .flatten();
         Ok(json!({
             "taskId": record.task_id,
             "sessionId": record.session_id,
             "sessionPath": record.session_path,
             "workspace": record.workspace,
             "createdAt": record.created_at,
-            "state": self.state_of(record),
+            "state": state,
             "title": title,
+            "model": task_model(record, summary.as_ref()),
+            "failure": failure,
         }))
     }
 
@@ -745,6 +789,27 @@ impl TaskManager {
         self.live().entry(task_id.to_string()).or_default().ran = false;
         self.watch(task_id, session, events);
         self.view(&self.record(task_id)?)
+    }
+
+    /// Sends a follow-up on another model: the task's session switches to it
+    /// first, the way the person switches a session's model, then the message goes.
+    pub async fn send_on(self: &Arc<Self>, client: &str, task_id: &str, text: &str, model: &Value) -> Result<Value, ApiError> {
+        Self::check_text(text)?;
+        let (Some(provider), Some(id)) = (model["provider"].as_str(), model["id"].as_str()) else {
+            return Err(ApiError::bad_request("model is {provider, id}"));
+        };
+        let record = self.owned(client, task_id)?;
+        policy::authorize(self.home(), client, Some(&record.workspace), Action::SendTask)?;
+        let session = self.session(&record)?;
+        session.select_model(provider, id).await?;
+        {
+            let mut store = self.store();
+            if let Some(task) = store.tasks.iter_mut().find(|task| task.task_id == task_id) {
+                task.model = Some(json!({ "provider": provider, "id": id }));
+            }
+            self.save(&store);
+        }
+        self.send(client, task_id, text)
     }
 
     /// Stops the task's current work. The conversation stays and can continue.
@@ -1015,6 +1080,38 @@ mod flow_tests {
             }
         }
         panic!("{task_id} never reached {state}; inbox saw {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_task_its_model_failed_says_why_and_on_which_model() {
+        let refusal = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(refusal.path(), "402 {\"error\":{\"code\":\"insufficient_balance\",\"message\":\"Insufficient balance\"}}").unwrap();
+        let file = refusal.path().to_string_lossy().into_owned();
+        let (manager, _home, workspace) = setup(&[("FAKE_RUNTIME_REPLY_ERROR_FILE", &file)]);
+        let tasks = TaskManager::new(manager.clone());
+        let model = json!({ "provider": "fixture", "id": "other" });
+        let task = tasks.start_with("agent-a", &folder(&workspace), "write a haiku", Some(model.clone())).unwrap();
+        let task_id = task["taskId"].as_str().unwrap().to_string();
+        let seen = wait_for(&tasks, "agent-a", &task_id, "failed").await;
+        let failed = seen.iter().rev().find(|entry| entry.task_id == task_id && entry.state == "failed").unwrap();
+        // The host's code and the provider's own words, with the model it ran on.
+        let failure = failed.failure.clone().expect("the failure travels with the entry");
+        assert_eq!(failure["code"], "quota", "{failure}");
+        assert!(failure["text"].as_str().unwrap().contains("insufficient_balance"), "{failure}");
+        assert_eq!(failure["provider"], "fixture", "{failure}");
+        assert_eq!(failed.model, model);
+        let view = tasks.get("agent-a", &task_id).unwrap();
+        assert_eq!(view["failure"]["code"], "quota");
+        assert_eq!(view["model"], model);
+
+        // The client switches the task to the model the user chose, then goes on.
+        std::fs::remove_file(refusal.path()).unwrap();
+        let chosen = json!({ "provider": "fixture", "id": "model" });
+        tasks.send_on("agent-a", &task_id, "try again", &chosen).await.unwrap();
+        wait_for(&tasks, "agent-a", &task_id, "finished").await;
+        let view = tasks.get("agent-a", &task_id).unwrap();
+        assert_eq!(view["model"], chosen, "{view}");
+        assert!(view["failure"].is_null(), "{view}");
     }
 
     #[tokio::test]

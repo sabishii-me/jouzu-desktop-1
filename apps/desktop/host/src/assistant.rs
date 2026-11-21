@@ -1,9 +1,15 @@
 //! The Assistant: Desktop's project coordinator (experimental).
 //!
-//! A persistent Node process on the Pi SDK (Desktop's own pinned copy), not a
-//! jouzu session: no Flow, no TextGuard, no jouzu system prompt. The host
-//! owns everything around it: the prompt, the tools (run here, as the
-//! built-in client `assistant`), its memory, and when it takes a turn.
+//! The Assistant is a jouzu session with its own configuration, not the coder's:
+//! the host starts a jouzu runtime for it the way it starts one for any session
+//! (same program, same environment, same process job), with the Assistant's
+//! prompt, its skills, only its tools plus read-only ones, no project context
+//! files, no MCP servers, and Flow and TextGuard off. Its models and sign-ins
+//! are jouzu's: whatever Settings lists, the Assistant can run on.
+//!
+//! Its tools live here, in the host, and run as the built-in client
+//! `assistant`. The runtime reaches them through the jouzu-assistant extension,
+//! which calls the host's bridge with a token made for that runtime alone.
 //!
 //! Turns are decoupled from events. A user message is delivered as soon as
 //! the Assistant is idle. Task changes wake it as soon as it is idle, with a
@@ -11,40 +17,59 @@
 //! arrive while it works are one wake when it is done. Nothing waits on a
 //! timer and nothing is polled: the loop runs when something happens.
 //!
-//! Nothing restarts it silently: if the process ends, it stays stopped until
+//! Nothing restarts it silently: if the runtime ends, it stays stopped until
 //! the user sends a message or turns it on again.
 
 use std::{
     collections::VecDeque,
+    ffi::OsString,
     path::{Path, PathBuf},
-    process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
+use axum::{
+    extract::State as Extract,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, Command},
-    sync::Notify,
-};
+use tokio::sync::{mpsc, Notify};
 
 use crate::{
     mcp::{self, AgentClient},
-    policy,
     projects::{Project, ProjectStore},
-    session::{ApiError, SessionManager},
+    runtime::{
+        adapter::pi::{self, command, Record},
+        RuntimeEvent, RuntimeSupervisor, SpawnSpec,
+    },
+    session::{ApiError, RuntimeSpec, SessionManager},
     tasks::TaskManager,
 };
 
 pub const CLIENT: &str = "assistant";
-/// The Pi SDK version Desktop installs for the Assistant: the one jouzu 0.2.5
-/// is built on, so auth.json and models.json read the same.
-pub const SDK_PACKAGE: &str = "@earendil-works/pi-coding-agent";
-pub const SDK_VERSION: &str = "1.5.0";
-const SCRIPT: &str = include_str!("../../../../packaging/desktop/assistant/assistant.mjs");
+/// The extension that gives the Assistant's runtime its tools. Written beside
+/// the Assistant's files and passed by path: no other session loads it.
+const EXTENSION: [(&str, &str); 2] = [
+    ("package.json", include_str!("../../../../packaging/desktop/extensions/jouzu-assistant/package.json")),
+    ("index.js", include_str!("../../../../packaging/desktop/extensions/jouzu-assistant/index.js")),
+];
+/// The runtime's own tools the Assistant has besides its own: reading only.
+const READ_TOOLS: [&str; 4] = ["read", "grep", "find", "ls"];
+/// jouzu's own options (read before Pi's): TextGuard is for the coder's work.
+const JOUZU_OPTIONS: [&str; 1] = ["--jouzu-textguard-off"];
+/// The runtime's session the Assistant continues across restarts.
+const SESSION_ID: &str = "assistant";
+/// A command's answer when the runtime ended: its end, with the reason, is
+/// reported by the event loop.
+const RUNTIME_ENDED: &str = "The Assistant's runtime ended";
+/// How long a starting runtime may take to answer (Node and extensions loading).
+const START_TIMEOUT: Duration = Duration::from_secs(180);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const PROMPT: &str = include_str!("../../../../packaging/desktop/assistant/prompt.md");
 pub const SKILLS: &[(&str, &str)] = &[
     ("write-a-brief", include_str!("../../../../packaging/desktop/assistant/skills/write-a-brief.md")),
@@ -64,7 +89,7 @@ const MEMORY_TYPES: [&str; 5] = ["user", "feedback", "project", "decision", "ref
 pub struct ModelPick {
     pub provider: String,
     pub id: String,
-    /// Reasoning effort as the SDK names it (off … max); absent: the model's own.
+    /// Reasoning effort as jouzu names it (off … max); absent: the model's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
 }
@@ -81,23 +106,16 @@ struct Settings {
 }
 
 /// Where things are. Tests point these at fixtures.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct AssistantPaths {
-    pub node: Option<PathBuf>,
-    /// The folder the SDK is installed into (its `node_modules`).
-    pub sdk: PathBuf,
-    /// jouzu's agent folder: auth.json and models.json are read from it.
-    pub runtime_agent: PathBuf,
-    /// A script to run instead of the embedded one (tests).
-    pub script: Option<PathBuf>,
-    /// A scripted model instead of a real one (tests).
-    pub faux: Option<Value>,
+    /// A program to run instead of the runtime sessions use (tests). The
+    /// environment is the sessions' either way.
+    pub runtime: Option<RuntimeSpec>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Off,
-    Installing,
     Starting,
     Idle,
     Running,
@@ -108,7 +126,6 @@ impl Phase {
     fn as_str(self) -> &'static str {
         match self {
             Phase::Off => "off",
-            Phase::Installing => "installing",
             Phase::Starting => "starting",
             Phase::Idle => "idle",
             Phase::Running => "running",
@@ -163,9 +180,11 @@ struct State {
     memory_seen: String,
 }
 
-struct Process {
-    child: Child,
-    stdin: ChildStdin,
+/// The Assistant's runtime while it lives.
+struct Runtime {
+    supervisor: Arc<RuntimeSupervisor>,
+    /// Opens the bridge for this runtime only.
+    token: String,
 }
 
 pub struct Assistant {
@@ -176,10 +195,12 @@ pub struct Assistant {
     projects: Arc<ProjectStore>,
     settings: Mutex<Settings>,
     state: Mutex<State>,
-    process: tokio::sync::Mutex<Option<Process>>,
+    runtime: Mutex<Option<Runtime>>,
     kick: Notify,
-    /// Bumped each start, so a reader of an old process ignores its end.
+    /// Bumped each start, so a reader of an old runtime ignores its end.
     generation: std::sync::atomic::AtomicU64,
+    /// Where the host listens, for the bridge (set once the host is bound).
+    port: OnceLock<u16>,
 }
 
 
@@ -232,21 +253,21 @@ impl Assistant {
                 turn: 0,
                 memory_seen: String::new(),
             }),
-            process: tokio::sync::Mutex::new(None),
+            runtime: Mutex::new(None),
             kick: Notify::new(),
             generation: std::sync::atomic::AtomicU64::new(0),
+            port: OnceLock::new(),
         })
     }
 
-    /// The paths a real host uses.
-    pub fn default_paths(home: &Path, sessions: &SessionManager) -> AssistantPaths {
-        AssistantPaths {
-            node: sessions.node_executable(),
-            sdk: home.join("assistant").join("sdk"),
-            runtime_agent: sessions.runtime_home().join("agent"),
-            script: None,
-            faux: None,
-        }
+    /// The paths a real host uses: the runtime every session runs on.
+    pub fn default_paths(_home: &Path, _sessions: &SessionManager) -> AssistantPaths {
+        AssistantPaths::default()
+    }
+
+    /// Where the host listens. The bridge is on the host's own listener.
+    pub fn set_port(&self, port: u16) {
+        let _ = self.port.set(port);
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -314,7 +335,6 @@ impl Assistant {
                 "inSeconds": wake.at.saturating_duration_since(Instant::now()).as_secs(),
                 "note": wake.note,
             })).collect::<Vec<_>>(),
-            "sdk": { "package": SDK_PACKAGE, "version": SDK_VERSION, "installed": self.sdk_installed() },
         })
     }
 
@@ -423,221 +443,252 @@ impl Assistant {
         json!({ "messages": rows[start..] })
     }
 
-    fn sdk_installed(&self) -> bool {
-        if self.paths.script.is_some() {
-            // A test script brings its own (or no) SDK.
-            return true;
-        }
-        let manifest = self.paths.sdk.join("node_modules").join(SDK_PACKAGE).join("package.json");
-        std::fs::read(manifest)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .is_some_and(|value| value["version"] == SDK_VERSION)
-    }
-
-    /// Installs the pinned SDK with the Node that came with Desktop.
-    async fn install_sdk(&self, node: &Path) -> Result<(), String> {
-        let npm = if cfg!(windows) {
-            node.parent().map(|dir| dir.join("node_modules").join("npm").join("bin").join("npm-cli.js"))
-        } else {
-            node.parent()
-                .and_then(Path::parent)
-                .map(|dir| dir.join("lib").join("node_modules").join("npm").join("bin").join("npm-cli.js"))
-        }
-        .filter(|path| path.is_file())
-        .ok_or("The Node that came with Desktop has no npm")?;
-        std::fs::create_dir_all(&self.paths.sdk).map_err(|error| error.to_string())?;
-        let manifest = self.paths.sdk.join("package.json");
-        if !manifest.is_file() {
-            std::fs::write(&manifest, r#"{"name":"jouzu-desktop-assistant","private":true}"#).map_err(|error| error.to_string())?;
-        }
-        let mut command = Command::new(node);
-        command
-            .arg(npm)
-            .arg("install")
-            .arg(format!("{SDK_PACKAGE}@{SDK_VERSION}"))
-            .args(["--omit=dev", "--no-audit", "--no-fund", "--save-exact"])
-            .current_dir(&self.paths.sdk)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        if let Some(dir) = node.parent() {
-            let path = std::env::var_os("PATH").unwrap_or_default();
-            let mut paths = vec![dir.to_path_buf()];
-            paths.extend(std::env::split_paths(&path));
-            if let Ok(joined) = std::env::join_paths(paths) {
-                command.env("PATH", joined);
-            }
-        }
-        #[cfg(windows)]
-        command.creation_flags(0x0800_0000);
-        let output = command.output().await.map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr);
-            let last = detail.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("").trim().to_string();
-            return Err(format!("The Assistant's SDK could not be installed: {last}"));
-        }
-        Ok(())
-    }
-
     async fn start(self: &Arc<Self>) {
         {
             let mut state = self.state();
-            if matches!(state.phase, Phase::Installing | Phase::Starting | Phase::Idle | Phase::Running) {
+            if matches!(state.phase, Phase::Starting | Phase::Idle | Phase::Running) {
                 return;
             }
             state.phase = Phase::Starting;
             state.error = None;
         }
+        self.set_phase(Phase::Starting, None);
         if let Err(message) = self.spawn().await {
             crate::log(self.sessions.home(), "warn", "assistant.start_failed", json!({ "message": message }));
-            self.record("error", &message);
-            self.set_phase(Phase::Stopped, Some(message));
-        }
-    }
-
-    async fn spawn(self: &Arc<Self>) -> Result<(), String> {
-        let node = self.paths.node.clone().ok_or("Node is not available to run the Assistant")?;
-        if !self.sdk_installed() {
-            self.set_phase(Phase::Installing, None);
-            self.install_sdk(&node).await?;
-            self.set_phase(Phase::Starting, None);
-        }
-        let model = if self.paths.faux.is_some() {
-            None
-        } else {
-            Some(self.settings().model.ok_or("Choose a model for the Assistant")?)
-        };
-        let agent_dir = self.dir.join("agent");
-        std::fs::create_dir_all(&agent_dir).map_err(|error| error.to_string())?;
-        let script = match &self.paths.script {
-            Some(script) => script.clone(),
-            None => {
-                let path = self.dir.join("assistant.mjs");
-                std::fs::write(&path, SCRIPT).map_err(|error| error.to_string())?;
-                path
+            if message == RUNTIME_ENDED {
+                // The event loop says why, from what the runtime wrote.
+                return;
             }
-        };
-        let mut command = Command::new(&node);
-        command
-            .arg(&script)
-            .current_dir(&agent_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        command.creation_flags(0x0800_0000);
-        // Where the sandbox will isolate the Assistant (#197); no change yet.
-        policy::launch_profile(&mut command, policy::Launch::Assistant);
-        let mut child = command.spawn().map_err(|error| format!("Could not start the Assistant: {error}"))?;
-        let mut stdin = child.stdin.take().ok_or("no stdin")?;
-        let stdout = child.stdout.take().ok_or("no stdout")?;
-        let stderr = child.stderr.take();
-        let start = json!({
-            "type": "start",
-            "sdk": self.paths.sdk,
-            "agentDir": agent_dir,
-            "sessionDir": self.dir.join("sessions"),
-            "authPath": self.paths.runtime_agent.join("auth.json"),
-            "modelsPath": self.paths.runtime_agent.join("models.json"),
-            "model": model,
-            "systemPrompt": self.system_prompt(),
-            "tools": tool_definitions(),
-            "faux": self.paths.faux,
-        });
-        stdin
-            .write_all(format!("{start}\n").as_bytes())
-            .await
-            .map_err(|error| error.to_string())?;
-        let generation = self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        *self.process.lock().await = Some(Process { child, stdin });
-        if let Some(stderr) = stderr {
-            let home = self.sessions.home().to_path_buf();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    crate::log(&home, "debug", "assistant.stderr", json!({ "line": cut(&line, 2000) }));
-                }
-            });
-        }
-        let assistant = Arc::clone(self);
-        tokio::spawn(async move { assistant.read_loop(stdout, generation).await });
-        Ok(())
-    }
-
-    fn system_prompt(&self) -> String {
-        let mut prompt = PROMPT.to_string();
-        prompt.push_str("\n## Skills (load with skill_read before doing that kind of work)\n");
-        for (name, text) in SKILLS {
-            let summary = text.lines().find(|line| line.starts_with("description:")).unwrap_or("");
-            prompt.push_str(&format!("- {name}: {}\n", summary.trim_start_matches("description:").trim()));
-        }
-        prompt
-    }
-
-    async fn write(&self, value: Value) -> bool {
-        let mut process = self.process.lock().await;
-        let Some(process) = process.as_mut() else { return false };
-        process.stdin.write_all(format!("{value}\n").as_bytes()).await.is_ok()
-    }
-
-    async fn read_loop(self: Arc<Self>, stdout: tokio::process::ChildStdout, generation: u64) {
-        let mut lines = BufReader::new(stdout).lines();
-        let mut fatal = None;
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
-            match message["type"].as_str() {
-                Some("ready") => {
-                    crate::log(self.sessions.home(), "info", "assistant.ready", json!({ "tools": message["tools"] }));
-                    self.set_phase(Phase::Idle, None);
-                }
-                Some("tool") => {
-                    let assistant = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        let name = message["name"].as_str().unwrap_or("").to_string();
-                        let result = assistant.run_tool(&name, &message["arguments"]).await;
-                        let (ok, result) = match result {
-                            Ok(value) => (true, value),
-                            Err(error) => (false, json!({ "error": { "code": error.code, "message": error.message } })),
-                        };
-                        assistant
-                            .write(json!({ "type": "tool_result", "callId": message["callId"], "ok": ok, "result": result }))
-                            .await;
-                    });
-                }
-                Some("reply") => {
-                    self.record("assistant", message["text"].as_str().unwrap_or(""));
-                }
-                Some("turn_end") => {
-                    if message["stopReason"] == "error" {
-                        let error = message["error"].as_str().unwrap_or("The turn failed").to_string();
-                        self.record("error", &error);
-                        self.set_phase(Phase::Idle, Some(error));
-                    } else {
-                        self.set_phase(Phase::Idle, None);
-                    }
-                }
-                Some("fatal") => fatal = message["message"].as_str().map(str::to_string),
-                _ => {}
-            }
-        }
-        if self.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
-            return;
-        }
-        let message = fatal.unwrap_or_else(|| "The Assistant stopped".to_string());
-        if self.state().phase != Phase::Off {
             self.record("error", &message);
             self.stop_process(Phase::Stopped, Some(message)).await;
         }
     }
 
-    async fn stop_process(&self, phase: Phase, error: Option<String>) {
-        if let Some(mut process) = self.process.lock().await.take() {
-            let _ = process.child.start_kill();
+    /// Writes what the runtime is started with: the prompt, the skills, the
+    /// extension and the tools it lists.
+    fn write_files(&self) -> Result<Files, String> {
+        let error = |error: std::io::Error| error.to_string();
+        std::fs::create_dir_all(&self.dir).map_err(error)?;
+        let prompt = self.dir.join("prompt.md");
+        std::fs::write(&prompt, self.system_prompt()).map_err(error)?;
+        let mut skills = Vec::new();
+        for (name, text) in SKILLS {
+            let folder = self.dir.join("skills").join(name);
+            std::fs::create_dir_all(&folder).map_err(error)?;
+            std::fs::write(folder.join("SKILL.md"), text).map_err(error)?;
+            skills.push(folder);
         }
+        let extension = self.dir.join("extension").join("jouzu-assistant");
+        std::fs::create_dir_all(&extension).map_err(error)?;
+        for (name, text) in EXTENSION {
+            std::fs::write(extension.join(name), text).map_err(error)?;
+        }
+        let tools = self.dir.join("extension").join("tools.json");
+        std::fs::write(&tools, serde_json::to_vec(&tool_definitions()).map_err(|error| error.to_string())?).map_err(error)?;
+        Ok(Files { prompt, skills, extension, tools })
+    }
+
+    /// The runtime's arguments after the ones every session's runtime gets.
+    fn arguments(&self, files: &Files) -> Vec<String> {
+        let path = |path: &Path| path.to_string_lossy().into_owned();
+        let mut tools: Vec<String> = tool_definitions()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect();
+        tools.extend(READ_TOOLS.iter().map(|tool| tool.to_string()));
+        let mut arguments = vec![
+            "--session-dir".to_string(),
+            path(&self.dir.join("sessions")),
+            "--session-id".to_string(),
+            SESSION_ID.to_string(),
+            "--system-prompt".to_string(),
+            path(&files.prompt),
+            "--tools".to_string(),
+            tools.join(","),
+            "--no-extensions".to_string(),
+            "--extension".to_string(),
+            path(&files.extension),
+            "--no-skills".to_string(),
+        ];
+        for skill in &files.skills {
+            arguments.push("--skill".to_string());
+            arguments.push(path(skill));
+        }
+        arguments.extend(["--no-context-files", "--no-mcp", "--no-prompt-templates"].map(str::to_string));
+        arguments
+    }
+
+    async fn spawn(self: &Arc<Self>) -> Result<(), String> {
+        let model = self.settings().model.ok_or("Choose a model for the Assistant")?;
+        let port = *self.port.get().ok_or("The Assistant's bridge is not ready")?;
+        let mut launch = self.sessions.runtime_launch().await.ok_or("The runtime is not installed yet")??;
+        let spec = self.paths.runtime.clone().unwrap_or_else(|| launch.spec.clone());
+        let mut environment = std::mem::take(&mut launch.environment);
+        let files = self.write_files()?;
+        let token = crate::new_token();
+        let mut set = |name: &str, value: OsString| {
+            environment.retain(|(key, _)| !key.to_string_lossy().eq_ignore_ascii_case(name));
+            environment.push((OsString::from(name), value));
+        };
+        set("JOUZU_FLOW_CONTROL", "0".into());
+        set("JOUZU_ASSISTANT_URL", format!("http://127.0.0.1:{port}/v1/assistant/bridge").into());
+        set("JOUZU_ASSISTANT_TOKEN", token.clone().into());
+        set("JOUZU_ASSISTANT_TOOLS", files.tools.clone().into_os_string());
+        // jouzu reads its own options before Pi's, right after the script.
+        let mut args = spec.args.clone();
+        let at = args.len().min(1);
+        for (offset, option) in JOUZU_OPTIONS.iter().enumerate() {
+            args.insert(at + offset, option.to_string());
+        }
+        args.extend(self.arguments(&files));
+        let (events_tx, events_rx) = mpsc::channel(256);
+        let supervisor = RuntimeSupervisor::start(
+            SpawnSpec { program: spec.program.clone(), args, env: environment, workspace: self.dir.clone(), low_priority: false },
+            events_tx,
+        )
+        .map_err(|error| format!("Could not start the Assistant: {error}"))?;
+        let generation = self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        *self.runtime_guard() = Some(Runtime { supervisor: supervisor.clone(), token });
+        let assistant = Arc::clone(self);
+        tokio::spawn(async move { assistant.event_loop(events_rx, generation).await });
+        crate::log(self.sessions.home(), "info", "assistant.runtime_started", json!({ "pid": supervisor.pid() }));
+
+        // Ready once it answers; then on the model the user chose, never another.
+        self.command(&supervisor, command::get_state(), START_TIMEOUT).await?;
+        launch.answered();
+        self.command(&supervisor, command::set_model(&model.provider, &model.id), COMMAND_TIMEOUT)
+            .await
+            .map_err(|error| format!("{} · {}: {error}", model.provider, model.id))?;
+        if let Some(level) = model.thinking.as_deref() {
+            self.command(&supervisor, command::set_thinking_level(level), COMMAND_TIMEOUT).await?;
+        }
+        if self.generation.load(std::sync::atomic::Ordering::SeqCst) == generation {
+            supervisor.set_probe_enabled(true);
+            self.set_phase(Phase::Idle, None);
+        }
+        Ok(())
+    }
+
+    /// One command and the runtime's answer; a refusal is its own words.
+    async fn command(&self, supervisor: &RuntimeSupervisor, value: Value, timeout: Duration) -> Result<Value, String> {
+        let id = format!("assistant-{}", crate::new_token().get(..12).unwrap_or("0"));
+        let kind = command::kind(&value).unwrap_or("command").to_string();
+        match supervisor.request(command::with_id(value, &id), timeout).await {
+            Ok(value) => Ok(value),
+            Err(crate::runtime::RequestError::Runtime(message)) => Err(message),
+            Err(crate::runtime::RequestError::Timeout) => Err(format!("The runtime did not answer {kind}")),
+            Err(crate::runtime::RequestError::Closed(_)) => Err(RUNTIME_ENDED.to_string()),
+        }
+    }
+
+    fn runtime_guard(&self) -> std::sync::MutexGuard<'_, Option<Runtime>> {
+        self.runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn supervisor(&self) -> Option<Arc<RuntimeSupervisor>> {
+        self.runtime_guard().as_ref().map(|runtime| runtime.supervisor.clone())
+    }
+
+    fn system_prompt(&self) -> String {
+        PROMPT.to_string()
+    }
+
+    /// What the runtime reports, until it ends.
+    async fn event_loop(self: Arc<Self>, mut events: mpsc::Receiver<RuntimeEvent>, generation: u64) {
+        let current = |assistant: &Assistant| assistant.generation.load(std::sync::atomic::Ordering::SeqCst) == generation;
+        let mut last_stderr = String::new();
+        let mut code = None;
+        while let Some(event) = events.recv().await {
+            if !current(&self) {
+                continue;
+            }
+            match event {
+                RuntimeEvent::Line(value) => self.handle_line(&value),
+                RuntimeEvent::Stderr(line) => {
+                    crate::log(self.sessions.home(), "debug", "assistant.stderr", json!({ "line": cut(&line, 2000) }));
+                    if telling(&line, &last_stderr) {
+                        last_stderr = cut(line.trim(), 500);
+                    }
+                }
+                RuntimeEvent::ParseError(_) | RuntimeEvent::IoError(_) => {}
+                RuntimeEvent::Exited(exit) => {
+                    code = exit;
+                    break;
+                }
+            }
+        }
+        if !current(&self) || self.state().phase == Phase::Off {
+            return;
+        }
+        let mut message = match code {
+            Some(code) => format!("{RUNTIME_ENDED} (exit code {code})"),
+            None => RUNTIME_ENDED.to_string(),
+        };
+        if !last_stderr.is_empty() {
+            message.push_str(&format!(": {last_stderr}"));
+        }
+        self.record("error", &message);
+        self.stop_process(Phase::Stopped, Some(message)).await;
+    }
+
+    fn handle_line(&self, value: &Value) {
+        match pi::classify(value) {
+            Record::MessageEnd if value["message"]["role"] == "assistant" => {
+                let message = &value["message"];
+                if message["stopReason"] == "error" {
+                    let error = message["errorMessage"].as_str().unwrap_or("The model call failed");
+                    self.record("error", error);
+                    return;
+                }
+                let text = pi::content_text(&message["content"]);
+                if !text.trim().is_empty() {
+                    self.record("assistant", text.trim());
+                }
+            }
+            Record::AgentSettled => {
+                if self.state().phase == Phase::Running {
+                    self.set_phase(Phase::Idle, None);
+                }
+            }
+            Record::ExtensionUiRequest => {
+                // Nobody sits at the Assistant's runtime to answer a dialog: a
+                // question is declined at once rather than left waiting.
+                let method = value["method"].as_str().unwrap_or("");
+                if matches!(method, "select" | "confirm" | "input" | "editor") {
+                    if let (Some(id), Some(supervisor)) = (value["id"].as_str(), self.supervisor()) {
+                        let _ = supervisor.enqueue(command::ui_cancelled(id));
+                    }
+                }
+                if method == "notify" {
+                    crate::log(self.sessions.home(), "info", "assistant.notice", json!({ "message": value["message"] }));
+                }
+            }
+            Record::ExtensionError | Record::Error => {
+                crate::log(self.sessions.home(), "warn", "assistant.runtime_error", json!({ "event": value }));
+            }
+            _ => {}
+        }
+    }
+
+    async fn stop_process(&self, phase: Phase, error: Option<String>) {
         self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(runtime) = self.runtime_guard().take() {
+            runtime.supervisor.terminate();
+        }
         self.set_phase(phase, error);
+    }
+
+    /// A call from the Assistant's runtime, through its extension. Only the
+    /// token made for the runtime now running opens it.
+    pub async fn bridge(&self, token: &str, name: &str, arguments: &Value) -> Result<Value, ApiError> {
+        let allowed = self.runtime_guard().as_ref().is_some_and(|runtime| same(&runtime.token, token));
+        if !allowed {
+            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", "Not the Assistant's runtime", false));
+        }
+        Ok(match self.run_tool(name, arguments).await {
+            Ok(result) => json!({ "ok": true, "result": result }),
+            Err(error) => json!({ "ok": false, "error": { "code": error.code, "message": error.message } }),
+        })
     }
 
     /// Delivers what is due whenever the Assistant is idle. Runs when
@@ -672,8 +723,32 @@ impl Assistant {
                     state.phase = Phase::Running;
                     state.turn
                 };
-                if !self.write(json!({ "type": "turn", "turnId": format!("t{turn}"), "text": text })).await {
-                    self.set_phase(Phase::Stopped, Some("The Assistant stopped".into()));
+                crate::log(self.sessions.home(), "info", "assistant.turn", json!({ "turn": turn }));
+                let assistant = Arc::clone(&self);
+                tokio::spawn(async move { assistant.deliver(text).await });
+            }
+        }
+    }
+
+    /// Hands one turn to the runtime. The run's end (agent_settled) makes the
+    /// Assistant idle again; a prompt the runtime refuses or handles without a
+    /// run does at once.
+    async fn deliver(self: Arc<Self>, text: String) {
+        let Some(supervisor) = self.supervisor() else {
+            self.set_phase(Phase::Stopped, Some("The Assistant stopped".into()));
+            return;
+        };
+        match self.command(&supervisor, command::prompt(&text, &[]), COMMAND_TIMEOUT).await {
+            Ok(value) if value.pointer("/data/disposition").and_then(Value::as_str) == Some("handled") => {
+                if self.state().phase == Phase::Running {
+                    self.set_phase(Phase::Idle, None);
+                }
+            }
+            Ok(_) => {}
+            Err(message) => {
+                self.record("error", &message);
+                if self.state().phase == Phase::Running {
+                    self.set_phase(Phase::Idle, Some(message));
                 }
             }
         }
@@ -783,14 +858,6 @@ impl Assistant {
             }
             "list_workflow_versions" => Ok(self.workflow().versions()),
             "restore_workflow" => self.workflow().restore(string(arguments, "version")?, CLIENT),
-            "skill_read" => {
-                let wanted = string(arguments, "name")?;
-                SKILLS
-                    .iter()
-                    .find(|(name, _)| *name == wanted)
-                    .map(|(_, text)| json!({ "skill": text }))
-                    .ok_or_else(|| ApiError::bad_request(format!("No skill named {wanted}")))
-            }
             "list_sessions" => Ok(self.list_sessions(arguments["limit"].as_u64().map(|limit| limit as usize))),
             "read_session" => {
                 let limit = arguments["limit"].as_u64().ok_or_else(|| ApiError::bad_request("limit is required"))?;
@@ -942,6 +1009,60 @@ impl Assistant {
     }
 }
 
+/// Whether a line of the runtime's error output says more about why it ended
+/// than `kept`: Node's own trailer and stack frames never do, and an error
+/// line is kept over the lines that follow it.
+fn telling(line: &str, kept: &str) -> bool {
+    let line = line.trim();
+    let noise = line.is_empty()
+        || line.starts_with("at ")
+        || line.starts_with("Node.js v")
+        || line.len() < 3
+        || line.starts_with("code:")
+        || line.starts_with("requireStack");
+    !noise && (line.contains("Error") || !kept.contains("Error"))
+}
+
+/// The files the Assistant's runtime is started with.
+struct Files {
+    prompt: PathBuf,
+    skills: Vec<PathBuf>,
+    extension: PathBuf,
+    tools: PathBuf,
+}
+
+/// Compares tokens without stopping at the first difference.
+fn same(expected: &str, presented: &str) -> bool {
+    expected.len() == presented.len()
+        && !expected.is_empty()
+        && expected.bytes().zip(presented.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+#[derive(Deserialize)]
+struct BridgeCall {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+/// The route the Assistant's runtime calls its tools on (`/v1/assistant/bridge`).
+/// It takes the runtime's own token only, never the host's or an agent's.
+pub fn bridge_router<S: Clone + Send + Sync + 'static>(assistant: Arc<Assistant>) -> Router<S> {
+    Router::new().route("/", post(bridge_call)).with_state(assistant)
+}
+
+async fn bridge_call(Extract(assistant): Extract<Arc<Assistant>>, headers: HeaderMap, Json(call): Json<BridgeCall>) -> Response {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
+    match assistant.bridge(token, &call.name, &call.arguments).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 fn string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, ApiError> {
     arguments[name]
         .as_str()
@@ -971,7 +1092,7 @@ fn wake_summary(entries: &[Value]) -> String {
 }
 
 /// Every tool the Assistant has: the task tools agents get over MCP, plus
-/// projects, memory, history, wakes and skills.
+/// projects, memory, history and wakes. Skills are jouzu's own (`--skill`).
 pub fn tool_definitions() -> Vec<Value> {
     let mut tools = mcp::task_tools();
     let name = json!({ "type": "string", "description": "kebab-case, a-z 0-9 -" });
@@ -997,7 +1118,6 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({ "name": "save_workflow", "description": "Replace the workflow definitions. Pass the revision get_workflow returned; a change since then is refused. The replaced version is kept and can be restored.", "inputSchema": { "type": "object", "properties": { "config": { "type": "object" }, "revision": { "type": "string" } }, "required": ["config", "revision"] } }),
         json!({ "name": "list_workflow_versions", "description": "Earlier workflow definitions kept on each save, oldest first.", "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "restore_workflow", "description": "Put an earlier workflow version back (the current one is kept).", "inputSchema": { "type": "object", "properties": { "version": { "type": "string" } }, "required": ["version"] } }),
-        json!({ "name": "skill_read", "description": "Load one of the skills listed in your instructions.", "inputSchema": { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] } }),
     ]);
     tools
 }
@@ -1021,8 +1141,6 @@ mod tests {
         assert_eq!(fixture.assistant.snapshot().await["enabled"], false);
     }
 
-    use crate::session::RuntimeSpec;
-
     struct Fixture {
         assistant: Arc<Assistant>,
         tasks: Arc<TaskManager>,
@@ -1035,16 +1153,8 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
     }
 
-    fn node() -> PathBuf {
-        which("node").expect("node on PATH")
-    }
-
-    fn which(name: &str) -> Option<PathBuf> {
-        std::env::split_paths(&std::env::var_os("PATH")?)
-            .map(|dir| dir.join(if cfg!(windows) { format!("{name}.exe") } else { name.to_string() }))
-            .find(|path| path.is_file())
-    }
-
+    /// The Assistant on a stand-in runtime (fake-assistant.mjs) that loads the
+    /// real jouzu-assistant extension, with the bridge served as the host serves it.
     fn setup() -> Fixture {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -1057,19 +1167,43 @@ mod tests {
             None,
         ));
         sessions.add_workspaces(&[workspace.path().to_string_lossy().into_owned()]).unwrap();
+        // The models tasks may name are the warm runtime's.
+        sessions.enable_warm_runtime();
         let tasks = TaskManager::new(sessions.clone());
         let projects = ProjectStore::new(sessions.clone(), tasks.clone());
-        // The fake writes it in its working folder, the Assistant's agent folder.
-        let log = home.path().join("assistant").join("agent").join("turns.log");
-        let paths = AssistantPaths {
-            node: Some(node()),
-            sdk: home.path().join("sdk"),
-            runtime_agent: home.path().join("agent"),
-            script: Some(fixtures().join("fake-assistant.mjs")),
-            faux: Some(json!([])),
-        };
+        // The stand-in writes it in its working folder, the Assistant's folder.
+        let log = home.path().join("assistant").join("turns.log");
+        let paths = AssistantPaths { runtime: Some(RuntimeSpec::node_script(&fixtures().join("fake-assistant.mjs"))) };
         let assistant = Assistant::new(home.path(), paths, sessions, tasks.clone(), projects);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assistant.set_port(listener.local_addr().unwrap().port());
+        let router = Router::new().nest("/v1/assistant/bridge", bridge_router(assistant.clone()));
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let _ = axum::serve(listener, router).await;
+        });
         Fixture { assistant, tasks, workspace, log, _home: home }
+    }
+
+    async fn until_async<F: std::future::Future<Output = bool>>(mut check: impl FnMut() -> F) {
+        for _ in 0..200 {
+            if check().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("condition was not reached");
+    }
+
+    fn errors(assistant: &Assistant) -> Vec<String> {
+        assistant.messages(500)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["kind"] == "error")
+            .filter_map(|row| row["text"].as_str().map(str::to_string))
+            .collect()
     }
 
     async fn until(mut check: impl FnMut() -> bool) {
@@ -1140,6 +1274,7 @@ mod tests {
         let id = said["id"].as_str().unwrap().to_string();
         let reply = assistant.record("assistant", "On it.");
         let folder = fixture.workspace.path().to_string_lossy().into_owned();
+        until_async(|| async { matches!(assistant.sessions.runtime_models().await, Some(Ok(_))) }).await;
 
         // Only the person's messages are kept as what they asked.
         let refused = assistant
@@ -1153,7 +1288,7 @@ mod tests {
 
         // A task gets the brief alone: nothing is added to it.
         let task = assistant
-            .run_tool("start_task", &json!({ "workspace": folder, "text": "Find why login fails on Safari only." }))
+            .run_tool("start_task", &json!({ "workspace": folder, "text": "Find why login fails on Safari only.", "model": { "provider": "fixture", "id": "model" } }))
             .await
             .unwrap();
         let task_id = task["taskId"].as_str().unwrap().to_string();
@@ -1229,6 +1364,7 @@ mod tests {
         fixture.assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
         fixture.assistant.send("exit").await.unwrap();
         until(|| fixture.assistant.state().phase == Phase::Stopped).await;
+        assert!(errors(&fixture.assistant).iter().any(|error| error.contains("asked to exit")), "the reason is shown");
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(fixture.assistant.state().phase, Phase::Stopped);
         fixture.assistant.send("again").await.unwrap();
@@ -1264,68 +1400,86 @@ mod tests {
         assert_eq!(assistant.memory_index_text(), "");
     }
 
-    /// The real bridge script on the real SDK, with a scripted model. Needs the
-    /// SDK installed: JOUZU_ASSISTANT_SDK=<folder with node_modules> cargo test -- --ignored
     #[tokio::test]
-    #[ignore]
-    async fn the_real_bridge_runs_host_tools_on_the_pinned_sdk() {
-        let sdk = PathBuf::from(std::env::var("JOUZU_ASSISTANT_SDK").expect("JOUZU_ASSISTANT_SDK"));
+    async fn it_is_a_jouzu_session_with_its_own_configuration() {
         let fixture = setup();
-        let paths = AssistantPaths {
-            node: Some(node()),
-            sdk,
-            runtime_agent: fixture._home.path().join("agent"),
-            script: None,
-            faux: Some(json!([{ "tool": "list_workspaces" }, { "text": "One folder." }])),
-        };
-        let real = Assistant::new(
-            fixture._home.path(),
-            paths,
-            fixture.assistant.sessions.clone(),
-            fixture.tasks.clone(),
-            fixture.assistant.projects.clone(),
-        );
-        // The installed SDK is the pinned one.
-        assert!(real.sdk_installed());
-        real.launch();
-        real.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
-        real.send("which folders?").await.unwrap();
-        until(|| replies(&real).iter().any(|reply| reply == "One folder.")).await;
-    }
-
-    /// Installs the pinned SDK with npm (network). cargo test -- --ignored
-    #[tokio::test]
-    #[ignore]
-    async fn installs_the_pinned_sdk_with_the_bundled_npm() {
-        let fixture = setup();
-        let mut paths = Assistant::default_paths(fixture._home.path(), &fixture.assistant.sessions);
-        paths.node = Some(node());
-        let assistant = Assistant::new(
-            fixture._home.path(),
-            paths,
-            fixture.assistant.sessions.clone(),
-            fixture.tasks.clone(),
-            fixture.assistant.projects.clone(),
-        );
-        assert!(!assistant.sdk_installed());
-        assistant.install_sdk(&node()).await.unwrap();
-        assert!(assistant.sdk_installed());
-    }
-
-    #[tokio::test]
-    async fn skills_are_listed_in_the_prompt_and_load_by_name() {
-        let fixture = setup();
-        let prompt = fixture.assistant.system_prompt();
+        fixture.assistant.launch();
+        fixture.assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
+        until(|| fixture.assistant.state().phase == Phase::Idle).await;
+        let dir = fixture._home.path().join("assistant");
+        let started: Value = serde_json::from_slice(&std::fs::read(dir.join("args.json")).unwrap()).unwrap();
+        let argv: Vec<String> = serde_json::from_value(started["argv"].clone()).unwrap();
+        let after = |flag: &str| argv.iter().position(|arg| arg == flag).map(|index| argv[index + 1].clone());
+        // The sessions' environment, Flow off, and a token for this runtime.
+        assert_eq!(started["home"], fixture._home.path().join("data").to_string_lossy().as_ref());
+        assert_eq!(started["flow"], "0");
+        assert_eq!(started["token"], true);
+        // Its own prompt, session, skills; nothing the coder discovers.
+        // jouzu's own options come first, before Pi's.
+        assert_eq!(argv[0], "--jouzu-textguard-off", "{argv:?}");
+        for flag in ["--no-extensions", "--no-skills", "--no-context-files", "--no-mcp", "--no-prompt-templates"] {
+            assert!(argv.iter().any(|arg| arg == flag), "{flag}: {argv:?}");
+        }
+        assert_eq!(after("--session-id").as_deref(), Some(SESSION_ID));
+        assert_eq!(std::fs::read_to_string(after("--system-prompt").unwrap()).unwrap(), PROMPT);
+        assert_eq!(argv.iter().filter(|arg| *arg == "--skill").count(), SKILLS.len());
         for (name, text) in SKILLS {
             // Line by line: a Windows checkout may have CRLF endings.
             let mut lines = text.lines();
             assert_eq!(lines.next(), Some("---"), "{name} starts with a header");
             assert_eq!(lines.next(), Some(format!("name: {name}").as_str()), "{name} has a matching header");
-            assert!(prompt.contains(&format!("- {name}: ")), "{name} is listed");
+            assert_eq!(std::fs::read_to_string(dir.join("skills").join(name).join("SKILL.md")).unwrap(), *text);
         }
-        let skill = fixture.assistant.run_tool("skill_read", &json!({ "name": "draw-task-views" })).await.unwrap();
-        assert!(skill["skill"].as_str().unwrap().contains("jouzu-view"));
-        assert!(fixture.assistant.run_tool("skill_read", &json!({ "name": "nope" })).await.is_err());
+        // Only its tools and reading: nothing that writes files or runs commands.
+        let tools: Vec<String> = after("--tools").unwrap().split(',').map(str::to_string).collect();
+        let mut expected: Vec<String> = tool_definitions().iter().filter_map(|tool| tool["name"].as_str().map(str::to_string)).collect();
+        expected.extend(READ_TOOLS.iter().map(|tool| tool.to_string()));
+        assert_eq!(tools, expected);
+        for coder in ["bash", "write", "edit", "powershell", "agent", "subagent", "background", "skill_read"] {
+            assert!(!tools.iter().any(|tool| tool == coder), "{coder}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_the_runtime_refuses_stops_it_with_the_runtimes_words() {
+        let fixture = setup();
+        fixture.assistant.launch();
+        let missing = ModelPick { id: "missing".into(), ..faux_pick() };
+        fixture.assistant.update(Some(true), Some(Some(missing))).await.unwrap();
+        until(|| fixture.assistant.state().phase == Phase::Stopped).await;
+        let error = fixture.assistant.snapshot().await["error"].as_str().unwrap_or("").to_string();
+        assert!(error.contains("Model not found: missing"), "{error}");
+        // Never another model in its place.
+        assert!(replies(&fixture.assistant).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_model_call_is_shown_and_the_assistant_stays_ready() {
+        let fixture = setup();
+        fixture.assistant.launch();
+        fixture.assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
+        fixture.assistant.send("fail quota exceeded").await.unwrap();
+        until(|| errors(&fixture.assistant).iter().any(|error| error == "quota exceeded")).await;
+        until(|| fixture.assistant.state().phase == Phase::Idle).await;
+        fixture.assistant.send("next").await.unwrap();
+        until(|| replies(&fixture.assistant).iter().any(|reply| reply == "ok: next")).await;
+    }
+
+    #[tokio::test]
+    async fn the_bridge_opens_only_for_the_running_assistant() {
+        let fixture = setup();
+        let assistant = &fixture.assistant;
+        // Nothing running: no token opens it.
+        assert_eq!(assistant.bridge("", "list_workspaces", &json!({})).await.unwrap_err().code, "unauthorized");
+        assistant.launch();
+        assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
+        until(|| assistant.state().phase == Phase::Idle).await;
+        let token = assistant.runtime_guard().as_ref().unwrap().token.clone();
+        assert!(assistant.bridge(&token, "list_workspaces", &json!({})).await.unwrap()["ok"] == true);
+        assert_eq!(assistant.bridge(&"0".repeat(token.len()), "list_workspaces", &json!({})).await.unwrap_err().code, "unauthorized");
+        // A stopped runtime's token opens nothing.
+        assistant.update(Some(false), None).await.unwrap();
+        assert_eq!(assistant.bridge(&token, "list_workspaces", &json!({})).await.unwrap_err().code, "unauthorized");
     }
 
     #[test]

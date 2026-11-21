@@ -457,6 +457,34 @@ fn string_arg<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, ApiError>
         .ok_or_else(|| ApiError::bad_request(format!("{name} is required")))
 }
 
+fn model_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "properties": { "provider": { "type": "string" }, "id": { "type": "string" } },
+        "required": ["provider", "id"],
+    })
+}
+
+/// A model the runtime offers; any other is refused, never swapped for another.
+async fn offered(sessions: &SessionManager, model: &Value) -> Result<(), ApiError> {
+    let listed = sessions.runtime_models().await.unwrap_or_else(|| {
+        Err(ApiError::unavailable("The runtime has not listed its models yet. Try again shortly."))
+    })?;
+    let offered = listed["models"].as_array().is_some_and(|models| {
+        models.iter().any(|item| item["provider"] == model["provider"] && item["id"] == model["id"])
+    });
+    if offered {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "No model {}/{} is available; list_models shows the ones that are",
+            model["provider"].as_str().unwrap_or("?"),
+            model["id"].as_str().unwrap_or("?")
+        )))
+    }
+}
+
 /// The task tools, as MCP lists them. The Assistant gets the same ones.
 pub(crate) fn task_tools() -> Vec<Value> {
     let task_id = json!({ "type": "string", "description": "The taskId start_task returned." });
@@ -474,14 +502,9 @@ pub(crate) fn task_tools() -> Vec<Value> {
                 "properties": {
                     "workspace": { "type": "string", "description": "A folder path from list_workspaces (or inside one)." },
                     "text": { "type": "string", "description": "What the task should do. Slash commands are not allowed." },
-                    "model": {
-                        "type": "object",
-                        "description": "Optional: run the task on this model (from list_models). Default: the user's default model.",
-                        "properties": { "provider": { "type": "string" }, "id": { "type": "string" } },
-                        "required": ["provider", "id"],
-                    },
+                    "model": model_schema("The model the task runs on, from list_models. Always chosen explicitly: there is no default."),
                 },
-                "required": ["workspace", "text"],
+                "required": ["workspace", "text", "model"],
             },
         }),
         json!({
@@ -491,10 +514,14 @@ pub(crate) fn task_tools() -> Vec<Value> {
         }),
         json!({
             "name": "send_task",
-            "description": "Send a follow-up message to a task. Returns at once.",
+            "description": "Send a follow-up message to a task. Returns at once. With model, the task switches to that model first (for example after its model failed and the user chose another).",
             "inputSchema": {
                 "type": "object",
-                "properties": { "taskId": task_id, "text": { "type": "string" } },
+                "properties": {
+                    "taskId": task_id,
+                    "text": { "type": "string" },
+                    "model": model_schema("Optional: switch the task to this model (from list_models) before sending."),
+                },
                 "required": ["taskId", "text"],
             },
         }),
@@ -601,25 +628,14 @@ pub(crate) async fn call_task_tool(
                     ));
                 }
             }
-            let model = arguments.get("model").filter(|model| !model.is_null()).cloned();
-            if let Some(model) = &model {
-                // A model the runtime does not offer is refused, never swapped
-                // for the default without a word.
-                let listed = sessions.runtime_models().await.unwrap_or_else(|| {
-                    Err(ApiError::unavailable("The runtime has not listed its models yet. Try again shortly."))
-                })?;
-                let offered = listed["models"].as_array().is_some_and(|models| {
-                    models.iter().any(|item| item["provider"] == model["provider"] && item["id"] == model["id"])
-                });
-                if !offered {
-                    return Err(ApiError::bad_request(format!(
-                        "No model {}/{} is available; list_models shows the ones that are",
-                        model["provider"].as_str().unwrap_or("?"),
-                        model["id"].as_str().unwrap_or("?")
-                    )));
-                }
-            }
-            tasks.start_with(id, workspace, string_arg(arguments, "text")?, model)
+            // Every task runs on a model its client chose: none falls back to a default.
+            let model = arguments
+                .get("model")
+                .filter(|model| !model.is_null())
+                .cloned()
+                .ok_or_else(|| ApiError::bad_request("model is required: choose one from list_models"))?;
+            offered(sessions, &model).await?;
+            tasks.start_with(id, workspace, string_arg(arguments, "text")?, Some(model))
         }
         "list_models" => {
             let answer = sessions.runtime_models().await.unwrap_or_else(|| {
@@ -642,7 +658,13 @@ pub(crate) async fn call_task_tool(
                 .unwrap_or_default();
             Ok(json!({ "models": models }))
         }
-        "send_task" => tasks.send(id, string_arg(arguments, "taskId")?, string_arg(arguments, "text")?),
+        "send_task" => match arguments.get("model").filter(|model| !model.is_null()) {
+            Some(model) => {
+                offered(sessions, model).await?;
+                tasks.send_on(id, string_arg(arguments, "taskId")?, string_arg(arguments, "text")?, model).await
+            }
+            None => tasks.send(id, string_arg(arguments, "taskId")?, string_arg(arguments, "text")?),
+        },
         "stop_task" => tasks.stop(id, string_arg(arguments, "taskId")?),
         "get_task" => tasks.get(id, string_arg(arguments, "taskId")?),
         "list_tasks" => tasks.list(id),
@@ -692,8 +714,21 @@ mod tests {
             None,
         ));
         sessions.add_workspaces(&[workspace.path().to_string_lossy().into_owned()]).unwrap();
+        // The models tasks may name are the warm runtime's.
+        sessions.enable_warm_runtime();
         let tasks = TaskManager::new(sessions.clone());
         (McpServer::new(home.path(), "9.9.9", tasks, sessions), home, workspace)
+    }
+
+    /// Waits until the runtime has listed the models a task may name.
+    async fn models_listed(server: &Arc<McpServer>) {
+        for _ in 0..200 {
+            if matches!(server.sessions.runtime_models().await, Some(Ok(_))) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the runtime never listed its models");
     }
 
     async fn rpc(server: &Arc<McpServer>, token: &str, body: Value) -> (StatusCode, Value) {
@@ -754,8 +789,15 @@ mod tests {
             "{folders}"
         );
 
-        let started = call(&server, &token, "start_task", json!({ "workspace": workspace.path(), "text": "hello" })).await;
+        models_listed(&server).await;
+        // Every task names its model: none falls back to a default.
+        let unnamed = call(&server, &token, "start_task", json!({ "workspace": workspace.path(), "text": "hello" })).await;
+        assert_eq!(unnamed["isError"], true, "{unnamed}");
+        assert!(unnamed["structuredContent"]["error"]["message"].as_str().unwrap().contains("list_models"), "{unnamed}");
+        let model = json!({ "provider": "fixture", "id": "model" });
+        let started = call(&server, &token, "start_task", json!({ "workspace": workspace.path(), "text": "hello", "model": model })).await;
         assert_eq!(started["isError"], false, "{started}");
+        assert_eq!(started["structuredContent"]["model"], model, "{started}");
         let task_id = started["structuredContent"]["taskId"].as_str().unwrap().to_string();
         let mut finished = false;
         let mut after = 0;
@@ -781,7 +823,8 @@ mod tests {
     async fn refused_calls_are_results_the_agent_can_read() {
         let (server, _home, workspace) = setup();
         let token = server.create_client("agent").unwrap()["token"].as_str().unwrap().to_string();
-        let slash = call(&server, &token, "start_task", json!({ "workspace": workspace.path(), "text": "/textguard off" })).await;
+        models_listed(&server).await;
+        let slash = call(&server, &token, "start_task", json!({ "workspace": workspace.path(), "text": "/textguard off", "model": { "provider": "fixture", "id": "model" } })).await;
         assert_eq!(slash["isError"], true);
         assert_eq!(slash["structuredContent"]["error"]["code"], "command-not-allowed");
         // A model nobody offers is refused, not swapped for the default.

@@ -1,54 +1,96 @@
-// A stand-in for packaging/desktop/assistant/assistant.mjs in host tests:
-// same protocol, no SDK, no model. Turns:
-//   "[wake]..."       -> read_inbox, ack_inbox(highest seq), reply "handled N"
+// A stand-in for the jouzu runtime the Assistant runs on, in host tests. It
+// speaks the pi RPC wire (get_state, set_model, set_thinking_level, prompt,
+// abort) and loads the extension it is given with --extension (the real
+// jouzu-assistant), the way the runtime would, through a minimal `pi`; tool
+// calls go through that extension to the host's bridge. No model. Turns:
+//   "[wake]..."          -> read_inbox, ack_inbox(highest seq), reply "handled N"
 //   "tool <name> <json>" -> call that tool, reply with its result
-//   "exit"            -> the process ends
-//   anything else     -> reply "ok: <text>"
+//   "fail <text>"        -> the model call fails with that text
+//   "exit"               -> the process ends
+//   anything else        -> reply "ok: <text>"
 // A user message's "[user message mN]" first line is read past, as a model would.
-// turns.log in the working folder: each turn's text, one JSON line each.
-import { appendFileSync } from "node:fs";
+// In its working folder: turns.log (each turn's text, one JSON line each) and
+// args.json (the arguments and Assistant variables it started with).
+import { appendFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { createInterface } from "node:readline";
 
-const send = value => process.stdout.write(`${JSON.stringify(value)}\n`);
-const lines = createInterface({ input: process.stdin });
-const pending = new Map();
-let next = 0;
-let turns = Promise.resolve();
-const call = (name, args) => new Promise(resolve => {
-  const callId = `c${++next}`;
-  pending.set(callId, resolve);
-  send({ type: "tool", callId, name, arguments: args });
-});
+const argv = process.argv.slice(2);
+const value = name => { const index = argv.indexOf(name); return index >= 0 ? argv[index + 1] : undefined; };
+writeFileSync("args.json", JSON.stringify({
+  argv,
+  flow: process.env.JOUZU_FLOW_CONTROL ?? null,
+  home: process.env.JOUZU_HOME ?? null,
+  token: Boolean(process.env.JOUZU_ASSISTANT_TOKEN),
+}));
+const tools = new Map();
+const extension = value("--extension");
+if (extension) {
+  const module = await import(pathToFileURL(join(extension, "index.js")).href);
+  module.default({ registerTool: tool => tools.set(tool.name, tool), on: () => {} });
+}
+const allowed = new Set((value("--tools") ?? "").split(",").filter(Boolean));
 
-async function turn({ turnId, text: raw }) {
-  appendFileSync("turns.log", `${JSON.stringify(raw)}\n`);
-  // A user message comes with its id first ("[user message m3]"), for quoting.
-  const header = /^\[user message (m\d+)\]\n/u.exec(raw);
-  const text = header ? raw.slice(header[0].length) : raw;
-  let reply;
-  if (text.startsWith("[wake]")) {
-    const inbox = await call("read_inbox", {});
-    const entries = inbox.result.entries ?? [];
-    const seq = Math.max(0, ...entries.map(entry => entry.seq));
-    await call("ack_inbox", { seq });
-    reply = `handled ${entries.length}`;
-  } else if (text.startsWith("tool ")) {
-    const [, name, ...rest] = text.split("\n")[0].split(" ");
-    const answer = await call(name, rest.length ? JSON.parse(rest.join(" ")) : {});
-    reply = JSON.stringify(answer);
-  } else if (text.startsWith("exit")) {
-    process.exit(3);
-  } else {
-    reply = `ok: ${text.split("\n")[0]}`;
-  }
-  send({ type: "reply", turnId, text: reply });
-  send({ type: "turn_end", turnId, stopReason: "stop" });
+const out = record => process.stdout.write(`${JSON.stringify(record)}\n`);
+const respond = (id, command, data) => out({ id, type: "response", command, success: true, data });
+const refuse = (id, command, error) => out({ id, type: "response", command, success: false, error });
+let model = null;
+let turns = Promise.resolve();
+
+async function call(name, args) {
+  const tool = tools.get(name);
+  if (!tool || !allowed.has(name)) return { error: `Tool ${name} not found` };
+  const result = await tool.execute("call", args, undefined);
+  return { ok: result.isError !== true, result: JSON.parse(result.content[0].text) };
 }
 
-lines.on("line", line => {
-  const message = JSON.parse(line);
-  if (message.type === "start") send({ type: "ready", tools: message.tools.map(tool => tool.name) });
-  if (message.type === "turn") turns = turns.then(() => turn(message));
-  if (message.type === "tool_result") { pending.get(message.callId)?.(message); pending.delete(message.callId); }
-});
-lines.on("close", () => process.exit(0));
+function say(text, extra = {}) {
+  const message = { role: "assistant", content: [{ type: "text", text }], stopReason: "stop", ...extra };
+  out({ type: "message_start", message });
+  out({ type: "message_end", message });
+}
+
+async function turn(raw) {
+  appendFileSync("turns.log", `${JSON.stringify(raw)}\n`);
+  out({ type: "agent_start" });
+  const header = /^\[user message (m\d+)\]\n/u.exec(raw);
+  const text = header ? raw.slice(header[0].length) : raw;
+  if (text.startsWith("[wake]")) {
+    const inbox = await call("read_inbox", {});
+    const entries = inbox.result?.entries ?? [];
+    const seq = Math.max(0, ...entries.map(entry => entry.seq));
+    await call("ack_inbox", { seq });
+    say(`handled ${entries.length}`);
+  } else if (text.startsWith("tool ")) {
+    const [, name, ...rest] = text.split("\n")[0].split(" ");
+    say(JSON.stringify(await call(name, rest.length ? JSON.parse(rest.join(" ")) : {})));
+  } else if (text.startsWith("fail ")) {
+    say("", { stopReason: "error", errorMessage: text.slice(5).split("\n")[0] });
+  } else if (text.startsWith("exit")) {
+    process.stderr.write("fake runtime: asked to exit\n");
+    process.exit(3);
+  } else {
+    say(`ok: ${text.split("\n")[0]}`);
+  }
+  out({ type: "agent_settled", aborted: false });
+}
+
+createInterface({ input: process.stdin }).on("line", line => {
+  const command = JSON.parse(line);
+  switch (command.type) {
+    case "get_state": respond(command.id, "get_state", { sessionId: value("--session-id"), isStreaming: false, model }); break;
+    case "set_model":
+      if (command.modelId === "missing") { refuse(command.id, "set_model", "Model not found: missing"); break; }
+      model = { provider: command.provider, id: command.modelId };
+      respond(command.id, "set_model", model);
+      break;
+    case "set_thinking_level": respond(command.id, "set_thinking_level"); break;
+    case "prompt":
+      respond(command.id, "prompt");
+      turns = turns.then(() => turn(String(command.message ?? "")));
+      break;
+    case "abort": respond(command.id, "abort"); break;
+    default: refuse(command.id, String(command.type), "unsupported command");
+  }
+}).on("close", () => process.exit(0));

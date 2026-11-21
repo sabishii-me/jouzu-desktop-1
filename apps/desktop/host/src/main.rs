@@ -226,6 +226,7 @@ async fn main() -> ExitCode {
     // Agents reach Desktop here once the user turned it on (Collaboration).
     state.mcp.reconcile().await;
     // The Assistant (experimental) starts if the user turned it on.
+    state.assistant.set_port(port);
     state.assistant.launch();
     // Tasks that waited for a free slot when the host stopped start now.
     state.tasks.resume();

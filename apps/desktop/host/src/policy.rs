@@ -58,8 +58,8 @@ pub fn authorize(
 /// Why a process is started; the sandbox will give each its own profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Launch {
+    /// A jouzu runtime: every session's, and the Assistant's (a jouzu session too).
     Runtime,
-    Assistant,
 }
 
 /// Applies the launch profile for `purpose` to a command before it spawns.
