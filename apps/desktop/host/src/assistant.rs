@@ -68,8 +68,6 @@ const SESSION_ID: &str = "assistant";
 /// reported by the event loop.
 const RUNTIME_ENDED: &str = "The Assistant's runtime ended";
 /// How long a starting runtime may take to answer (Node and extensions loading).
-const START_TIMEOUT: Duration = Duration::from_secs(180);
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const PROMPT: &str = include_str!("../../../../packaging/desktop/assistant/prompt.md");
 pub const SKILLS: &[(&str, &str)] = &[
     ("write-a-brief", include_str!("../../../../packaging/desktop/assistant/skills/write-a-brief.md")),
@@ -554,13 +552,13 @@ impl Assistant {
         crate::log(self.sessions.home(), "info", "assistant.runtime_started", json!({ "pid": supervisor.pid() }));
 
         // Ready once it answers; then on the model the user chose, never another.
-        self.command(&supervisor, command::get_state(), START_TIMEOUT).await?;
+        self.command(&supervisor, command::get_state()).await?;
         launch.answered();
-        self.command(&supervisor, command::set_model(&model.provider, &model.id), COMMAND_TIMEOUT)
+        self.command(&supervisor, command::set_model(&model.provider, &model.id))
             .await
             .map_err(|error| format!("{} · {}: {error}", model.provider, model.id))?;
         if let Some(level) = model.thinking.as_deref() {
-            self.command(&supervisor, command::set_thinking_level(level), COMMAND_TIMEOUT).await?;
+            self.command(&supervisor, command::set_thinking_level(level)).await?;
         }
         if self.generation.load(std::sync::atomic::Ordering::SeqCst) == generation {
             supervisor.set_probe_enabled(true);
@@ -570,10 +568,12 @@ impl Assistant {
     }
 
     /// One command and the runtime's answer; a refusal is its own words.
-    async fn command(&self, supervisor: &RuntimeSupervisor, value: Value, timeout: Duration) -> Result<Value, String> {
+    /// A command, answered by the runtime or ended by it exiting: the host sets
+    /// no deadline of its own (D1).
+    async fn command(&self, supervisor: &RuntimeSupervisor, value: Value) -> Result<Value, String> {
         let id = format!("assistant-{}", crate::new_token().get(..12).unwrap_or("0"));
         let kind = command::kind(&value).unwrap_or("command").to_string();
-        match supervisor.request(command::with_id(value, &id), timeout).await {
+        match supervisor.answer(command::with_id(value, &id)).await {
             Ok(value) => Ok(value),
             Err(crate::runtime::RequestError::Runtime(message)) => Err(message),
             Err(crate::runtime::RequestError::Timeout) => Err(format!("The runtime did not answer {kind}")),
@@ -738,7 +738,7 @@ impl Assistant {
             self.set_phase(Phase::Stopped, Some("The Assistant stopped".into()));
             return;
         };
-        match self.command(&supervisor, command::prompt(&text, &[]), COMMAND_TIMEOUT).await {
+        match self.command(&supervisor, command::prompt(&text, &[])).await {
             Ok(value) if value.pointer("/data/disposition").and_then(Value::as_str) == Some("handled") => {
                 if self.state().phase == Phase::Running {
                     self.set_phase(Phase::Idle, None);

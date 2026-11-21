@@ -149,6 +149,20 @@ impl RuntimeSupervisor {
         value: Value,
         timeout: Duration,
     ) -> Result<Value, RequestError> {
+        self.send_request(value, Some(timeout)).await
+    }
+
+    /// Waits for the runtime's own answer, with no timer of the host's: the
+    /// request ends when the runtime answers, exits or is stopped.
+    pub async fn answer(&self, value: Value) -> Result<Value, RequestError> {
+        self.send_request(value, None).await
+    }
+
+    async fn send_request(
+        &self,
+        value: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, RequestError> {
         let id = value
             .get("id")
             .and_then(Value::as_str)
@@ -166,7 +180,11 @@ impl RuntimeSupervisor {
                 .remove(&id);
             return Err(RequestError::Closed("runtime queue is full".to_string()));
         }
-        match tokio::time::timeout(timeout, rx).await {
+        let answered = match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, rx).await,
+            None => Ok(rx.await),
+        };
+        match answered {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(message))) => Err(RequestError::Runtime(message)),
             Ok(Err(_)) => Err(RequestError::Closed(
