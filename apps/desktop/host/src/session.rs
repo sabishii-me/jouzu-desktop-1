@@ -43,8 +43,7 @@ fn session_header_id(session_path: &str) -> Option<String> {
 
 fn session_header_cwd(session_path: &str) -> Option<String> {
     let header = session_header(session_path)?;
-    let cwd = header.get("cwd").and_then(Value::as_str)?.to_string();
-    Path::new(&cwd).is_dir().then_some(cwd)
+    Some(header.get("cwd").and_then(Value::as_str)?.to_string())
 }
 
 /// The messages a saved session file holds, in the order they were written.
@@ -7117,6 +7116,20 @@ impl SessionManager {
             }
             cache.clone().unwrap_or_default()
         };
+        // Whether each session's folder is still there is read now, not when the
+        // index was built: a folder deleted or moved since then makes the session
+        // readable but not runnable, and the list says so (#174).
+        let entries: Vec<Value> = entries
+            .into_iter()
+            .map(|mut entry| {
+                let missing = entry
+                    .get("workspacePath")
+                    .and_then(Value::as_str)
+                    .is_some_and(|folder| !Path::new(folder).is_dir());
+                entry["folderMissing"] = Value::Bool(missing);
+                entry
+            })
+            .collect();
         let Some(wanted) = workspace else {
             return entries;
         };
@@ -7312,11 +7325,18 @@ impl SessionManager {
     ) -> Result<Arc<Session>, ApiError> {
         // A saved conversation belongs to the folder its file names, whatever
         // folder the client happens to be showing: the runtime works there and
-        // the sidebar must file it there.
-        let workspace = session_path
-            .as_deref()
-            .and_then(session_header_cwd)
-            .unwrap_or_else(|| workspace.to_string());
+        // the sidebar must file it there. When that folder is gone the session
+        // cannot run anywhere else, so it is refused, never moved (#174).
+        let saved_folder = session_path.as_deref().and_then(session_header_cwd);
+        if let Some(folder) = saved_folder.as_deref().filter(|folder| !Path::new(folder).is_dir()) {
+            return Err(ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "session-folder-missing",
+                format!("The session's folder no longer exists: {folder}"),
+                false,
+            ));
+        }
+        let workspace = saved_folder.unwrap_or_else(|| workspace.to_string());
         let workspace = std::fs::canonicalize(&workspace)
             .map_err(|_| ApiError::bad_request("workspacePath is unavailable"))?;
         if !workspace.is_dir() {

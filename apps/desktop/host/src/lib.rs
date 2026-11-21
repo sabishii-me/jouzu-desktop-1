@@ -4369,6 +4369,70 @@ mod session_tests {
         assert!(listed.iter().any(|entry| entry["sessionPath"].as_str().is_some_and(|path| path.ends_with("cut.jsonl"))), "{listed:?}");
     }
 
+    /// A saved session whose folder was deleted (#174) stays in its own folder:
+    /// the list says the folder is missing, its history can be read, and opening
+    /// it is refused instead of starting a runtime in the folder the client shows.
+    #[tokio::test]
+    async fn a_saved_session_whose_folder_is_gone_is_refused_and_keeps_its_folder() {
+        let (manager, _home, workspace) = manager(50);
+        let gone = tempfile::tempdir().unwrap();
+        let folder = gone.path().join("ui-test");
+        std::fs::create_dir_all(&folder).unwrap();
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let header = json!({ "type": "session", "version": 3, "id": "gone", "timestamp": "2026-01-01T00:00:00Z", "cwd": folder.to_string_lossy() });
+        let user = json!({ "type": "message", "message": { "role": "user", "content": "remember this" } });
+        let file = directory.join("gone.jsonl");
+        std::fs::write(&file, format!("{header}\n{user}\n")).unwrap();
+        let app = app(manager.clone());
+        let listed: Value = serde_json::from_str(
+            &call(app.clone(), request(Method::GET, "/v1/sessions/persisted").body(Body::empty()).unwrap()).await.2,
+        )
+        .unwrap();
+        assert_eq!(listed["sessions"][0]["folderMissing"], false, "{listed}");
+
+        std::fs::remove_dir_all(&folder).unwrap();
+        // Read from the cached index: the folder is checked when listed.
+        let listed: Value = serde_json::from_str(
+            &call(app.clone(), request(Method::GET, "/v1/sessions/persisted").body(Body::empty()).unwrap()).await.2,
+        )
+        .unwrap();
+        let entry = &listed["sessions"][0];
+        assert_eq!(entry["folderMissing"], true, "{listed}");
+        assert_eq!(entry["workspacePath"], json!(crate::session::canonical_path(&folder.to_string_lossy())), "{listed}");
+
+        let opened = call(
+            app.clone(),
+            request(Method::POST, "/v1/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "workspacePath": workspace.path(), "sessionPath": file, "clientId": "window" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(opened.0, StatusCode::CONFLICT, "{}", opened.2);
+        assert!(opened.2.contains("session-folder-missing"), "{}", opened.2);
+        // Nothing was started for it, in any folder.
+        let live: Value = serde_json::from_str(
+            &call(app.clone(), request(Method::GET, "/v1/sessions").body(Body::empty()).unwrap()).await.2,
+        )
+        .unwrap();
+        assert_eq!(live["sessions"].as_array().map(Vec::len), Some(0), "{live}");
+        // Its history is still there to read.
+        let query = format!("/v1/sessions/history?sessionPath={}", urlencoding_path(&file));
+        let history = call(app, request(Method::GET, &query).body(Body::empty()).unwrap()).await;
+        assert!(history.2.contains("remember this"), "{}", history.2);
+        manager.stop_all();
+    }
+
+    fn urlencoding_path(path: &std::path::Path) -> String {
+        path.to_string_lossy().bytes().map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (byte as char).to_string(),
+            other => format!("%{other:02X}"),
+        }).collect()
+    }
+
     #[tokio::test]
     async fn persisted_list_is_cached_until_refresh() {
         let (manager, _home, workspace) = manager(50);

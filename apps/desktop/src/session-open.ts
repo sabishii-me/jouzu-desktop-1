@@ -21,6 +21,8 @@ export interface SessionRow {
   path: string;
   /** Whether the session has a file: rename, pin, archive and its id need one. */
   saved: boolean;
+  /** Its folder was deleted or moved: it can be read, not run (#174). */
+  folderMissing?: boolean;
   title: string;
   workspace: string;
   updated: number;
@@ -61,6 +63,7 @@ export function sessionRow(value: SessionSummary): SessionRow | null {
   return {
     path: key,
     saved: !!value.sessionPath,
+    folderMissing: value.folderMissing === true,
     title,
     workspace: value.workspacePath,
     updated,

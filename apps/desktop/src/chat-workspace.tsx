@@ -1163,6 +1163,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setSelectedSession(sessionPath);
     setHero(false);
     const summary = sessions.find(item => normalizedPath(item.path) === normalizedPath(sessionPath));
+    // Its folder is gone: the history can be read, nothing can run it (#174).
+    if (summary?.folderMissing) {
+      queuedSwitch.current = null;
+      loadPreview(sessionPath);
+      return;
+    }
     if (client && opensLive(summary)) {
       startSwitch(sessionPath);
       return;
@@ -1520,7 +1526,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const replyAction = replyActionFor(lastMessage);
   // The one thing that ever takes the composer's place: the session cannot go on.
   const sessionFailure = showingAttached && snapshot.status === "error" ? snapshot.failure ?? { code: "", text: "" } : null;
-  const blocked = sessionFailure
+  const folderGone = selectedRow?.folderMissing ? selectedRow.workspace : null;
+  const blocked = folderGone
+    ? { text: fill(t.sessionFolderMissing, { folder: folderGone.replace(/^\\\\\?\\/u, "") }) }
+    : sessionFailure
     ? { text: failureText(t, sessionFailure.code), details: sessionFailure.text || undefined, action: { label: t.restartSession, run: () => { settle("restart", null); void reopenBoundSession(); }, disabled: commandBusy || switching }, result: results.restart }
     : sessionError
       ? { text: t.openFailed, details: sessionError, action: selectedSession ? { label: t.retry, run: () => { setSessionError(null); startSwitch(selectedSession); } } : undefined }
