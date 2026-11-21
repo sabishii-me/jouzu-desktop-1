@@ -1,7 +1,8 @@
 // Commit attribution against a real jouzu runtime, in throwaway folders:
 //   node commit-attribution.mjs <jouzu dist/cli.js>
-// with ATTR_ON=1 (setting on) or ATTR_ON=0. A loopback provider makes the agent
-// run `git commit` once through its bash tool; prints the commit message and
+// with ATTR_ON=1 (setting on) or ATTR_ON=0, and ATTR_AUTHOR=1 for "Commit as
+// Jouzu Desktop". A loopback provider makes the agent run `git commit` once
+// through its bash tool; prints the commit's author, committer, message and
 // whether the pull request line reached the system prompt. No network, no
 // credentials, never the user's data folder.
 import { createServer } from 'node:http';
@@ -17,7 +18,7 @@ const repo = mkdtempSync(join(tmpdir(), 'attr-repo-'));
 mkdirSync(join(home, 'agent', 'extensions'), { recursive: true });
 cpSync(extDir, join(home, 'agent', 'extensions', 'jouzu-attribution'), { recursive: true });
 const on = process.env.ATTR_ON === '1';
-writeFileSync(join(home, 'agent', 'attribution.json'), JSON.stringify({ enabled: on }));
+writeFileSync(join(home, 'agent', 'attribution.json'), JSON.stringify({ enabled: on, author: process.env.ATTR_AUTHOR === '1' }));
 const genv = { ...process.env, GIT_AUTHOR_NAME: 'a', GIT_AUTHOR_EMAIL: 'a@x', GIT_COMMITTER_NAME: 'a', GIT_COMMITTER_EMAIL: 'a@x', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(repo, '.none') };
 delete genv.GIT_CONFIG_COUNT;
 spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: repo, env: genv });
@@ -48,7 +49,7 @@ const server = createServer((req, res) => {
   const tick = setInterval(() => {
     if (settled || Date.now() - t0 > 90000) {
       clearInterval(tick); child.kill(); server.close();
-      const log = spawnSync('git', ['log', '-1', '--format=%B'], { cwd: repo, env: genv, encoding: 'utf8' });
+      const log = spawnSync('git', ['log', '-1', '--format=Author: %an <%ae>%nCommitter: %cn <%ce>%n%n%B'], { cwd: repo, env: genv, encoding: 'utf8' });
       console.log('settled', settled, 'calls', calls);
       console.log('COMMIT:\n' + log.stdout + log.stderr);
       console.log('PR guideline in prompt:', systems.some(s => s.includes('Generated with Jouzu Desktop')));

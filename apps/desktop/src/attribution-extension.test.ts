@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import extension, { HOOKS, applyTo, enabled, guideline, installHooks } from "../../../packaging/desktop/extensions/jouzu-attribution/index.js";
+import extension, { AUTHOR, HOOKS, applyTo, enabled, guideline, installHooks, settings } from "../../../packaging/desktop/extensions/jouzu-attribution/index.js";
 
 const temps: string[] = [];
 function temp(prefix: string) {
@@ -27,6 +27,26 @@ describe("jouzu-attribution extension", () => {
     expect(enabled(homeWith({}))).toBe(false);
     expect(enabled(homeWith({ enabled: "yes" }))).toBe(false);
     expect(enabled(homeWith({ enabled: true }))).toBe(true);
+    expect(settings(homeWith({ enabled: true }))).toEqual({ enabled: true, author: false });
+    expect(settings(homeWith({ enabled: true, author: true }))).toEqual({ enabled: true, author: true });
+    // "Commit as Jouzu Desktop" counts only while marking is on.
+    expect(settings(homeWith({ enabled: false, author: true }))).toEqual({ enabled: false, author: false });
+  });
+
+  it("makes Jouzu Desktop the author only while both are on, and gives the person's author back", () => {
+    const kept = {};
+    const env = { GIT_AUTHOR_NAME: "Person", GIT_CONFIG_COUNT: "1" };
+    applyTo(env, { enabled: true, author: true }, "1", "/hooks", kept);
+    expect(env).toMatchObject({ GIT_AUTHOR_NAME: AUTHOR.name, GIT_AUTHOR_EMAIL: AUTHOR.email, JOUZU_GIT_AUTHOR: "1", GIT_CONFIG_COUNT: "2" });
+    // Applied again (every tool call): what it keeps is still the person's own.
+    applyTo(env, { enabled: true, author: true }, "1", "/hooks", kept);
+    applyTo(env, { enabled: true, author: false }, "1", "/hooks", kept);
+    expect(env.GIT_AUTHOR_NAME).toBe("Person");
+    expect("GIT_AUTHOR_EMAIL" in env).toBe(false);
+    expect("JOUZU_GIT_AUTHOR" in env).toBe(false);
+    applyTo(env, { enabled: true, author: true }, "1", "/hooks", kept);
+    applyTo(env, false, "1", undefined, kept);
+    expect(env).toEqual({ GIT_AUTHOR_NAME: "Person", GIT_CONFIG_COUNT: "1" });
   });
 
   it("appends its git configuration after the runtime's own and takes it back", () => {
@@ -120,6 +140,24 @@ describe("jouzu-attribution extension", () => {
     expect(run(base, "checkout", "-q", "main").status).toBe(0);
     expect(run(agent, "cherry-pick", "--allow-empty", "side").status).toBe(0);
     expect(message()).toBe("by a person");
+
+    // "Commit as Jouzu Desktop": new commits are authored by Jouzu Desktop,
+    // committed by the person, who is named as co-author. Amend and
+    // cherry-pick keep the author a commit has.
+    const author = { ...base, PI_SESSION_ID: "s-2" };
+    applyTo(author, { enabled: true, author: true }, "1", hooks, {});
+    const who = (format: string) => run(base, "log", "-1", `--format=${format}`).stdout.trim();
+    expect(run(author, "commit", "-q", "--allow-empty", "-m", "authored").status).toBe(0);
+    expect(who("%an <%ae> / %cn <%ce>")).toBe(`${AUTHOR.name} <${AUTHOR.email}> / a <a@example.com>`);
+    expect(message()).toBe(`authored\n\nCo-authored-by: a <a@example.com>\n${plain}\nJouzu-Session: s-2`);
+    expect(run(author, "commit", "-q", "--amend", "--allow-empty", "--no-edit").status).toBe(0);
+    expect(message()).toBe(`authored\n\nCo-authored-by: a <a@example.com>\n${plain}\nJouzu-Session: s-2`);
+    expect(run(base, "commit", "-q", "--allow-empty", "-m", "the person's").status).toBe(0);
+    expect(run(author, "commit", "-q", "--amend", "--allow-empty", "-m", "the person's, amended").status).toBe(0);
+    expect(who("%an")).toBe("a");
+    expect(message()).toBe(`the person's, amended\n\n${plain}\nJouzu-Session: s-2`);
+    expect(run(author, "cherry-pick", "--allow-empty", "side").status).toBe(0);
+    expect(who("%an")).toBe("a");
   // Each git call starts sh for every hook: on Windows this test takes several seconds.
   }, 60_000);
 });

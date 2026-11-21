@@ -12,6 +12,12 @@
 //   tools give every command.
 // - the agent is asked to end pull request descriptions with a line naming
 //   Jouzu Desktop and its model. That one is an instruction, not enforced.
+// - if "Commit as Jouzu Desktop" is on too, new commits the agent makes have
+//   Jouzu Desktop as their author (GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL), so
+//   GitHub counts them for the jouzu-desktop account. The committer stays the
+//   person's own git identity (and signing key), and `prepare-commit-msg` adds
+//   the person as `Co-authored-by`. Amend, rebase and cherry-pick keep the
+//   author a commit already has.
 //
 // The setting is read for every tool call and every run, so turning it on or
 // off applies at once, in open sessions too. It marks commits; it does not
@@ -36,13 +42,25 @@ export function home() {
   return process.env.JOUZU_HOME || join(process.env.LOCALAPPDATA || process.cwd(), "Shisa.ai", "JouzuDesktop", "data");
 }
 
-/** On only when the person turned it on; anything unreadable is off. */
-export function enabled(root = home()) {
+/** The agent's commit author while "Commit as Jouzu Desktop" is on. */
+export const AUTHOR = { name: "Jouzu Desktop", email: "359074535+jouzu-desktop@users.noreply.github.com" };
+
+/**
+ * What the person turned on; anything unreadable is off. `author` counts only
+ * while marking is on.
+ */
+export function settings(root = home()) {
   try {
-    return JSON.parse(readFileSync(join(root, "agent", "attribution.json"), "utf8"))?.enabled === true;
+    const value = JSON.parse(readFileSync(join(root, "agent", "attribution.json"), "utf8"));
+    const on = value?.enabled === true;
+    return { enabled: on, author: on && value?.author === true };
   } catch {
-    return false;
+    return { enabled: false, author: false };
   }
+}
+
+export function enabled(root = home()) {
+  return settings(root).enabled;
 }
 
 /** Write the hooks as this extension ships them; a file already right is left alone. */
@@ -67,11 +85,15 @@ export function installHooks(directory = join(HERE, "hooks")) {
  * runtime's own environment, which the shell tools copy for every command;
  * `original` is its GIT_CONFIG_COUNT before we touched it.
  */
-export function applyTo(env, on, original, hooks) {
-  // `hooks`: the hooks folder, needed only when on.
+export function applyTo(env, on, original, hooks, kept = {}) {
+  // `on`: settings() or a boolean (marking only). `hooks`: the hooks folder,
+  // needed only when on. `kept`: where the person's own author is kept while
+  // we replace it.
+  if (on === false || on === true) on = { enabled: on, author: false };
   const parsed = Number.parseInt(original ?? "0", 10);
   const index = Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
-  if (on) {
+  setAuthor(env, on.enabled && on.author, kept);
+  if (on.enabled) {
     env[`GIT_CONFIG_KEY_${index}`] = "core.hooksPath";
     env[`GIT_CONFIG_VALUE_${index}`] = hooks;
     env.GIT_CONFIG_COUNT = String(index + 1);
@@ -86,6 +108,33 @@ export function applyTo(env, on, original, hooks) {
   }
 }
 
+/**
+ * Make Jouzu Desktop the author of new commits, or give the runtime's own
+ * author back. `kept` holds what GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL were
+ * before we touched them (undefined when unset).
+ */
+function setAuthor(env, on, kept) {
+  if (on) {
+    if (env.JOUZU_GIT_AUTHOR !== "1") {
+      kept.name = env.GIT_AUTHOR_NAME;
+      kept.email = env.GIT_AUTHOR_EMAIL;
+    }
+    env.GIT_AUTHOR_NAME = AUTHOR.name;
+    env.GIT_AUTHOR_EMAIL = AUTHOR.email;
+    // Marks that the author is ours, so turning it off gives the person's back.
+    env.JOUZU_GIT_AUTHOR = "1";
+  } else if (env.JOUZU_GIT_AUTHOR === "1") {
+    restore(env, "GIT_AUTHOR_NAME", kept.name);
+    restore(env, "GIT_AUTHOR_EMAIL", kept.email);
+    delete env.JOUZU_GIT_AUTHOR;
+  }
+}
+
+function restore(env, key, value) {
+  if (value === undefined) delete env[key];
+  else env[key] = value;
+}
+
 export function guideline(model) {
   const name = model?.name || model?.id;
   const line = name ? `Generated with Jouzu Desktop (${name})` : "Generated with Jouzu Desktop";
@@ -94,16 +143,17 @@ export function guideline(model) {
 
 export default function (pi) {
   const original = process.env.GIT_CONFIG_COUNT;
+  const kept = {};
   let hooks = null;
 
   pi.on("tool_call", event => {
     if (!SHELL_TOOLS.has(event.toolName)) return;
-    const on = enabled();
+    const on = settings();
     try {
-      applyTo(process.env, on, original, on ? (hooks ??= installHooks()) : undefined);
+      applyTo(process.env, on, original, on.enabled ? (hooks ??= installHooks()) : undefined, kept);
     } catch {
       // The hooks could not be written: commits go unmarked rather than failing.
-      applyTo(process.env, false, original);
+      applyTo(process.env, false, original, undefined, kept);
     }
   });
 
