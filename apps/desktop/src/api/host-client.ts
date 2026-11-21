@@ -17,6 +17,7 @@ import {
   type McpServerState,
   type AssistantMessage,
   type AssistantModel,
+  type AssistantTask,
   type AssistantState,
   type ProjectsSnapshot,
   type SavedMessagesPage,
@@ -437,6 +438,10 @@ export class HostClient {
 
   projects(): Promise<ProjectsSnapshot> {
     return this.request("/v1/projects");
+  }
+
+  assistantTasks(): Promise<{ tasks: AssistantTask[] }> {
+    return this.request("/v1/assistant/tasks");
   }
 
   async removeMcpAgent(id: string): Promise<void> {

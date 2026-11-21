@@ -292,6 +292,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assistant", get(assistant_snapshot).put(update_assistant))
         .route("/assistant/messages", get(assistant_messages).post(send_assistant))
         .route("/assistant/seen", axum::routing::post(assistant_seen))
+        .route("/assistant/tasks", get(assistant_tasks))
         .route("/workflow", get(read_workflow).put(save_workflow))
         .route("/workflow/versions", get(workflow_versions))
         .route("/workflow/restore", axum::routing::post(restore_workflow))
@@ -552,6 +553,12 @@ async fn update_assistant(
 
 async fn assistant_messages(State(state): State<AppState>, Query(query): Query<TaskQuery>) -> Json<Value> {
     Json(state.assistant.messages(query.limit.unwrap_or(50)))
+}
+
+/// The Assistant's tasks with their state as the host derives it, for the
+/// views its pane draws. Read only.
+async fn assistant_tasks(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    state.tasks.list(assistant::CLIENT).map(Json)
 }
 
 async fn assistant_seen(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

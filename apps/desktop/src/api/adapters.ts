@@ -186,6 +186,7 @@ function hostGroups(client: HostClient) {
       messages: limit => client.assistantMessages(limit),
       send: text => client.sendAssistant(text),
       seen: () => client.assistantSeen(),
+      tasks: () => client.assistantTasks(),
       projects: () => client.projects(),
     },
     webAccess: {

@@ -422,6 +422,15 @@ export interface AssistantMessage {
   text: string;
 }
 
+/** One of the Assistant's tasks, as the host derives its state now. */
+export interface AssistantTask {
+  taskId: string;
+  sessionPath?: string | null;
+  title?: string | null;
+  /** waiting_to_start, starting, running, waiting_user, held, finished, failed, stopped, unloaded. */
+  state: string;
+}
+
 export interface SettingsApi {
   environment: {
     /** Saving goes through the configuration queue (`environment`). */
@@ -454,6 +463,8 @@ export interface SettingsApi {
     /** The person looked at the pane: what it said so far is read (one mark for every window). */
     seen(): Promise<AssistantState>;
     projects(): Promise<ProjectsSnapshot>;
+    /** The Assistant's tasks and their states, for the views its pane draws. */
+    tasks(): Promise<{ tasks: AssistantTask[] }>;
   };
   /** Only the desktop window may manage web access; web clients get `forbidden`. */
   webAccess: {

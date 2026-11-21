@@ -1140,6 +1140,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     return normalizedPath(target) === normalizedPath(connection.current?.snapshot.sessionFile ?? "");
   }
   /** A click only records intent. The runtime load is always the single path below. */
+  /** Opens a task's session from the Assistant's pane (its overview and views). */
+  function openTaskSession(sessionPath: string) {
+    void openSession(sessionPath);
+  }
+
   function openSession(sessionPath: string) {
     setAppView("chat");
     const client = connection.current;
@@ -1668,7 +1673,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     </aside>}
     {assistantOpened && <section aria-label={t.assistant} className={appView === "assistant" ? "flex min-h-0 min-w-0 flex-1 flex-col" : "hidden"}>
       <div className="flex items-center px-2 py-1.5"><Button variant="ghost" className="size-8 shrink-0 p-0" aria-label={sidebar ? t.hideWorkspaces : t.showWorkspaces} title={t.workspaces} aria-expanded={sidebar} onClick={() => setSidebar(value => !value)}><PanelLeft className="size-4" /></Button></div>
-      <AssistantWorkspace overview={<AssistantOverview rows={sessions} states={rowStates} now={listNow} onOpen={path => void openSession(path)} />} />
+      <AssistantWorkspace rows={sessions} onOpen={openTaskSession} overview={<AssistantOverview rows={sessions} states={rowStates} now={listNow} onOpen={openTaskSession} />} />
     </section>}
     <section className={appView !== "chat" ? "hidden" : "flex min-h-0 min-w-0 flex-1 flex-col"}>
       {hero ? <div className="flex items-center px-2 py-1.5"><Button variant="ghost" className="size-8 shrink-0 p-0" aria-label={sidebar ? t.hideWorkspaces : t.showWorkspaces} title={t.workspaces} aria-expanded={sidebar} onClick={() => setSidebar(value => !value)}><PanelLeft className="size-4" /></Button></div> : <div className="flex items-center gap-2 border-b border-border px-2 py-2 sm:px-3">

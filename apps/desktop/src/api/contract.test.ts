@@ -118,6 +118,7 @@ function bridge() {
       send: vi.fn(async () => { throw new Error('unused'); }),
       seen: vi.fn(async () => { throw new Error('unused'); }),
       projects: vi.fn(async () => ({ projects: [], sessions: [] })),
+      tasks: vi.fn(async () => ({ tasks: [] })),
     },
     webAccess: {
       read: vi.fn(async () => { throw new Error('unused'); }),
