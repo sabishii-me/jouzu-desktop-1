@@ -174,10 +174,26 @@ for workflow roles (the workers) are a separate choice, recommended from COSPA
 
 The Assistant shows boards, tables, graphs, timelines and progress as fenced
 `jouzu-view` JSON blocks, and anything else as `svg` blocks. The format the
-Assistant is taught is `skills/draw-task-views.md`; it is the reference for
-the UI that will draw them. Views name tasks by `taskId` only and the UI
-fills in live state when it draws, so a view is never stale. The UI removes
-scripts, event handlers, `foreignObject` and external references from SVG.
+Assistant is taught is `skills/draw-task-views.md`, the one source of it; a
+UI test reads every example there. Its pane draws every view the skill
+teaches (`src/task-views.tsx`, layout in `src/task-views-model.ts`):
+
+- Views name tasks by `taskId` only. Their titles and states are looked up
+  when the view is drawn: the state from the host (`GET /v1/assistant/tasks`,
+  read again on `task.changed`), the title from the session list. A task opens
+  its session; one with no session yet shows its id and state.
+- board: columns of tasks; table: the Assistant's cells plus a State column;
+  graph: layered by the longest chain of dependencies, every edge pointing
+  forward (a cycle is still drawn); timeline: in date order; progress: counts
+  from live states (finished, failed or stopped, waiting for you, under way).
+- `svg` is drawn at its viewBox scale, narrowed to fit, after removing
+  scripts, event handlers, `foreignObject`, links, images, references outside
+  the drawing and CSS imports. Nothing in it runs.
+- A block that cannot be read says why in place (which field, or the JSON
+  error) above its source; it is never shown as plain code or breaks the
+  message. Each drawn view can show its source.
+- Wide views (board, graph) scroll inside their frame, so the page never
+  scrolls sideways at phone width (remote web).
 
 ## Workflow and models
 
