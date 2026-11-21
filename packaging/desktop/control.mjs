@@ -210,6 +210,31 @@ try {
       if (existsSync(staged)) unlinkSync(staged);
       await release();
     }
+  } else if (request.action === 'custom-provider-remove') {
+    // A provider this program added to models.json (or one written there by
+    // hand) is removed with its saved key, as one change (#171). Built-in
+    // providers are not in models.json and are refused, not silently kept.
+    const file = join(paths.agentDir, 'models.json');
+    const config = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : { providers: {} };
+    if (typeof request.provider !== 'string' || !Object.hasOwn(config.providers ?? {}, request.provider)) throw new Error('Not a custom provider');
+    // The runtime would start on a default that no longer exists; another
+    // default is chosen first.
+    const unread = settings.drainErrors();
+    if (unread.length) throw new SettingsFailure(unread);
+    if (settings.getDefaultProvider() === request.provider) throw new Error('Provider is the default');
+    const { ensurePrivateDirectory, writeFilePrivateAtomic } = await load('private-fs');
+    ensurePrivateDirectory(paths.agentDir);
+    const require = createRequire(join(appRoot, 'node_modules/jouzu/package.json'));
+    const lock = require('proper-lockfile');
+    const release = await lock.lock(file, { realpath: false, retries: 0 });
+    try {
+      const current = JSON.parse(readFileSync(file, 'utf8'));
+      delete current.providers[request.provider];
+      writeFilePrivateAtomic(file, JSON.stringify(current, null, 2), paths.agentDir);
+    } finally {
+      await release();
+    }
+    if ((await auth.list()).some(credential => credential.providerId === request.provider)) await auth.delete(request.provider);
   } else if (request.action === 'provider-key') {
     if (!runtime.getProvider(request.provider)) throw new Error('Unknown provider');
     if (typeof request.token !== 'string' || !request.token.trim() || /^[!$]/.test(request.token.trim()) || request.token.length > 8192 || [...request.token].some(c => c.charCodeAt(0) < 32)) throw new Error('Invalid key');
@@ -232,7 +257,7 @@ try {
     const unwritten = settings.drainErrors();
     if (unwritten.length) throw new SettingsFailure(unwritten);
   } else if (request.action !== 'status') throw new Error('Unsupported operation');
-  if (request.action === "custom-provider") await runtime.refresh({ allowNetwork: false });
+  if (request.action === "custom-provider" || request.action === "custom-provider-remove") await runtime.refresh({ allowNetwork: false });
   const { ModelConfig } = await pi('model-config');
   const savedConfig = await ModelConfig.load(join(paths.agentDir, 'models.json'));
   const customProviders = savedConfig.getProviderIds().map(id => {
@@ -279,6 +304,7 @@ try {
     'provider-remove': 'Could not remove the provider key. Refresh its state before retrying.',
     'custom-provider': 'Could not save the custom connection. Check its unique ID, endpoint and model. Existing advanced configurations cannot be edited with this form.',
     'default-model': 'Could not save the default model. Refresh the model list and retry.',
+    'custom-provider-remove': 'Could not remove the connection. Only a custom connection that is not the default can be removed.',
     'shisa-login': 'Shisa.AI sign-in did not complete. Refresh its state before retrying.',
     'provider-oauth': 'Provider sign-in did not complete. Refresh its state before retrying.',
     'refresh-catalogs': 'Models could not be refreshed. Sign in to Shisa.AI again or add a provider key.',
