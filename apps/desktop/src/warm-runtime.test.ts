@@ -1,17 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { nextWarmView, warmBlocks } from "./warm-runtime";
+import { nextWarmView } from "./warm-runtime";
 
 describe("warm runtime view", () => {
-  it("blocks loading until the host says how the warm-up stands", () => {
-    expect(warmBlocks({ state: "unknown", since: null, error: null })).toBe(true);
-    expect(warmBlocks({ state: "starting", since: 1, error: null })).toBe(true);
-    expect(warmBlocks({ state: "ready", since: null, error: null })).toBe(false);
-    expect(warmBlocks({ state: "off", since: null, error: null })).toBe(false);
-  });
-
-  it("keeps loading on a failed warm-up, with its reason, instead of letting the user into a chat that cannot answer", () => {
+  it("keeps the reason of a failed warm-up", () => {
     const view = nextWarmView({ state: "starting", since: 1, error: null }, { state: "failed", error: "node missing" }, 5);
-    expect(warmBlocks(view)).toBe(true);
+    expect(view.state).toBe("failed");
     expect(view.error).toBe("node missing");
   });
 

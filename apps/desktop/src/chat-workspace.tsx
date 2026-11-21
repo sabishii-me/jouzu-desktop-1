@@ -31,9 +31,9 @@ import { BackgroundMenu, deriveFlow, deriveSubagents, FlowMenu, latestFlowError,
 import { SessionStatsBar } from "./session-stats-bar";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import type { TextGuardMode } from "./session-notices";
-import { opensLive, rowState, sessionRow as fromApiSession, type RowState, type SessionRow as SessionSummary } from "./session-open";
+import { liveRowKey, opensLive, rowState, sessionRow as fromApiSession, type RowState, type SessionRow as SessionSummary } from "./session-open";
 import { SessionRowStatus, rowStateText } from "./session-row-status";
-import { useWarmRuntime, warmBlocks, type WarmView } from "./warm-runtime";
+import { useWarmRuntime, type WarmView } from "./warm-runtime";
 import { newId, copyText } from "./secure-context";
 
 /** The side pane starts at half the window so chat and pane have equal room. */
@@ -236,8 +236,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [entryOpening, setEntryOpening] = useState(true);
   const entryTarget = useRef<string | null>(null);
   const entryChosen = useRef(false);
-  const [entryAttaching, setEntryAttaching] = useState(false);
-  const [entryExisting, setEntryExisting] = useState(false);
   useEffect(() => {
     if (!copied) return;
     const timer = setTimeout(() => { setCopied(null); setSessionMenu(null); }, 1200);
@@ -374,15 +372,14 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         settled = true;
         client = leased;
         if (reopen) {
-          entryTarget.current = reopen;
-          setEntryExisting(true);
           selectedSessionRef.current = reopen;
           setSelectedSession(reopen);
           setHero(false);
-          // Opened: the entry ends when its runtime is attached. Not opened: the
-          // queued switch runs as soon as the connection reports ready.
-          if (opened) setEntryAttaching(true);
-          else queuedSwitch.current = reopen;
+          // Opened: the entry is the host's session now, its runtime starts behind
+          // it and the host holds what is sent meanwhile (0016). Not opened: the
+          // queued switch opens it, and the entry ends when that switch ends.
+          if (opened) setEntryOpening(false);
+          else { entryTarget.current = reopen; queuedSwitch.current = reopen; }
         } else if (choosing) setEntryOpening(false);
         bindClient(leased);
       } catch (error) {
@@ -441,29 +438,15 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // Only a live turn blocks a runtime restart. A saved draft does not: it lives in
   // localStorage and must not make a model refresh wait for the composer to empty.
   useEffect(() => { onBusyChange?.(snapshot.pending || snapshot.projection.running); }, [snapshot.pending, snapshot.projection.running, onBusyChange]);
-  // The app keeps its own loader up until the entry session is connected and the
-  // runtime is warm, so the start-up cost is paid here, not on the first message.
-  // With an entry session to open, loading lasts until it is open (its runtime is
-  // attached and its history shown) or failed; a failure is shown in the chat.
-  // A new entry session needs a warm runtime for its first message; an existing one
-  // has its own runtime once open, so it does not wait for the pool.
-  // A connection that failed (a lease refused with an error) has nothing left to
-  // wait for: loading ends so the chat shows the error and its retry (issue #87).
+  // The app's loader stays up only until the entry session exists in the host
+  // and its history is shown. It never waits for a runtime: the host holds what
+  // is sent while the runtime starts (0016), so the person can type and send at
+  // once. A connection that failed (a lease refused with an error) has nothing
+  // left to wait for: loading ends so the chat shows the error and its retry (#87).
   useEffect(() => {
     const failed = !snapshot.connected && (!!snapshot.connectionError || !!startError);
-    onBootChange?.(!chatUnavailable && !failed && (!snapshot.connected || entryOpening || (!entryExisting && warmBlocks(warm))), warm, retryWarm);
-  }, [snapshot.connected, snapshot.connectionError, startError, onBootChange, chatUnavailable, warm, entryOpening, entryExisting]);
-  useEffect(() => {
-    const target = entryTarget.current;
-    if (!entryAttaching || !target) return;
-    const attached = snapshot.connected && normalizedPath(snapshot.sessionFile ?? "") === normalizedPath(target)
-      && !["pending", "starting", "recovering"].includes(snapshot.status ?? "");
-    if (attached || snapshot.connectionError || sessionError) {
-      entryTarget.current = null;
-      setEntryAttaching(false);
-      setEntryOpening(false);
-    }
-  }, [entryAttaching, snapshot.connected, snapshot.sessionFile, snapshot.status, snapshot.connectionError, sessionError]);
+    onBootChange?.(!chatUnavailable && !failed && (!snapshot.connected || entryOpening), warm, retryWarm);
+  }, [snapshot.connected, snapshot.connectionError, startError, onBootChange, chatUnavailable, warm, entryOpening]);
   // Remember the session on screen for the next start; a new session forgets it.
   useEffect(() => {
     if (entryOpening) return;
@@ -790,7 +773,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     // only a session with a transcript is keyed by path; an unstored one is closed
     // unless it is still working.
     if (sessionFile && previous.snapshot.projection.messages.length) chatPool.remember(sessionFile, previous);
-    else if (previous.snapshot.projection.running || previous.snapshot.pending) chatPool.remember(`unsaved:${newId()}`, previous);
+    else if (previous.snapshot.projection.running || previous.snapshot.pending) chatPool.remember(previous.snapshot.sessionId ? liveRowKey(previous.snapshot.sessionId) : `unsaved:${newId()}`, previous);
     else void previous.close().catch(() => {});
   }
   function queueNewSession() {
@@ -968,7 +951,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       setHero(false);
       return;
     }
-    let landed = false;
     let retried = false;
     switchingRef.current = true;
     switchingTarget.current = target;
@@ -980,7 +962,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (connection.current !== previous) return;
       if (previous && previous !== next) parkPrevious(previous);
       if (connection.current !== next) bindClient(next);
-      landed = true;
       const loaded = next.snapshot.sessionFile ?? target;
       // A click that arrived while this switch was running owns the selection.
       if (!queuedSwitch.current && normalizedPath(loaded) !== normalizedPath(selectedSessionRef.current ?? "")) setSelectedSession(loaded);
@@ -1027,15 +1008,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       switchingTarget.current = null;
       setSwitching(false);
       onStartSession?.();
-      // The entry is open when its runtime is attached (see the effect below); a
-      // switch that did not land on it ends the wait now, its error on screen.
-      // A retry settles the entry itself.
+      // The switch that opens the entry ends its wait, landed or not (a failure
+      // is on screen). A retry settles the entry itself.
       if (!retried && entryTarget.current && normalizedPath(entryTarget.current) === normalizedPath(target)) {
-        if (landed) setEntryAttaching(true);
-        else {
-          entryTarget.current = null;
-          setEntryOpening(false);
-        }
+        entryTarget.current = null;
+        setEntryOpening(false);
       }
     }
   }
@@ -1166,6 +1143,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     // A session with a pooled runtime opens live: no preview, no switch_session,
     // and Stop keeps reaching a turn that is still in flight.
     const live = switchingRef.current ? undefined : chatPool.client(sessionPath);
+    // A host session with no file yet has nothing to open from disk: it opens only
+    // as the live session this window holds (#177).
+    if (!live && sessionPath.startsWith(liveRowKey(""))) return;
     if (live) {
       if (connection.current !== live) { parkPrevious(connection.current); bindClient(live); }
       queuedSwitch.current = null;
@@ -1294,15 +1274,17 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   }, [workspaces, sessions, search, sort, showArchived]);
   const defaultGroup = groups.find(group => isDefaultWorkspace(group.path));
   const regularGroups = defaultGroup ? groups.filter(group => group !== defaultGroup) : groups;
-  const activeSession = normalizedPath(snapshot.sessionFile ?? "");
-  const selectedKey = normalizedPath(selectedSession ?? snapshot.sessionFile ?? "");
+  // A host session the runtime has not written yet is its list row by its id (#177).
+  const boundRow = snapshot.sessionFile ?? (snapshot.sessionId && !hero ? liveRowKey(snapshot.sessionId) : "");
+  const activeSession = normalizedPath(boundRow);
+  const selectedKey = normalizedPath(selectedSession ?? boundRow);
   // The session on screen has been seen: a run that ended unseen is not news any
   // more, here or in any other client (#212). The host also marks it when a live
   // session is shown; this covers a session shown from its file.
   const selectedRow = hero ? undefined : sessions.find(item => normalizedPath(item.path) === selectedKey);
   const selectedUnseenAt = selectedRow?.unseenRun?.endedAt;
   useEffect(() => {
-    if (!selectedRow || !selectedUnseenAt) return;
+    if (!selectedRow?.saved || !selectedUnseenAt) return;
     void api.sessions.seen?.(selectedRow.path).catch(() => { /* The mark stays; the list says so. */ });
   }, [selectedRow?.path, selectedUnseenAt]);
   const selectedSessionWorkspace = sessions.find(item => normalizedPath(item.path) === selectedKey)?.workspace ?? path;
@@ -1627,7 +1609,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
                   : <button type="button" onClick={() => void openSession(session.path)} title={session.path} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left">
                   {rowStates.get(session.path) ? <SessionRowStatus state={rowStates.get(session.path)!} now={listNow} t={t} /> : session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label={t.pinned} /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span className="min-w-0 flex-1 truncate">{session.title}</span>{rowStates.get(session.path) && <span className="sr-only">{rowStateText(rowStates.get(session.path)!, listNow, t)}</span>}<span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={fill(t.artifactCount, { n: artifactCount(session.path) })}>{artifactCount(session.path)}</span>}
                 </button>}
-                <div className={`relative flex shrink-0 items-center gap-0.5 pr-1 transition-opacity focus-within:opacity-100 group-hover/session:opacity-100 ${sessionMenu === session.path ? "opacity-100" : "opacity-0"}`} data-session-menu>
+                {session.saved && <div className={`relative flex shrink-0 items-center gap-0.5 pr-1 transition-opacity focus-within:opacity-100 group-hover/session:opacity-100 ${sessionMenu === session.path ? "opacity-100" : "opacity-0"}`} data-session-menu>
                   <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={session.pinned ? t.unpinSession : t.pinSession} title={session.pinned ? t.unpinSession : t.pinSession} onClick={() => void updateSession(session.path, { pinned: !session.pinned })}><Pin className={`size-3.5 ${session.pinned ? "text-primary" : "text-muted-foreground"}`} /></button>
                   <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={t.sessionActions} title={t.sessionActions} aria-haspopup="menu" aria-expanded={sessionMenu === session.path} onClick={() => setSessionMenu(value => value === session.path ? null : session.path)}><MoreHorizontal className="size-4 text-muted-foreground" /></button>
                   {sessionMenu === session.path && <div role="menu" aria-label={fill(t.actionsFor, { name: session.title })} className="absolute right-0 top-full z-40 mt-1 w-52 rounded-xl border border-border bg-popover p-1 text-sm shadow-xl">
@@ -1636,7 +1618,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
                     <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { archived: !session.archived }); setSessionMenu(null); }}>{session.archived ? <ArchiveRestore className="size-4 text-muted-foreground" /> : <Archive className="size-4 text-muted-foreground" />}{session.archived ? t.restoreSession : t.archiveSession}</button>
                     <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void copySessionId(session)}>{copied === session.path ? <><Check className="size-4 text-primary" />{t.copied}</> : <><Copy className="size-4 text-muted-foreground" />{t.copySessionId}</>}</button>
                   </div>}
-                </div>
+                </div>}
               </div>)}
               {!group.sessions.length && <p className="px-2 py-1.5 text-xs text-muted-foreground">{t.noSessions}</p>}
             </div>}

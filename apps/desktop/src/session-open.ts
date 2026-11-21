@@ -17,7 +17,10 @@ export function opensLive(summary: Pick<SessionSummary, "status" | "running" | "
 
 /** A session as the session list shows it, with what decides how it opens. */
 export interface SessionRow {
+  /** The session file, or `liveRowKey(id)` for a host session with no file yet. */
   path: string;
+  /** Whether the session has a file: rename, pin, archive and its id need one. */
+  saved: boolean;
   title: string;
   workspace: string;
   updated: number;
@@ -35,18 +38,29 @@ export interface SessionRow {
   unseenRun?: UnseenRun | null;
 }
 
+/**
+ * The row key of a host session whose runtime has not written its file yet (a
+ * message sent while the runtime starts, #177). The host lists it, titled by that
+ * message; the file and its path come once the runtime has started.
+ */
+export function liveRowKey(sessionId: string): string {
+  return `session:${sessionId}`;
+}
+
 /** The list row for a host session entry, or null for one that is not listed. */
 export function sessionRow(value: SessionSummary): SessionRow | null {
-  if (!value.sessionPath) return null;
+  const key = value.sessionPath ?? (value.sessionId ? liveRowKey(value.sessionId) : null);
+  if (!key) return null;
   const title = value.title?.trim() ?? "";
-  const fileId = value.sessionPath.split(/[\\/]/u).at(-1)?.replace(/\.jsonl$/u, "") ?? "";
+  const fileId = value.sessionPath?.split(/[\\/]/u).at(-1)?.replace(/\.jsonl$/u, "") ?? "";
   // Empty page-load sessions can come back from the persisted index with the
   // file id as a title. That is not a user-facing title.
   if (!title || title === fileId) return null;
   const parsed = value.updatedAt ? Date.parse(value.updatedAt) : NaN;
   const updated = Number.isFinite(parsed) && parsed > 0 ? parsed / 1000 : Date.now() / 1000;
   return {
-    path: value.sessionPath,
+    path: key,
+    saved: !!value.sessionPath,
     title,
     workspace: value.workspacePath,
     updated,
