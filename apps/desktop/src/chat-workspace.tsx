@@ -1579,28 +1579,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   }
   // Above the composer: only the queue of messages sent during a run.
   const banners = <SteerQueue items={queued} onEdit={id => void editQueued(id)} onRemove={id => changeQueue(client => client.unqueue(id))} onContinue={() => changeQueue(client => client.queue("continue"))} onDiscard={() => changeQueue(client => client.queue("discard"))} result={results.queue} />;
-  // `overflow-clip`, not `overflow-hidden`: the layout is never a scroll container,
-  // so a sideways wheel or scrollIntoView cannot shift it (#113).
-  return <div ref={chatRoot} className="relative flex min-h-0 min-w-0 flex-1 overflow-clip">
-    {dropActive && <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-primary bg-background/85 text-sm font-medium text-primary">{t.dropFiles}</div>}
-    {sidebar && <aside aria-label={t.workspaces} className="absolute inset-y-0 left-0 z-20 flex w-80 max-w-[85%] flex-col border-r border-border bg-background shadow-xl md:relative md:z-auto md:shadow-none">
-      <div className="flex items-center gap-2 px-2 pb-2 pt-3"><Button className="min-w-0 flex-1 justify-start gap-2" disabled={locked} onClick={() => void startNewSession()}><Plus className="size-4" />{t.newSession}</Button><Button variant="ghost" className="size-8 p-0 md:hidden" aria-label={t.hideWorkspaces} onClick={() => setSidebar(false)}><X className="size-4" /></Button></div>
-      <div className="px-2 pb-2"><Button variant={appView === "artifacts" ? "default" : "ghost"} className="w-full justify-start gap-2" aria-pressed={appView === "artifacts"} onClick={() => setAppView(appView === "artifacts" ? "chat" : "artifacts")}><Images className="size-4" />{t.artifacts}</Button></div>
-      <div className="flex items-center justify-between border-t border-border px-3 py-2">
-        <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t.workspaces}</h2>
-        <div className="flex items-center gap-1">
-          <Button variant="ghost" className="size-7 p-0" aria-label={t.searchWorkspaces} aria-pressed={searchOpen} onClick={() => { setSearchOpen(value => !value); if (searchOpen) setSearch(""); }}><Search className="size-3.5" /></Button>
-          {(hasArchived || showArchived) && <Button variant="ghost" className="size-7 p-0" aria-label={showArchived ? t.hideArchived : t.showArchived} aria-pressed={showArchived} onClick={() => setShowArchived(value => !value)}><Archive className="size-3.5" /></Button>}
-          <Button variant="ghost" className="size-7 p-0" aria-label={sort === "recent" ? t.sortByName : t.sortByRecent} onClick={() => setSort(value => value === "recent" ? "name" : "recent")}><ArrowUpDown className="size-3.5" /></Button>
-          <Button variant="ghost" className="size-7 p-0" aria-label={t.addFolder} onClick={onAddFolder}><FolderPlus className="size-3.5" /></Button>
-        </div>
-      </div>
-      {folderNotice && <div className="px-2 pb-2">{folderNotice}</div>}
-      {/* Over the bottom of the list, so the list never moves. */}
-      {sidebarNote && <div className="absolute inset-x-2 bottom-14 z-10 rounded-lg bg-background shadow-lg"><NoticeRow alert={{ id: "sidebar", level: "error", text: sidebarNote.text, details: sidebarNote.details, actions: [], dismiss: () => setSidebarNote(null) }} /></div>}
-      {searchOpen && <div className="px-2 pb-2"><Input autoFocus aria-label={t.searchSessions} placeholder={t.searchSessions} value={search} onChange={event => setSearch(event.target.value)} /></div>}
-      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 pb-2">
-        {[...regularGroups, ...(defaultGroup ? [defaultGroup] : [])].map(group => {
+  const renderGroup = (group: (typeof groups)[number]) => {
           const open = !!search.trim() || !collapsedGroups.has(group.id);
           return <section key={group.id} className="mb-1">
             <div className={`group flex items-center gap-1 rounded-lg ${(selectedWorkspace ? normalizedPath(selectedWorkspace) === normalizedPath(group.path) : !selectedKey && normalizedPath(group.path) === normalizedPath(path)) ? "bg-accent/70" : "hover:bg-muted/60"}`}>
@@ -1632,9 +1611,32 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
               {!group.sessions.length && <p className="px-2 py-1.5 text-xs text-muted-foreground">{t.noSessions}</p>}
             </div>}
           </section>;
-        })}
+  };
+  // `overflow-clip`, not `overflow-hidden`: the layout is never a scroll container,
+  // so a sideways wheel or scrollIntoView cannot shift it (#113).
+  return <div ref={chatRoot} className="relative flex min-h-0 min-w-0 flex-1 overflow-clip">
+    {dropActive && <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-primary bg-background/85 text-sm font-medium text-primary">{t.dropFiles}</div>}
+    {sidebar && <aside aria-label={t.workspaces} className="absolute inset-y-0 left-0 z-20 flex w-80 max-w-[85%] flex-col border-r border-border bg-background shadow-xl md:relative md:z-auto md:shadow-none">
+      <div className="flex items-center gap-2 px-2 pb-2 pt-3"><Button className="min-w-0 flex-1 justify-start gap-2" disabled={locked} onClick={() => void startNewSession()}><Plus className="size-4" />{t.newSession}</Button><Button variant="ghost" className="size-8 p-0 md:hidden" aria-label={t.hideWorkspaces} onClick={() => setSidebar(false)}><X className="size-4" /></Button></div>
+      <div className="px-2 pb-2"><Button variant={appView === "artifacts" ? "default" : "ghost"} className="w-full justify-start gap-2" aria-pressed={appView === "artifacts"} onClick={() => setAppView(appView === "artifacts" ? "chat" : "artifacts")}><Images className="size-4" />{t.artifacts}</Button></div>
+      <div className="flex items-center justify-between border-t border-border px-3 py-2">
+        <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t.workspaces}</h2>
+        <div className="flex items-center gap-1">
+          <Button variant="ghost" className="size-7 p-0" aria-label={t.searchWorkspaces} aria-pressed={searchOpen} onClick={() => { setSearchOpen(value => !value); if (searchOpen) setSearch(""); }}><Search className="size-3.5" /></Button>
+          {(hasArchived || showArchived) && <Button variant="ghost" className="size-7 p-0" aria-label={showArchived ? t.hideArchived : t.showArchived} aria-pressed={showArchived} onClick={() => setShowArchived(value => !value)}><Archive className="size-3.5" /></Button>}
+          <Button variant="ghost" className="size-7 p-0" aria-label={sort === "recent" ? t.sortByName : t.sortByRecent} onClick={() => setSort(value => value === "recent" ? "name" : "recent")}><ArrowUpDown className="size-3.5" /></Button>
+          <Button variant="ghost" className="size-7 p-0" aria-label={t.addFolder} onClick={onAddFolder}><FolderPlus className="size-3.5" /></Button>
+        </div>
+      </div>
+      {folderNotice && <div className="px-2 pb-2">{folderNotice}</div>}
+      {/* Over the bottom of the list, so the list never moves. */}
+      {sidebarNote && <div className="absolute inset-x-2 bottom-14 z-10 rounded-lg bg-background shadow-lg"><NoticeRow alert={{ id: "sidebar", level: "error", text: sidebarNote.text, details: sidebarNote.details, actions: [], dismiss: () => setSidebarNote(null) }} /></div>}
+      {searchOpen && <div className="px-2 pb-2"><Input autoFocus aria-label={t.searchSessions} placeholder={t.searchSessions} value={search} onChange={event => setSearch(event.target.value)} /></div>}
+      <div data-sidebar-workspace-list className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 pb-2">
+        {regularGroups.map(renderGroup)}
         {!groups.length && <p className="p-3 text-sm text-muted-foreground">{search ? t.noMatchingSessions : t.noWorkspaces}</p>}
       </div>
+      {defaultGroup && <div data-sidebar-default-workspace className="shrink-0 max-h-48 overflow-y-auto border-t border-border px-1.5 py-2">{renderGroup(defaultGroup)}</div>}
       <div className="mt-auto border-t border-border p-2">
         <div className="flex items-center gap-1">
           <Button variant="ghost" className="min-w-0 flex-1 justify-start gap-2" onClick={onSettings}><Settings className="size-4" />{t.settings}</Button>
