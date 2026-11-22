@@ -30,6 +30,7 @@ pub mod session_runs;
 pub mod sessions_repair;
 pub mod session;
 pub mod tasks;
+pub mod triggers;
 pub mod web_access;
 pub mod workflow;
 
@@ -75,6 +76,7 @@ pub struct AppState {
     pub mcp: Arc<mcp::McpServer>,
     pub projects: Arc<projects::ProjectStore>,
     pub assistant: Arc<assistant::Assistant>,
+    pub triggers: Arc<triggers::Triggers>,
 }
 
 #[derive(Debug, Serialize)]
@@ -296,6 +298,10 @@ pub fn router(state: AppState) -> Router {
         .route("/workflow", get(read_workflow).put(save_workflow))
         .route("/workflow/versions", get(workflow_versions))
         .route("/workflow/restore", axum::routing::post(restore_workflow))
+        .route("/triggers", get(list_triggers).post(create_trigger))
+        .route("/triggers/firings", get(trigger_firings))
+        .route("/triggers/{id}", axum::routing::put(update_trigger).delete(delete_trigger))
+        .route("/triggers/{id}/run", axum::routing::post(run_trigger))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", axum::routing::put(update_project).delete(delete_project))
         .route("/tasks", get(list_tasks).post(start_task))
@@ -410,6 +416,57 @@ pub fn router(state: AppState) -> Router {
             host_origin_guard,
         ))
         .with_state(state)
+}
+
+// ---- Triggers: "when this happens, do that" ----
+// The user's: only the host token reaches these (agents have /mcp only). The
+// Assistant proposes through its own tools; turning a proposal on is here.
+
+async fn list_triggers(State(state): State<AppState>) -> Response {
+    Json(state.triggers.list()).into_response()
+}
+
+async fn create_trigger(State(state): State<AppState>, Json(input): Json<triggers::TriggerInput>) -> Response {
+    match state.triggers.create(triggers::BY_USER, input) {
+        Ok(trigger) => (StatusCode::CREATED, Json(trigger)).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn update_trigger(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(input): Json<triggers::TriggerInput>,
+) -> Response {
+    match state.triggers.update(&id, input) {
+        Ok(trigger) => Json(trigger).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn delete_trigger(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    match state.triggers.delete(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn run_trigger(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    match state.triggers.run_now(&id).await {
+        Ok(firing) => Json(firing).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct FiringsQuery {
+    #[serde(rename = "triggerId")]
+    trigger_id: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn trigger_firings(State(state): State<AppState>, Query(query): Query<FiringsQuery>) -> Response {
+    Json(state.triggers.firings(query.trigger_id.as_deref(), query.limit)).into_response()
 }
 
 // ---- Collaboration > MCP: the user's switch and agent tokens ----
@@ -2860,6 +2917,7 @@ mod tests {
         let sessions = Arc::new(SessionManager::new(None, dist.clone(), dist.clone(), None, 10, None));
         let tasks = tasks::TaskManager::new(sessions.clone());
         let projects = projects::ProjectStore::new(sessions.clone(), tasks.clone());
+        let triggers = triggers::Triggers::new(&dist, sessions.clone(), tasks.clone());
         AppState {
             token: Arc::new("a".repeat(64)),
             port: 40123,
@@ -2873,7 +2931,8 @@ mod tests {
             tasks: tasks.clone(),
             mcp: mcp::McpServer::new(&dist, "0.1.0", tasks.clone(), sessions.clone()),
             projects: projects.clone(),
-            assistant: assistant::Assistant::new(&dist, assistant::Assistant::default_paths(&dist, &sessions), sessions.clone(), tasks, projects),
+            assistant: assistant::Assistant::new(&dist, assistant::Assistant::default_paths(&dist, &sessions), sessions.clone(), tasks.clone(), projects, triggers.clone()),
+            triggers,
         }
     }
 
@@ -3473,6 +3532,7 @@ mod session_tests {
         let home = std::env::temp_dir();
         let tasks = tasks::TaskManager::new(manager.clone());
         let projects = projects::ProjectStore::new(manager.clone(), tasks.clone());
+        let triggers = triggers::Triggers::new(manager.home(), manager.clone(), tasks.clone());
         AppState {
             token: Arc::new("a".repeat(64)),
             port: 40123,
@@ -3486,7 +3546,8 @@ mod session_tests {
             tasks: tasks.clone(),
             mcp: mcp::McpServer::new(manager.home(), "0.1.0", tasks.clone(), manager.clone()),
             projects: projects.clone(),
-            assistant: assistant::Assistant::new(manager.home(), assistant::Assistant::default_paths(manager.home(), &manager), manager.clone(), tasks, projects),
+            assistant: assistant::Assistant::new(manager.home(), assistant::Assistant::default_paths(manager.home(), &manager), manager.clone(), tasks.clone(), projects, triggers.clone()),
+            triggers,
         }
         .pipe(router)
     }
@@ -3512,6 +3573,43 @@ mod session_tests {
         let headers = response.headers().clone();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn the_user_manages_triggers_over_http() {
+        let (manager, _home, _workspace) = manager(50);
+        let app = app(manager);
+        let send = |method: Method, uri: &str, body: Value| {
+            request(method, uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let created = call(
+            app.clone(),
+            send(Method::POST, "/v1/triggers", json!({ "name": "Ping", "source": { "kind": "manual" }, "action": { "kind": "wakeAssistant", "text": "ping" } })),
+        )
+        .await;
+        assert_eq!(created.0, StatusCode::CREATED, "{}", created.2);
+        let trigger: Value = serde_json::from_str(&created.2).unwrap();
+        assert_eq!(trigger["state"], "enabled");
+        let id = trigger["id"].as_str().unwrap();
+        let refused = call(app.clone(), send(Method::POST, "/v1/triggers", json!({ "source": { "kind": "time" }, "action": { "kind": "wakeAssistant", "text": "x" } }))).await;
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{}", refused.2);
+        let paused = call(app.clone(), send(Method::PUT, &format!("/v1/triggers/{id}"), json!({ "state": "paused" }))).await;
+        assert_eq!(paused.0, StatusCode::OK, "{}", paused.2);
+        let listed = call(app.clone(), request(Method::GET, "/v1/triggers").body(Body::empty()).unwrap()).await;
+        assert!(listed.2.contains("\"paused\""), "{}", listed.2);
+        // Run fires even a paused trigger: the user asked for it.
+        let ran = call(app.clone(), request(Method::POST, &format!("/v1/triggers/{id}/run")).body(Body::empty()).unwrap()).await;
+        assert_eq!(ran.0, StatusCode::OK, "{}", ran.2);
+        let firings = call(app.clone(), request(Method::GET, &format!("/v1/triggers/firings?triggerId={id}")).body(Body::empty()).unwrap()).await;
+        let firings: Value = serde_json::from_str(&firings.2).unwrap();
+        assert_eq!(firings["firings"].as_array().map(Vec::len), Some(1), "{firings}");
+        let deleted = call(app.clone(), request(Method::DELETE, &format!("/v1/triggers/{id}")).body(Body::empty()).unwrap()).await;
+        assert_eq!(deleted.0, StatusCode::NO_CONTENT);
+        let gone = call(app, request(Method::DELETE, &format!("/v1/triggers/{id}")).body(Body::empty()).unwrap()).await;
+        assert_eq!(gone.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -121,7 +121,7 @@ try {
   check('only what it says reaches the user', shown.filter(row => row.kind === 'assistant').length === 1 && !shown.some(row => row.text?.includes('FINAL TEXT')), JSON.stringify(shown.map(row => row.text)).slice(0, 300));
 
   const offered = new Set(requests[0]?.tools ?? []);
-  check('offered its own tools', ['say', 'list_workspaces', 'start_task', 'read_inbox', 'memory_write', 'list_projects'].every(name => offered.has(name)), [...offered].join(','));
+  check('offered its own tools', ['say', 'list_workspaces', 'start_task', 'read_inbox', 'memory_write', 'list_projects', 'schedule_wake', 'cancel_wake', 'list_triggers', 'propose_trigger'].every(name => offered.has(name)), [...offered].join(','));
   check('offered read-only tools', offered.has('read'), '');
   const coder = ['bash', 'write', 'edit', 'powershell'].filter(name => offered.has(name));
   check('offered nothing that runs commands or writes files', coder.length === 0, coder.join(','));

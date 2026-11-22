@@ -54,6 +54,10 @@ pub struct TaskRecord {
     /// while it waited). A task with a session reads its state there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_started: Option<String>,
+    /// The triggers that led to this task, oldest first. A trigger never
+    /// fires on the end of a task it led to, so triggers cannot loop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggered_by: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -113,6 +117,8 @@ pub struct TaskManager {
     store: Mutex<Store>,
     live: Mutex<HashMap<String, Live>>,
     notify: Notify,
+    /// A task ended (finished, failed or stopped): what triggers listen to.
+    ended: Mutex<Vec<tokio::sync::mpsc::UnboundedSender<crate::triggers::Event>>>,
 }
 
 /// States a task counts against the user's limit in: its runtime is in use.
@@ -229,6 +235,7 @@ impl TaskManager {
             store: Mutex::new(store),
             live: Mutex::new(HashMap::new()),
             notify: Notify::new(),
+            ended: Mutex::new(Vec::new()),
         })
     }
 
@@ -402,6 +409,18 @@ impl TaskManager {
         text: &str,
         model: Option<Value>,
     ) -> Result<Value, ApiError> {
+        self.start_triggered(client, workspace, text, model, Vec::new())
+    }
+
+    /// Like `start_with`, for a task triggers led to (see `triggered_by`).
+    pub fn start_triggered(
+        self: &Arc<Self>,
+        client: &str,
+        workspace: &str,
+        text: &str,
+        model: Option<Value>,
+        triggered_by: Vec<String>,
+    ) -> Result<Value, ApiError> {
         Self::check_text(text)?;
         if let Some(model) = &model {
             if !(model["provider"].is_string() && model["id"].is_string()) {
@@ -421,6 +440,7 @@ impl TaskManager {
             pending_text: Some(text.to_string()),
             model,
             not_started: None,
+            triggered_by,
         };
         {
             let mut store = self.store();
@@ -641,8 +661,35 @@ impl TaskManager {
             });
             self.save(&store);
             self.sessions.publish_control("inbox.changed", json!({ "clientId": record.client_id, "seq": seq }));
+            if matches!(state, "finished" | "failed" | "stopped") {
+                let at = now();
+                let event = crate::triggers::Event {
+                    id: format!("task.ended:{task_id}:{seq}"),
+                    kind: "task.ended".into(),
+                    at,
+                    fields: json!({
+                        "taskId": task_id,
+                        "state": state,
+                        "clientId": record.client_id,
+                        "workspace": record.workspace,
+                        "triggeredBy": record.triggered_by,
+                    }),
+                };
+                // Unbounded: an event is never dropped for being one too many.
+                self.ended
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retain(|listener| listener.send(event.clone()).is_ok());
+            }
         }
         self.notify.notify_waiters();
+    }
+
+    /// Tasks ending, as events.
+    pub fn subscribe_ended(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::triggers::Event> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        self.ended.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(sender);
+        receiver
     }
 
     /// Starts waiting tasks, oldest first, while slots are free.

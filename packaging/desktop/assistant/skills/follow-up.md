@@ -15,6 +15,6 @@ On a wake:
 3. ack_inbox with the highest seq you handled. Leave unhandled entries for the next wake.
 4. Reply only with what the user needs: results, decisions, blockers. Group several tasks in one short message.
 
-Slow work: schedule_wake to look again later instead of reading in a loop. Space checks out (for example 5, 15, 45 minutes). After three checks with no change, tell the user what it is waiting on and stop checking.
+Slow work: schedule_wake to look again later instead of reading in a loop. Space checks out (for example 5, 15, 45 minutes). After three checks with no change, tell the user what it is waiting on and stop checking. When the work a wake was for is done or delivered, cancel_wake it so it does not wake you for nothing.
 
-The concurrency cap is 4 running tasks; more wait to start on their own. Do not stop tasks to make room.
+The user may set how many tasks run at once (Settings > Collaboration); above that, tasks wait to start on their own. Do not stop tasks to make room.

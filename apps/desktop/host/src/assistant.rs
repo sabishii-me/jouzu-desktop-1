@@ -25,7 +25,6 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
-    time::{Duration, Instant},
 };
 
 use axum::{
@@ -49,6 +48,7 @@ use crate::{
     },
     session::{ApiError, RuntimeSpec, SessionManager},
     tasks::TaskManager,
+    triggers::{self, Source, TriggerInput, TriggerState, Triggers},
 };
 
 pub const CLIENT: &str = "assistant";
@@ -132,37 +132,18 @@ impl Phase {
     }
 }
 
-struct Wake {
-    at: Instant,
-    note: String,
-}
-
-/// Scheduled wakes on disk, by wall-clock time, so a restart keeps them: the
-/// Assistant may already have told the user a reminder is set.
-fn load_wakes(dir: &Path) -> Vec<Wake> {
+/// Reminders the Assistant set before they became triggers (wakes.json):
+/// they move into the trigger table once, keeping their time.
+fn move_old_wakes(dir: &Path, triggers: &Triggers) {
+    let file = dir.join("wakes.json");
+    let Ok(bytes) = std::fs::read(&file) else { return };
     let now_ms = Utc::now().timestamp_millis();
-    std::fs::read(dir.join("wakes.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).ok())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|wake| {
-            let due = wake["dueMs"].as_i64()?;
-            let left = Duration::from_millis(due.saturating_sub(now_ms).max(0) as u64);
-            Some(Wake { at: Instant::now() + left, note: wake["note"].as_str().unwrap_or("").to_string() })
-        })
-        .collect()
-}
-
-fn save_wakes(dir: &Path, wakes: &[Wake]) {
-    let now = Instant::now();
-    let now_ms = Utc::now().timestamp_millis();
-    let rows: Vec<Value> = wakes
-        .iter()
-        .map(|wake| json!({ "dueMs": now_ms + wake.at.saturating_duration_since(now).as_millis() as i64, "note": wake.note }))
-        .collect();
-    let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::write(dir.join("wakes.json"), serde_json::to_vec(&rows).unwrap_or_default());
+    for wake in serde_json::from_slice::<Vec<Value>>(&bytes).unwrap_or_default() {
+        let Some(due) = wake["dueMs"].as_i64() else { continue };
+        let seconds = (due.saturating_sub(now_ms).max(0) as u64).div_ceil(1000).max(1);
+        let _ = triggers.remind(seconds, wake["note"].as_str().unwrap_or(""));
+    }
+    let _ = std::fs::remove_file(file);
 }
 
 struct State {
@@ -172,7 +153,8 @@ struct State {
     queue: VecDeque<String>,
     /// Inbox seq the last wake covered.
     woken_seq: u64,
-    scheduled: Vec<Wake>,
+    /// Notes from triggers that fired, waiting for the Assistant to be idle.
+    due_notes: Vec<String>,
     turn: u64,
     /// The memory index as the Assistant last saw it.
     memory_seen: String,
@@ -194,6 +176,7 @@ pub struct Assistant {
     sessions: Arc<SessionManager>,
     tasks: Arc<TaskManager>,
     projects: Arc<ProjectStore>,
+    triggers: Arc<Triggers>,
     settings: Mutex<Settings>,
     state: Mutex<State>,
     runtime: Mutex<Option<Runtime>>,
@@ -231,26 +214,28 @@ impl Assistant {
         sessions: Arc<SessionManager>,
         tasks: Arc<TaskManager>,
         projects: Arc<ProjectStore>,
+        triggers: Arc<Triggers>,
     ) -> Arc<Self> {
         let dir = home.join("assistant");
         let settings = std::fs::read(dir.join("assistant.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Settings>(&bytes).ok())
             .unwrap_or_default();
-        let scheduled = load_wakes(&dir);
+        move_old_wakes(&dir, &triggers);
         Arc::new(Self {
             dir,
             paths,
             sessions,
             tasks,
             projects,
+            triggers,
             settings: Mutex::new(settings),
             state: Mutex::new(State {
                 phase: Phase::Off,
                 error: None,
                 queue: VecDeque::new(),
                 woken_seq: 0,
-                scheduled,
+                due_notes: Vec::new(),
                 turn: 0,
                 memory_seen: String::new(),
                 interrupted: false,
@@ -314,6 +299,14 @@ impl Assistant {
     /// Starts the scheduler and, when the user turned the Assistant on, the
     /// process. Called once when the host starts.
     pub fn launch(self: &Arc<Self>) {
+        // A trigger that wakes the Assistant leaves its note here.
+        let weak = Arc::downgrade(self);
+        self.triggers.set_waker(move |note| {
+            if let Some(assistant) = weak.upgrade() {
+                assistant.state().due_notes.push(note);
+                assistant.kick.notify_one();
+            }
+        });
         let assistant = Arc::clone(self);
         tokio::spawn(async move { assistant.schedule_loop().await });
         if self.settings().enabled {
@@ -333,10 +326,7 @@ impl Assistant {
             "error": state.error,
             "queued": state.queue.len(),
             "unseen": self.unseen(),
-            "scheduledWakes": state.scheduled.iter().map(|wake| json!({
-                "inSeconds": wake.at.saturating_duration_since(Instant::now()).as_secs(),
-                "note": wake.note,
-            })).collect::<Vec<_>>(),
+            "scheduledWakes": self.reminders(),
         })
     }
 
@@ -414,6 +404,23 @@ impl Assistant {
 
     /// Whether the Assistant said something (a reply or an error) after the
     /// last time the person looked at its pane. One mark for every window.
+    /// The Assistant's own reminders that have not fired yet.
+    fn reminders(&self) -> Vec<Value> {
+        let list = self.triggers.list();
+        list["triggers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| serde_json::from_value::<triggers::Trigger>(row.clone()).ok())
+            .filter(|trigger| {
+                trigger.created_by == triggers::BY_ASSISTANT
+                    && trigger.state == TriggerState::Enabled
+                    && matches!(trigger.source, Source::Time { .. })
+            })
+            .map(|trigger| json!({ "id": trigger.id, "at": trigger.next_at, "note": trigger.name }))
+            .collect()
+    }
+
     fn unseen(&self) -> bool {
         let seen = std::fs::read_to_string(self.dir.join("seen.json"))
             .ok()
@@ -738,20 +745,12 @@ impl Assistant {
             let inbox = self.tasks.inbox_changed();
             tokio::pin!(inbox);
             inbox.as_mut().enable();
-            let due = self.state().scheduled.iter().map(|wake| wake.at).min();
             let next = self.next_turn();
             if next.is_none() {
                 let kicked = self.kick.notified();
-                match due {
-                    Some(at) => tokio::select! {
-                        _ = kicked => {}
-                        _ = inbox => {}
-                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => {}
-                    },
-                    None => tokio::select! {
-                        _ = kicked => {}
-                        _ = inbox => {}
-                    },
+                tokio::select! {
+                    _ = kicked => {}
+                    _ = inbox => {}
                 }
                 continue;
             }
@@ -814,24 +813,16 @@ impl Assistant {
         if let Some(text) = state.queue.pop_front() {
             return Some(format!("{text}{}", memory_note.unwrap_or_default()));
         }
-        let now = Instant::now();
         let entries: Vec<Value> = inbox
             .as_ref()
             .and_then(|inbox| inbox["entries"].as_array().cloned())
             .unwrap_or_default();
         let newest = entries.iter().filter_map(|entry| entry["seq"].as_u64()).max().unwrap_or(0);
         let inbox_wake = newest > state.woken_seq;
-        let due: Vec<String> = state
-            .scheduled
-            .iter()
-            .filter(|wake| wake.at <= now)
-            .map(|wake| wake.note.clone())
-            .collect();
-        if !inbox_wake && due.is_empty() {
+        if !inbox_wake && state.due_notes.is_empty() {
             return None;
         }
-        state.scheduled.retain(|wake| wake.at > now);
-        save_wakes(&self.dir, &state.scheduled);
+        let due = std::mem::take(&mut state.due_notes);
         let mut text = String::from("[wake]");
         if inbox_wake {
             state.woken_seq = newest;
@@ -883,15 +874,19 @@ impl Assistant {
             "history_search" => Ok(self.history_search(string(arguments, "query")?, arguments["limit"].as_u64().map(|limit| limit as usize))),
             "schedule_wake" => {
                 let seconds = arguments["seconds"].as_u64().ok_or_else(|| ApiError::bad_request("seconds is required"))?;
-                let note = arguments["note"].as_str().unwrap_or("").to_string();
-                let mut state = self.state();
-                state.scheduled.push(Wake { at: Instant::now() + Duration::from_secs(seconds), note });
-                save_wakes(&self.dir, &state.scheduled);
-                let scheduled = state.scheduled.len();
-                drop(state);
-                // The loop sleeps until the earliest wake: it must hear of this one.
-                self.kick.notify_one();
-                Ok(json!({ "scheduled": scheduled }))
+                let trigger = self.triggers.remind(seconds, arguments["note"].as_str().unwrap_or(""))?;
+                Ok(json!({ "id": trigger.id, "at": trigger.next_at }))
+            }
+            "cancel_wake" => {
+                self.triggers.cancel_reminder(string(arguments, "id")?)?;
+                Ok(json!({ "cancelled": true }))
+            }
+            "list_triggers" => Ok(self.triggers.list()),
+            "propose_trigger" => {
+                let input: TriggerInput = serde_json::from_value(arguments.clone())
+                    .map_err(|error| ApiError::bad_request(format!("Invalid trigger: {error}")))?;
+                let trigger = self.triggers.create(triggers::BY_ASSISTANT, input)?;
+                Ok(json!({ "id": trigger.id, "state": "proposed", "note": "The user turns it on in Desktop; until then it does nothing." }))
             }
             "get_workflow" => self.workflow().read(),
             "save_workflow" => {
@@ -1157,7 +1152,10 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({ "name": "memory_delete", "description": "Delete a memory that is wrong or no longer true.", "inputSchema": { "type": "object", "properties": { "name": name }, "required": ["name"] } }),
         json!({ "name": "memory_search", "description": "Find memories containing a text.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } }),
         json!({ "name": "history_search", "description": "Find earlier messages, replies and wakes of your conversation containing a text.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "description": "The newest this many; all when left out." } }, "required": ["query"] } }),
-        json!({ "name": "schedule_wake", "description": "Be woken after some seconds with a note to yourself.", "inputSchema": { "type": "object", "properties": { "seconds": { "type": "integer", "minimum": 1 }, "note": { "type": "string" } }, "required": ["seconds"] } }),
+        json!({ "name": "schedule_wake", "description": "Be woken after some seconds with a note to yourself. Returns its id; cancel it with cancel_wake when it is no longer needed.", "inputSchema": { "type": "object", "properties": { "seconds": { "type": "integer", "minimum": 1 }, "note": { "type": "string" } }, "required": ["seconds"] } }),
+        json!({ "name": "cancel_wake", "description": "Cancel a wake you set, or withdraw a trigger you proposed that the user has not turned on.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } }),
+        json!({ "name": "list_triggers", "description": "The user's triggers (when this happens, do that), your proposals and your wakes, with their state.", "inputSchema": { "type": "object", "properties": {} } }),
+        json!({ "name": "propose_trigger", "description": "Propose a trigger to the user. It does nothing until the user turns it on in Desktop. source: {kind:'time', at?: RFC 3339, everySeconds?} | {kind:'manual'} | {kind:'event', event:'task.ended'}. filter: event field -> value (a list means any; * matches any text). action: {kind:'wakeAssistant', text} | {kind:'startTask', workspace, text, model?}. {{field}} in text takes the event's field.", "inputSchema": { "type": "object", "properties": { "name": { "type": "string" }, "source": { "type": "object" }, "filter": { "type": "object" }, "action": { "type": "object" } }, "required": ["name", "source", "action"] } }),
         json!({ "name": "get_workflow", "description": "jouzu's workflow definitions (agents.json): roles, their model tier, tools, instructions, maxConcurrent. config is null while the runtime uses its defaults. Load the configure-workflow skill first.", "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "save_workflow", "description": "Replace the workflow definitions. Pass the revision get_workflow returned; a change since then is refused. The replaced version is kept and can be restored.", "inputSchema": { "type": "object", "properties": { "config": { "type": "object" }, "revision": { "type": "string" } }, "required": ["config", "revision"] } }),
         json!({ "name": "list_workflow_versions", "description": "Earlier workflow definitions kept on each save, oldest first.", "inputSchema": { "type": "object", "properties": {} } }),
@@ -1169,6 +1167,7 @@ pub fn tool_definitions() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn faux_pick() -> ModelPick {
         ModelPick { provider: "faux".into(), id: "faux-1".into(), thinking: None }
@@ -1188,6 +1187,7 @@ mod tests {
     struct Fixture {
         assistant: Arc<Assistant>,
         tasks: Arc<TaskManager>,
+        triggers: Arc<Triggers>,
         workspace: tempfile::TempDir,
         log: PathBuf,
         _home: tempfile::TempDir,
@@ -1218,7 +1218,9 @@ mod tests {
         // The stand-in writes it in its working folder, the Assistant's folder.
         let log = home.path().join("assistant").join("turns.log");
         let paths = AssistantPaths { runtime: Some(RuntimeSpec::node_script(&fixtures().join("fake-assistant.mjs"))) };
-        let assistant = Assistant::new(home.path(), paths, sessions, tasks.clone(), projects);
+        let triggers = Triggers::new(home.path(), sessions.clone(), tasks.clone());
+        let assistant = Assistant::new(home.path(), paths, sessions, tasks.clone(), projects, triggers.clone());
+        triggers.launch();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         assistant.set_port(listener.local_addr().unwrap().port());
@@ -1227,7 +1229,7 @@ mod tests {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             let _ = axum::serve(listener, router).await;
         });
-        Fixture { assistant, tasks, workspace, log, _home: home }
+        Fixture { assistant, tasks, triggers, workspace, log, _home: home }
     }
 
     async fn until_async<F: std::future::Future<Output = bool>>(mut check: impl FnMut() -> F) {
@@ -1363,18 +1365,94 @@ mod tests {
     async fn a_scheduled_wake_survives_a_restart() {
         let fixture = setup();
         fixture.assistant.run_tool("schedule_wake", &json!({ "seconds": 3600, "note": "check the release" })).await.unwrap();
+        let triggers = Triggers::new(fixture._home.path(), fixture.assistant.sessions.clone(), fixture.tasks.clone());
         let again = Assistant::new(
             fixture._home.path(),
             Assistant::default_paths(fixture._home.path(), &fixture.assistant.sessions),
             fixture.assistant.sessions.clone(),
             fixture.tasks.clone(),
             fixture.assistant.projects.clone(),
+            triggers,
         );
         let wakes = again.snapshot().await["scheduledWakes"].clone();
         assert_eq!(wakes.as_array().map(Vec::len), Some(1), "{wakes}");
         assert_eq!(wakes[0]["note"], "check the release");
-        assert!(wakes[0]["inSeconds"].as_u64().is_some_and(|left| (3590..=3600).contains(&left)), "{wakes}");
+        let at = chrono::DateTime::parse_from_rfc3339(wakes[0]["at"].as_str().unwrap()).unwrap();
+        let left = (at.with_timezone(&Utc) - Utc::now()).num_seconds();
+        assert!((3590..=3600).contains(&left), "{wakes}");
     }
+
+    #[tokio::test]
+    async fn wakes_set_before_triggers_move_into_the_trigger_table() {
+        let fixture = setup();
+        let dir = fixture._home.path().join("assistant");
+        std::fs::create_dir_all(&dir).unwrap();
+        let due = Utc::now().timestamp_millis() + 600_000;
+        std::fs::write(dir.join("wakes.json"), json!([{ "dueMs": due, "note": "old reminder" }]).to_string()).unwrap();
+        let triggers = Triggers::new(fixture._home.path(), fixture.assistant.sessions.clone(), fixture.tasks.clone());
+        let again = Assistant::new(
+            fixture._home.path(),
+            Assistant::default_paths(fixture._home.path(), &fixture.assistant.sessions),
+            fixture.assistant.sessions.clone(),
+            fixture.tasks.clone(),
+            fixture.assistant.projects.clone(),
+            triggers,
+        );
+        let wakes = again.snapshot().await["scheduledWakes"].clone();
+        assert_eq!(wakes[0]["note"], "old reminder", "{wakes}");
+        assert!(!dir.join("wakes.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_wake_never_comes_and_a_due_one_comes_once() {
+        let fixture = setup();
+        fixture.assistant.launch();
+        fixture.assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
+        until(|| fixture.assistant.state().phase == Phase::Idle).await;
+        let cancelled = fixture.assistant.run_tool("schedule_wake", &json!({ "seconds": 1, "note": "never" })).await.unwrap();
+        fixture.assistant.run_tool("cancel_wake", &json!({ "id": cancelled["id"] })).await.unwrap();
+        fixture.assistant.run_tool("schedule_wake", &json!({ "seconds": 1, "note": "look again" })).await.unwrap();
+        until(|| std::fs::read_to_string(&fixture.log).unwrap_or_default().contains("look again")).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let turns = std::fs::read_to_string(&fixture.log).unwrap();
+        assert_eq!(turns.matches("look again").count(), 1, "{turns}");
+        assert!(!turns.contains("never"), "{turns}");
+        assert_eq!(fixture.assistant.snapshot().await["scheduledWakes"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_proposed_trigger_does_nothing_until_the_user_turns_it_on() {
+        let fixture = setup();
+        let proposed = fixture
+            .assistant
+            .run_tool(
+                "propose_trigger",
+                &json!({ "name": "Retry failed tasks", "source": { "kind": "event", "event": "task.ended" }, "filter": { "state": "failed" }, "action": { "kind": "wakeAssistant", "text": "{{taskId}} failed" } }),
+            )
+            .await
+            .unwrap();
+        let id = proposed["id"].as_str().unwrap().to_string();
+        assert_eq!(fixture.triggers.get(&id).unwrap().state, TriggerState::Proposed);
+        let event = |n: u32| triggers::Event { id: format!("e{n}"), kind: "task.ended".into(), at: String::new(), fields: json!({ "taskId": "task-1", "state": "failed" }) };
+        fixture.triggers.emit(event(1)).await;
+        assert_eq!(fixture.triggers.firings(Some(&id), None)["firings"], json!([]));
+        assert!(fixture.triggers.run_now(&id).await.is_err(), "a proposal cannot be run");
+        // The user turns it on; then it fires.
+        fixture.triggers.update(&id, TriggerInput { state: Some(TriggerState::Enabled), ..Default::default() }).unwrap();
+        fixture.triggers.emit(event(2)).await;
+        assert_eq!(fixture.triggers.firings(Some(&id), None)["firings"].as_array().map(Vec::len), Some(1));
+        // Now it is the user's: the Assistant cannot withdraw it.
+        let refused = fixture.assistant.run_tool("cancel_wake", &json!({ "id": id })).await.unwrap_err();
+        assert_eq!(refused.code, "not-yours");
+        // Nor any trigger the user made.
+        let mine = fixture
+            .triggers
+            .create(triggers::BY_USER, serde_json::from_value(json!({ "source": { "kind": "manual" }, "action": { "kind": "wakeAssistant", "text": "hi" } })).unwrap())
+            .unwrap();
+        assert_eq!(mine.state, TriggerState::Enabled);
+        assert!(fixture.assistant.run_tool("cancel_wake", &json!({ "id": mine.id })).await.is_err());
+    }
+
 
     #[tokio::test]
     async fn task_changes_wake_the_assistant_when_idle_and_none_is_lost() {
