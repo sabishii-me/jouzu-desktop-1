@@ -51,7 +51,7 @@ async function installRunningSessionFixture(page: Page) {
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ stats: null }) });
     }
     if ((path === "/v1/sessions/s1/events" || path === "/v1/sessions/undefined/events") && request.method() === "GET") {
-      const data = `id: 1\nevent: session.updated\ndata: ${JSON.stringify({ seq: 1, sessionId: "s1", event: "session.updated", data: sessionSnapshot })}\n\n`;
+      const data = `id: 1\nevent: session.updated\ndata: ${JSON.stringify({ seq: 1, sessionId: "s1", event: "session.updated", data: snapshot })}\n\n`;
       return route.fulfill({ status: 200, contentType: "text/event-stream", body: data });
     }
     if (path === "/v1/sessions/s1/view" && request.method() === "POST") return route.fulfill({ status: 204, body: "" });
