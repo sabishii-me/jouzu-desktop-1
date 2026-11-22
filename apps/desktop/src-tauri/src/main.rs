@@ -321,7 +321,7 @@ async fn runtime_install(
     // An update replaces node_modules underneath every live runtime. Stop the
     // sessions first; otherwise the old process keeps the old files mapped and
     // the user has to quit the whole app before a session can start again.
-    host_bootstrap::stop_sessions()?;
+    host_bootstrap::stop_sessions().await?;
     let handle = app.clone();
     let version = tauri::async_runtime::spawn_blocking(move || {
         let emit = |value: serde_json::Value| { let _ = tauri::Emitter::emit(&handle, "runtime-install-progress", value); };
