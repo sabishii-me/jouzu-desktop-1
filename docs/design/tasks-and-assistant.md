@@ -304,7 +304,7 @@ Nodes:
 | --- | --- | --- |
 | agent | Starts a task (the user's, client `desktop`) with the brief | `done` when the turn ended and every file in `outputs` was written during this attempt (a file left by an earlier attempt does not count); `undelivered` when some are missing; `failed` when the task failed or stopped |
 | check | Runs a command with the system shell in the folder | `passed` on exit 0, else `failed`; exit code, stdout and stderr are kept |
-| connector | An action at a connector (GitHub `read_issue`, `comment`, `open_pr`, `open_issues` from a JSON file) with templated `args` | `done` with the answer kept (also as `answer.json` in the step's evidence folder, `{{evidence}}/<step>-<n>/`), or `failed` with the reason; writes run only right after an approved checkpoint, and one cut off by a host stop is never repeated |
+| connector | An action at a connector (GitHub `read_issue`, `comment`, `open_pr`, `open_issues` from a JSON file) with templated `args` | `done` with the answer kept (also as `answer.json` in the step's evidence folder, `{{evidence}}/<step>-<n>/`), or `failed` with the reason; writes run only after an approved checkpoint with no agent step since (checks and connector steps that went well may sit between, such as pushing a branch before opening the pull request), and one cut off by a host stop is never repeated |
 | checkpoint | Stops; the question and what to look at become the user's to-do | `approved`; or the user sends the run back to a node in `sendBack` with a note, or stops it |
 
 Edges are `{from, to, when, attempts?}`. The first edge from the node whose
@@ -312,10 +312,17 @@ Edges are `{from, to, when, attempts?}`. The first edge from the node whose
 this run, is taken. That is how a graph leaves a loop: "after the second
 failed check, ask the user" is an edge; the engine holds no number. With no
 matching edge, `done`, `passed` or `approved` finish the run and any other
-result fails it, with the reason. A note the user sends back with goes into
-the next attempt's brief word for word. Briefs, folders, commands and
+result fails it, with the reason. A note the user sends back with goes at the
+top of the next attempt's brief, word for word, with the ask to say how it
+was followed. A run is refused at start when a step's folder is not a folder. Briefs, folders, commands and
 questions take `{{param}}`, `{{runId}}`, `{{evidence}}` (the run's evidence
 folder) and `{{note}}`.
+
+A host stop cuts off whatever step was running. On the next start a command
+runs again; an agent step whose task did not finish runs again, told that the
+host stopped and its earlier work may still be in the folder; a step cut off
+twice in a row is not started a third time (it may be what stops the host)
+and the run fails, saying so. A connector step is never repeated.
 
 What "done" means is the engine's, not the model's. A gap stays recorded:
 "its background processes ended" needs a process group per runtime (plan
@@ -357,9 +364,11 @@ starts the run.
 - `issue-loop` (repo, number, workspace, base, test): read the issue, triage
   (reproduce, duplicates, severity) → checkpoint on scope → root cause and
   plan, no code changes → checkpoint on the plan → fix on
-  `loop/issue-<number>` with a test → the test command; failing goes back to
-  the fix, and the third failure goes to a checkpoint → checkpoint to accept
-  → open the pull request → checkpoint once merged. The issue stays open
+  `loop/issue-<number>` with a test that fails before and passes after,
+  committed but not pushed → the test command; failing goes back to the fix,
+  and the third failure goes to a checkpoint → checkpoint to accept → push the
+  branch → open the pull request → checkpoint once merged. Nothing leaves the
+  machine before the user accepts the fix. The issue stays open
   until a release with the fix is verified.
 - `qa-release-loop` (repo, tag, workspace, tour): the tour command installs
   the release, walks its states and compares them with the baseline → an
