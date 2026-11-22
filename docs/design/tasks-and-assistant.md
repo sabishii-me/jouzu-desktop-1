@@ -144,11 +144,13 @@ Assistant is idle. Task changes wake it as soon as it is idle, with a
 one-line summary (how many tasks, by state); it reads and acknowledges its
 inbox itself. Changes that arrive while it works are one wake when it is
 done. There is no timer and no poll: the loop runs on a user message, the
-Assistant going idle, an inbox entry, or a scheduled wake coming due. `schedule_wake` lets it look again later.
+Assistant going idle, an inbox entry, or a wake trigger firing. `schedule_wake` lets it look again later.
 If the runtime ends it stays stopped, with the reason, until the user writes or turns it on.
-Scheduled wakes are kept on disk by wall-clock time, so a restart keeps a
-reminder the Assistant already promised; one that came due meanwhile fires
-when it is next idle.
+A scheduled wake is a one-time trigger (see Triggers) created by the
+Assistant: on at once, kept on disk by wall-clock time so a restart keeps a
+reminder it already promised, and one that came due meanwhile fires once.
+`schedule_wake` returns its id and `cancel_wake` removes it, so a wake set
+to check on work that is already delivered does not come.
 
 ### What it hears and reads
 
@@ -238,6 +240,50 @@ teaches (`src/task-views.tsx`, layout in `src/task-views-model.ts`):
   message. Each drawn view can show its source.
 - Wide views (board, graph) scroll inside their frame, so the page never
   scrolls sideways at phone width (remote web).
+
+## Triggers
+
+"When this happens, do that", kept by the host (`triggers.rs`, data in
+`<host home>/triggers/`). This is step 1 of the loop engine: later steps add
+graphs that a trigger starts, human checkpoints, and connectors as event
+sources.
+
+A trigger has:
+
+- a source: a time (`at`, `everySeconds`, or both), `manual` (only when the
+  user presses Run), or an event kind (`task.ended` now; connector events
+  later);
+- a filter on the event's fields: a value, a list (any of them), or a string
+  with `*`;
+- an action: wake the Assistant with a note, or start a task in one of the
+  user's folders. `{{field}}` in the text takes the event's field; a field
+  the event does not carry fails the firing instead of running with words
+  missing;
+- its state (`proposed`, `enabled`, `paused`, `done` for a one-time trigger
+  that fired), who created it, when it last fired and when it fires next.
+
+Rules:
+
+- Every firing is recorded with its event (`firings.jsonl`) before the action
+  runs. One event fires a trigger once, across restarts too.
+- Triggers only see events. A timer, a task ending, or later a connector
+  polling or a webhook all arrive the same way, so changing how an event is
+  received does not change triggers.
+- A time trigger missed while the host was off fires once on start; a
+  repeating one then moves to its next time after now. The host sets no
+  numbers: how often it repeats is the trigger's own data.
+- No loops: a task a trigger started carries the triggers that led to it
+  (`triggeredBy`), and a trigger never fires on the end of work it led to.
+- Tasks a trigger starts are the user's (client `desktop`), counted against
+  the user's limit like any task.
+
+Who decides: the user, over `/v1/triggers` (list, create, change, pause,
+delete, Run, firings). Agents with MCP tokens cannot reach it. The
+Assistant may `propose_trigger`: the proposal does nothing (no firing, no
+Run) until the user turns it on, because a trigger can start work and spend
+money while nobody watches. The Assistant can withdraw its own proposal and
+cancel its own wakes, and nothing else. There is no UI yet; the data and API
+come first.
 
 ## Workflow and models
 
