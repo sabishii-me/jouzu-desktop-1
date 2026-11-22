@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { execFile } from "node:child_process";
 import { spawn, type ChildProcess } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,17 +20,39 @@ const hostBin = process.env.JOUZU_HOST_BIN
 const dist = join(root, "dist");
 const startDelayMs = 8000;
 
-test.skip(!existsSync(hostBin) || !existsSync(join(dist, "index.html")), "build the UI and the host first");
+test.describe("send while starting", () => {
+  test.skip(!existsSync(hostBin) || !existsSync(join(dist, "index.html")), "build the UI and the host first");
 
-let host: ChildProcess | undefined;
-let scratch = "";
-test.afterEach(() => {
-  host?.kill();
-  if (scratch) rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-});
+  let host: ChildProcess | undefined;
+  let scratch = "";
+  test.afterEach(async () => {
+    const child = host;
+    host = undefined;
+    if (child?.pid && child.exitCode === null) {
+      await new Promise<void>(resolve => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        child.once("exit", finish);
+        if (process.platform === "win32") {
+          execFile("taskkill", ["/PID", String(child.pid), "/T", "/F"], finish);
+        } else {
+          child.kill("SIGTERM");
+        }
+        setTimeout(finish, 5000);
+      });
+    }
+    if (scratch) {
+      rmSync(scratch, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
+      scratch = "";
+    }
+  });
 
-test("a message sent while the runtime starts is accepted and listed at once", async ({ page }) => {
-  test.setTimeout(60_000);
+  test("a message sent while the runtime starts is accepted and listed at once", async ({ page }) => {
+    test.setTimeout(60_000);
   scratch = mkdtempSync(join(tmpdir(), "jouzu-send-starting-"));
   const home = join(scratch, "home");
   const node = join(scratch, "node", "bin", process.platform === "win32" ? "node.exe" : "node");
@@ -84,10 +107,8 @@ test("a message sent while the runtime starts is accepted and listed at once", a
   await expect(page.getByText(/Enter to steer/i)).toHaveCount(0);
   await expect(page.getByText(/Starting session/i).first()).toBeVisible();
   expect(Date.now() - opened).toBeLessThan(startDelayMs);
-
-
-
-  // The held message is answered once the runtime is up, in the same row.
-  await expect(page.getByText(/Starting session/i)).toHaveCount(0, { timeout: startDelayMs + 15_000 });
-  await expect(sidebar.getByText("first message while starting")).toHaveCount(1);
+    // The held message is answered once the runtime is up, in the same row.
+    await expect(page.getByText(/Starting session/i)).toHaveCount(0, { timeout: startDelayMs + 15_000 });
+    await expect(sidebar.getByText("first message while starting")).toHaveCount(1);
+  });
 });
