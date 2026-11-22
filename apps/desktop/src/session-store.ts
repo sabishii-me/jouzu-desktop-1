@@ -743,6 +743,8 @@ export class SessionStore {
     const failed = record(data.failedTurn);
     const failedError = record(failed?.error);
     const failure = record(data.failure);
+    const textguard = data.textguard && typeof data.textguard === "object" ? data.textguard as Data : undefined;
+    const textguardMode = textguard?.mode === "on" || textguard?.mode === "strict" || textguard?.mode === "off" ? textguard.mode : undefined;
     // The session's model, its list and levels are the runtime's, as the host relays them.
     const selected = record(data.model);
     const modelState = selected ? modelStateOf(selected.state) : this.state.modelState;
@@ -772,6 +774,7 @@ export class SessionStore {
       ...(prompts ? { prompts } : {}),
       ...("widgets" in data ? { widgets: widgetsOf(data.widgets) } : {}),
       ...("statuses" in data ? { statuses: statusesOf(data.statuses) } : {}),
+      ...(textguardMode ? { textguard: { mode: textguardMode, ...(typeof textguard?.alert === "string" ? { alert: textguard.alert } : {}) } } : {}),
     });
     if ("activeTurn" in data) this.applyTurn(activeTurnOf(data.activeTurn));
   }
