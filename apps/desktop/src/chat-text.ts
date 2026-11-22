@@ -41,6 +41,7 @@ const en = {
   replyModelUnavailable: "The provider does not offer this model",
   replyImage: "The model refused an image in this conversation",
   replyUnavailable: "The provider did not answer",
+  replyProviderError: "The provider had an error",
   replyOther: "The reply stopped with an error",
   signIn: "Sign in",
   failed: "Failed",
@@ -483,6 +484,7 @@ const ja: ChatText = {
   replyModelUnavailable: "プロバイダーはこのモデルを提供していません",
   replyImage: "モデルがこの会話の画像を拒否しました",
   replyUnavailable: "プロバイダーから応答がありません",
+  replyProviderError: "プロバイダーでエラーが発生しました",
   replyOther: "応答がエラーで止まりました",
   signIn: "サインイン",
   failed: "失敗",
@@ -919,6 +921,7 @@ const hans: ChatText = {
   replyModelUnavailable: "服务商不提供这个模型",
   replyImage: "模型拒绝了此对话中的图片",
   replyUnavailable: "服务商没有响应",
+  replyProviderError: "服务商返回了错误",
   replyOther: "回复因错误而停止",
   signIn: "登录",
   failed: "失败",
@@ -1355,6 +1358,7 @@ const hant: ChatText = {
   replyModelUnavailable: "服務商不提供這個模型",
   replyImage: "模型拒絕了此對話中的圖片",
   replyUnavailable: "服務商沒有回應",
+  replyProviderError: "服務商回傳了錯誤",
   replyOther: "回覆因錯誤而停止",
   signIn: "登入",
   failed: "失敗",
@@ -1862,6 +1866,7 @@ const REPLY_REASONS: Record<string, TextKey> = {
   "model-unavailable": "replyModelUnavailable",
   image: "replyImage",
   unavailable: "replyUnavailable",
+  "provider-error": "replyProviderError",
 };
 
 /** The short reason for a failed reply, from the code the host gives it. */

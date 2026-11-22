@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { chatTexts, explain } from "./chat-text";
+import { chatTexts, explain, replyReason } from "./chat-text";
 import { InputError } from "./input-error";
 
 // #100: with the interface set to another language, the main window, its panels
@@ -18,6 +18,11 @@ describe("the main window's words", () => {
     }
   });
 
+  it("maps provider response and transport codes to distinct localized reasons", () => {
+    expect(replyReason(chatTexts.en, "provider-error")).toBe(chatTexts.en.replyProviderError);
+    expect(replyReason(chatTexts.en, "unavailable")).toBe(chatTexts.en.replyUnavailable);
+    expect(replyReason(chatTexts.ja, "provider-error")).toBe(chatTexts.ja.replyProviderError);
+  });
   it("are written in the interface language, not in the source", () => {
     // Settings (App.tsx and its sections) take their words from i18n.ts.
     const skip = /\.test\.|\/App\.tsx$|\/main\.tsx$|-section\.tsx$/u;
