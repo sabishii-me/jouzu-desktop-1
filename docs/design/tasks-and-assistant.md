@@ -302,9 +302,9 @@ Nodes:
 
 | Kind | Does | Results |
 | --- | --- | --- |
-| agent | Starts a task (the user's, client `desktop`) with the brief | `done` when the turn ended and every file in `outputs` exists; `undelivered` when some are missing; `failed` when the task failed or stopped |
+| agent | Starts a task (the user's, client `desktop`) with the brief | `done` when the turn ended and every file in `outputs` was written during this attempt (a file left by an earlier attempt does not count); `undelivered` when some are missing; `failed` when the task failed or stopped |
 | check | Runs a command with the system shell in the folder | `passed` on exit 0, else `failed`; exit code, stdout and stderr are kept |
-| connector | An action at a connector (GitHub `read_issue`, `comment`, `open_pr`) with templated `args` | `done` with the answer kept, or `failed` with the reason; writes run only right after an approved checkpoint, and one cut off by a host stop is never repeated |
+| connector | An action at a connector (GitHub `read_issue`, `comment`, `open_pr`, `open_issues` from a JSON file) with templated `args` | `done` with the answer kept (also as `answer.json` in the step's evidence folder, `{{evidence}}/<step>-<n>/`), or `failed` with the reason; writes run only right after an approved checkpoint, and one cut off by a host stop is never repeated |
 | checkpoint | Stops; the question and what to look at become the user's to-do | `approved`; or the user sends the run back to a node in `sendBack` with a note, or stops it |
 
 Edges are `{from, to, when, attempts?}`. The first edge from the node whose
@@ -345,6 +345,28 @@ MCP agents can also write to the Assistant in the user's place
 user; the pane shows which agent wrote. There is no UI for graphs, runs or
 to-dos yet.
 
+### Shipped graphs
+
+Two tuned graphs come with Desktop (`packaging/desktop/graphs/`) and are
+installed as the user's version 1. A newer shipped graph replaces only a
+graph the user has not changed since the last shipped copy; the user's own
+versions always stay. Nothing project-specific is in them: the folder, base
+branch and commands are parameters, usually given by the trigger that
+starts the run.
+
+- `issue-loop` (repo, number, workspace, base, test): read the issue, triage
+  (reproduce, duplicates, severity) → checkpoint on scope → root cause and
+  plan, no code changes → checkpoint on the plan → fix on
+  `loop/issue-<number>` with a test → the test command; failing goes back to
+  the fix, and the third failure goes to a checkpoint → checkpoint to accept
+  → open the pull request → checkpoint once merged. The issue stays open
+  until a release with the fix is verified.
+- `qa-release-loop` (repo, tag, workspace, tour): the tour command installs
+  the release, walks its states and compares them with the baseline → an
+  agent classifies each difference as intended or a regression, with
+  evidence → checkpoint → the regressions are filed as issues labelled
+  `regression`, which an issue trigger can turn into issue loops.
+
 ## Connectors
 
 A connector turns what happens in an outside service into events for
@@ -360,7 +382,7 @@ name of the environment variable that holds the token (Settings >
 Environment; the token is read when needed and never stored by the
 connector). It sends conditional requests (ETag), so a quiet repository
 costs no rate limit. The first look at a repository only notes where it is;
-what happened before is not an event. Events: `github.issue.opened`,
+what happened before is not an event. Actions: `read_issue`, `comment`, `open_pr`, `open_issues`. Events: `github.issue.opened`,
 `github.pr.opened`, `github.issue.labeled`, `github.issue.closed`,
 `github.issue.reopened`, `github.release.published` (drafts aside), each with
 the repository, number or tag, title and link. Each look reads one page
