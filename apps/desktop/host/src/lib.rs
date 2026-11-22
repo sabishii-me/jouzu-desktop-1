@@ -15,6 +15,7 @@ use std::{
 mod artifacts;
 pub mod assistant;
 pub mod awake;
+pub mod connectors;
 pub mod control;
 mod environment;
 pub mod events;
@@ -79,6 +80,7 @@ pub struct AppState {
     pub assistant: Arc<assistant::Assistant>,
     pub triggers: Arc<triggers::Triggers>,
     pub runs: Arc<runs::Runs>,
+    pub connectors: Arc<connectors::Connectors>,
 }
 
 #[derive(Debug, Serialize)]
@@ -313,6 +315,9 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/{id}/stop", axum::routing::post(stop_run))
         .route("/runs/{id}/decision", axum::routing::post(decide_run))
         .route("/todos", get(list_todos))
+        .route("/connectors", get(list_connectors))
+        .route("/connectors/github", axum::routing::put(update_github))
+        .route("/connectors/github/poll", axum::routing::post(poll_github))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", axum::routing::put(update_project).delete(delete_project))
         .route("/tasks", get(list_tasks).post(start_task))
@@ -557,6 +562,21 @@ async fn decide_run(State(state): State<AppState>, AxumPath(id): AxumPath<String
 
 async fn list_todos(State(state): State<AppState>) -> Response {
     Json(state.runs.todos()).into_response()
+}
+
+// Connectors: the user's settings (which repositories, how often, which
+// environment variable holds the token). The token itself never passes here.
+async fn list_connectors(State(state): State<AppState>) -> Response {
+    Json(state.connectors.snapshot()).into_response()
+}
+
+async fn update_github(State(state): State<AppState>, Json(settings): Json<connectors::GitHubSettings>) -> Response {
+    reply(state.connectors.update(settings))
+}
+
+async fn poll_github(State(state): State<AppState>) -> Response {
+    state.connectors.poll().await;
+    Json(state.connectors.snapshot()).into_response()
 }
 
 // ---- Collaboration > MCP: the user's switch and agent tokens ----
@@ -3023,6 +3043,7 @@ mod tests {
             mcp: mcp::McpServer::new(&dist, "0.1.0", tasks.clone(), sessions.clone()),
             projects: projects.clone(),
             assistant: assistant::Assistant::new(&dist, assistant::Assistant::default_paths(&dist, &sessions), sessions.clone(), tasks.clone(), projects, triggers.clone(), runs.clone()),
+            connectors: connectors::Connectors::new(&dist, sessions.clone(), triggers.clone()),
             triggers,
             runs,
         }
@@ -3640,6 +3661,7 @@ mod session_tests {
             mcp: mcp::McpServer::new(manager.home(), "0.1.0", tasks.clone(), manager.clone()),
             projects: projects.clone(),
             assistant: assistant::Assistant::new(manager.home(), assistant::Assistant::default_paths(manager.home(), &manager), manager.clone(), tasks.clone(), projects, triggers.clone(), runs.clone()),
+            connectors: connectors::Connectors::new(manager.home(), manager.clone(), triggers.clone()),
             triggers,
             runs,
         }

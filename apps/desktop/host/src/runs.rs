@@ -42,7 +42,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
     session::{ApiError, SessionManager},
     tasks::TaskManager,
-    triggers::{fill, Event},
+    connectors::Connectors,
+    triggers::{fill, fill_value, Event},
 };
 
 /// Tasks a run starts are the user's, like tasks started in Desktop.
@@ -70,6 +71,16 @@ pub enum Node {
         /// The command, run by the system shell in the folder. Templated.
         run: String,
     },
+    /// An action at a connector (e.g. GitHub `read_issue`, `comment`,
+    /// `open_pr`). Writing actions run only right after an approved
+    /// checkpoint. `args` are templated.
+    #[serde(rename_all = "camelCase")]
+    Connector {
+        connector: String,
+        action: String,
+        #[serde(default)]
+        args: Value,
+    },
     #[serde(rename_all = "camelCase")]
     Checkpoint {
         /// The question for the user. Templated.
@@ -91,6 +102,7 @@ impl Node {
         match self {
             Node::Agent { .. } => &["done", "undelivered", "failed"],
             Node::Check { .. } => &["passed", "failed"],
+            Node::Connector { .. } => &["done", "failed"],
             Node::Checkpoint { .. } => &["approved"],
         }
     }
@@ -272,6 +284,7 @@ pub struct Runs {
     ended: Mutex<Vec<mpsc::UnboundedSender<Event>>>,
     /// Tasks that ended before their run recorded them, by task id.
     early: Mutex<HashMap<String, String>>,
+    connectors: OnceLock<Arc<Connectors>>,
 }
 
 fn now_iso() -> String {
@@ -332,7 +345,13 @@ impl Runs {
             reporter: OnceLock::new(),
             ended: Mutex::new(Vec::new()),
             early: Mutex::new(HashMap::new()),
+            connectors: OnceLock::new(),
         })
+    }
+
+    /// The connectors `connector` steps act through. Set once.
+    pub fn set_connectors(&self, connectors: Arc<Connectors>) {
+        let _ = self.connectors.set(connectors);
     }
 
     pub fn set_reporter(&self, reporter: impl Fn(Value, String) + Send + Sync + 'static) {
@@ -489,6 +508,7 @@ impl Runs {
         value["waitingOn"] = json!(match (run.state, current) {
             (RunState::Waiting, _) => Some("user"),
             (RunState::Running, Some(attempt)) if attempt.evidence["taskId"].is_string() => Some("task"),
+            (RunState::Running, Some(attempt)) if attempt.evidence["connector"].is_string() => Some("connector"),
             (RunState::Running, Some(_)) => Some("check"),
             _ => None,
         });
@@ -576,10 +596,15 @@ impl Runs {
             self.end(run_id, RunState::Failed, Some(format!("The graph has no node {node_id}")));
             return;
         };
-        let (fields, n, chain) = {
+        let (fields, n, chain, may_write) = {
             let mut runs = self.runs();
             let Some(run) = runs.get_mut(run_id) else { return };
             let n = run.count(node_id) + 1;
+            // Public writes only right after the user approved a checkpoint.
+            let may_write = run.attempts.last().is_some_and(|last| {
+                last.result.as_deref() == Some("approved")
+                    && matches!(graph.nodes.get(&last.node), Some(Node::Checkpoint { .. }))
+            });
             run.attempts.push(Attempt {
                 node: node_id.to_string(),
                 n,
@@ -589,7 +614,7 @@ impl Runs {
                 ..Default::default()
             });
             run.state = if matches!(node, Node::Checkpoint { .. }) { RunState::Waiting } else { RunState::Running };
-            (self.fields(run, note.as_deref()), n, run.triggered_by.clone())
+            (self.fields(run, note.as_deref()), n, run.triggered_by.clone(), may_write)
         };
         let started: Result<Value, String> = match &node {
             Node::Agent { workspace, brief, model, .. } => (|| {
@@ -609,6 +634,10 @@ impl Runs {
                 let command = fill(run, &fields)?;
                 let dir = self.evidence_dir(run_id).join(format!("{node_id}-{n}"));
                 Ok(json!({ "command": command, "workspace": workspace, "dir": dir.to_string_lossy() }))
+            })(),
+            Node::Connector { connector, action, args } => (|| {
+                let args = fill_value(args, &fields)?;
+                Ok(json!({ "connector": connector, "action": action, "args": args, "mayWrite": may_write }))
             })(),
             Node::Checkpoint { ask, show, workspace, send_back } => (|| {
                 let ask = fill(ask, &fields)?;
@@ -648,6 +677,9 @@ impl Runs {
                     );
                     self.spawn_check(run_id, workspace, command, &dir);
                 }
+                if let Node::Connector { connector, action, .. } = &node {
+                    self.spawn_connector(run_id, connector, action, evidence["args"].clone(), may_write);
+                }
                 if let Some(task) = evidence["taskId"].as_str() {
                     let early = self.early().remove(task);
                     if let Some(state) = early {
@@ -668,6 +700,21 @@ impl Runs {
                 self.finish_attempt(run_id, "failed", json!({ "error": message }));
             }
         }
+    }
+
+    fn spawn_connector(self: &Arc<Self>, run_id: &str, connector: &str, action: &str, args: Value, may_write: bool) {
+        let runs = Arc::clone(self);
+        let (run_id, connector, action) = (run_id.to_string(), connector.to_string(), action.to_string());
+        tokio::spawn(async move {
+            let outcome = match runs.connectors.get() {
+                Some(connectors) => connectors.act(&connector, &action, &args, may_write).await,
+                None => Err("Connectors are not available".into()),
+            };
+            match outcome {
+                Ok(answer) => runs.finish_attempt(&run_id, "done", json!({ "answer": answer })),
+                Err(error) => runs.finish_attempt(&run_id, "failed", json!({ "error": error })),
+            }
+        });
     }
 
     fn spawn_check(self: &Arc<Self>, run_id: &str, workspace: &str, command: &str, dir: &Path) {
@@ -936,6 +983,9 @@ impl Runs {
                 if let Some(state) = state.filter(|state| matches!(state.as_str(), "finished" | "failed" | "stopped")) {
                     self.task_ended(task, &state);
                 }
+            } else if attempt.evidence["connector"].is_string() {
+                // An outside action may have happened: never sent twice.
+                self.finish_attempt(&run_id, "failed", json!({ "error": "The host stopped during this action; it was not repeated. Check the service before running it again." }));
             } else {
                 // A command cut off by the host stopping: it runs again.
                 let graph = {

@@ -253,6 +253,25 @@ pub fn fill(template: &str, fields: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// `fill` through a JSON value: every string is filled, and a string that
+/// is only `{{field}}` takes the field's own value (a number stays a number).
+pub fn fill_value(value: &Value, fields: &Value) -> Result<Value, String> {
+    Ok(match value {
+        Value::String(text) => match text.trim().strip_prefix("{{").and_then(|rest| rest.strip_suffix("}}")) {
+            Some(field) if !field.contains("{{") && !field.contains("}}") => match &fields[field.trim()] {
+                Value::Null => return Err(format!("the event has no field {}", field.trim())),
+                value => value.clone(),
+            },
+            _ => Value::String(fill(text, fields)?),
+        },
+        Value::Array(items) => Value::Array(items.iter().map(|item| fill_value(item, fields)).collect::<Result<_, _>>()?),
+        Value::Object(map) => Value::Object(
+            map.iter().map(|(key, item)| Ok((key.clone(), fill_value(item, fields)?))).collect::<Result<_, String>>()?,
+        ),
+        other => other.clone(),
+    })
+}
+
 impl Triggers {
     pub fn new(home: &Path, sessions: Arc<SessionManager>, tasks: Arc<TaskManager>, runs: Arc<Runs>) -> Arc<Self> {
         let dir = home.join("triggers");
@@ -603,17 +622,7 @@ impl Triggers {
             Action::StartRun { graph, params } => {
                 let mut filled = Map::new();
                 for (name, value) in params {
-                    let value = match value {
-                        Value::String(text) => match text.trim().strip_prefix("{{").and_then(|rest| rest.strip_suffix("}}")) {
-                            Some(field) if !field.contains("{{") => match &fields[field.trim()] {
-                                Value::Null => return Err(format!("the event has no field {}", field.trim())),
-                                value => value.clone(),
-                            },
-                            _ => Value::String(fill(text, fields)?),
-                        },
-                        other => other.clone(),
-                    };
-                    filled.insert(name.clone(), value);
+                    filled.insert(name.clone(), fill_value(value, fields)?);
                 }
                 let mut led_by = chain(fields);
                 led_by.push(trigger.id.clone());
