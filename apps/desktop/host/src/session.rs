@@ -201,6 +201,8 @@ pub struct SessionConfig {
     pub providers: Arc<crate::provider_answers::ProviderAnswers>,
     /// Runs that ended while no client showed their session (`run_marks`).
     pub runs: Arc<crate::run_marks::RunMarks>,
+    /// Each saved session's waiting messages, kept across a host restart (#162).
+    pub waiting: Arc<crate::waiting_messages::WaitingMessages>,
 }
 
 impl SessionConfig {
@@ -2033,6 +2035,58 @@ impl Session {
         }
     }
 
+    /// Keep the waiting list of a saved session where a host restart, or a
+    /// session that replaces this one, finds it (#162). Every change to the
+    /// list is published as a summary, so it is kept from here.
+    fn remember_waiting(&self) {
+        // A stopped session has left the table; whatever replaced it owns the list now.
+        if matches!(self.status(), Status::Stopped | Status::Cancelled) {
+            return;
+        }
+        let Some(path) = self.list_key() else { return };
+        let list = self
+            .queue_guard()
+            .iter()
+            .map(|item| crate::waiting_messages::Waiting { prompt: item.prompt.clone(), row: item.row.clone() })
+            .collect();
+        self.config.waiting.set(&path, list);
+    }
+
+    /// The messages that were waiting when this session's file was last open
+    /// come back as the user left them, but paused: the runtime that had any of
+    /// them (steered, held by Flow, or written as a prompt) is gone, so each is
+    /// the user's again, to continue or discard, as after a runtime exit (#162).
+    fn restore_waiting(&self) {
+        let Some(path) = self.list_key() else { return };
+        let saved = self.config.waiting.get(&path);
+        if saved.is_empty() {
+            return;
+        }
+        {
+            let mut queue = self.queue_guard();
+            let mut messages = self.messages.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for waiting in saved {
+                let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
+                let turn = format!("m-{counter}");
+                let item = Queued {
+                    turn: turn.clone(),
+                    prompt: waiting.prompt,
+                    row: waiting.row,
+                    steered: None,
+                    no_steer: false,
+                    held: false,
+                    prompted: false,
+                };
+                if let Some(id) = item.client_message_id() {
+                    messages.insert(id.to_string(), SentMessage { message_id: turn, text: item.text().to_string() });
+                }
+                queue.push_back(item);
+            }
+        }
+        self.queue_paused.store(true, Ordering::SeqCst);
+        log(&self.home, "info", "queue.restored", json!({ "session": self.id, "count": self.queue_guard().len() }));
+    }
+
     /// The session's file as the session list keys it.
     fn list_key(&self) -> Option<String> {
         self.saved_path().as_deref().map(canonical_path)
@@ -2056,6 +2110,7 @@ impl Session {
     }
 
     fn publish_summary(&self) {
+        self.remember_waiting();
         if let Some(hub) = &self.config.events {
             hub.publish_session(&self.id, self.cursor(), "session.updated", self.summary());
         }
@@ -6097,6 +6152,8 @@ pub struct SessionManager {
     providers: Arc<crate::provider_answers::ProviderAnswers>,
     /// Runs that ended while no client showed their session (`run_marks`).
     runs: Arc<crate::run_marks::RunMarks>,
+    /// Each saved session's waiting messages (`waiting_messages`, #162).
+    waiting: Arc<crate::waiting_messages::WaitingMessages>,
     /// How runtimes are started. Kept from the moment the runtime is found; see
     /// `config()`.
     config: std::sync::OnceLock<SessionConfig>,
@@ -6221,6 +6278,7 @@ impl SessionManager {
     ) -> Self {
         let providers = Arc::new(crate::provider_answers::ProviderAnswers::new());
         let runs = Arc::new(crate::run_marks::RunMarks::new(Some(home.join("session-runs.json"))));
+        let waiting = Arc::new(crate::waiting_messages::WaitingMessages::new(Some(home.join("waiting-messages.json"))));
         let config = std::sync::OnceLock::new();
         if let Some(spec) = spec {
             let _ = config.set(SessionConfig {
@@ -6235,11 +6293,13 @@ impl SessionManager {
                 known: Arc::new(KnownModels::new()),
                 providers: providers.clone(),
                 runs: runs.clone(),
+                waiting: waiting.clone(),
             });
         }
         Self {
             providers,
             runs,
+            waiting,
             config,
             managed: None,
             warm_wanted: AtomicBool::new(false),
@@ -6295,6 +6355,7 @@ impl SessionManager {
                 known: Arc::new(KnownModels::new()),
                 providers: self.providers.clone(),
                 runs: self.runs.clone(),
+                waiting: self.waiting.clone(),
             }
         });
         if found {
@@ -7462,6 +7523,7 @@ impl SessionManager {
             &config,
         );
         session.fresh.store(fresh, Ordering::SeqCst);
+        session.restore_waiting();
         if let Some(failure) = carried_failure {
             *session
                 .failed_turn
@@ -7977,6 +8039,7 @@ mod environment_tests {
             known: Arc::new(KnownModels::new()),
             providers: Arc::new(crate::provider_answers::ProviderAnswers::new()),
             runs: Arc::new(crate::run_marks::RunMarks::new(None)),
+            waiting: Arc::new(crate::waiting_messages::WaitingMessages::new(None)),
         }
     }
 
