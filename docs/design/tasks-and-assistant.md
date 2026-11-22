@@ -304,6 +304,7 @@ Nodes:
 | --- | --- | --- |
 | agent | Starts a task (the user's, client `desktop`) with the brief | `done` when the turn ended and every file in `outputs` exists; `undelivered` when some are missing; `failed` when the task failed or stopped |
 | check | Runs a command with the system shell in the folder | `passed` on exit 0, else `failed`; exit code, stdout and stderr are kept |
+| connector | An action at a connector (GitHub `read_issue`, `comment`, `open_pr`) with templated `args` | `done` with the answer kept, or `failed` with the reason; writes run only right after an approved checkpoint, and one cut off by a host stop is never repeated |
 | checkpoint | Stops; the question and what to look at become the user's to-do | `approved`; or the user sends the run back to a node in `sendBack` with a note, or stops it |
 
 Edges are `{from, to, when, attempts?}`. The first edge from the node whose
@@ -343,6 +344,34 @@ MCP agents can also write to the Assistant in the user's place
 (`assistant_send`, `assistant_messages`), for drills where an agent plays the
 user; the pane shows which agent wrote. There is no UI for graphs, runs or
 to-dos yet.
+
+## Connectors
+
+A connector turns what happens in an outside service into events for
+triggers, and offers actions to `connector` steps (`connectors.rs`). It is
+built in for now and shaped like the plugin kind reserved for connectors: an
+id, the user's settings, a status, events out, actions in. Moving it into a
+plugin later changes neither triggers nor graphs, and neither does receiving
+events by webhook instead of polling.
+
+GitHub is the first. The user sets the repositories (`owner/name`), how
+often to look (`everySeconds`; nothing is polled until it is set), and the
+name of the environment variable that holds the token (Settings >
+Environment; the token is read when needed and never stored by the
+connector). It sends conditional requests (ETag), so a quiet repository
+costs no rate limit. The first look at a repository only notes where it is;
+what happened before is not an event. Events: `github.issue.opened`,
+`github.pr.opened`, `github.issue.labeled`, `github.issue.closed`,
+`github.issue.reopened`, `github.release.published` (drafts aside), each with
+the repository, number or tag, title and link. Each look reads one page
+(GitHub's largest); more new items than that within one interval are a
+recorded gap.
+
+Writes in public (`comment`, `open_pr`) run only in a step that comes right
+after a checkpoint the user approved, and text holding a local path (the
+user's home folder, the host's data folder) is refused. Settings:
+`GET /v1/connectors`, `PUT /v1/connectors/github`, and
+`POST /v1/connectors/github/poll` to look now.
 
 ## Workflow and models
 
