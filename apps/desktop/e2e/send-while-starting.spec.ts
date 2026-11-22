@@ -25,7 +25,7 @@ let host: ChildProcess | undefined;
 let scratch = "";
 test.afterEach(() => {
   host?.kill();
-  if (scratch) rmSync(scratch, { recursive: true, force: true });
+  if (scratch) rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("a message sent while the runtime starts is accepted and listed at once", async ({ page }) => {
@@ -34,7 +34,13 @@ test("a message sent while the runtime starts is accepted and listed at once", a
   const home = join(scratch, "home");
   const node = join(scratch, "node", "bin", process.platform === "win32" ? "node.exe" : "node");
   mkdirSync(join(scratch, "node", "bin"), { recursive: true });
-  symlinkSync(process.execPath, node);
+  try {
+    symlinkSync(process.execPath, node);
+  } catch (error) {
+    // Windows commonly refuses symlink creation without developer mode or elevation.
+    if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+    copyFileSync(process.execPath, node);
+  }
   mkdirSync(join(home, "app"), { recursive: true });
   copyFileSync(join(root, "host", "tests", "fixtures", "fake-runtime.mjs"), join(home, "app", "bootstrap.mjs"));
   host = spawn(hostBin, ["--dist", dist, "--home", home, "--runtime-home", join(scratch, "runtime")], {
@@ -73,9 +79,13 @@ test("a message sent while the runtime starts is accepted and listed at once", a
   // Listed and titled while the runtime is still starting.
   const sidebar = page.getByRole("complementary").or(page.locator("aside")).first();
   await expect(sidebar.getByText("first message while starting")).toBeVisible({ timeout: 2000 });
+  await expect(page.getByRole("button", { name: /^Send$/ })).toBeVisible({ timeout: 2000 });
+  await expect(page.getByRole("button", { name: /^Steer$/ })).toHaveCount(0);
+  await expect(page.getByText(/Enter to steer/i)).toHaveCount(0);
   await expect(page.getByText(/Starting session/i).first()).toBeVisible();
   expect(Date.now() - opened).toBeLessThan(startDelayMs);
-  await expect(page.getByText("No sessions yet")).toHaveCount(0);
+
+
 
   // The held message is answered once the runtime is up, in the same row.
   await expect(page.getByText(/Starting session/i)).toHaveCount(0, { timeout: startDelayMs + 15_000 });

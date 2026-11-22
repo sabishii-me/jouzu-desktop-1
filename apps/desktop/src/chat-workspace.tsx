@@ -34,9 +34,9 @@ import type { TextGuardMode } from "./session-notices";
 import { liveRowKey, opensLive, rowState, sessionRow as fromApiSession, type RowState, type SessionRow as SessionSummary } from "./session-open";
 import { SessionRowStatus, rowStateText } from "./session-row-status";
 import { useWarmRuntime, type WarmView } from "./warm-runtime";
+import { composerRunningFor } from "./composer-state";
 import { newId, copyText } from "./secure-context";
 
-/** The side pane starts at half the window so chat and pane have equal room. */
 function defaultPaneWidth() {
   return Math.min(960, Math.max(480, Math.round(window.innerWidth / 2)));
 }
@@ -1301,7 +1301,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // ChatWorkspace snapshot and is never the source here. Do not key Stop off
   // sessionFile: a new pending session has no file yet, which hid Stop during
   // the first turn.
-  const composerRunning = snapshot.projection.running;
+  const composerRunning = composerRunningFor(snapshot.activeTurn, snapshot.projection.running);
   // A cancel token is sent with the clientMessageId, so Stop can be offered as
   // soon as the local outbox exists.
   const composerStarting = (snapshot.pending || !!localSubmitted) && !composerRunning;
