@@ -8,11 +8,11 @@ test.use({ channel: process.env.JOUZU_UI_TEST_BROWSER });
 const sessionSnapshot = {
   sessionId: "s1",
   sessionPath: "C:/sessions/issue-185.jsonl",
+  title: "Issue 185 running session",
   status: "running",
   cursor: 1,
   model: { state: "ready", provider: "fixture", id: "model", name: "Fixture model with an intentionally long label" },
   models: [{ provider: "fixture", id: "model", name: "Fixture model with an intentionally long label" }],
-  textguard: { mode: "on", disabled: false },
   activeTurn: { turnId: "t1", phase: "working", step: { n: 1, state: "thinking", tools: [] } },
 };
 
@@ -38,7 +38,7 @@ async function installRunningSessionFixture(page: Page) {
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ sessions: [] }) });
     }
     if (path === "/v1/events") {
-      const data = `id: 1\nevent: session.updated\ndata: ${JSON.stringify(snapshot)}\n\n`;
+      const data = `id: 1\nevent: session.updated\ndata: ${JSON.stringify(snapshot)}\n\nid: 2\nevent: session.notice\ndata: ${JSON.stringify({ sessionId: "s1", event: "session.notice", message: "TextGuard scans again. Flagged web results reach the model labelled as untrusted data.", level: "info", seq: 2 })}\n\n`;
       return route.fulfill({ status: 200, contentType: "text/event-stream", body: data });
     }
     if (path === "/v1/sessions/s1/snapshot") {
@@ -70,7 +70,6 @@ test("issue 185: running composer keeps essential controls separate from its ste
   await page.setViewportSize({ width: 1024, height: 800 });
   await stubHost(page, {
     control: () => ({ ...emptyControlState, modelReady: true }),
-    skipSessionDetails: true,
     workspaces: [{ id: "windows:C:/Projects/Issue 185", path: "C:/Projects/Issue 185", environment: { kind: "windows" } }],
   });
   const requests = await installRunningSessionFixture(page);
@@ -86,10 +85,6 @@ test("issue 185: running composer keeps essential controls separate from its ste
   });
   await page.goto("http://jouzu-ui.test/");
   await expect(page.getByRole("button", { name: "Choose workspace" })).toBeVisible();
-  const workspaceButton = page.getByRole("button", { name: "Choose workspace" });
-  await workspaceButton.dispatchEvent("click");
-  await expect(page.getByRole("menuitemradio", { name: /Issue 185/ })).toBeVisible();
-  await page.getByRole("menuitemradio", { name: /Issue 185/ }).click();
   await expect(page.getByLabel("Message Jouzu")).toBeVisible();
   await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Steer", exact: true })).toBeVisible();
@@ -138,7 +133,6 @@ test("issue 185: running composer keeps essential controls separate from its ste
     "POST /v1/sessions",
     "GET /v1/sessions/s1/snapshot",
     "GET /v1/sessions/s1/messages",
-    "GET /v1/sessions/s1/events",
   ]));
-  expect(requests.some(request => request.includes("/v1/sessions/s1/events"))).toBe(true);
+  expect(requests).toContain("GET /v1/events");
 });
