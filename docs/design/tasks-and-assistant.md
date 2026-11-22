@@ -311,8 +311,10 @@ Edges are `{from, to, when, attempts?}`. The first edge from the node whose
 `when` is the result, and whose `attempts` (if any) the node has reached in
 this run, is taken. That is how a graph leaves a loop: "after the second
 failed check, ask the user" is an edge; the engine holds no number. With no
-matching edge, `done`, `passed` or `approved` finish the run and any other
-result fails it, with the reason. A note the user sends back with goes at the
+matching edge, `done`, `passed` or `approved` finish the run; any other
+result makes the run wait for the user, who can send it back (with a note) to
+any agent or check step it already went through, or stop it. There is nothing
+to approve there, and the step keeps its result. A note the user sends back with goes at the
 top of the next attempt's brief, word for word, with the ask to say how it
 was followed. A run is refused at start when a step's folder is not a folder. Briefs, folders, commands and
 questions take `{{param}}`, `{{runId}}`, `{{evidence}}` (the run's evidence
