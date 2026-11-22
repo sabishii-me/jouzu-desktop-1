@@ -251,12 +251,13 @@ sources.
 A trigger has:
 
 - a source: a time (`at`, `everySeconds`, or both), `manual` (only when the
-  user presses Run), or an event kind (`task.ended` now; connector events
-  later);
+  user presses Run), or an event kind (`task.ended`, `run.ended`; connector
+  events later);
 - a filter on the event's fields: a value, a list (any of them), or a string
   with `*`;
-- an action: wake the Assistant with a note, or start a task in one of the
-  user's folders. `{{field}}` in the text takes the event's field; a field
+- an action: wake the Assistant with a note, start a run of a graph (its
+  parameters from the event; a parameter that is only `{{field}}` keeps the
+  field's type), or start a task in one of the user's folders. `{{field}}` in the text takes the event's field; a field
   the event does not carry fails the firing instead of running with words
   missing;
 - its state (`proposed`, `enabled`, `paused`, `done` for a one-time trigger
@@ -272,8 +273,9 @@ Rules:
 - A time trigger missed while the host was off fires once on start; a
   repeating one then moves to its next time after now. The host sets no
   numbers: how often it repeats is the trigger's own data.
-- No loops: a task a trigger started carries the triggers that led to it
-  (`triggeredBy`), and a trigger never fires on the end of work it led to.
+- No loops: a task or run a trigger started carries the triggers that led to
+  it (`triggeredBy`, passed on to the tasks a run starts), and a trigger
+  never fires on the end of work it led to.
 - Tasks a trigger starts are the user's (client `desktop`), counted against
   the user's limit like any task.
 
@@ -284,6 +286,63 @@ Run) until the user turns it on, because a trigger can start work and spend
 money while nobody watches. The Assistant can withdraw its own proposal and
 cancel its own wakes, and nothing else. There is no UI yet; the data and API
 come first.
+
+## Graphs and runs (the loop engine)
+
+Strong processes come from orchestration, not from the model. A graph is
+data (`<host home>/graphs/<id>/v<N>.json`); the engine (`runs.rs`) only
+interprets it. Each run is a file (`<host home>/runs/<runId>.json`) with
+the graph version it uses, its parameters, and every attempt; its evidence
+files are beside it. The engine moves only on events (a task ending, a
+command exiting, the user deciding), so a restart picks runs up where they
+were: a task that ended meanwhile is judged, a command the host cut off runs
+again.
+
+Nodes:
+
+| Kind | Does | Results |
+| --- | --- | --- |
+| agent | Starts a task (the user's, client `desktop`) with the brief | `done` when the turn ended and every file in `outputs` exists; `undelivered` when some are missing; `failed` when the task failed or stopped |
+| check | Runs a command with the system shell in the folder | `passed` on exit 0, else `failed`; exit code, stdout and stderr are kept |
+| checkpoint | Stops; the question and what to look at become the user's to-do | `approved`; or the user sends the run back to a node in `sendBack` with a note, or stops it |
+
+Edges are `{from, to, when, attempts?}`. The first edge from the node whose
+`when` is the result, and whose `attempts` (if any) the node has reached in
+this run, is taken. That is how a graph leaves a loop: "after the second
+failed check, ask the user" is an edge; the engine holds no number. With no
+matching edge, `done`, `passed` or `approved` finish the run and any other
+result fails it, with the reason. A note the user sends back with goes into
+the next attempt's brief word for word. Briefs, folders, commands and
+questions take `{{param}}`, `{{runId}}`, `{{evidence}}` (the run's evidence
+folder) and `{{note}}`.
+
+What "done" means is the engine's, not the model's. A gap stays recorded:
+"its background processes ended" needs a process group per runtime (plan
+stage 7); until then an agent step is done when its turn ended and its
+outputs exist.
+
+Reports: when a run waits for the user, a step ends badly, or a run ends,
+the engine itself adds a `report` row to the Assistant's pane with the facts
+(`waiting`, `step`, `ended`); the pane words them in the user's language. A
+run ending is also a `run.ended` event for triggers.
+
+Who decides:
+
+- Graphs are the user's (`PUT /v1/graphs/{id}` saves a new version; old ones
+  stay). The Assistant may `propose_graph`; it is used only after the user
+  accepts it (`/v1/graphs/{id}/proposal/accept`).
+- Runs start from the user (`POST /v1/runs`), a trigger, or the Assistant
+  when the user asks (`start_run`).
+- Checkpoints are answered only at `POST /v1/runs/{id}/decision`, with the
+  host token. The Assistant and MCP agents read runs and to-dos
+  (`list_runs`, `get_run`, `list_todos`) and have no way to decide.
+- The user can stop a run at any time (`POST /v1/runs/{id}/stop`); its task
+  and command stop with it.
+
+MCP agents can also write to the Assistant in the user's place
+(`assistant_send`, `assistant_messages`), for drills where an agent plays the
+user; the pane shows which agent wrote. There is no UI for graphs, runs or
+to-dos yet.
 
 ## Workflow and models
 
