@@ -315,7 +315,8 @@ try {
   };
   const message = messages[action] ?? 'Unsupported configuration operation.';
   const cause = localCause(error);
-  console.log(JSON.stringify({ error: cause ? `${message}\n${cause}` : message }));
+  const detail = cause && ['default-model', 'catalog-accept', 'catalog-reject'].includes(action) ? cause : null;
+  console.log(JSON.stringify({ error: detail ?? (cause ? `${message}\n${cause}` : message) }));
   process.exitCode = 1;
 }
 
