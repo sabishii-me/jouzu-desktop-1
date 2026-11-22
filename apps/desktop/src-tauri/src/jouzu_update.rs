@@ -12,7 +12,7 @@ pub async fn jouzu_update(app: tauri::AppHandle, action: String, version: Option
  if action=="install" {
   // The running desktop runtime holds the shared update-session lock. Stop it
   // before taking the exclusive installer lock; the frontend reconnects after install.
-  crate::host_bootstrap::stop_sessions()?;
+  crate::host_bootstrap::stop_sessions().await?;
  }
  tauri::async_runtime::spawn_blocking(move || {
   let _guard=guard;
