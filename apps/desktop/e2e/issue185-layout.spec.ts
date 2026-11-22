@@ -27,7 +27,7 @@ async function installRunningSessionFixture(page: Page) {
     const url = new URL(request.url());
     const path = url.pathname;
     if (path === "/v1/sessions" && request.method() === "POST") {
-      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...sessionSnapshot, sessionId: "s1", workspacePath: "C:/Projects/Issue 185", sessionPath: "C:/sessions/issue-185.jsonl", status: "running", cursor: 1 }) });
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...sessionSnapshot, sessionId: "s1", workspacePath: "C:/Projects/Issue 185", sessionPath: "C:/sessions/issue-185.jsonl", status: "running", cursor: 1, textguard: { mode: "on" }, activeTurn: sessionSnapshot.activeTurn }) });
     }
 
     if (path === "/v1/sessions" && request.method() === "GET") return route.fallback();
