@@ -724,8 +724,8 @@ impl Runs {
                 if waiting {
                     let ask = evidence["ask"].as_str().unwrap_or("");
                     self.report(
-                        json!({ "type": "waiting", "runId": run.run_id, "graphId": run.graph_id, "node": node_id, "ask": ask }),
-                        format!("Run {} ({}) waits for you at {node_id}: {ask}", run.run_id, run.graph_id),
+                        json!({ "type": "waiting", "runId": run.run_id, "graphId": run.graph_id, "node": node_id, "ask": ask, "n": n }),
+                        format!("Run {} ({}) waits for you at {node_id} (time {n}): {ask}", run.run_id, run.graph_id),
                     );
                 }
             }
@@ -766,8 +766,12 @@ impl Runs {
         let (run_id, workspace, command, dir) = (run_id.to_string(), workspace.to_string(), command.to_string(), dir.to_path_buf());
         tokio::spawn(async move {
             let mut shell = if cfg!(windows) {
+                // Passed to cmd as typed: Rust's argument quoting turns `"` into
+                // `\"`, which cmd does not understand. /S /C "..." strips exactly
+                // the outer quotes and runs the rest as the user wrote it.
                 let mut shell = tokio::process::Command::new("cmd");
-                shell.arg("/C").arg(&command);
+                #[cfg(windows)]
+                shell.raw_arg(format!("/S /C \"{command}\""));
                 shell
             } else {
                 let mut shell = tokio::process::Command::new("sh");

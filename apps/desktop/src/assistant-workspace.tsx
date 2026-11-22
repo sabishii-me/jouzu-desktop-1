@@ -49,13 +49,18 @@ export function reportText(t: ChatText, message: AssistantMessage): string {
   const report = message.report;
   if (!report) return message.text;
   const graph = report.graphId;
-  if (report.type === "waiting") return fill(t.assistantRunWaiting, { graph, node: report.node ?? "", ask: report.ask ?? "" });
+  // Which run: the end of its id, enough to tell runs of one graph apart.
+  const run = report.runId.replace(/^run-/, "").slice(-6);
+  if (report.type === "waiting") {
+    const again = (report.n ?? 1) > 1 ? fill(t.assistantRunAgain, { n: String(report.n) }) : "";
+    return fill(t.assistantRunWaiting, { graph, run, node: report.node ?? "", ask: report.ask ?? "", again });
+  }
   if (report.type === "step") {
     const result = report.result === "undelivered" ? t.runResultUndelivered : report.result === "failed" ? t.runResultFailed : null;
-    return result ? fill(t.assistantRunStep, { graph, node: report.node ?? "", result, n: String(report.n ?? "") }) : message.text;
+    return result ? fill(t.assistantRunStep, { graph, run, node: report.node ?? "", result, n: String(report.n ?? "") }) : message.text;
   }
   const state = report.state === "finished" ? t.runStateFinished : report.state === "failed" ? t.runStateFailed : report.state === "stopped" ? t.runStateStopped : null;
-  return state ? fill(t.assistantRunEnded, { graph, state }) : message.text;
+  return state ? fill(t.assistantRunEnded, { graph, run, state }) : message.text;
 }
 
 export function AssistantWorkspace({ overview, rows = [], onOpen = () => {} }: { overview?: ReactNode; rows?: SessionRow[]; onOpen?: (path: string) => void }) {
