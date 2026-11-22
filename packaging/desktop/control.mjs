@@ -5,27 +5,11 @@ import { pathToFileURL } from 'node:url';
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { SettingsFailure, serializeControlError } from './control-errors.mjs';
 const root = process.argv[1]?.endsWith("control.mjs") ? process.argv[2] : process.argv[1];
 const appRoot = process.argv[1]?.endsWith('control.mjs') ? (process.argv[3] || join(root, 'app')) : (process.argv[2] || join(root, 'app'));
 const load = name => import(pathToFileURL(join(appRoot, 'node_modules/jouzu/dist', `${name}.js`)));
 let action = "status";
-// What the runtime's settings manager recorded instead of throwing: one entry
-// per settings file, with the error it met there.
-class SettingsFailure extends Error {
-  constructor(failures) { super('Settings not saved'); this.failures = failures; }
-}
-// What the system refused (its code and call) on a file is a local fact the
-// person can act on, so it is relayed with the file. Any other error text may
-// carry upstream input or credentials and is not; of a settings file that
-// failed otherwise, only the file and the kind of error are named.
-const fileFact = (error, path) => {
-  const file = typeof error?.path === 'string' ? error.path : path;
-  if (typeof error?.code === 'string' && typeof error?.syscall === 'string') return `${file ? `${file}: ` : ''}${error.code} (${error.syscall})`;
-  return typeof file === 'string' ? `${file}: ${error?.name ?? 'Error'}` : null;
-};
-const localCause = error => error instanceof SettingsFailure
-  ? error.failures.map(({ error: each, path }) => fileFact(each, path)).filter(Boolean).join('\n') || null
-  : fileFact(error);
 // Remote revocation is advisory: a saved sign-out still clears local credentials.
 let signOutRevocation;
 // A held catalog revision is a decision, not an error, and "nothing to refresh"
@@ -314,9 +298,8 @@ try {
     'shisa-logout': 'Shisa.AI sign-out could not be fully confirmed. Refresh its state and check the Shisa.AI dashboard.',
   };
   const message = messages[action] ?? 'Unsupported configuration operation.';
-  const cause = localCause(error);
-  const detail = cause && ['default-model', 'catalog-accept', 'catalog-reject'].includes(action) ? cause : null;
-  console.log(JSON.stringify({ error: detail ?? (cause ? `${message}\n${cause}` : message) }));
+  const cause = serializeControlError(action, error, messages);
+  console.log(JSON.stringify({ error: cause }));
   process.exitCode = 1;
 }
 
