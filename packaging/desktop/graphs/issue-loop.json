@@ -77,7 +77,7 @@
         "head": "loop/issue-{{number}}",
         "base": "{{base}}",
         "title": "Fix #{{number}}",
-        "body": "Fixes #{{number}}. Root cause, plan and test results were reviewed at each step before this pull request was opened."
+        "body": "Refs #{{number}}. Root cause, plan and test results were reviewed at each step before this pull request was opened. The issue stays open until a release with the fix is verified."
       }
     },
     "merged": {
