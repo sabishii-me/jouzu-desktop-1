@@ -202,7 +202,8 @@ async fn main() -> ExitCode {
 
     let tasks = jouzu_host::tasks::TaskManager::new(sessions.clone());
     let projects = jouzu_host::projects::ProjectStore::new(sessions.clone(), tasks.clone());
-    let triggers = jouzu_host::triggers::Triggers::new(&home, sessions.clone(), tasks.clone());
+    let runs = jouzu_host::runs::Runs::new(&home, sessions.clone(), tasks.clone());
+    let triggers = jouzu_host::triggers::Triggers::new(&home, sessions.clone(), tasks.clone(), runs.clone());
     let state = AppState {
         token: std::sync::Arc::new(token.clone()),
         port,
@@ -223,15 +224,19 @@ async fn main() -> ExitCode {
             tasks.clone(),
             projects,
             triggers.clone(),
+            runs.clone(),
         ),
         triggers,
+        runs,
     };
     // Agents reach Desktop here once the user turned it on (Collaboration).
+    state.mcp.attach(state.runs.clone(), state.assistant.clone());
     state.mcp.reconcile().await;
     // The Assistant (experimental) starts if the user turned it on.
     state.assistant.set_port(port);
     state.assistant.launch();
-    // Triggers start after the Assistant, so a wake that is due finds it.
+    // Triggers and runs start after the Assistant, so a wake or report finds it.
+    state.runs.launch();
     state.triggers.launch();
     // Tasks that waited for a free slot when the host stopped start now.
     state.tasks.resume();

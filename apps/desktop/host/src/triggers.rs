@@ -30,7 +30,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::sync::Notify;
 
-use crate::{session::{ApiError, SessionManager}, tasks::TaskManager};
+use crate::{
+    runs::Runs,
+    session::{ApiError, SessionManager},
+    tasks::TaskManager,
+};
 
 /// Who created a trigger.
 pub const BY_USER: &str = "user";
@@ -61,6 +65,15 @@ pub enum Source {
 pub enum Action {
     /// Wakes the Assistant with a note. `{{field}}` takes the event's field.
     WakeAssistant { text: String },
+    /// Starts a run of a graph (its latest version). Each parameter's text
+    /// is templated as above; one that is only `{{field}}` keeps the
+    /// field's type (a number stays a number).
+    #[serde(rename_all = "camelCase")]
+    StartRun {
+        graph: String,
+        #[serde(default)]
+        params: Map<String, Value>,
+    },
     /// Starts a task in a folder the user added. `{{field}}` as above.
     #[serde(rename_all = "camelCase")]
     StartTask {
@@ -143,6 +156,7 @@ pub struct Triggers {
     dir: PathBuf,
     sessions: Arc<SessionManager>,
     tasks: Arc<TaskManager>,
+    runs: Arc<Runs>,
     store: Mutex<Store>,
     changed: Notify,
     /// How a firing reaches the Assistant (set when the Assistant starts).
@@ -240,7 +254,7 @@ pub fn fill(template: &str, fields: &Value) -> Result<String, String> {
 }
 
 impl Triggers {
-    pub fn new(home: &Path, sessions: Arc<SessionManager>, tasks: Arc<TaskManager>) -> Arc<Self> {
+    pub fn new(home: &Path, sessions: Arc<SessionManager>, tasks: Arc<TaskManager>, runs: Arc<Runs>) -> Arc<Self> {
         let dir = home.join("triggers");
         let triggers = std::fs::read(dir.join("triggers.json"))
             .ok()
@@ -256,6 +270,7 @@ impl Triggers {
             dir,
             sessions,
             tasks,
+            runs,
             store: Mutex::new(Store { triggers, fired }),
             changed: Notify::new(),
             waker: OnceLock::new(),
@@ -293,6 +308,13 @@ impl Triggers {
         let mut ended = self.tasks.subscribe_ended();
         tokio::spawn(async move {
             while let Some(event) = ended.recv().await {
+                triggers.emit(event).await;
+            }
+        });
+        let triggers = Arc::clone(self);
+        let mut runs_ended = self.runs.subscribe_ended();
+        tokio::spawn(async move {
+            while let Some(event) = runs_ended.recv().await {
                 triggers.emit(event).await;
             }
         });
@@ -340,6 +362,7 @@ impl Triggers {
         }
         match action {
             Action::WakeAssistant { text } if text.trim().is_empty() => Err(ApiError::bad_request("The note is empty")),
+            Action::StartRun { graph, .. } if graph.trim().is_empty() => Err(ApiError::bad_request("Which graph?")),
             Action::StartTask { workspace, text, model } => {
                 if workspace.trim().is_empty() || text.trim().is_empty() {
                     return Err(ApiError::bad_request("A task needs a folder and what to do"));
@@ -577,6 +600,28 @@ impl Triggers {
                     None => Err("The Assistant is not available".into()),
                 }
             }
+            Action::StartRun { graph, params } => {
+                let mut filled = Map::new();
+                for (name, value) in params {
+                    let value = match value {
+                        Value::String(text) => match text.trim().strip_prefix("{{").and_then(|rest| rest.strip_suffix("}}")) {
+                            Some(field) if !field.contains("{{") => match &fields[field.trim()] {
+                                Value::Null => return Err(format!("the event has no field {}", field.trim())),
+                                value => value.clone(),
+                            },
+                            _ => Value::String(fill(text, fields)?),
+                        },
+                        other => other.clone(),
+                    };
+                    filled.insert(name.clone(), value);
+                }
+                let mut led_by = chain(fields);
+                led_by.push(trigger.id.clone());
+                self.runs
+                    .start(graph, None, filled, json!({ "by": "trigger", "triggerId": trigger.id }), led_by)
+                    .map(|run| json!({ "runId": run["runId"] }))
+                    .map_err(|error| error.message)
+            }
             Action::StartTask { workspace, text, model } => {
                 let text = fill(text, fields)?;
                 let workspace = fill(workspace, fields)?;
@@ -702,7 +747,8 @@ mod tests {
         ));
         sessions.add_workspaces(&[workspace.path().to_string_lossy().into_owned()]).unwrap();
         let tasks = TaskManager::new(sessions.clone());
-        let triggers = Triggers::new(home.path(), sessions, tasks.clone());
+        let runs = Runs::new(home.path(), sessions.clone(), tasks.clone());
+        let triggers = Triggers::new(home.path(), sessions, tasks.clone(), runs);
         (triggers, tasks, home, workspace)
     }
 
@@ -744,7 +790,7 @@ mod tests {
         assert_eq!(rows[0]["event"]["id"], "a");
         assert_eq!(rows[0]["outcome"], "started");
         // A restart remembers what fired.
-        let again = Triggers::new(_home.path(), triggers.sessions.clone(), triggers.tasks.clone());
+        let again = Triggers::new(_home.path(), triggers.sessions.clone(), triggers.tasks.clone(), triggers.runs.clone());
         again.set_waker(|_| panic!("fired twice"));
         again.emit(event("a", "failed")).await;
         assert_eq!(fired(&again, &trigger.id).len(), 1);
@@ -798,6 +844,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_trigger_starts_a_run_with_the_event_fields_as_parameters() {
+        let (triggers, _tasks, _home, _workspace) = setup();
+        triggers.launch();
+        let graph = |id: &str, kind: &str| -> crate::runs::Graph {
+            serde_json::from_value(json!({ "id": id, "params": { "issue": kind }, "start": "ask", "nodes": { "ask": { "kind": "checkpoint", "ask": "Issue {{issue}}?" } } })).unwrap()
+        };
+        triggers.runs.save_graph(graph("by-number", "number")).unwrap();
+        let trigger = triggers
+            .create(BY_USER, input(json!({ "source": { "kind": "event", "event": "issue.opened" }, "action": { "kind": "startRun", "graph": "by-number", "params": { "issue": "{{number}}" } } })))
+            .unwrap();
+        triggers.emit(Event { id: "issue-7".into(), kind: "issue.opened".into(), at: now_iso(), fields: json!({ "number": 7 }) }).await;
+        let row = fired(&triggers, &trigger.id).remove(0);
+        assert_eq!(row["outcome"], "started", "{row}");
+        let run = triggers.runs.get(row["detail"]["runId"].as_str().unwrap()).unwrap();
+        assert_eq!(run["params"]["issue"], 7, "a number stays a number");
+        assert_eq!(run["triggeredBy"], json!([trigger.id]));
+        assert_eq!(triggers.runs.todos()["todos"][0]["ask"], "Issue 7?");
+        // A run ending is an event too.
+        let after = triggers
+            .create(BY_USER, input(json!({ "source": { "kind": "event", "event": "run.ended" }, "filter": { "state": "stopped" }, "action": { "kind": "startTask", "workspace": "/nowhere", "text": "{{runId}} stopped" } })))
+            .unwrap();
+        triggers.runs.stop(run["runId"].as_str().unwrap()).unwrap();
+        until(|| fired(&triggers, &after.id).len() == 1).await;
+        assert_eq!(fired(&triggers, &after.id)[0]["event"]["fields"]["graphId"], "by-number");
+    }
+
+    #[tokio::test]
     async fn an_action_that_cannot_run_is_recorded_as_failed() {
         let (triggers, _tasks, _home, _workspace) = setup();
         let trigger = triggers
@@ -834,7 +907,7 @@ mod tests {
         let next = parse(triggers.get(&hourly.id).unwrap().next_at.as_deref().unwrap()).unwrap();
         assert!(next > Utc::now() && next <= Utc::now() + chrono::Duration::seconds(3600), "{next}");
         // A restart does not fire them again.
-        let again = Triggers::new(home.path(), triggers.sessions.clone(), triggers.tasks.clone());
+        let again = Triggers::new(home.path(), triggers.sessions.clone(), triggers.tasks.clone(), triggers.runs.clone());
         again.set_waker(|note| panic!("fired again: {note}"));
         again.launch();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowUp, LoaderCircle, Sparkles } from "lucide-react";
 import { useApi } from "./api/context";
 import type { AssistantMessage, AssistantState, AssistantTask } from "./api/jouzu-api";
+import type { ChatText } from "./chat-text";
 import { Button } from "./components/ui/button";
 import { ChatMarkdown } from "./chat-markdown";
 import { eventRouter } from "./event-router";
@@ -43,6 +44,20 @@ function useTaskLookup(rows: SessionRow[], onOpen: (path: string) => void): Task
  * The Assistant's conversation. The host owns the Assistant, its model and its
  * transcript; this pane shows them and sends the user's messages.
  */
+/** An engine report in the user's language; the host's English words when the facts are not known here. */
+export function reportText(t: ChatText, message: AssistantMessage): string {
+  const report = message.report;
+  if (!report) return message.text;
+  const graph = report.graphId;
+  if (report.type === "waiting") return fill(t.assistantRunWaiting, { graph, node: report.node ?? "", ask: report.ask ?? "" });
+  if (report.type === "step") {
+    const result = report.result === "undelivered" ? t.runResultUndelivered : report.result === "failed" ? t.runResultFailed : null;
+    return result ? fill(t.assistantRunStep, { graph, node: report.node ?? "", result, n: String(report.n ?? "") }) : message.text;
+  }
+  const state = report.state === "finished" ? t.runStateFinished : report.state === "failed" ? t.runStateFailed : report.state === "stopped" ? t.runStateStopped : null;
+  return state ? fill(t.assistantRunEnded, { graph, state }) : message.text;
+}
+
 export function AssistantWorkspace({ overview, rows = [], onOpen = () => {} }: { overview?: ReactNode; rows?: SessionRow[]; onOpen?: (path: string) => void }) {
   const api = useApi();
   const t = useChatText();
@@ -86,7 +101,9 @@ export function AssistantWorkspace({ overview, rows = [], onOpen = () => {} }: {
     {overview}
     {messages.length ? <TaskLookupProvider value={lookup}><div className="min-h-0 flex-1 overflow-y-auto px-4 py-5"><div className="mx-auto max-w-3xl space-y-5">
       {messages.map((message, index) => message.kind === "user"
-        ? <article key={index} aria-label="user message" className="rounded-xl bg-muted p-4"><ChatMarkdown text={message.text} /></article>
+        ? <article key={index} aria-label="user message" className="rounded-xl bg-muted p-4"><ChatMarkdown text={message.text} />{message.via && <p className="mt-2 text-xs text-muted-foreground">{fill(t.assistantVia, { agent: message.via })}</p>}</article>
+        : message.kind === "report"
+          ? <p key={index} role="status" className="px-1 text-xs text-muted-foreground">{reportText(t, message)}</p>
         : message.kind === "assistant"
           ? <article key={index} aria-label="assistant message" className="min-w-0 px-1"><ChatMarkdown text={message.text} renderBlock={renderViewBlock} /></article>
           : message.kind === "show"

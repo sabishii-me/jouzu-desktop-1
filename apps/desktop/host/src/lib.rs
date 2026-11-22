@@ -25,6 +25,7 @@ pub mod policy;
 pub mod projects;
 pub mod provider_answers;
 mod provider_error;
+pub mod runs;
 pub mod runtime;
 pub mod session_runs;
 pub mod sessions_repair;
@@ -77,6 +78,7 @@ pub struct AppState {
     pub projects: Arc<projects::ProjectStore>,
     pub assistant: Arc<assistant::Assistant>,
     pub triggers: Arc<triggers::Triggers>,
+    pub runs: Arc<runs::Runs>,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,6 +304,15 @@ pub fn router(state: AppState) -> Router {
         .route("/triggers/firings", get(trigger_firings))
         .route("/triggers/{id}", axum::routing::put(update_trigger).delete(delete_trigger))
         .route("/triggers/{id}/run", axum::routing::post(run_trigger))
+        .route("/graphs", get(list_graphs))
+        .route("/graphs/{id}", get(read_graph).put(save_graph))
+        .route("/graphs/{id}/proposal", get(read_graph_proposal).delete(reject_graph_proposal))
+        .route("/graphs/{id}/proposal/accept", axum::routing::post(accept_graph_proposal))
+        .route("/runs", get(list_runs).post(start_run))
+        .route("/runs/{id}", get(get_run))
+        .route("/runs/{id}/stop", axum::routing::post(stop_run))
+        .route("/runs/{id}/decision", axum::routing::post(decide_run))
+        .route("/todos", get(list_todos))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", axum::routing::put(update_project).delete(delete_project))
         .route("/tasks", get(list_tasks).post(start_task))
@@ -467,6 +478,85 @@ struct FiringsQuery {
 
 async fn trigger_firings(State(state): State<AppState>, Query(query): Query<FiringsQuery>) -> Response {
     Json(state.triggers.firings(query.trigger_id.as_deref(), query.limit)).into_response()
+}
+
+// ---- Graphs and runs (the loop engine) ----
+// The user's: only the host token reaches these. Checkpoint decisions are
+// here and nowhere else: agents and the Assistant read to-dos, never answer.
+
+fn reply<T: Serialize>(result: Result<T, ApiError>) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn list_graphs(State(state): State<AppState>) -> Response {
+    Json(state.runs.list_graphs()).into_response()
+}
+
+#[derive(Deserialize)]
+struct GraphQuery {
+    version: Option<u64>,
+}
+
+async fn read_graph(State(state): State<AppState>, AxumPath(id): AxumPath<String>, Query(query): Query<GraphQuery>) -> Response {
+    reply(state.runs.graph(&id, query.version))
+}
+
+async fn save_graph(State(state): State<AppState>, AxumPath(id): AxumPath<String>, Json(mut graph): Json<runs::Graph>) -> Response {
+    graph.id = id;
+    reply(state.runs.save_graph(graph))
+}
+
+async fn read_graph_proposal(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    reply(state.runs.proposal(&id))
+}
+
+async fn accept_graph_proposal(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    reply(state.runs.accept_proposal(&id))
+}
+
+async fn reject_graph_proposal(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    match state.runs.reject_proposal(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn list_runs(State(state): State<AppState>) -> Response {
+    Json(state.runs.list()).into_response()
+}
+
+#[derive(Deserialize)]
+struct RunRequest {
+    graph: String,
+    version: Option<u64>,
+    #[serde(default)]
+    params: serde_json::Map<String, Value>,
+}
+
+async fn start_run(State(state): State<AppState>, Json(request): Json<RunRequest>) -> Response {
+    match state.runs.start(&request.graph, request.version, request.params, json!({ "by": "user" }), Vec::new()) {
+        Ok(run) => (StatusCode::CREATED, Json(run)).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn get_run(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    reply(state.runs.get(&id))
+}
+
+async fn stop_run(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    reply(state.runs.stop(&id))
+}
+
+async fn decide_run(State(state): State<AppState>, AxumPath(id): AxumPath<String>, Json(decision): Json<runs::Decision>) -> Response {
+    reply(state.runs.decide(&id, decision))
+}
+
+async fn list_todos(State(state): State<AppState>) -> Response {
+    Json(state.runs.todos()).into_response()
 }
 
 // ---- Collaboration > MCP: the user's switch and agent tokens ----
@@ -2917,7 +3007,8 @@ mod tests {
         let sessions = Arc::new(SessionManager::new(None, dist.clone(), dist.clone(), None, 10, None));
         let tasks = tasks::TaskManager::new(sessions.clone());
         let projects = projects::ProjectStore::new(sessions.clone(), tasks.clone());
-        let triggers = triggers::Triggers::new(&dist, sessions.clone(), tasks.clone());
+        let runs = runs::Runs::new(&dist, sessions.clone(), tasks.clone());
+        let triggers = triggers::Triggers::new(&dist, sessions.clone(), tasks.clone(), runs.clone());
         AppState {
             token: Arc::new("a".repeat(64)),
             port: 40123,
@@ -2931,8 +3022,9 @@ mod tests {
             tasks: tasks.clone(),
             mcp: mcp::McpServer::new(&dist, "0.1.0", tasks.clone(), sessions.clone()),
             projects: projects.clone(),
-            assistant: assistant::Assistant::new(&dist, assistant::Assistant::default_paths(&dist, &sessions), sessions.clone(), tasks.clone(), projects, triggers.clone()),
+            assistant: assistant::Assistant::new(&dist, assistant::Assistant::default_paths(&dist, &sessions), sessions.clone(), tasks.clone(), projects, triggers.clone(), runs.clone()),
             triggers,
+            runs,
         }
     }
 
@@ -3532,7 +3624,8 @@ mod session_tests {
         let home = std::env::temp_dir();
         let tasks = tasks::TaskManager::new(manager.clone());
         let projects = projects::ProjectStore::new(manager.clone(), tasks.clone());
-        let triggers = triggers::Triggers::new(manager.home(), manager.clone(), tasks.clone());
+        let runs = runs::Runs::new(manager.home(), manager.clone(), tasks.clone());
+        let triggers = triggers::Triggers::new(manager.home(), manager.clone(), tasks.clone(), runs.clone());
         AppState {
             token: Arc::new("a".repeat(64)),
             port: 40123,
@@ -3546,8 +3639,9 @@ mod session_tests {
             tasks: tasks.clone(),
             mcp: mcp::McpServer::new(manager.home(), "0.1.0", tasks.clone(), manager.clone()),
             projects: projects.clone(),
-            assistant: assistant::Assistant::new(manager.home(), assistant::Assistant::default_paths(manager.home(), &manager), manager.clone(), tasks.clone(), projects, triggers.clone()),
+            assistant: assistant::Assistant::new(manager.home(), assistant::Assistant::default_paths(manager.home(), &manager), manager.clone(), tasks.clone(), projects, triggers.clone(), runs.clone()),
             triggers,
+            runs,
         }
         .pipe(router)
     }

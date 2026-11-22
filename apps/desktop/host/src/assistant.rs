@@ -48,6 +48,7 @@ use crate::{
     },
     session::{ApiError, RuntimeSpec, SessionManager},
     tasks::TaskManager,
+    runs::{Graph, Runs},
     triggers::{self, Source, TriggerInput, TriggerState, Triggers},
 };
 
@@ -177,6 +178,7 @@ pub struct Assistant {
     tasks: Arc<TaskManager>,
     projects: Arc<ProjectStore>,
     triggers: Arc<Triggers>,
+    runs: Arc<Runs>,
     settings: Mutex<Settings>,
     state: Mutex<State>,
     runtime: Mutex<Option<Runtime>>,
@@ -215,6 +217,7 @@ impl Assistant {
         tasks: Arc<TaskManager>,
         projects: Arc<ProjectStore>,
         triggers: Arc<Triggers>,
+        runs: Arc<Runs>,
     ) -> Arc<Self> {
         let dir = home.join("assistant");
         let settings = std::fs::read(dir.join("assistant.json"))
@@ -229,6 +232,7 @@ impl Assistant {
             tasks,
             projects,
             triggers,
+            runs,
             settings: Mutex::new(settings),
             state: Mutex::new(State {
                 phase: Phase::Off,
@@ -285,9 +289,30 @@ impl Assistant {
     /// Adds a row to the transcript. Each row has a fixed id (`m<line>`), by
     /// which a project keeps the person's words it was asked with.
     fn record(&self, kind: &str, text: &str) -> Value {
+        self.record_via(kind, text, None)
+    }
+
+    /// An engine report: the facts for the pane to word, and English words.
+    fn record_report(&self, facts: Value, text: &str) -> Value {
+        self.append(json!({ "kind": "report", "text": text, "report": facts }))
+    }
+
+    /// Like `record`; `via` names the agent that wrote for the user (MCP),
+    /// so the pane shows it was not the person typing.
+    fn record_via(&self, kind: &str, text: &str, via: Option<&str>) -> Value {
+        let mut row = json!({ "kind": kind, "text": text });
+        if let Some(via) = via {
+            row["via"] = json!(via);
+        }
+        self.append(row)
+    }
+
+    /// Adds a row with its fixed id and time, and tells the pane.
+    fn append(&self, mut row: Value) -> Value {
         let _ = std::fs::create_dir_all(&self.dir);
         let line = std::fs::read_to_string(self.transcript()).map(|text| text.lines().count()).unwrap_or(0) + 1;
-        let row = json!({ "id": format!("m{line}"), "at": now_iso(), "kind": kind, "text": text });
+        row["id"] = json!(format!("m{line}"));
+        row["at"] = json!(now_iso());
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(self.transcript()) {
             use std::io::Write;
             let _ = writeln!(file, "{row}");
@@ -305,6 +330,14 @@ impl Assistant {
             if let Some(assistant) = weak.upgrade() {
                 assistant.state().due_notes.push(note);
                 assistant.kick.notify_one();
+            }
+        });
+        // What the engine reports reaches the user in this pane as the
+        // engine's own words, not the Assistant's.
+        let weak = Arc::downgrade(self);
+        self.runs.set_reporter(move |facts, text| {
+            if let Some(assistant) = weak.upgrade() {
+                assistant.record_report(facts, &text);
             }
         });
         let assistant = Arc::clone(self);
@@ -370,6 +403,12 @@ impl Assistant {
     /// Queues a message from the user. Starts the Assistant again if it had
     /// stopped: the user asked.
     pub async fn send(self: &Arc<Self>, text: &str) -> Result<Value, ApiError> {
+        self.send_via(text, None).await
+    }
+
+    /// A message for the Assistant written by an agent the user let in (MCP),
+    /// in the user's place; it shows which agent wrote it.
+    pub async fn send_via(self: &Arc<Self>, text: &str, via: Option<&str>) -> Result<Value, ApiError> {
         let text = text.trim();
         if text.is_empty() {
             return Err(ApiError::bad_request("Enter a message"));
@@ -377,7 +416,7 @@ impl Assistant {
         if !self.settings().enabled {
             return Err(ApiError::new(axum::http::StatusCode::CONFLICT, "assistant-off", "Turn the Assistant on first", false));
         }
-        let row = self.record("user", text);
+        let row = self.record_via("user", text, via);
         let (restart, interrupt) = {
             let mut state = self.state();
             // The id lets a project keep these exact words (requestIds).
@@ -882,6 +921,22 @@ impl Assistant {
                 Ok(json!({ "cancelled": true }))
             }
             "list_triggers" => Ok(self.triggers.list()),
+            "list_graphs" => Ok(self.runs.list_graphs()),
+            "get_graph" => self.runs.graph(string(arguments, "id")?, arguments["version"].as_u64()).map(|graph| json!(graph)),
+            "propose_graph" => {
+                let graph: Graph = serde_json::from_value(arguments["graph"].clone())
+                    .map_err(|error| ApiError::bad_request(format!("Invalid graph: {error}")))?;
+                let mut proposed = self.runs.propose_graph(graph)?;
+                proposed["note"] = json!("The user accepts it in Desktop; until then runs use the saved version.");
+                Ok(proposed)
+            }
+            "start_run" => {
+                let params = arguments["params"].as_object().cloned().unwrap_or_default();
+                self.runs.start(string(arguments, "graph")?, None, params, json!({ "by": "assistant" }), Vec::new())
+            }
+            "list_runs" => Ok(self.runs.list()),
+            "get_run" => self.runs.get(string(arguments, "runId")?),
+            "list_todos" => Ok(self.runs.todos()),
             "propose_trigger" => {
                 let input: TriggerInput = serde_json::from_value(arguments.clone())
                     .map_err(|error| ApiError::bad_request(format!("Invalid trigger: {error}")))?;
@@ -1155,6 +1210,13 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({ "name": "schedule_wake", "description": "Be woken after some seconds with a note to yourself. Returns its id; cancel it with cancel_wake when it is no longer needed.", "inputSchema": { "type": "object", "properties": { "seconds": { "type": "integer", "minimum": 1 }, "note": { "type": "string" } }, "required": ["seconds"] } }),
         json!({ "name": "cancel_wake", "description": "Cancel a wake you set, or withdraw a trigger you proposed that the user has not turned on.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } }),
         json!({ "name": "list_triggers", "description": "The user's triggers (when this happens, do that), your proposals and your wakes, with their state.", "inputSchema": { "type": "object", "properties": {} } }),
+        json!({ "name": "list_graphs", "description": "The user's graphs (loops the engine runs: agent steps, checks, and checkpoints where the user decides), with their versions and whether you proposed a change.", "inputSchema": { "type": "object", "properties": {} } }),
+        json!({ "name": "get_graph", "description": "A graph: its parameters, nodes and edges. The latest version unless you give one.", "inputSchema": { "type": "object", "properties": { "id": { "type": "string" }, "version": { "type": "integer" } }, "required": ["id"] } }),
+        json!({ "name": "propose_graph", "description": "Propose a new graph or a change to one. Nothing uses it until the user accepts it in Desktop. Nodes: {kind:'agent', workspace, brief, model?, outputs?: [files]} | {kind:'check', workspace, run} | {kind:'checkpoint', ask, show?, workspace?, sendBack?: [nodes]}. Edges: {from, to, when, attempts?}; when is done/undelivered/failed (agent), passed/failed (check), approved (checkpoint). {{param}}, {{runId}}, {{evidence}}, {{note}} are filled in.", "inputSchema": { "type": "object", "properties": { "graph": { "type": "object" } }, "required": ["graph"] } }),
+        json!({ "name": "start_run", "description": "Start a run of a graph when the user asks for it. The engine moves it; you do not. It stops at checkpoints for the user.", "inputSchema": { "type": "object", "properties": { "graph": { "type": "string" }, "params": { "type": "object" } }, "required": ["graph"] } }),
+        json!({ "name": "list_runs", "description": "Runs and where each is: current step, since when, and who it waits on (task, check or user).", "inputSchema": { "type": "object", "properties": {} } }),
+        json!({ "name": "get_run", "description": "One run with every attempt and the evidence the engine kept (task, files, exit codes, stdout/stderr files, the user's decisions).", "inputSchema": { "type": "object", "properties": { "runId": { "type": "string" } }, "required": ["runId"] } }),
+        json!({ "name": "list_todos", "description": "Checkpoints waiting for the user, with the question and the evidence. Only the user can answer them; help them decide.", "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "propose_trigger", "description": "Propose a trigger to the user. It does nothing until the user turns it on in Desktop. source: {kind:'time', at?: RFC 3339, everySeconds?} | {kind:'manual'} | {kind:'event', event:'task.ended'}. filter: event field -> value (a list means any; * matches any text). action: {kind:'wakeAssistant', text} | {kind:'startTask', workspace, text, model?}. {{field}} in text takes the event's field.", "inputSchema": { "type": "object", "properties": { "name": { "type": "string" }, "source": { "type": "object" }, "filter": { "type": "object" }, "action": { "type": "object" } }, "required": ["name", "source", "action"] } }),
         json!({ "name": "get_workflow", "description": "jouzu's workflow definitions (agents.json): roles, their model tier, tools, instructions, maxConcurrent. config is null while the runtime uses its defaults. Load the configure-workflow skill first.", "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "save_workflow", "description": "Replace the workflow definitions. Pass the revision get_workflow returned; a change since then is refused. The replaced version is kept and can be restored.", "inputSchema": { "type": "object", "properties": { "config": { "type": "object" }, "revision": { "type": "string" } }, "required": ["config", "revision"] } }),
@@ -1218,8 +1280,9 @@ mod tests {
         // The stand-in writes it in its working folder, the Assistant's folder.
         let log = home.path().join("assistant").join("turns.log");
         let paths = AssistantPaths { runtime: Some(RuntimeSpec::node_script(&fixtures().join("fake-assistant.mjs"))) };
-        let triggers = Triggers::new(home.path(), sessions.clone(), tasks.clone());
-        let assistant = Assistant::new(home.path(), paths, sessions, tasks.clone(), projects, triggers.clone());
+        let runs = Runs::new(home.path(), sessions.clone(), tasks.clone());
+        let triggers = Triggers::new(home.path(), sessions.clone(), tasks.clone(), runs.clone());
+        let assistant = Assistant::new(home.path(), paths, sessions, tasks.clone(), projects, triggers.clone(), runs);
         triggers.launch();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1365,7 +1428,7 @@ mod tests {
     async fn a_scheduled_wake_survives_a_restart() {
         let fixture = setup();
         fixture.assistant.run_tool("schedule_wake", &json!({ "seconds": 3600, "note": "check the release" })).await.unwrap();
-        let triggers = Triggers::new(fixture._home.path(), fixture.assistant.sessions.clone(), fixture.tasks.clone());
+        let triggers = Triggers::new(fixture._home.path(), fixture.assistant.sessions.clone(), fixture.tasks.clone(), fixture.assistant.runs.clone());
         let again = Assistant::new(
             fixture._home.path(),
             Assistant::default_paths(fixture._home.path(), &fixture.assistant.sessions),
@@ -1373,6 +1436,7 @@ mod tests {
             fixture.tasks.clone(),
             fixture.assistant.projects.clone(),
             triggers,
+            fixture.assistant.runs.clone(),
         );
         let wakes = again.snapshot().await["scheduledWakes"].clone();
         assert_eq!(wakes.as_array().map(Vec::len), Some(1), "{wakes}");
@@ -1389,7 +1453,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let due = Utc::now().timestamp_millis() + 600_000;
         std::fs::write(dir.join("wakes.json"), json!([{ "dueMs": due, "note": "old reminder" }]).to_string()).unwrap();
-        let triggers = Triggers::new(fixture._home.path(), fixture.assistant.sessions.clone(), fixture.tasks.clone());
+        let triggers = Triggers::new(fixture._home.path(), fixture.assistant.sessions.clone(), fixture.tasks.clone(), fixture.assistant.runs.clone());
         let again = Assistant::new(
             fixture._home.path(),
             Assistant::default_paths(fixture._home.path(), &fixture.assistant.sessions),
@@ -1397,6 +1461,7 @@ mod tests {
             fixture.tasks.clone(),
             fixture.assistant.projects.clone(),
             triggers,
+            fixture.assistant.runs.clone(),
         );
         let wakes = again.snapshot().await["scheduledWakes"].clone();
         assert_eq!(wakes[0]["note"], "old reminder", "{wakes}");
@@ -1418,6 +1483,24 @@ mod tests {
         assert_eq!(turns.matches("look again").count(), 1, "{turns}");
         assert!(!turns.contains("never"), "{turns}");
         assert_eq!(fixture.assistant.snapshot().await["scheduledWakes"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn an_agent_writing_in_the_users_place_is_named_and_engine_reports_are_kept_as_facts() {
+        let fixture = setup();
+        fixture.assistant.launch();
+        fixture.assistant.update(Some(true), Some(Some(faux_pick()))).await.unwrap();
+        fixture.assistant.send_via("how are the runs?", Some("Claude Code")).await.unwrap();
+        let rows = fixture.assistant.messages(10)["messages"].clone();
+        let user = rows.as_array().unwrap().iter().find(|row| row["kind"] == "user").unwrap().clone();
+        assert_eq!(user["via"], "Claude Code");
+        // The engine reports into the pane itself, not through the model.
+        fixture.assistant.runs.save_graph(serde_json::from_value(json!({ "id": "ask", "start": "ask", "nodes": { "ask": { "kind": "checkpoint", "ask": "Ship it?" } } })).unwrap()).unwrap();
+        fixture.assistant.runs.start("ask", None, serde_json::Map::new(), json!({ "by": "user" }), Vec::new()).unwrap();
+        let rows = fixture.assistant.messages(20)["messages"].clone();
+        let report = rows.as_array().unwrap().iter().find(|row| row["kind"] == "report").expect("a report row").clone();
+        assert_eq!(report["report"]["type"], "waiting");
+        assert_eq!(report["report"]["ask"], "Ship it?");
     }
 
     #[tokio::test]

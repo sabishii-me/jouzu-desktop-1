@@ -34,6 +34,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    assistant::Assistant,
+    runs::Runs,
     session::{ApiError, SessionManager},
     tasks::TaskManager,
 };
@@ -109,6 +111,8 @@ pub struct McpServer {
     settings: Mutex<Settings>,
     listener: tokio::sync::Mutex<Option<Listener>>,
     error: Mutex<Option<String>>,
+    /// The loop engine and the Assistant, once the host has them.
+    more: std::sync::OnceLock<(Arc<Runs>, Arc<Assistant>)>,
 }
 
 fn hash(token: &str) -> String {
@@ -158,7 +162,14 @@ impl McpServer {
             settings: Mutex::new(settings),
             listener: tokio::sync::Mutex::new(None),
             error: Mutex::new(None),
+            more: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Gives agents read access to runs and to-dos, and a way to talk to the
+    /// Assistant in the user's place. Called once when the host starts.
+    pub fn attach(&self, runs: Arc<Runs>, assistant: Arc<Assistant>) {
+        let _ = self.more.set((runs, assistant));
     }
 
     fn clients_guard(&self) -> std::sync::MutexGuard<'_, Vec<AgentClient>> {
@@ -403,11 +414,16 @@ async fn handle(State(state): State<McpState>, headers: HeaderMap, body: Bytes) 
             )
         }
         "ping" => rpc_result(id, json!({})),
-        "tools/list" => rpc_result(id, json!({ "tools": task_tools() })),
+        "tools/list" => rpc_result(id, json!({ "tools": ([task_tools(), engine_tools()].concat()) })),
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("").to_string();
             let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            let result = call_task_tool(&state.server.tasks, &state.server.sessions, &client, &name, &arguments).await;
+            let result = match state.server.more.get() {
+                Some((runs, assistant)) if engine_tools().iter().any(|tool| tool["name"] == name.as_str()) => {
+                    call_engine_tool(runs, assistant, &client, &name, &arguments).await
+                }
+                _ => call_task_tool(&state.server.tasks, &state.server.sessions, &client, &name, &arguments).await,
+            };
             rpc_result(id, tool_result(result))
         }
         _ => rpc_error(id, -32601, "Method not found"),
@@ -572,6 +588,41 @@ pub(crate) fn task_tools() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": { "seq": { "type": "integer", "minimum": 0 } }, "required": ["seq"] },
         }),
     ]
+}
+
+/// What agents may see of the loop engine, and how they talk to the
+/// Assistant. Read only: checkpoints are the user's to answer, in Desktop.
+fn engine_tools() -> Vec<Value> {
+    vec![
+        json!({ "name": "list_runs", "description": "Runs of the user's graphs and where each is: current step, since when, who it waits on (task, check or user).", "inputSchema": { "type": "object", "properties": {} } }),
+        json!({ "name": "get_run", "description": "One run with every attempt and the evidence the engine kept.", "inputSchema": { "type": "object", "properties": { "runId": { "type": "string" } }, "required": ["runId"] } }),
+        json!({ "name": "list_todos", "description": "Checkpoints waiting for the user. Read only: only the user answers them, in Desktop.", "inputSchema": { "type": "object", "properties": {} } }),
+        json!({ "name": "assistant_send", "description": "Write to the Desktop Assistant in the user's place. The user sees the message came from this agent. Its answers come back in assistant_messages.", "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] } }),
+        json!({ "name": "assistant_messages", "description": "The latest rows of the Assistant's conversation (user, assistant, show, report, error), newest last.", "inputSchema": { "type": "object", "properties": { "limit": { "type": "integer", "minimum": 1 } }, "required": ["limit"] } }),
+    ]
+}
+
+async fn call_engine_tool(
+    runs: &Runs,
+    assistant: &Arc<Assistant>,
+    client: &AgentClient,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, ApiError> {
+    if !client.scopes.iter().any(|scope| scope == "tasks") {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "scope-missing", "This agent may not run tasks", false));
+    }
+    match name {
+        "list_runs" => Ok(runs.list()),
+        "get_run" => runs.get(string_arg(arguments, "runId")?),
+        "list_todos" => Ok(runs.todos()),
+        "assistant_send" => assistant.send_via(string_arg(arguments, "text")?, Some(&client.name)).await,
+        "assistant_messages" => {
+            let limit = arguments["limit"].as_u64().ok_or_else(|| ApiError::bad_request("limit is required"))?;
+            Ok(assistant.messages(limit as usize))
+        }
+        _ => Err(ApiError::new(StatusCode::NOT_FOUND, "unknown-tool", format!("No tool named {name}"), false)),
+    }
 }
 
 /// Folders this agent may use: the user's, narrowed by the agent's own list.
@@ -817,6 +868,44 @@ mod tests {
         assert!(!read["structuredContent"]["messages"].as_array().unwrap().is_empty());
         let acked = call(&server, &token, "ack_inbox", json!({ "seq": after })).await;
         assert_eq!(acked["structuredContent"]["left"], 0);
+    }
+
+    #[tokio::test]
+    async fn agents_read_runs_and_todos_and_talk_to_the_assistant_but_never_decide() {
+        let (server, home, _workspace) = setup();
+        let runs = Runs::new(home.path(), server.sessions.clone(), server.tasks.clone());
+        let triggers = crate::triggers::Triggers::new(home.path(), server.sessions.clone(), server.tasks.clone(), runs.clone());
+        let projects = crate::projects::ProjectStore::new(server.sessions.clone(), server.tasks.clone());
+        let assistant = Assistant::new(
+            home.path(),
+            Assistant::default_paths(home.path(), &server.sessions),
+            server.sessions.clone(),
+            server.tasks.clone(),
+            projects,
+            triggers,
+            runs.clone(),
+        );
+        server.attach(runs.clone(), assistant);
+        runs.save_graph(serde_json::from_value(json!({ "id": "ask", "start": "ask", "nodes": { "ask": { "kind": "checkpoint", "ask": "Ship it?" } } })).unwrap()).unwrap();
+        let run = runs.start("ask", None, serde_json::Map::new(), json!({ "by": "user" }), Vec::new()).unwrap();
+        let token = server.create_client("Claude Code").unwrap()["token"].as_str().unwrap().to_string();
+        let (_, listed) = rpc(&server, &token, json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })).await;
+        let names: Vec<&str> = listed["result"]["tools"].as_array().unwrap().iter().filter_map(|tool| tool["name"].as_str()).collect();
+        for name in ["list_runs", "get_run", "list_todos", "assistant_send", "assistant_messages"] {
+            assert!(names.contains(&name), "{names:?}");
+        }
+        for name in &names {
+            assert!(!name.contains("decide") && !name.contains("decision") && !name.contains("approve"), "{name}");
+        }
+        let todos = call(&server, &token, "list_todos", json!({})).await;
+        assert_eq!(todos["structuredContent"]["todos"][0]["ask"], "Ship it?", "{todos}");
+        let got = call(&server, &token, "get_run", json!({ "runId": run["runId"] })).await;
+        assert_eq!(got["structuredContent"]["waitingOn"], "user");
+        // The Assistant is off here: the message is refused, not lost silently.
+        let sent = call(&server, &token, "assistant_send", json!({ "text": "how is it going?" })).await;
+        assert_eq!(sent["structuredContent"]["error"]["code"], "assistant-off", "{sent}");
+        let read = call(&server, &token, "assistant_messages", json!({ "limit": 10 })).await;
+        assert_eq!(read["isError"], false, "{read}");
     }
 
     #[tokio::test]

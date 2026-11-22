@@ -419,9 +419,25 @@ export interface AssistantMessage {
   /** Fixed id (`m<n>`); a project keeps the person's requests by it. */
   id?: string;
   at: string;
-  /** user, assistant, wake (what woke it, from the host), error. */
+  /** user, assistant, show, wake (what woke it, from the host), report (the loop engine's facts), error. */
   kind: string;
   text: string;
+  /** user: the agent that wrote in the user's place (MCP), if not the person. */
+  via?: string;
+  /** report: what the engine reports, for the pane to word. */
+  report?: AssistantReport;
+}
+
+/** A loop-engine report: a run waits for the user, a step went wrong, or a run ended. */
+export interface AssistantReport {
+  type: "waiting" | "step" | "ended";
+  runId: string;
+  graphId: string;
+  node?: string;
+  ask?: string;
+  result?: string;
+  n?: number;
+  state?: string;
 }
 
 /** One of the Assistant's tasks, as the host derives its state now. */
