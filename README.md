@@ -1,6 +1,6 @@
 # Jouzu Desktop
 
-Standalnoe desktop product repository.
+Standalone desktop product repository.
 
 ```text
 apps/launcher/      Tauri desktop shell and React UI
