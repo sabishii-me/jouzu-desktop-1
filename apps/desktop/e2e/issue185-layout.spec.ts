@@ -17,6 +17,7 @@ const sessionSnapshot = {
 };
 
 async function installRunningSessionFixture(page: Page) {
+  const snapshot = { ...sessionSnapshot, sessionId: "s1", workspacePath: "C:/Projects/Issue 185", sessionPath: "C:/sessions/issue-185.jsonl", status: "running", cursor: 1 };
   const requests: string[] = [];
   page.on("request", request => {
     const url = new URL(request.url());
@@ -27,17 +28,21 @@ async function installRunningSessionFixture(page: Page) {
     const url = new URL(request.url());
     const path = url.pathname;
     if (path === "/v1/sessions" && request.method() === "POST") {
-      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...sessionSnapshot, sessionId: "s1", workspacePath: "C:/Projects/Issue 185", sessionPath: "C:/sessions/issue-185.jsonl", status: "running", cursor: 1, textguard: { mode: "on" }, activeTurn: sessionSnapshot.activeTurn }) });
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(snapshot) });
     }
 
-    if (path === "/v1/sessions" && request.method() === "GET") return route.fallback();
+    if (path === "/v1/sessions" && request.method() === "GET") {
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ sessions: [{ ...sessionSnapshot, workspacePath: "C:/Projects/Issue 185", sessionPath: "C:/sessions/issue-185.jsonl", status: "running", running: true }] }) });
+    }
+    if (path === "/v1/sessions/persisted" && request.method() === "GET") {
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ sessions: [] }) });
+    }
     if (path === "/v1/events") {
-      const data = `id: 1\nevent: session.updated\ndata: ${JSON.stringify({ sessionId: "s1", event: "session.updated", data: sessionSnapshot, seq: 1 })}\n\n`;
+      const data = `id: 1\nevent: session.updated\ndata: ${JSON.stringify(snapshot)}\n\n`;
       return route.fulfill({ status: 200, contentType: "text/event-stream", body: data });
     }
     if (path === "/v1/sessions/s1/snapshot") {
-      const view = { ...sessionSnapshot, sessionId: "s1", workspacePath: "C:/Projects/Issue 185", sessionPath: "C:/sessions/issue-185.jsonl", status: "running", cursor: 1, textguard: { mode: "on" } };
-      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(view) });
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(snapshot) });
     }
     if (path === "/v1/sessions/s1/messages" || path === "/v1/sessions/undefined/messages") {
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ messages: [], nextBefore: null, turn: 0 }) });
@@ -95,7 +100,6 @@ test("issue 185: running composer keeps essential controls separate from its ste
   const model = page.getByRole("button", { name: "Model", exact: true });
   const stop = page.getByRole("button", { name: "Stop", exact: true });
   const send = page.getByRole("button", { name: "Steer", exact: true });
-  await page.waitForTimeout(1000);
   await expect(textguard).toBeVisible();
   const rectangles = async () => page.evaluate(() => Object.fromEntries(
     ["textguard", "model", "stop", "send", "hint"].map(name => {
