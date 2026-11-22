@@ -104,6 +104,8 @@ test.describe("send while starting", () => {
   await expect(sidebar.getByText("first message while starting")).toBeVisible({ timeout: 2000 });
   await expect(page.getByRole("button", { name: /^Send$/ })).toBeVisible({ timeout: 2000 });
   await expect(page.getByRole("button", { name: /^Steer$/ })).toHaveCount(0);
+  // Nothing can be steered yet, but the turn can be stopped.
+  await expect(page.getByRole("button", { name: /^Stop$/ })).toBeVisible();
   await expect(page.getByText(/Enter to steer/i)).toHaveCount(0);
   await expect(page.getByText(/Starting session/i).first()).toBeVisible();
   expect(Date.now() - opened).toBeLessThan(startDelayMs);
