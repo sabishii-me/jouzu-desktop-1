@@ -11,7 +11,8 @@
 /// - `rate-limit`: too many requests for now.
 /// - `model-unavailable`: the provider does not offer the model.
 /// - `image`: the request was refused because of an image.
-/// - `unavailable`: the provider or the network did not answer.
+/// - `unavailable`: the provider or network did not answer (a transport failure).
+/// - `provider-error`: the provider or its gateway answered with an error.
 /// - `other`: anything else.
 pub fn code(text: &str) -> &'static str {
     let lower = text.to_lowercase();
@@ -34,6 +35,9 @@ pub fn code(text: &str) -> &'static str {
     }
     if has(&["insufficient_balance", "free_allowance_exhausted"]) {
         return "quota";
+    }
+    if ["500", "502", "503", "504", "529"].iter().any(|code| status(code)) {
+        return "provider-error";
     }
     if has(&["auth_verification_busy", "backend_at_capacity"]) {
         return "unavailable";
@@ -72,23 +76,17 @@ pub fn code(text: &str) -> &'static str {
     if has(&["image"]) {
         return "image";
     }
-    if ["500", "502", "503", "504", "529"].iter().any(|code| status(code))
-        || has(&[
-            "overloaded",
-            "service unavailable",
-            "internal server error",
-            "bad gateway",
-            "timed out",
-            "timeout",
-            "econnreset",
-            "econnrefused",
-            "enotfound",
-            "fetch failed",
-            "network",
-            "connection error",
-            "socket hang up",
-        ])
-    {
+    if has(&[
+        "timed out",
+        "timeout",
+        "econnreset",
+        "econnrefused",
+        "enotfound",
+        "fetch failed",
+        "network",
+        "connection error",
+        "socket hang up",
+    ]) {
         return "unavailable";
     }
     "other"
@@ -106,15 +104,29 @@ mod tests {
         assert_eq!(code("You exceeded your current quota, please check your plan and billing details."), "quota");
         assert_eq!(code("404 {\"error\":{\"message\":\"The model `gone` does not exist\"}}"), "model-unavailable");
         assert_eq!(code("400 Invalid image: the image could not be decoded"), "image");
-        assert_eq!(code("503 Service Unavailable"), "unavailable");
+        assert_eq!(code("500 Internal Server Error"), "provider-error");
+        assert_eq!(code("502 Bad Gateway"), "provider-error");
+        // A 503 response is answered; it is not a connection that received no answer.
+        assert_eq!(code("503 Service Unavailable"), "provider-error");
+        assert_eq!(code("504 Gateway Timeout"), "provider-error");
+        assert_eq!(code("529 Overloaded"), "provider-error");
+        assert_eq!(code("503 {\"error\":{\"code\":\"auth_verification_busy\"}}"), "provider-error");
+        assert_eq!(code("500 timeout: gateway did answer"), "provider-error");
         assert_eq!(code("fetch failed"), "unavailable");
+        assert_eq!(code("ECONNREFUSED"), "unavailable");
+        assert_eq!(code("ENOTFOUND provider.example"), "unavailable");
+        assert_eq!(code("timed out"), "unavailable");
+        assert_eq!(code("timeout"), "unavailable");
         assert_eq!(code("Connection error."), "unavailable");
+        assert_eq!(code("econnreset"), "unavailable");
+        assert_eq!(code("network error"), "unavailable");
+        assert_eq!(code("socket hang up"), "unavailable");
         // Shisa router codes decide over the status they come with.
         assert_eq!(code("403 {\"error\":{\"message\":\"Model not in plan\",\"code\":\"model_not_in_plan\"}}"), "model-unavailable");
         assert_eq!(code("402 {\"error\":{\"code\":\"insufficient_balance\"}}"), "quota");
         assert_eq!(code("429 {\"error\":{\"code\":\"free_allowance_exhausted\"}}"), "quota");
         assert_eq!(code("429 {\"error\":{\"code\":\"rate_limit_exceeded\"}}"), "rate-limit");
-        assert_eq!(code("503 {\"error\":{\"code\":\"auth_verification_busy\"}}"), "unavailable");
+        assert_eq!(code("503 {\"error\":{\"code\":\"auth_verification_busy\"}}"), "provider-error");
         assert_eq!(code("401 {\"error\":{\"message\":\"Invalid API key.\",\"code\":\"invalid_api_key\"}}"), "auth");
         assert_eq!(code("Something odd happened"), "other");
         // A number inside a longer one is not a status.
