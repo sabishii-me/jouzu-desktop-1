@@ -43,7 +43,7 @@
     "fix": {
       "kind": "agent",
       "workspace": "{{workspace}}",
-      "brief": "Fix GitHub issue {{repo}}#{{number}} following the approved plan in {{evidence}}/plan.md.\n\nWork on branch loop/issue-{{number}} from {{base}}. Add the test the plan names. Run `{{test}}` and make it pass without loosening any check. Commit, and push the branch.\n\nWrite to {{evidence}}/fix.md what you changed, the commits, and the test output. If earlier test runs failed, their output is under {{evidence}} (tests-N/stderr.txt).",
+      "brief": "Fix GitHub issue {{repo}}#{{number}} following the approved plan in {{evidence}}/plan.md.\n\nWork on branch loop/issue-{{number}} from {{base}}. Add the test the plan names, and show it failing before the fix and passing after. Run `{{test}}` and make it pass without loosening any check. Commit on the branch. Do not push and do not open a pull request: both happen only after the user approves the fix.\n\nWrite to {{evidence}}/fix.md what you changed, the commits, and the output of every test you ran. If any test you ran still fails, say so in the first line. If earlier test runs failed, their output is under {{evidence}} (tests-N/stderr.txt).",
       "outputs": ["{{evidence}}/fix.md"]
     },
     "tests": {
@@ -59,9 +59,14 @@
     },
     "accept": {
       "kind": "checkpoint",
-      "ask": "The fix for {{repo}}#{{number}} is on branch loop/issue-{{number}} and the tests pass. Approve to open a pull request into {{base}}, send it back, or stop.",
+      "ask": "The fix for {{repo}}#{{number}} is committed on branch loop/issue-{{number}} (not pushed yet), and the check `{{test}}` passed. Read fix.md for what else was run and how it went. Approve to push the branch and open a pull request into {{base}}, send it back, or stop.",
       "show": ["{{evidence}}/fix.md", "{{evidence}}/plan.md"],
       "sendBack": ["fix", "root-cause"]
+    },
+    "push": {
+      "kind": "check",
+      "workspace": "{{workspace}}",
+      "run": "git push -u origin loop/issue-{{number}}"
     },
     "pr": {
       "kind": "connector",
@@ -91,7 +96,8 @@
     { "from": "tests", "to": "accept", "when": "passed" },
     { "from": "tests", "to": "stuck", "when": "failed", "attempts": 3 },
     { "from": "tests", "to": "fix", "when": "failed" },
-    { "from": "accept", "to": "pr", "when": "approved" },
+    { "from": "accept", "to": "push", "when": "approved" },
+    { "from": "push", "to": "pr", "when": "passed" },
     { "from": "pr", "to": "merged", "when": "done" }
   ]
 }

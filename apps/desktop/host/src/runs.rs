@@ -594,6 +594,26 @@ impl Runs {
                 return Err(ApiError::bad_request(format!("Parameter {name} ({kind}) is required")));
             }
         }
+        // Every step's folder must exist before anything starts: a run that
+        // would fail at its first task is refused with the reason instead.
+        let probe = {
+            let mut fields = Value::Object(params.clone());
+            fields["runId"] = json!("");
+            fields["evidence"] = json!("");
+            fields["note"] = json!("");
+            fields
+        };
+        for (id, node) in &graph.nodes {
+            let workspace = match node {
+                Node::Agent { workspace, .. } | Node::Check { workspace, .. } => workspace,
+                _ => continue,
+            };
+            if let Ok(folder) = fill(workspace, &probe) {
+                if !Path::new(&folder).is_dir() {
+                    return Err(ApiError::bad_request(format!("Step {id} works in {folder}, which is not a folder")));
+                }
+            }
+        }
         let run = Run {
             run_id: new_id("run-"),
             graph_id: graph.id.clone(),
@@ -633,11 +653,18 @@ impl Runs {
             let mut runs = self.runs();
             let Some(run) = runs.get_mut(run_id) else { return };
             let n = run.count(node_id) + 1;
-            // Public writes only right after the user approved a checkpoint.
-            let may_write = run.attempts.last().is_some_and(|last| {
-                last.result.as_deref() == Some("approved")
-                    && matches!(graph.nodes.get(&last.node), Some(Node::Checkpoint { .. }))
-            });
+            // Public writes only after the user approved a checkpoint, with
+            // nothing an agent did in between: checks and connector steps that
+            // went well may sit between the approval and the write (push, then
+            // open the pull request), an agent step may not.
+            let may_write = run
+                .attempts
+                .iter()
+                .rev()
+                .find(|done| !(matches!(graph.nodes.get(&done.node), Some(Node::Check { .. } | Node::Connector { .. })) && done.result.as_deref().is_some_and(good)))
+                .is_some_and(|last| {
+                    last.result.as_deref() == Some("approved") && matches!(graph.nodes.get(&last.node), Some(Node::Checkpoint { .. }))
+                });
             run.attempts.push(Attempt {
                 node: node_id.to_string(),
                 n,
@@ -654,7 +681,10 @@ impl Runs {
                 let workspace = fill(workspace, &fields)?;
                 let mut text = fill(brief, &fields)?;
                 if let Some(note) = note.as_deref().filter(|note| !note.trim().is_empty()) {
-                    text.push_str(&format!("\n\nThe user sent this step back with this note:\n{note}"));
+                    // The user's note comes first: it is what this attempt is for.
+                    text = format!(
+                        "The user sent this step back. Their note comes before everything below; follow it, and say in what you write how you did:\n{note}\n\n---\n\n{text}"
+                    );
                 }
                 let task = self
                     .tasks
@@ -1029,31 +1059,62 @@ impl Runs {
             .collect();
         for (run_id, attempt) in going {
             if let Some(task) = attempt.evidence["taskId"].as_str() {
-                // A task that ended while the host was off is judged now.
+                // A task that finished while the host was off is judged now.
+                // One that did not finish was cut off with the host (its
+                // runtime stops with it): the step runs again, told so.
                 let state = self.tasks.get(TASK_CLIENT, task).ok().and_then(|view| view["state"].as_str().map(str::to_string));
-                if let Some(state) = state.filter(|state| matches!(state.as_str(), "finished" | "failed" | "stopped")) {
-                    self.task_ended(task, &state);
+                if state.as_deref() == Some("finished") {
+                    self.task_ended(task, "finished");
+                } else {
+                    self.rerun_cut_off(&run_id, &attempt, "The host stopped while this step ran");
                 }
             } else if attempt.evidence["connector"].is_string() {
                 // An outside action may have happened: never sent twice.
                 self.finish_attempt(&run_id, "failed", json!({ "error": "The host stopped during this action; it was not repeated. Check the service before running it again." }));
             } else {
                 // A command cut off by the host stopping: it runs again.
-                let graph = {
-                    let mut runs = self.runs();
-                    let Some(run) = runs.get_mut(&run_id) else { continue };
-                    if let Some(cut) = run.attempts.last_mut() {
-                        cut.result = Some("interrupted".into());
-                        cut.ended_at = Some(now_iso());
-                        cut.evidence["error"] = json!("The host stopped while the command ran");
-                    }
-                    self.graph(&run.graph_id, Some(run.graph_version))
-                };
-                match graph {
-                    Ok(graph) => self.enter(&run_id, &graph, &attempt.node, attempt.note.clone()),
-                    Err(error) => self.end(&run_id, RunState::Failed, Some(error.message)),
-                }
+                self.rerun_cut_off(&run_id, &attempt, "The host stopped while the command ran");
             }
+        }
+    }
+
+    /// Marks the current attempt interrupted and runs its step again, with
+    /// its note. A step cut off twice in a row is not tried a third time:
+    /// it may be what stops the host, so the run ends and says so.
+    fn rerun_cut_off(self: &Arc<Self>, run_id: &str, attempt: &Attempt, why: &str) {
+        let (graph, again) = {
+            let mut runs = self.runs();
+            let Some(run) = runs.get_mut(run_id) else { return };
+            let again = run
+                .attempts
+                .iter()
+                .rev()
+                .nth(1)
+                .is_some_and(|before| before.node == attempt.node && before.result.as_deref() == Some("interrupted"));
+            if let Some(cut) = run.attempts.last_mut() {
+                cut.result = Some("interrupted".into());
+                cut.ended_at = Some(now_iso());
+                cut.evidence["error"] = json!(why);
+            }
+            (self.graph(&run.graph_id, Some(run.graph_version)), again)
+        };
+        if let Some(run) = self.runs().get(run_id) {
+            self.save_run(run);
+        }
+        match graph {
+            Ok(_) if again => self.end(
+                run_id,
+                RunState::Failed,
+                Some(format!("{} was cut off by the host stopping twice in a row; it was not started a third time", attempt.node)),
+            ),
+            Ok(graph) => {
+                let note = match attempt.note.as_deref().filter(|note| !note.trim().is_empty()) {
+                    Some(note) => format!("{note}\n\n({why}; your earlier work may still be in the folder.)"),
+                    None => format!("{why}; your earlier work may still be in the folder."),
+                };
+                self.enter(run_id, &graph, &attempt.node, Some(note))
+            }
+            Err(error) => self.end(run_id, RunState::Failed, Some(error.message)),
         }
     }
 }
@@ -1180,6 +1241,51 @@ mod tests {
         assert!(done["endedAt"].is_string());
         assert_eq!(runs.todos()["todos"], json!([]));
         assert!(runs.decide(&run_id, Decision { decision: "approve".into(), node: None, note: None }).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_agent_step_cut_off_by_the_host_runs_again_once() {
+        let fixture = setup();
+        let runs = &fixture.runs;
+        runs.save_graph(three_steps(&fixture.folder)).unwrap();
+        let cut = |n: u64, result: Option<&str>| Attempt {
+            node: "write".into(),
+            n,
+            started_at: now_iso(),
+            result: result.map(str::to_string),
+            evidence: json!({ "taskId": format!("task-gone-{n}") }),
+            ..Default::default()
+        };
+        let stored = |id: &str, attempts: Vec<Attempt>| {
+            let run = Run {
+                run_id: id.into(),
+                graph_id: "three".into(),
+                graph_version: 1,
+                params: params(json!({ "topic": "tea" })),
+                state: RunState::Running,
+                attempts,
+                started_by: json!({ "by": "user" }),
+                triggered_by: Vec::new(),
+                created_at: now_iso(),
+                ended_at: None,
+                reason: None,
+            };
+            write_json(&runs.run_file(id), &run).unwrap();
+        };
+        // Its task never finished: the host stopped with it.
+        stored("run-cut-once", vec![cut(1, None)]);
+        // Cut off already, and again: it may be what stops the host.
+        stored("run-cut-twice", vec![cut(1, Some("interrupted")), cut(2, None)]);
+        let restarted = Runs::new(fixture.home.path(), runs.sessions.clone(), runs.tasks.clone());
+        restarted.launch();
+        let once = restarted.get("run-cut-once").unwrap();
+        let attempts = once["attempts"].as_array().unwrap();
+        assert_eq!(attempts[0]["result"], "interrupted", "{once}");
+        assert_eq!(attempts[1]["node"], "write");
+        assert!(attempts[1]["note"].as_str().unwrap().contains("The host stopped"), "{once}");
+        let twice = restarted.get("run-cut-twice").unwrap();
+        assert_eq!(twice["state"], "failed", "{twice}");
+        assert!(twice["reason"].as_str().unwrap().contains("twice in a row"), "{twice}");
     }
 
     #[tokio::test]

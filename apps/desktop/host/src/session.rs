@@ -6744,10 +6744,15 @@ impl SessionManager {
     }
 
     pub fn add_workspaces(&self, paths: &[String]) -> Result<Vec<Value>, ApiError> {
+        // Nothing is added unless every path is a folder: a typo is refused
+        // with its name, not silently dropped.
+        if let Some(bad) = paths.iter().map(|path| path.trim()).find(|path| !path.is_empty() && !Path::new(path).is_dir()) {
+            return Err(ApiError::bad_request(format!("Not a folder: {bad}")));
+        }
         let mut workspaces = self.workspaces();
         for path in paths {
             let path = path.trim();
-            if path.is_empty() || !Path::new(path).is_dir() {
+            if path.is_empty() {
                 continue;
             }
             let lower = path.replace('\\', "/").to_lowercase();

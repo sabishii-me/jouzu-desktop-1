@@ -19,7 +19,7 @@
 //   JOUZU_E2E_RUNTIME=<folder with bootstrap.mjs and node_modules/jouzu>
 //   JOUZU_E2E_HOST_BIN=<jouzu-host binary> (default: host/target/debug/jouzu-host)
 //   node e2e-runtime/loop-drill.mjs
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -162,6 +162,15 @@ const folder = join(root, 'app');
 mkdirSync(folder);
 const qaFolder = join(root, 'qa');
 mkdirSync(qaFolder);
+// The project is a git repository with a remote, so the push step really pushes.
+const remote = join(root, 'remote.git');
+const git = (cwd, ...args) => execFileSync('git', args, { cwd, stdio: 'pipe' }).toString().trim();
+git(root, 'init', '-q', '--bare', remote);
+git(folder, 'init', '-q', '-b', 'develop');
+git(folder, '-c', 'user.name=drill', '-c', 'user.email=drill@example.test', 'commit', '-q', '--allow-empty', '-m', 'start');
+git(folder, 'remote', 'add', 'origin', remote);
+git(folder, 'branch', 'loop/issue-7');
+const pushed = () => git(remote, 'branch', '--list', 'loop/issue-7') !== '';
 
 let host;
 let base;
@@ -226,6 +235,13 @@ try {
     action: { kind: 'startRun', graph: 'qa-release-loop', params: { repo: '{{repo}}', tag: '{{tag}}', workspace: qaFolder, tour: 'node -e "console.log(\'1 difference: settings button\')"' } } });
   check('the user adds two triggers', issueTrigger.status === 201 && releaseTrigger.status === 201, `${issueTrigger.status} ${releaseTrigger.status} ${JSON.stringify(issueTrigger.body?.error ?? releaseTrigger.body?.error ?? '')}`);
 
+  // A run whose folder does not exist is refused with the reason, and so is the folder.
+  const missing = join(root, 'no-such-folder');
+  const refusedRun = await api('POST', '/runs', { graph: 'issue-loop', params: { repo: REPO, number: 1, workspace: missing, base: 'develop', test } });
+  check('a run in a folder that does not exist is refused', refusedRun.status === 400 && String(refusedRun.body?.error?.message ?? JSON.stringify(refusedRun.body)).includes('not a folder'), JSON.stringify(refusedRun.body).slice(0, 200));
+  const refusedFolder = await api('POST', '/workspaces', { paths: [missing] });
+  check('adding a folder that does not exist is refused', refusedFolder.status === 400, String(refusedFolder.status));
+
   // The first look is a baseline: the issue that was already there starts nothing.
   await api('POST', '/connectors/github/poll');
   check('the first look starts nothing', ((await api('GET', '/runs')).body?.runs ?? []).length === 0);
@@ -268,10 +284,11 @@ try {
   value = await waitAt(id, 'accept');
   const tests = value.attempts.filter(attempt => attempt.node === 'tests').map(attempt => attempt.result);
   check('failing tests went back to the fix, passing tests to the user', JSON.stringify(tests) === '["failed","passed"]', path(value));
-  check('still nothing written to GitHub', gh.pulls.length === 0);
+  check('still nothing written to GitHub, and the branch is not pushed', gh.pulls.length === 0 && !pushed());
 
   await api('POST', `/runs/${id}/decision`, { decision: 'approve' });
   value = await waitAt(id, 'merged');
+  check('after approval the branch is pushed', pushed(), path(value));
   check('after approval the pull request is opened', gh.pulls.length === 1 && gh.pulls[0].head === 'loop/issue-7' && gh.pulls[0].base === 'develop', JSON.stringify(gh.pulls));
   await api('POST', `/runs/${id}/decision`, { decision: 'approve' });
   value = await until('run ends', async () => { const v = await run(id); return v?.state === 'finished' ? v : null; }, 30);
