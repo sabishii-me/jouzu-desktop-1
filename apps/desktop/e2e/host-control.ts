@@ -27,7 +27,7 @@ export type HostStub = {
  */
 export async function stubHost(
   page: Page,
-  options: { control: (body: any, host: HostStub) => unknown; workspaces?: Workspace[] },
+  options: { control: (body: any, host: HostStub) => unknown; workspaces?: Workspace[]; skipSessionDetails?: boolean },
 ) {
   const workspaces = [...(options.workspaces ?? [])];
   // Events wait here until the window's stream next connects. The stub answers
@@ -86,7 +86,7 @@ export async function stubHost(
     const url = new URL(request.url());
     const path = url.pathname;
     const method = request.method();
-    if (path === "/v1/app") { await chain; return route.fulfill(json(view)); }
+    if (options.skipSessionDetails && (/^\/v1\/sessions\/[^/]+\/(snapshot|messages|stats|events)$/.test(path) || path === "/v1/sessions" && method === "POST")) return route.fallback();
     const config = /^\/v1\/config\/([a-z-]+)$/.exec(path);
     if (config && method === "POST") return route.fulfill(json(enqueue(config[1], request.postDataJSON() ?? {}), 202));
     if (/^\/v1\/config\/operations\/[^/]+\/cancel$/.test(path)) { for (const cancel of [...cancels]) cancel(); return route.fulfill({ status: 204, body: "" }); }

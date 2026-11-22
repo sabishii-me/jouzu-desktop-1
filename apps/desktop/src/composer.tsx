@@ -290,16 +290,18 @@ export function Composer({ hero = false, autoFocus = false, textguard, blocked, 
         }
         if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); submit(); }
       }} />
-      <div className="composer-footer flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-1">
+      <div className="composer-footer flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-1">
           {onAddImages && <><input ref={imageInput} type="file" accept={IMAGE_ACCEPT} multiple className="hidden" aria-label={t.chooseImages} onChange={event => { const files = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ""; onAddImages(files); }} /></>}
           {onAddVideo && <Button type="button" variant="ghost" className="size-8 p-0" aria-label={t.addVideoUrl} title={t.addVideoUrl} onClick={() => setVideoOpen(value => !value)}><Video className="size-4" /></Button>}
           <AddMenu open={addOpen} onOpenChange={setAddOpen} onAddImage={onAddImages && !readingImages && attachments.length < MAX_IMAGES ? () => imageInput.current?.click() : undefined} onCompact={onCompact} onModel={() => setModelOpen(true)} onExport={onExport} onReloadMcp={onReloadMcp} compactDisabled={compactDisabled} exportDisabled={exportDisabled || readingImages} result={results.attach ?? results.commands} />
           {textguard && <TextGuardControl control={textguard} result={results.textguard} />}
           {readingImages && <span role="status" className="text-xs text-muted-foreground">{t.readingImages}</span>}
         </div>
+        <div className="min-w-0 flex-1 text-xs text-muted-foreground">
+          <span data-composer-steering-hint className="block truncate" title={!connected ? t.connecting : unavailable ? t.sessionUnavailable : opening ? t.openingSession : starting ? t.starting : pending ? t.sending : running ? t.enterToSteer : t.enterToSend}>{!connected ? t.connecting : unavailable ? t.sessionUnavailable : opening ? t.openingSession : starting ? t.starting : pending ? t.sending : running ? t.enterToSteer : t.enterToSend}</span>
+        </div>
         <div className="flex shrink-0 items-center gap-2">
-          <span data-composer-steering-hint className="composer-steering-hint hidden text-xs text-muted-foreground lg:inline">{!connected ? t.connecting : unavailable ? t.sessionUnavailable : opening ? t.openingSession : starting ? t.starting : pending ? t.sending : running ? t.enterToSteer : t.enterToSend}</span>
           <ModelMenu open={modelOpen} onOpenChange={setModelOpen} models={models} model={model} state={modelState} onSelect={onSelectModel} onSetup={onSetupModel} thinkingLevel={thinkingLevel} thinkingLevels={thinkingLevels} onThinking={onThinkingLevel} result={results.model} />
           {active && <Button type="button" variant="outline" className="h-8 px-2" onClick={onStop}><Square className="size-3.5" />{t.stop}</Button>}
           {active && <ResultMark result={results.stop} />}

@@ -37,8 +37,7 @@
   input, textarea, [contenteditable="true"], .select-text { user-select: text; -webkit-user-select: text; }
   img { -webkit-user-drag: none; }
 }
-  .composer-footer { container-type: inline-size; }
-  @container (max-width: 44rem) { .composer-steering-hint { display: none; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } }
 
 /* The app's dotted sign, animated: cyan dots on the left, purple on the right, the same palette as the JZ icon.
    A bump travels along the row, the way a message moves through the mark, so a wait reads as motion rather than a static ring. */
