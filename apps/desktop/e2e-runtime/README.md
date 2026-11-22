@@ -133,3 +133,19 @@ the Assistant's tools and read-only ones and nothing that runs commands or write
 runs on the Assistant's prompt with its skills, that a tool call goes through the jouzu-assistant
 extension to the host and back, and that the bridge refuses the host's token. Results, with the
 system prompt the model received, are written to `assistant-session-result.json`.
+
+## Task loop engine, closed loop
+
+```powershell
+$env:JOUZU_E2E_RUNTIME = '<extracted official setup>'
+node e2e-runtime/loop-drill.mjs
+```
+
+Runs both shipped graphs end to end with no person and no network: a host on throwaway
+folders, a loopback model that writes the files each brief names, and a loopback GitHub with
+ETags. The script is the user: it sets up the GitHub connector and two triggers, and answers
+every checkpoint through the user's API (one send back, the rest approvals). It checks that a
+new issue starts the issue loop and a release tag starts the QA release loop, that outputs are
+kept as evidence, that failing tests go back to the fix, that a checkpoint survives a host
+restart, that the Assistant pane gets the reports, and that nothing is written to GitHub before
+the user approves. It takes about 15 seconds. Results are written to `loop-drill-result.json`.
