@@ -17,7 +17,7 @@ const sessionSnapshot = {
 };
 
 async function installRunningSessionFixture(page: Page) {
-  const snapshot = { ...sessionSnapshot, sessionId: "s1", workspacePath: "C:/Projects/Issue 185", sessionPath: "C:/sessions/issue-185.jsonl", status: "running", cursor: 1 };
+  const snapshot = { ...sessionSnapshot, sessionId: "s1", sessionPath: "C:/sessions/issue-185.jsonl", status: "running", cursor: 1 };
   const requests: string[] = [];
   page.on("request", request => {
     const url = new URL(request.url());
