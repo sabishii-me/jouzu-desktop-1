@@ -680,7 +680,9 @@ mod tests {
         // Writing without a checkpoint before it is refused.
         fixture.runs.save_graph(graph("rash", json!({ "read": read, "say": comment("Thanks") }), json!([{ "from": "read", "to": "say", "when": "done" }]))).unwrap();
         let rash = fixture.runs.start("rash", None, serde_json::from_value(json!({ "number": 5 })).unwrap(), json!({ "by": "user" }), Vec::new()).unwrap();
-        let failed = until_state(&fixture.runs, rash["runId"].as_str().unwrap(), "failed").await;
+        // The step failed and the graph has no way on: the run waits for the user.
+        let failed = until_state(&fixture.runs, rash["runId"].as_str().unwrap(), "waiting").await;
+        assert_eq!(failed["attempts"][1]["result"], "failed", "{failed}");
         assert_eq!(failed["attempts"][0]["evidence"]["answer"]["title"], "Issue 5", "{failed}");
         assert!(failed["attempts"][1]["evidence"]["error"].as_str().unwrap().contains("checkpoint"), "{failed}");
         assert!(lock(&fixture.fake).comments.is_empty());
@@ -711,9 +713,9 @@ mod tests {
         lock(&fixture.fake).issues.push(issue(9, false));
         let params = json!({ "repo": "acme/app", "number": 9, "workspace": fixture._workspace.path(), "base": "develop", "test": "echo ok" });
         let run = fixture.runs.start("issue-loop", None, serde_json::from_value(params).unwrap(), json!({ "by": "user" }), Vec::new()).unwrap();
-        // The stand-in agent writes no triage: the step is undelivered, and
-        // the graph has no way on from there.
-        let failed = until_state(&fixture.runs, run["runId"].as_str().unwrap(), "failed").await;
+        // The stand-in agent writes no triage: the step is undelivered, the
+        // graph has no way on from there, and the run waits for the user.
+        let failed = until_state(&fixture.runs, run["runId"].as_str().unwrap(), "waiting").await;
         let answer = failed["attempts"][0]["evidence"]["answerFile"].as_str().unwrap();
         assert!(answer.ends_with("answer.json") && answer.contains("read-1"), "{failed}");
         assert!(std::fs::read_to_string(answer).unwrap().contains("Issue 9"));

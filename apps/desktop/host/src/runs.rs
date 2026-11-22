@@ -268,8 +268,12 @@ pub struct Run {
 }
 
 impl Run {
+    /// The attempt the run is on: one still going, or a step that ended
+    /// badly with no next step, which the user now has to answer.
     fn current(&self) -> Option<&Attempt> {
-        self.attempts.last().filter(|attempt| attempt.result.is_none())
+        self.attempts
+            .last()
+            .filter(|attempt| attempt.result.is_none() || (self.state == RunState::Waiting && attempt.evidence["stuck"] == json!(true)))
     }
 
     fn count(&self, node: &str) -> u64 {
@@ -940,8 +944,39 @@ impl Runs {
         match next {
             Some(to) => self.enter(run_id, &graph, &to, None),
             None if good(result) => self.end(run_id, RunState::Finished, None),
-            None => self.end(run_id, RunState::Failed, Some(format!("{node_id} ended {result} and the graph has no step for that"))),
+            None => self.stuck(run_id, &graph, &node_id, result),
         }
+    }
+
+    /// A step ended badly and the graph says nothing for that: the run
+    /// waits for the user instead of failing, with what they can do. They
+    /// can send it back to any step it already went through (with a note),
+    /// or stop it. Nothing is approved here: there is nothing good to take on.
+    fn stuck(self: &Arc<Self>, run_id: &str, graph: &Graph, node_id: &str, result: &str) {
+        let snapshot = {
+            let mut runs = self.runs();
+            let Some(run) = runs.get_mut(run_id) else { return };
+            let mut back: Vec<String> = Vec::new();
+            for attempt in &run.attempts {
+                let redo = matches!(graph.nodes.get(&attempt.node), Some(Node::Agent { .. } | Node::Check { .. }));
+                if redo && !back.contains(&attempt.node) {
+                    back.push(attempt.node.clone());
+                }
+            }
+            let ask = format!("{node_id} ended {result}, and the graph has no next step for that. Send a step back with what to change, or stop.");
+            if let Some(attempt) = run.attempts.last_mut() {
+                attempt.evidence["ask"] = json!(ask);
+                attempt.evidence["sendBack"] = json!(back);
+                attempt.evidence["stuck"] = json!(true);
+            }
+            run.state = RunState::Waiting;
+            run.clone()
+        };
+        self.save_run(&snapshot);
+        self.report(
+            json!({ "type": "waiting", "runId": run_id, "graphId": snapshot.graph_id, "node": node_id, "ask": snapshot.attempts.last().map(|attempt| attempt.evidence["ask"].clone()), "n": snapshot.count(node_id) }),
+            format!("Run {run_id} ({}) waits for you after {node_id} ended {result}", snapshot.graph_id),
+        );
     }
 
     fn end(&self, run_id: &str, state: RunState, reason: Option<String>) {
@@ -973,18 +1008,22 @@ impl Runs {
     /// The user's decision at a checkpoint. Only the user: agents and the
     /// Assistant have no way here.
     pub fn decide(self: &Arc<Self>, run_id: &str, decision: Decision) -> Result<Value, ApiError> {
-        let (graph, node_id, send_back) = {
+        let (graph, node_id, send_back, stuck) = {
             let runs = self.runs();
             let run = runs.get(run_id).ok_or_else(|| not_found("run-not-found", "No such run"))?;
             let attempt = run.current().filter(|_| run.state == RunState::Waiting).ok_or_else(|| {
                 ApiError::new(StatusCode::CONFLICT, "not-waiting", "This run is not waiting for you", false)
             })?;
             let send_back: Vec<String> = serde_json::from_value(attempt.evidence["sendBack"].clone()).unwrap_or_default();
-            (self.graph(&run.graph_id, Some(run.graph_version))?, attempt.node.clone(), send_back)
+            let stuck = attempt.evidence["stuck"] == json!(true);
+            (self.graph(&run.graph_id, Some(run.graph_version))?, attempt.node.clone(), send_back, stuck)
         };
         let note = decision.note.clone().filter(|note| !note.trim().is_empty());
         let record = json!({ "decision": decision.decision, "node": decision.node, "note": note, "at": now_iso() });
         match decision.decision.as_str() {
+            "approve" if stuck => {
+                return Err(ApiError::bad_request(format!("{node_id} did not end well; send a step back or stop")));
+            }
             "approve" => self.finish_attempt(run_id, "approved", json!({ "decided": record })),
             "sendBack" => {
                 let target = decision.node.clone().ok_or_else(|| ApiError::bad_request("Send back to which step?"))?;
@@ -994,8 +1033,10 @@ impl Runs {
                 {
                     let mut runs = self.runs();
                     if let Some(attempt) = runs.get_mut(run_id).and_then(|run| run.attempts.last_mut()) {
-                        attempt.result = Some("sentBack".into());
-                        attempt.ended_at = Some(now_iso());
+                        if !stuck {
+                            attempt.result = Some("sentBack".into());
+                            attempt.ended_at = Some(now_iso());
+                        }
                         attempt.evidence["decided"] = record;
                     }
                 }
@@ -1005,8 +1046,10 @@ impl Runs {
                 {
                     let mut runs = self.runs();
                     if let Some(attempt) = runs.get_mut(run_id).and_then(|run| run.attempts.last_mut()) {
-                        attempt.result = Some("stopped".into());
-                        attempt.ended_at = Some(now_iso());
+                        if !stuck {
+                            attempt.result = Some("stopped".into());
+                            attempt.ended_at = Some(now_iso());
+                        }
                         attempt.evidence["decided"] = record;
                     }
                 }
@@ -1319,7 +1362,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn undelivered_work_and_a_missing_step_fail_the_run_with_the_reason() {
+    async fn undelivered_work_with_no_next_step_waits_for_the_user() {
         let fixture = setup();
         let runs = &fixture.runs;
         runs.save_graph(graph(json!({
@@ -1328,12 +1371,23 @@ mod tests {
         })))
         .unwrap();
         let run = runs.start("deliver", None, Map::new(), json!({ "by": "user" }), Vec::new()).unwrap();
-        let failed = until_state(runs, run["runId"].as_str().unwrap(), "failed").await;
-        assert_eq!(failed["attempts"][0]["result"], "undelivered");
-        assert_eq!(failed["attempts"][0]["evidence"]["missing"], json!(["report.md"]));
-        assert!(failed["reason"].as_str().unwrap().contains("undelivered"), "{failed}");
+        let run_id = run["runId"].as_str().unwrap().to_string();
+        let waiting = until_state(runs, &run_id, "waiting").await;
+        assert_eq!(waiting["attempts"][0]["result"], "undelivered");
+        assert_eq!(waiting["attempts"][0]["evidence"]["missing"], json!(["report.md"]));
+        let todos = runs.todos()["todos"].clone();
+        assert_eq!(todos[0]["node"], "write", "{todos}");
+        assert_eq!(todos[0]["sendBack"], json!(["write"]));
+        assert!(todos[0]["ask"].as_str().unwrap().contains("ended undelivered"), "{todos}");
         let reports = fixture.reports.lock().unwrap().join("\n");
         assert!(reports.contains("write ended undelivered"), "{reports}");
+        // Nothing good to approve; the user sends it back with a note, or stops.
+        assert!(runs.decide(&run_id, Decision { decision: "approve".into(), node: None, note: None }).is_err());
+        runs.decide(&run_id, Decision { decision: "sendBack".into(), node: Some("write".into()), note: Some("write report.md".into()) }).unwrap();
+        let again = runs.get(&run_id).unwrap();
+        assert_eq!(again["attempts"][0]["result"], "undelivered", "the bad result is kept: {again}");
+        assert_eq!(again["attempts"][1]["note"], "write report.md");
+        runs.stop(&run_id).unwrap();
     }
 
     #[tokio::test]
