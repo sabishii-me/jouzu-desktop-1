@@ -1,15 +1,38 @@
 // Private, JSON-only adapter to the installed Jouzu configuration implementation.
 // Requests arrive through stdin, never command-line arguments containing secrets.
+// The host and the runtime installer embed this file in their binaries and run it
+// as one program with `node --input-type=module --eval` (decision 0012, D8), so it
+// has no location on disk: it imports only Node built-ins and the installed runtime
+// by absolute path, never a file next to it.
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { SettingsFailure, serializeControlError } from './control-errors.mjs';
 const root = process.argv[1]?.endsWith("control.mjs") ? process.argv[2] : process.argv[1];
 const appRoot = process.argv[1]?.endsWith('control.mjs') ? (process.argv[3] || join(root, 'app')) : (process.argv[2] || join(root, 'app'));
 const load = name => import(pathToFileURL(join(appRoot, 'node_modules/jouzu/dist', `${name}.js`)));
 let action = "status";
+// What the runtime's settings manager recorded instead of throwing: one entry
+// per settings file, with the error it met there.
+class SettingsFailure extends Error {
+  constructor(failures) { super('Settings not saved'); this.failures = failures; }
+}
+// What the system refused (its code and call) on a file is a local fact the
+// person can act on, so it is relayed with the file. Any other error text may
+// carry upstream input or credentials and is not; of a settings file that
+// failed otherwise, only the file and the kind of error are named.
+const fileFact = (error, path) => {
+  const file = typeof error?.path === 'string' ? error.path : path;
+  if (typeof error?.code === 'string' && typeof error?.syscall === 'string') return `${file ? `${file}: ` : ''}${error.code} (${error.syscall})`;
+  return typeof file === 'string' ? `${file}: ${error?.name ?? 'Error'}` : null;
+};
+const localCause = error => error instanceof SettingsFailure
+  ? error.failures.map(({ error: each, path }) => fileFact(each, path)).filter(Boolean).join('\n') || null
+  : fileFact(error);
+// Saving the default model and deciding a held catalog only write settings, so a
+// local cause is the whole answer: the generic sentence would name another cause.
+const causeOnly = new Set(['default-model', 'catalog-accept', 'catalog-reject']);
 // Remote revocation is advisory: a saved sign-out still clears local credentials.
 let signOutRevocation;
 // A held catalog revision is a decision, not an error, and "nothing to refresh"
@@ -298,8 +321,8 @@ try {
     'shisa-logout': 'Shisa.AI sign-out could not be fully confirmed. Refresh its state and check the Shisa.AI dashboard.',
   };
   const message = messages[action] ?? 'Unsupported configuration operation.';
-  const cause = serializeControlError(action, error, messages);
-  console.log(JSON.stringify({ error: cause }));
+  const cause = localCause(error);
+  console.log(JSON.stringify({ error: cause ? (causeOnly.has(action) ? cause : `${message}\n${cause}`) : message }));
   process.exitCode = 1;
 }
 
