@@ -1,0 +1,41 @@
+{
+  "id": "qa-release-loop",
+  "name": "Check a QA release",
+  "params": {
+    "repo": "string",
+    "tag": "string",
+    "workspace": "string",
+    "tour": "string"
+  },
+  "start": "tour",
+  "nodes": {
+    "tour": {
+      "kind": "check",
+      "workspace": "{{workspace}}",
+      "run": "{{tour}}"
+    },
+    "classify": {
+      "kind": "agent",
+      "workspace": "{{workspace}}",
+      "brief": "Release {{tag}} of {{repo}} was installed and toured, and compared with the last baseline. The tour's output is in {{evidence}}/tour-1/stdout.txt and stderr.txt; it names the differences and where their screenshots are. Do not change any code or baseline.\n\nFor each difference, say whether it is an intended change (name the issue or pull request) or a regression, with the screenshots or text that show it. Write the list to {{evidence}}/classified.md.\n\nWrite the regressions to {{evidence}}/regressions.json as a JSON list of {\"title\", \"body\"}: one per real problem, in English, with steps, what was expected and what happened. Use [] when there are none. No local paths or machine names.",
+      "outputs": ["{{evidence}}/classified.md", "{{evidence}}/regressions.json"]
+    },
+    "decide": {
+      "kind": "checkpoint",
+      "ask": "Review the differences in {{tag}}. Approve to file the regressions listed in regressions.json as issues, send it back with corrections, or stop.",
+      "show": ["{{evidence}}/classified.md", "{{evidence}}/regressions.json"],
+      "sendBack": ["classify"]
+    },
+    "file": {
+      "kind": "connector",
+      "connector": "github",
+      "action": "open_issues",
+      "args": { "repo": "{{repo}}", "file": "{{evidence}}/regressions.json", "labels": ["regression"] }
+    }
+  },
+  "edges": [
+    { "from": "tour", "to": "classify", "when": "passed" },
+    { "from": "classify", "to": "decide", "when": "done" },
+    { "from": "decide", "to": "file", "when": "approved" }
+  ]
+}

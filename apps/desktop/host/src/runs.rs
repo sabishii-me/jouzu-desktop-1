@@ -46,6 +46,14 @@ use crate::{
     triggers::{fill, fill_value, Event},
 };
 
+/// Graphs that come with Desktop, tuned by us. Installed as the user's
+/// version 1; a newer shipped one is installed only over a graph the user
+/// has not changed.
+const SHIPPED: [&str; 2] = [
+    include_str!("../../../../packaging/desktop/graphs/issue-loop.json"),
+    include_str!("../../../../packaging/desktop/graphs/qa-release-loop.json"),
+];
+
 /// Tasks a run starts are the user's, like tasks started in Desktop.
 const TASK_CLIENT: &str = "desktop";
 
@@ -336,7 +344,7 @@ impl Runs {
             .filter_map(|bytes| serde_json::from_slice::<Run>(&bytes).ok())
             .map(|run| (run.run_id.clone(), run))
             .collect();
-        Arc::new(Self {
+        let engine = Arc::new(Self {
             home: home.to_path_buf(),
             sessions,
             tasks,
@@ -346,7 +354,32 @@ impl Runs {
             ended: Mutex::new(Vec::new()),
             early: Mutex::new(HashMap::new()),
             connectors: OnceLock::new(),
-        })
+        });
+        engine.install_shipped();
+        engine
+    }
+
+    /// Puts the shipped graphs in place: new ones as version 1, newer ones
+    /// over a graph the user has not changed since the last shipped copy.
+    fn install_shipped(&self) {
+        for text in SHIPPED {
+            let Ok(graph) = serde_json::from_str::<Graph>(text) else { continue };
+            let copy = self.graphs_dir().join(&graph.id).join("shipped.json");
+            let last_shipped: Option<Graph> = std::fs::read(&copy).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok());
+            let same = |a: &Graph, b: &Graph| Graph { version: 0, ..a.clone() } == Graph { version: 0, ..b.clone() };
+            if last_shipped.as_ref().is_some_and(|last| same(last, &graph)) {
+                continue;
+            }
+            let latest = self.graph(&graph.id, None).ok();
+            let untouched = match (&latest, &last_shipped) {
+                (None, _) => true,
+                (Some(latest), Some(last)) => same(latest, last),
+                (Some(_), None) => false,
+            };
+            if untouched && self.save_graph(graph.clone()).is_ok() {
+                let _ = write_json(&copy, &graph);
+            }
+        }
     }
 
     /// The connectors `connector` steps act through. Set once.
@@ -637,7 +670,8 @@ impl Runs {
             })(),
             Node::Connector { connector, action, args } => (|| {
                 let args = fill_value(args, &fields)?;
-                Ok(json!({ "connector": connector, "action": action, "args": args, "mayWrite": may_write }))
+                let dir = self.evidence_dir(run_id).join(format!("{node_id}-{n}"));
+                Ok(json!({ "connector": connector, "action": action, "args": args, "mayWrite": may_write, "dir": dir.to_string_lossy() }))
             })(),
             Node::Checkpoint { ask, show, workspace, send_back } => (|| {
                 let ask = fill(ask, &fields)?;
@@ -678,7 +712,8 @@ impl Runs {
                     self.spawn_check(run_id, workspace, command, &dir);
                 }
                 if let Node::Connector { connector, action, .. } = &node {
-                    self.spawn_connector(run_id, connector, action, evidence["args"].clone(), may_write);
+                    let dir = PathBuf::from(evidence["dir"].as_str().unwrap_or_default());
+                    self.spawn_connector(run_id, connector, action, evidence["args"].clone(), may_write, dir);
                 }
                 if let Some(task) = evidence["taskId"].as_str() {
                     let early = self.early().remove(task);
@@ -702,7 +737,9 @@ impl Runs {
         }
     }
 
-    fn spawn_connector(self: &Arc<Self>, run_id: &str, connector: &str, action: &str, args: Value, may_write: bool) {
+    /// The answer is kept as `answer.json` in the step's evidence folder, so
+    /// later steps can read it ({{evidence}}/<step>-<n>/answer.json).
+    fn spawn_connector(self: &Arc<Self>, run_id: &str, connector: &str, action: &str, args: Value, may_write: bool, dir: PathBuf) {
         let runs = Arc::clone(self);
         let (run_id, connector, action) = (run_id.to_string(), connector.to_string(), action.to_string());
         tokio::spawn(async move {
@@ -711,7 +748,12 @@ impl Runs {
                 None => Err("Connectors are not available".into()),
             };
             match outcome {
-                Ok(answer) => runs.finish_attempt(&run_id, "done", json!({ "answer": answer })),
+                Ok(answer) => {
+                    let file = dir.join("answer.json");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(&file, serde_json::to_vec_pretty(&answer).unwrap_or_default());
+                    runs.finish_attempt(&run_id, "done", json!({ "answer": answer, "answerFile": file.to_string_lossy() }))
+                }
                 Err(error) => runs.finish_attempt(&run_id, "failed", json!({ "error": error })),
             }
         });
@@ -798,7 +840,12 @@ impl Runs {
                     for output in &outputs {
                         let path = fill(output, &fields).unwrap_or_else(|_| output.clone());
                         let full = Path::new(&base).join(&path);
-                        if full.exists() {
+                        // Written in this attempt: a file left by an earlier one does not count.
+                        let started = run.current().and_then(|attempt| chrono::DateTime::parse_from_rfc3339(&attempt.started_at).ok());
+                        let fresh = std::fs::metadata(&full).and_then(|meta| meta.modified()).ok().is_some_and(|modified| {
+                            started.is_none_or(|started| chrono::DateTime::<Utc>::from(modified) >= started.with_timezone(&Utc) - chrono::Duration::seconds(1))
+                        });
+                        if fresh {
                             found.push(full.to_string_lossy().into_owned());
                         } else {
                             missing.push(path);
@@ -1203,6 +1250,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shipped_graphs_are_valid_installed_and_never_replace_the_users_changes() {
+        let fixture = setup();
+        let runs = &fixture.runs;
+        for text in SHIPPED {
+            let graph: Graph = serde_json::from_str(text).unwrap();
+            graph.check().unwrap();
+            assert_eq!(runs.graph(&graph.id, None).unwrap().version, 1, "{} installed", graph.id);
+        }
+        // The user changes one; a restart (or a newer Desktop) leaves it alone.
+        let mut mine = runs.graph("issue-loop", None).unwrap();
+        mine.name = "Mine".into();
+        runs.save_graph(mine).unwrap();
+        std::fs::remove_file(fixture.home.path().join("graphs/issue-loop/shipped.json")).unwrap();
+        std::fs::write(
+            fixture.home.path().join("graphs/issue-loop/shipped.json"),
+            serde_json::to_vec(&Graph { name: "Older shipped".into(), ..serde_json::from_str::<Graph>(SHIPPED[0]).unwrap() }).unwrap(),
+        )
+        .unwrap();
+        let again = Runs::new(fixture.home.path(), runs.sessions.clone(), runs.tasks.clone());
+        assert_eq!(again.graph("issue-loop", None).unwrap().name, "Mine");
+        assert_eq!(again.graph("qa-release-loop", None).unwrap().version, 1);
+    }
+
+    #[tokio::test]
     async fn graphs_keep_their_versions_and_proposals_wait_for_the_user() {
         let fixture = setup();
         let runs = &fixture.runs;
@@ -1221,10 +1292,11 @@ mod tests {
         changed.name = "Proposed".into();
         runs.propose_graph(changed).unwrap();
         assert_eq!(runs.graph("three", None).unwrap().version, 2, "a proposal is not used");
-        assert_eq!(runs.list_graphs()["graphs"][0]["proposed"], true);
+        let three = || runs.list_graphs()["graphs"].as_array().unwrap().iter().find(|graph| graph["id"] == "three").cloned().unwrap();
+        assert_eq!(three()["proposed"], true);
         let accepted = runs.accept_proposal("three").unwrap();
         assert_eq!((accepted.version, accepted.name.as_str()), (3, "Proposed"));
         assert!(runs.proposal("three").is_err());
-        assert_eq!(runs.list_graphs()["graphs"][0]["versions"], json!([1, 2, 3]));
+        assert_eq!(three()["versions"], json!([1, 2, 3]));
     }
 }

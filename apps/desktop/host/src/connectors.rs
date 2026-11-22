@@ -175,7 +175,7 @@ impl Connectors {
                 "tokenFound": self.token(&settings).is_some(),
                 "status": status,
                 "events": ["github.issue.opened", "github.pr.opened", "github.issue.labeled", "github.issue.closed", "github.issue.reopened", "github.release.published"],
-                "actions": ["read_issue", "comment", "open_pr"],
+                "actions": ["read_issue", "comment", "open_pr", "open_issues"],
             }]
         })
     }
@@ -422,12 +422,15 @@ impl Connectors {
         }
         let settings = self.settings();
         let repo = args["repo"].as_str().filter(|repo| valid_repo(repo)).ok_or("repo is owner/name")?;
-        let write = matches!(action, "comment" | "open_pr");
+        let write = matches!(action, "comment" | "open_pr" | "open_issues");
         if write && !may_write {
             return Err(format!("{action} writes in public: it runs only right after a checkpoint you approved"));
         }
         let number = || args["number"].as_u64().ok_or("number is required");
         let text = |name: &str| args[name].as_str().map(str::to_string).ok_or(format!("{name} is required"));
+        if action == "open_issues" {
+            return self.open_issues(&settings, repo, args).await;
+        }
         let (method, path, body) = match action {
             "read_issue" => (reqwest::Method::GET, format!("/repos/{repo}/issues/{}", number()?), None),
             "comment" => {
@@ -464,6 +467,42 @@ impl Connectors {
             }),
             _ => json!({ "url": value["html_url"], "number": value["number"] }),
         })
+    }
+}
+
+impl Connectors {
+    /// Opens one issue per entry of a JSON file (`[{title, body}]`), with
+    /// `labels` on each. Every text is scanned first: one bad entry sends none.
+    async fn open_issues(&self, settings: &GitHubSettings, repo: &str, args: &Value) -> Result<Value, String> {
+        let file = args["file"].as_str().ok_or("file is required")?;
+        let bytes = std::fs::read(file).map_err(|error| format!("Cannot read {file}: {error}"))?;
+        let entries: Vec<Value> = serde_json::from_slice(&bytes).map_err(|error| format!("{file} is not a JSON list: {error}"))?;
+        for entry in &entries {
+            let title = entry["title"].as_str().filter(|title| !title.trim().is_empty()).ok_or("Every issue needs a title")?;
+            self.scan(title)?;
+            self.scan(entry["body"].as_str().unwrap_or(""))?;
+        }
+        let labels = args["labels"].clone();
+        let mut opened = Vec::new();
+        for entry in &entries {
+            let mut body = json!({ "title": entry["title"], "body": entry["body"].as_str().unwrap_or("") });
+            if labels.is_array() {
+                body["labels"] = labels.clone();
+            }
+            let response = self
+                .request(settings, reqwest::Method::POST, &format!("/repos/{repo}/issues"))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| format!("GitHub did not answer: {error}"))?;
+            let status = response.status();
+            let value: Value = response.json().await.unwrap_or(Value::Null);
+            if !status.is_success() {
+                return Err(format!("GitHub answered {status} after {} opened: {}", opened.len(), value["message"].as_str().unwrap_or("")));
+            }
+            opened.push(json!({ "number": value["number"], "url": value["html_url"] }));
+        }
+        Ok(json!({ "opened": opened }))
     }
 }
 
@@ -664,6 +703,22 @@ mod tests {
         assert!(refused.unwrap_err().contains("local path"));
         assert_eq!(lock(&fixture.fake).comments.len(), 1);
         assert!(url.starts_with("http://127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn the_shipped_issue_loop_reads_the_issue_and_holds_its_steps_to_their_files() {
+        let fixture = setup().await;
+        lock(&fixture.fake).issues.push(issue(9, false));
+        let params = json!({ "repo": "acme/app", "number": 9, "workspace": fixture._workspace.path(), "base": "develop", "test": "echo ok" });
+        let run = fixture.runs.start("issue-loop", None, serde_json::from_value(params).unwrap(), json!({ "by": "user" }), Vec::new()).unwrap();
+        // The stand-in agent writes no triage: the step is undelivered, and
+        // the graph has no way on from there.
+        let failed = until_state(&fixture.runs, run["runId"].as_str().unwrap(), "failed").await;
+        let answer = failed["attempts"][0]["evidence"]["answerFile"].as_str().unwrap();
+        assert!(answer.ends_with("answer.json") && answer.contains("read-1"), "{failed}");
+        assert!(std::fs::read_to_string(answer).unwrap().contains("Issue 9"));
+        assert_eq!(failed["attempts"][1]["result"], "undelivered", "{failed}");
+        assert!(failed["attempts"][1]["evidence"]["missing"][0].as_str().unwrap().ends_with("triage.md"), "{failed}");
     }
 
     #[test]

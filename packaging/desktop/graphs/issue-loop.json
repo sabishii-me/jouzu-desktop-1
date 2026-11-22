@@ -1,0 +1,97 @@
+{
+  "id": "issue-loop",
+  "name": "Work a GitHub issue",
+  "params": {
+    "repo": "string",
+    "number": "number",
+    "workspace": "string",
+    "base": "string",
+    "test": "string"
+  },
+  "start": "read",
+  "nodes": {
+    "read": {
+      "kind": "connector",
+      "connector": "github",
+      "action": "read_issue",
+      "args": { "repo": "{{repo}}", "number": "{{number}}" }
+    },
+    "triage": {
+      "kind": "agent",
+      "workspace": "{{workspace}}",
+      "brief": "Triage GitHub issue {{repo}}#{{number}}. The issue is in {{evidence}}/read-1/answer.json. Do not change any code.\n\n1. Reproduce it if you can, and say exactly how (commands, what you saw).\n2. Look for duplicates among the repository's open and closed issues.\n3. Suggest a severity and why.\n\nWrite all of it to {{evidence}}/triage.md. Say what you checked and what you only suspect.",
+      "outputs": ["{{evidence}}/triage.md"]
+    },
+    "scope": {
+      "kind": "checkpoint",
+      "ask": "Work on {{repo}}#{{number}}? Read the triage first. Approve to look for the root cause, send triage back with what to check, or stop.",
+      "show": ["{{evidence}}/triage.md"],
+      "sendBack": ["triage"]
+    },
+    "root-cause": {
+      "kind": "agent",
+      "workspace": "{{workspace}}",
+      "brief": "Find the root cause of GitHub issue {{repo}}#{{number}} (issue: {{evidence}}/read-1/answer.json, triage: {{evidence}}/triage.md). Do not change any code.\n\nName the layer and the code that causes it, with evidence (file and line, a log, a failing command). Then plan the fix: what changes where, what it must not change, and how it is verified, including a test that fails before the fix and passes after.\n\nWrite it to {{evidence}}/plan.md.",
+      "outputs": ["{{evidence}}/plan.md"]
+    },
+    "plan": {
+      "kind": "checkpoint",
+      "ask": "Fix {{repo}}#{{number}} as planned? Approve, send it back with what is wrong, or stop.",
+      "show": ["{{evidence}}/plan.md"],
+      "sendBack": ["root-cause"]
+    },
+    "fix": {
+      "kind": "agent",
+      "workspace": "{{workspace}}",
+      "brief": "Fix GitHub issue {{repo}}#{{number}} following the approved plan in {{evidence}}/plan.md.\n\nWork on branch loop/issue-{{number}} from {{base}}. Add the test the plan names. Run `{{test}}` and make it pass without loosening any check. Commit, and push the branch.\n\nWrite to {{evidence}}/fix.md what you changed, the commits, and the test output. If earlier test runs failed, their output is under {{evidence}} (tests-N/stderr.txt).",
+      "outputs": ["{{evidence}}/fix.md"]
+    },
+    "tests": {
+      "kind": "check",
+      "workspace": "{{workspace}}",
+      "run": "{{test}}"
+    },
+    "stuck": {
+      "kind": "checkpoint",
+      "ask": "Tests on {{repo}}#{{number}} still fail after three fixes. Send it back to the fix or the root cause with what to change, or stop.",
+      "show": ["{{evidence}}/fix.md", "{{evidence}}/plan.md"],
+      "sendBack": ["fix", "root-cause"]
+    },
+    "accept": {
+      "kind": "checkpoint",
+      "ask": "The fix for {{repo}}#{{number}} is on branch loop/issue-{{number}} and the tests pass. Approve to open a pull request into {{base}}, send it back, or stop.",
+      "show": ["{{evidence}}/fix.md", "{{evidence}}/plan.md"],
+      "sendBack": ["fix", "root-cause"]
+    },
+    "pr": {
+      "kind": "connector",
+      "connector": "github",
+      "action": "open_pr",
+      "args": {
+        "repo": "{{repo}}",
+        "head": "loop/issue-{{number}}",
+        "base": "{{base}}",
+        "title": "Fix #{{number}}",
+        "body": "Fixes #{{number}}. Root cause, plan and test results were reviewed at each step before this pull request was opened."
+      }
+    },
+    "merged": {
+      "kind": "checkpoint",
+      "ask": "Approve once the pull request for {{repo}}#{{number}} is merged. The issue stays open until a release with the fix is verified.",
+      "sendBack": ["fix"]
+    }
+  },
+  "edges": [
+    { "from": "read", "to": "triage", "when": "done" },
+    { "from": "triage", "to": "scope", "when": "done" },
+    { "from": "scope", "to": "root-cause", "when": "approved" },
+    { "from": "root-cause", "to": "plan", "when": "done" },
+    { "from": "plan", "to": "fix", "when": "approved" },
+    { "from": "fix", "to": "tests", "when": "done" },
+    { "from": "tests", "to": "accept", "when": "passed" },
+    { "from": "tests", "to": "stuck", "when": "failed", "attempts": 3 },
+    { "from": "tests", "to": "fix", "when": "failed" },
+    { "from": "accept", "to": "pr", "when": "approved" },
+    { "from": "pr", "to": "merged", "when": "done" }
+  ]
+}
