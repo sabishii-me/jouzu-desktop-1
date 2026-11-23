@@ -34,6 +34,7 @@ import type { TextGuardMode } from "./session-notices";
 import { liveRowKey, opensLive, rowState, sessionRow as fromApiSession, type RowState, type SessionRow as SessionSummary } from "./session-open";
 import { SessionRowStatus, rowStateText } from "./session-row-status";
 import { useWarmRuntime, type WarmView } from "./warm-runtime";
+import { unusedNewSession } from "./new-session";
 import { composerTurn } from "./composer-state";
 import { newId, copyText } from "./secure-context";
 
@@ -799,10 +800,14 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       queueNewSession();
       return;
     }
+    // A new session nobody has used is what New session would open: keep it and its
+    // runtime. Leaving it would stop a runtime that may be the only one started yet,
+    // and the next session would wait for one of its own.
+    const previous = connection.current;
+    if (hero && !selectedSessionRef.current && previous && !startError && !sessionError && unusedNewSession(previous.snapshot)) return;
     // A new session must run in the real workspace, so it cannot lease a scratch
     // warm slot. The previous runtime stays alive in the pool: starting a session
     // never replaces or stops a running turn.
-    const previous = connection.current;
     setHero(true);
     setSelectedSession(null);
     // Do not leave the previous transcript under a hero titled t.defaultWorkspace
