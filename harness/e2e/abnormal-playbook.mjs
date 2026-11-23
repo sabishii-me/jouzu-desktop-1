@@ -1121,7 +1121,12 @@ add("#87 Retry after the runtime's files come back", "The runtime's files are mi
     await page.evaluate(value => localStorage.setItem("jouzu.ui.language", value), lang);
     await page.reload();
   };
-  const connecting = () => page.getByText(/Connecting|接続しています|正在连接|正在連線/i).filter({ visible: true }).count();
+  const connecting = () => page.getByText(/Connecting|接続しています|接続中|正在连接|正在連線/i).filter({ visible: true }).count();
+  // A Connecting that flashes while the session opens is fine; it fails only if it is still there after 3 s.
+  const staysConnecting = async () => {
+    for (const end = now() + 3_000; now() < end; await sleep(250)) if (!await connecting()) return false;
+    return await connecting() > 0;
+  };
   try {
     await reopen({ runtime: "missing" });
     const alert = page.locator("[data-session-blocked]").first();
@@ -1134,7 +1139,7 @@ add("#87 Retry after the runtime's files come back", "The runtime's files are mi
     await retry().click();
     await sleep(3_000);
     if (!await alert.isVisible().catch(() => false)) c.fail("Retry while the files are still missing no longer says what is wrong");
-    if (await connecting()) c.fail("Retry while the files are missing leaves the window on Connecting");
+    if (await staysConnecting()) c.fail("Retry while the files are missing leaves the window on Connecting");
     const restored = await control("/runtime/restore", {});
     if (!restored.restored) { c.fail("the exam could not put the runtime back"); return; }
     const start = now();
@@ -1142,7 +1147,7 @@ add("#87 Retry after the runtime's files come back", "The runtime's files are mi
     const gone = await alert.waitFor({ state: "hidden", timeout: 20_000 }).then(() => true, () => false);
     c.metric("retryToSessionMs", now() - start);
     if (!gone) { c.fail("after the runtime came back, Retry did not open a session within 20 s"); await page.screenshot({ path: join(shots, `${slug(c.record.name)}-after-retry.png`) }).catch(() => {}); return; }
-    if (await connecting()) c.fail("after Retry the window stays on Connecting");
+    if (await staysConnecting()) c.fail("after Retry the window stays on Connecting");
     await textbox().waitFor({ timeout: 15_000 }).catch(() => {});
     const next = ask();
     await typeAndSend(next.prompt);
