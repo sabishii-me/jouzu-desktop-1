@@ -20,6 +20,10 @@ seconds and the first message could go to the wrong model. Replaces D12 of
 - A message sent before the runtime is attached is held by the host and delivered
   in order with the right model. Two messages sent at startup are never merged.
 - An unused new session leaves no row in the session list.
+- The start-up screen pays for the first runtime start: it stays until the folder's warm
+  runtime is ready (a reopened session: until its runtime is attached), so the first New
+  session after start-up is ready at once. 1.1.5-rc.1 ended it early and moved that wait
+  onto the first message.
 - The concurrency floor of [0004](0004-chat-view-concurrency.md) still holds: no
   session blocks another, and no path refuses a session because of a count.
 
@@ -28,3 +32,5 @@ seconds and the first message could go to the wrong model. Replaces D12 of
 - The warm pool size is not a cap; more sessions start more runtimes.
 - "0 s" is measured from the person's click, not from Send and not only the host's
   part (see [0019](0019-development-and-release-gates.md)).
+- The start-up screen does not wait for later sessions: a session whose runtime is still
+  starting after start-up takes messages at once and is listed (#177).
