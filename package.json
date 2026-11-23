@@ -1,0 +1,13 @@
+{
+  "name": "jouzu-desktop-qa",
+  "private": true,
+  "type": "module",
+  "description": "Independent QA for Jouzu Desktop: the UI atlas and the harness that records it.",
+  "scripts": {
+    "atlas:build": "node tools/atlas-build.mjs",
+    "atlas:diff": "node tools/atlas-diff.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}
