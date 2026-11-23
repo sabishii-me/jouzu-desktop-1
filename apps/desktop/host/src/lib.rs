@@ -5877,6 +5877,29 @@ mod session_tests {
         manager.stop_all();
     }
 
+    /// The entry session takes the only warm runtime while it is still starting.
+    /// Until that session has attached, the pool starts nothing else, but it is
+    /// not idle: it reads "starting" until the next runtime is ready, so the
+    /// start-up screen covers that start and the next new session finds a ready
+    /// runtime (0016).
+    #[tokio::test]
+    async fn the_pool_reads_starting_while_a_session_attaches_until_the_next_is_ready() {
+        let (manager, _home, workspace) =
+            manager_with_env(50, &[("FAKE_RUNTIME_START_DELAY_MS", "500")]);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        session.attach_early();
+        assert_eq!(pool.status()["attaching"], 1, "{}", pool.status());
+        assert_eq!(pool.status()["state"], "starting", "{}", pool.status());
+        let settled = pool.wait_settled(Duration::from_secs(10)).await;
+        let settled = if settled["state"] == "starting" { pool.wait_settled(Duration::from_secs(10)).await } else { settled };
+        assert_eq!(settled["state"], "ready", "{settled}");
+        assert_ne!(settled["pid"].as_u64().map(|pid| pid as u32), session.runtime_pid(), "{settled}");
+        manager.stop_all();
+    }
+
     #[tokio::test]
     async fn a_session_takes_a_warm_runtime_that_is_still_starting() {
         let (manager, _home, workspace) =

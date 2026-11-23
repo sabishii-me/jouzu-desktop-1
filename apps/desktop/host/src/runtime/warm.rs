@@ -160,7 +160,11 @@ impl Inner {
     fn state(&self) -> WarmState {
         if self.slots.iter().any(|slot| slot.ready_ms.is_some()) {
             WarmState::Ready
-        } else if !self.slots.is_empty() || self.spawning.is_some() {
+        } else if !self.slots.is_empty() || self.spawning.is_some() || (self.attaching > 0 && !self.stopped && self.failures < MAX_FAILURES) {
+            // A session attaching to a runtime it took holds the next start back
+            // (see `attaching`); the pool starts one as soon as it is done. Until
+            // then it is still getting a runtime ready, not idle: the start-up
+            // screen waits for it (0016) instead of reading "off" in between.
             WarmState::Starting
         } else if self.error.is_some() {
             WarmState::Failed

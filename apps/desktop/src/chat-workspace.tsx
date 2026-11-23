@@ -33,7 +33,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import type { TextGuardMode } from "./session-notices";
 import { liveRowKey, opensLive, rowState, sessionRow as fromApiSession, type RowState, type SessionRow as SessionSummary } from "./session-open";
 import { SessionRowStatus, rowStateText } from "./session-row-status";
-import { useWarmRuntime, type WarmView } from "./warm-runtime";
+import { useWarmRuntime, warmBlocks, type WarmView } from "./warm-runtime";
 import { composerTurn } from "./composer-state";
 import { newId, copyText } from "./secure-context";
 
@@ -236,6 +236,8 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [entryOpening, setEntryOpening] = useState(true);
   const entryTarget = useRef<string | null>(null);
   const entryChosen = useRef(false);
+  const [entryAttaching, setEntryAttaching] = useState(false);
+  const [entryExisting, setEntryExisting] = useState(false);
   useEffect(() => {
     if (!copied) return;
     const timer = setTimeout(() => { setCopied(null); setSessionMenu(null); }, 1200);
@@ -372,14 +374,15 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         settled = true;
         client = leased;
         if (reopen) {
+          entryTarget.current = reopen;
+          setEntryExisting(true);
           selectedSessionRef.current = reopen;
           setSelectedSession(reopen);
           setHero(false);
-          // Opened: the entry is the host's session now, its runtime starts behind
-          // it and the host holds what is sent meanwhile (0016). Not opened: the
-          // queued switch opens it, and the entry ends when that switch ends.
-          if (opened) setEntryOpening(false);
-          else { entryTarget.current = reopen; queuedSwitch.current = reopen; }
+          // Opened: the entry ends when its runtime is attached. Not opened: the
+          // queued switch runs as soon as the connection reports ready.
+          if (opened) setEntryAttaching(true);
+          else queuedSwitch.current = reopen;
         } else if (choosing) setEntryOpening(false);
         bindClient(leased);
       } catch (error) {
@@ -438,15 +441,29 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // Only a live turn blocks a runtime restart. A saved draft does not: it lives in
   // localStorage and must not make a model refresh wait for the composer to empty.
   useEffect(() => { onBusyChange?.(snapshot.pending || snapshot.projection.running); }, [snapshot.pending, snapshot.projection.running, onBusyChange]);
-  // The app's loader stays up only until the entry session exists in the host
-  // and its history is shown. It never waits for a runtime: the host holds what
-  // is sent while the runtime starts (0016), so the person can type and send at
-  // once. A connection that failed (a lease refused with an error) has nothing
-  // left to wait for: loading ends so the chat shows the error and its retry (#87).
+  // The app keeps its own loader up until the entry session is connected and the
+  // runtime is warm, so the start-up cost is paid here, not on the first message.
+  // With an entry session to open, loading lasts until it is open (its runtime is
+  // attached and its history shown) or failed; a failure is shown in the chat.
+  // A new entry session needs a warm runtime for its first message; an existing one
+  // has its own runtime once open, so it does not wait for the pool.
+  // A connection that failed (a lease refused with an error) has nothing left to
+  // wait for: loading ends so the chat shows the error and its retry (issue #87).
   useEffect(() => {
     const failed = !snapshot.connected && (!!snapshot.connectionError || !!startError);
-    onBootChange?.(!chatUnavailable && !failed && (!snapshot.connected || entryOpening), warm, retryWarm);
-  }, [snapshot.connected, snapshot.connectionError, startError, onBootChange, chatUnavailable, warm, entryOpening]);
+    onBootChange?.(!chatUnavailable && !failed && (!snapshot.connected || entryOpening || (!entryExisting && warmBlocks(warm))), warm, retryWarm);
+  }, [snapshot.connected, snapshot.connectionError, startError, onBootChange, chatUnavailable, warm, entryOpening, entryExisting]);
+  useEffect(() => {
+    const target = entryTarget.current;
+    if (!entryAttaching || !target) return;
+    const attached = snapshot.connected && normalizedPath(snapshot.sessionFile ?? "") === normalizedPath(target)
+      && !["pending", "starting", "recovering"].includes(snapshot.status ?? "");
+    if (attached || snapshot.connectionError || sessionError) {
+      entryTarget.current = null;
+      setEntryAttaching(false);
+      setEntryOpening(false);
+    }
+  }, [entryAttaching, snapshot.connected, snapshot.sessionFile, snapshot.status, snapshot.connectionError, sessionError]);
   // Remember the session on screen for the next start; a new session forgets it.
   useEffect(() => {
     if (entryOpening) return;
@@ -951,6 +968,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       setHero(false);
       return;
     }
+    let landed = false;
     let retried = false;
     switchingRef.current = true;
     switchingTarget.current = target;
@@ -962,6 +980,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       if (connection.current !== previous) return;
       if (previous && previous !== next) parkPrevious(previous);
       if (connection.current !== next) bindClient(next);
+      landed = true;
       const loaded = next.snapshot.sessionFile ?? target;
       // A click that arrived while this switch was running owns the selection.
       if (!queuedSwitch.current && normalizedPath(loaded) !== normalizedPath(selectedSessionRef.current ?? "")) setSelectedSession(loaded);
@@ -1008,11 +1027,15 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       switchingTarget.current = null;
       setSwitching(false);
       onStartSession?.();
-      // The switch that opens the entry ends its wait, landed or not (a failure
-      // is on screen). A retry settles the entry itself.
+      // The entry is open when its runtime is attached (see the effect below); a
+      // switch that did not land on it ends the wait now, its error on screen.
+      // A retry settles the entry itself.
       if (!retried && entryTarget.current && normalizedPath(entryTarget.current) === normalizedPath(target)) {
-        entryTarget.current = null;
-        setEntryOpening(false);
+        if (landed) setEntryAttaching(true);
+        else {
+          entryTarget.current = null;
+          setEntryOpening(false);
+        }
       }
     }
   }

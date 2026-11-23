@@ -6,10 +6,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 /**
- * The runtime takes seconds to start (ui-layer §3, decision 0016): the window
- * lets the person type and send at once, the host holds the message, and the
- * session is listed, titled by that message, before the runtime has written its
- * file (#177).
+ * The runtime takes seconds to start (ui-layer §3, decision 0016). The start-up
+ * screen waits for the warm runtime, so the first new session is ready at once.
+ * A session whose runtime is still starting later takes a message at once, the
+ * host holds it, and the session is listed, titled by that message, before the
+ * runtime has written its file (#177).
  *
  * Runs the built UI (dist/) against a real host and the fake runtime, which
  * starts 8 s late. Build both first: `npm run build` and `cargo build` in host/.
@@ -52,7 +53,7 @@ test.describe("send while starting", () => {
   });
 
   test("a message sent while the runtime starts is accepted and listed at once", async ({ page }) => {
-    test.setTimeout(60_000);
+    test.setTimeout(120_000);
   scratch = mkdtempSync(join(tmpdir(), "jouzu-send-starting-"));
   const home = join(scratch, "home");
   const node = join(scratch, "node", "bin", process.platform === "win32" ? "node.exe" : "node");
@@ -66,6 +67,7 @@ test.describe("send while starting", () => {
   }
   mkdirSync(join(home, "app"), { recursive: true });
   copyFileSync(join(root, "host", "tests", "fixtures", "fake-runtime.mjs"), join(home, "app", "bootstrap.mjs"));
+  const launched = Date.now();
   host = spawn(hostBin, ["--dist", dist, "--home", home, "--runtime-home", join(scratch, "runtime")], {
     env: { ...process.env, HOME: scratch, USERPROFILE: scratch, JOUZU_HOST_NODE: node, FAKE_RUNTIME_START_DELAY_MS: String(startDelayMs) },
     stdio: ["ignore", "pipe", "ignore"],
@@ -89,17 +91,30 @@ test.describe("send while starting", () => {
     localStorage.setItem("jouzu.ui.language", "en");
   }, [base, ready.token]);
 
-  const opened = Date.now();
+  // The start-up screen waits for the folder's warm runtime (0016): the first
+  // session's runtime start is paid there, not on its first message.
+  // (The host starts that runtime when it starts, before the page is opened.)
   await page.goto(base);
   const composer = page.getByRole("textbox").first();
-  // Clicking checks that nothing covers the composer: no loading screen waits
-  // for the runtime.
-  await composer.click({ timeout: startDelayMs / 2 });
+  const loading = page.getByText(/Starting the Jouzu runtime/i).first();
+  await expect(loading).toBeVisible();
+  await expect(loading).toBeHidden({ timeout: 2 * startDelayMs + 15_000 });
+  expect(Date.now() - launched).toBeGreaterThanOrEqual(startDelayMs);
+  await expect(page.getByText(/Starting session/i)).toHaveCount(0);
+
+  // So a New session right after is ready at once: it takes the runtime that is
+  // ready, and the pool starts the next one.
+  await page.getByRole("button", { name: "New session" }).click();
+  await expect(page.getByText(/Starting session/i)).toHaveCount(0);
+
+  // Another New session before the pool's next runtime is up starts its own:
+  // it takes a message at once, the host holds it, and the session is listed and
+  // titled before the runtime has written its file (#177).
+  await page.getByRole("button", { name: "New session" }).click();
+  const sent = Date.now();
+  await composer.click({ timeout: 2000 });
   await composer.fill("first message while starting");
   await composer.press("Enter");
-  expect(Date.now() - opened).toBeLessThan(startDelayMs / 2);
-
-  // Listed and titled while the runtime is still starting.
   const sidebar = page.getByRole("complementary").or(page.locator("aside")).first();
   await expect(sidebar.getByText("first message while starting")).toBeVisible({ timeout: 2000 });
   await expect(page.getByRole("button", { name: /^Send$/ })).toBeVisible({ timeout: 2000 });
@@ -108,7 +123,7 @@ test.describe("send while starting", () => {
   await expect(page.getByRole("button", { name: /^Stop$/ })).toBeVisible();
   await expect(page.getByText(/Enter to steer/i)).toHaveCount(0);
   await expect(page.getByText(/Starting session/i).first()).toBeVisible();
-  expect(Date.now() - opened).toBeLessThan(startDelayMs);
+  expect(Date.now() - sent).toBeLessThan(startDelayMs);
     // The held message is answered once the runtime is up, in the same row.
     await expect(page.getByText(/Starting session/i)).toHaveCount(0, { timeout: startDelayMs + 15_000 });
     await expect(sidebar.getByText("first message while starting")).toHaveCount(1);
