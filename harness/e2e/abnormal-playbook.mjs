@@ -1112,6 +1112,47 @@ add("#119 An image in a sent message stays after switching sessions", "The image
   if (after < before) c.fail(`the image is gone after switching sessions (${before} -> ${after})`);
 }, { langs: ["en"] });
 
+add("#87 Retry after the runtime's files come back", "The runtime's files are missing at start: the start page says so (not an endless Connecting), Retry says so again while they are missing, and once they are back Retry opens a session that answers.", async c => {
+  if (!await browserMode()) { c.record.skipped = true; c.note("the installed app's window cannot be restarted by this exam; run it with ABN_INSTALL"); return; }
+  const reopen = async body => {
+    const restarted = await control("/host/restart", body);
+    if (!restarted.url) throw new Error(`the host did not restart: ${JSON.stringify(restarted)}`);
+    await page.goto(restarted.url);
+    await page.evaluate(value => localStorage.setItem("jouzu.ui.language", value), lang);
+    await page.reload();
+  };
+  const connecting = () => page.getByText(/Connecting|接続しています|正在连接|正在連線/i).filter({ visible: true }).count();
+  try {
+    await reopen({ runtime: "missing" });
+    const alert = page.locator("[data-session-blocked]").first();
+    const shown = await alert.waitFor({ timeout: 20_000 }).then(() => true, () => false);
+    await page.screenshot({ path: join(shots, `${slug(c.record.name)}-missing.png`) }).catch(() => {});
+    if (!shown) { c.fail(`missing runtime files are not said at the start page (Connecting shown: ${await connecting() > 0})`); return; }
+    c.note(`shown: ${(await alert.innerText()).replace(/\s+/g, " ").slice(0, 160)}`);
+    const retry = () => alert.getByRole("button", { name: named("retry") }).first();
+    if (!await retry().count()) { c.fail("no Retry at the start page"); return; }
+    await retry().click();
+    await sleep(3_000);
+    if (!await alert.isVisible().catch(() => false)) c.fail("Retry while the files are still missing no longer says what is wrong");
+    if (await connecting()) c.fail("Retry while the files are missing leaves the window on Connecting");
+    const restored = await control("/runtime/restore", {});
+    if (!restored.restored) { c.fail("the exam could not put the runtime back"); return; }
+    const start = now();
+    await retry().click().catch(() => c.fail("Retry is gone before the files came back"));
+    const gone = await alert.waitFor({ state: "hidden", timeout: 20_000 }).then(() => true, () => false);
+    c.metric("retryToSessionMs", now() - start);
+    if (!gone) { c.fail("after the runtime came back, Retry did not open a session within 20 s"); await page.screenshot({ path: join(shots, `${slug(c.record.name)}-after-retry.png`) }).catch(() => {}); return; }
+    if (await connecting()) c.fail("after Retry the window stays on Connecting");
+    await textbox().waitFor({ timeout: 15_000 }).catch(() => {});
+    const next = ask();
+    await typeAndSend(next.prompt);
+    if (!await replyArrives(next.answer, 40_000)) c.fail("the session opened by Retry did not answer");
+  } finally {
+    await reopen({ runtime: "normal" }).catch(error => c.note(`could not restore the normal host: ${error.message}`));
+    await newSession().waitFor({ timeout: 60_000 }).catch(() => {});
+  }
+}, { langs: ["en", "ja"] });
+
 /** A 32×32 solid red PNG, built here so the playbook needs no fixture file. */
 async function redSquarePng() {
   const { deflateSync } = await import("node:zlib");

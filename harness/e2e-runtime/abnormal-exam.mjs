@@ -1,6 +1,6 @@
 import { chromium } from '@playwright/test';
 import { execFileSync, spawn } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -180,13 +180,18 @@ async function shellHost(stack, timeout = 60_000) {
 
 function startHost(stack) {
   const { pkg, paths } = stack;
+  // stack.managed: the source build runs its runtime as an installation does, from <home>\app
+  // and a Node it is given, so the runtime's files can go missing and come back (#87).
   const args = pkg
     ? ['--dist', pkg.dist, '--home', paths.home, '--runtime-home', paths.data, '--install', paths.home]
-    : ['--dist', resolve(process.env.ABN_DIST), '--home', paths.home, '--runtime-home', paths.data, '--install', sourceInstall(paths.root),
-      '--runtime', process.execPath, '--runtime-arg', join(resolve(process.env.ABN_RUNTIME_APP), 'bootstrap.mjs'), '--runtime-arg', '--mode', '--runtime-arg', 'rpc'];
+    : stack.managed
+      ? ['--dist', resolve(process.env.ABN_DIST), '--home', paths.home, '--runtime-home', paths.data, '--install', sourceInstall(paths.root)]
+      : ['--dist', resolve(process.env.ABN_DIST), '--home', paths.home, '--runtime-home', paths.data, '--install', sourceInstall(paths.root),
+        '--runtime', process.execPath, '--runtime-arg', join(resolve(process.env.ABN_RUNTIME_APP), 'bootstrap.mjs'), '--runtime-arg', '--mode', '--runtime-arg', 'rpc'];
   for (const dir of ['localappdata', 'appdata']) mkdirSync(join(paths.root, dir), { recursive: true });
   try { rmSync(join(paths.home, 'host.json')); } catch { /* first start */ }
-  const child = spawn(pkg ? pkg.host : resolve(process.env.ABN_HOST), args, { env: cleanEnv(paths.root), cwd: paths.workspace, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+  const env = cleanEnv(paths.root, !pkg && stack.managed ? { JOUZU_HOST_NODE: process.execPath } : {});
+  const child = spawn(pkg ? pkg.host : resolve(process.env.ABN_HOST), args, { env, cwd: paths.workspace, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
   children.add(child);
   child.on('exit', () => children.delete(child));
   stack.host = child;
@@ -279,7 +284,9 @@ function suspend(pids, on) {
 /**
  * The world the playbook may change, over HTTP on 127.0.0.1:
  *   GET  /state                       host and runtime process ids, and whether it is the app window
- *   POST /host/restart                the host ends and starts again on the same home; answers the new page URL
+ *   POST /host/restart {runtime}      the host ends and starts again on the same home; answers the new page URL;
+ *                                     runtime "missing" starts it without the runtime's files, "normal" as before
+ *   POST /runtime/restore             the runtime's files are put in place while the app runs
  *   POST /runtime/kill {which}        kill the newest runtime, or "all" of them
  *   POST /runtime/kill-loop {ms}      kill every runtime that appears, for ms
  *   POST /runtime/delay {ms}          later runtime starts wait ms
@@ -304,6 +311,15 @@ function worldServer(stack) {
           if (stack.shell) return reply({ unsupported: 'installed app window' });
           killAll([hostPid, ...descendants(hostPid).map(row => row.pid)]);
           await sleep(1_000);
+          // {runtime: "missing"}: the runtime's files are gone when the app starts (#87).
+          const app = join(stack.paths.home, 'app');
+          if (input.runtime === 'missing') {
+            stack.managed = true;
+            if (existsSync(app)) renameSync(app, `${app}.away`);
+          } else if (input.runtime === 'normal') {
+            stack.managed = false;
+            if (existsSync(`${app}.away`) && !existsSync(app)) renameSync(`${app}.away`, app);
+          }
           startHost(stack);
           const info = await hostInfo(stack, 30_000);
           return reply({ url: `http://127.0.0.1:${info.port}/?token=${info.token}` });
@@ -318,6 +334,14 @@ function worldServer(stack) {
           let killed = 0;
           while (Date.now() < until) { killed += killAll(runtimes(hostPid).map(row => row.pid)).length; await sleep(300); }
           return reply({ killed });
+        }
+        if (url.pathname === '/runtime/restore') {
+          // The runtime's files are put in place while the app runs (a late first-run
+          // preparation or a repair, #87).
+          const app = join(stack.paths.home, 'app');
+          if (existsSync(`${app}.away`)) renameSync(`${app}.away`, app);
+          else if (!existsSync(app)) symlinkSync(resolve(process.env.ABN_RUNTIME_APP), app, 'junction');
+          return reply({ restored: existsSync(join(app, 'bootstrap.mjs')) });
         }
         if (url.pathname === '/runtime/delay') {
           writeFileSync(join(stack.paths.root, 'runtime-delay.json'), JSON.stringify({ ms: input.ms ?? 0 }));
