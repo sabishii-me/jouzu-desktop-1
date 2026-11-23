@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.1.5-rc.1 - 2026-11-23
+
+First release candidate for 1.1.5, on the QA channel. It follows 1.1.4.
+
+- The session list shows each session's live state as an icon, and a stopped reply looks like
+  a session at rest (#212). The status line takes how the last reply ended from the app, so a
+  finished reply is no longer shown as interrupted (#214).
+- While a new session's runtime starts, you can already send, and the session is listed. Stop is offered while it starts, and the composer no longer offers Steer
+  before there is a reply to steer (#177, #179).
+- Messages waiting in the queue come back paused after a restart instead of being lost (#162).
+- Changing a key, a provider or the environment gives open sessions a new runtime that uses
+  it (#173). Removing a custom connection removes its key too (#171).
+- A saved session whose folder is gone stays in the list and is not started (#174).
+- A provider server error is named as one, not as "no network" (#178). A failing default
+  model's Details start with the actual cause (#167).
+- Settings → Collaboration can mark commits the agent makes: off, Jouzu Desktop as
+  co-author, or Jouzu Desktop as author, with a preview of how GitHub will show it.
+- Installing an update replaces the app's own folders whole, keeps Jouzu's Git Bash, and
+  stops running sessions first without freezing the window (#207, #158, #221). Uninstall treats
+  the runtime as one unit (#158).
+- What's new shows release notes as paragraphs and lists (#206). Retry on the start page asks
+  again after the runtime was missing (#87).
+- Sessions start on macOS (#181).
+
 ## 1.1.4 - 2026-11-20
 
 Stable release. It follows 1.0.23 on the stable channel and contains everything from 1.1.0
