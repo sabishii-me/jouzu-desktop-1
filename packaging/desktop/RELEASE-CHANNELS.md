@@ -33,7 +33,7 @@ runner per platform. A release that cannot build or pass on one platform is not 
 | Platform | Runner | Download | Updater installs | Feed key |
 | --- | --- | --- | --- | --- |
 | Windows x64 | `windows-latest` | `JouzuDesktop_<v>_x64-setup.exe` | the same installer | `windows-x86_64` |
-| macOS Apple Silicon | `macos-14` | `JouzuDesktop_<v>_aarch64.dmg` | `JouzuDesktop_<v>_aarch64.app.tar.gz` | `darwin-aarch64` |
+| macOS Apple Silicon | `macos-latest` | `JouzuDesktop_<v>_aarch64.dmg` | `JouzuDesktop_<v>_aarch64.app.tar.gz` | `darwin-aarch64` |
 | Linux x64 | `ubuntu-22.04` | `JouzuDesktop_<v>_amd64.AppImage` | the AppImage | `linux-x86_64` |
 | Linux x64 (Debian, Ubuntu) | `ubuntu-22.04` | `JouzuDesktop_<v>_amd64.deb` | the next `.deb` (dpkg, asks for a password) | `linux-x86_64-deb` |
 

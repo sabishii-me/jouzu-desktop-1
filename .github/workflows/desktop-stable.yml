@@ -167,7 +167,7 @@ jobs:
       matrix:
         include:
           - platform: macos
-            runner: macos-14
+            runner: macos-latest
             bundles: app,dmg
           - platform: linux
             runner: ubuntu-22.04
