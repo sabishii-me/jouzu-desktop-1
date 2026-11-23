@@ -93,7 +93,9 @@ export type RowState =
 
 export function rowState(row: Pick<SessionRow, "running" | "status" | "activeTurn" | "waiting" | "unseenRun">): RowState | null {
   if (row.waiting) return { kind: "waiting", on: row.waiting };
-  if (row.running || row.status === "running" || row.status === "starting" || row.status === "recovering") return { kind: "running", turn: row.activeTurn ?? null };
+  // A run is a turn the host holds. A runtime starting or recovering for a
+  // session that has no turn (it was only opened) is not one.
+  if (row.running || row.activeTurn || row.status === "running") return { kind: "running", turn: row.activeTurn ?? null };
   if (row.status === "error") return { kind: "failed" };
   if (row.unseenRun) return { kind: row.unseenRun.outcome };
   return null;

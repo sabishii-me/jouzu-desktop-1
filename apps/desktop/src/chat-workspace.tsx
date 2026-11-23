@@ -34,7 +34,7 @@ import type { TextGuardMode } from "./session-notices";
 import { liveRowKey, opensLive, rowState, sessionRow as fromApiSession, type RowState, type SessionRow as SessionSummary } from "./session-open";
 import { SessionRowStatus, rowStateText } from "./session-row-status";
 import { useWarmRuntime, type WarmView } from "./warm-runtime";
-import { composerRunningFor } from "./composer-state";
+import { composerTurn } from "./composer-state";
 import { newId, copyText } from "./secure-context";
 
 function defaultPaneWidth() {
@@ -1301,10 +1301,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // ChatWorkspace snapshot and is never the source here. Do not key Stop off
   // sessionFile: a new pending session has no file yet, which hid Stop during
   // the first turn.
-  const composerRunning = composerRunningFor(snapshot.activeTurn, snapshot.projection.running);
   // A cancel token is sent with the clientMessageId, so Stop can be offered as
-  // soon as the local outbox exists.
-  const composerStarting = (snapshot.pending || !!localSubmitted) && !composerRunning;
+  // soon as the local outbox exists. A turn whose runtime is still starting can
+  // be stopped but not steered (#179).
+  const composer = composerTurn(snapshot.activeTurn, snapshot.projection.running, snapshot.pending || !!localSubmitted);
+  const composerRunning = composer.steer;
+  const composerStarting = composer.sending;
+  const composerStoppable = composer.stop;
   const [appView, setAppView] = useState<"chat" | "artifacts">("chat");
   const [artifactCounts, setArtifactCounts] = useState<Record<string, number>>({});
   const [panes, setPanes] = useState<Array<{ tabs: string[]; active: string; width: number }>>([]);
@@ -1671,7 +1674,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           <div className="mb-2 flex flex-wrap items-center gap-2 px-1">{workspacePicker}</div>
           {promptNode && <div className="mb-3">{promptNode}</div>}
           {banners}
-          <Composer hero blocked={heroBlocked} results={controlResults} connected={snapshot.connected} pending={snapshot.pending || locked } settling={commandBusy} opening={switching || opening || booting} starting={composerStarting} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={snapshot.models ?? []} model={snapshot.model} modelState={snapshot.modelState ?? "resolving"} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
+          <Composer hero blocked={heroBlocked} results={controlResults} connected={snapshot.connected} pending={snapshot.pending || locked } settling={commandBusy} opening={switching || opening || booting} starting={composerStarting} stoppable={composerStoppable} running={composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={snapshot.models ?? []} model={snapshot.model} modelState={snapshot.modelState ?? "resolving"} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={snapshot.thinkingLevel} thinkingLevels={snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} />
           <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>
       </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">{t.openingSession}</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
@@ -1685,7 +1688,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
             <AgentAction thinking={liveThinking} label={turnLabel(snapshot.activeTurn, now, t)} running={conversationProjection.running} elapsed={elapsed} settled={settled} noReply={noReply} hold={hold} notice={runtimeNotice} />
           </div>
           {promptNode && <div className="absolute bottom-full left-1/2 z-20 mb-2 w-[min(48rem,calc(100vw-2rem))] -translate-x-1/2 px-3">{promptNode}</div>}
-          <Composer autoFocus={composerFocus} blocked={blocked} results={controlResults} connected={snapshot.connected || !!activePreview} pending={elsewhere ? locked : snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={elsewhere || (opening && !activePreview)} starting={!elsewhere && composerStarting} unavailable={!!sessionError} running={!elsewhere && composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={elsewhere ? [] : snapshot.models ?? []} model={elsewhere ? undefined : snapshot.model} modelState={elsewhere ? "ready" : snapshot.modelState ?? "resolving"} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={elsewhere ? undefined : snapshot.thinkingLevel} thinkingLevels={elsewhere ? [] : snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
+          <Composer autoFocus={composerFocus} blocked={blocked} results={controlResults} connected={snapshot.connected || !!activePreview} pending={elsewhere ? locked : snapshot.pending || (opening && !activePreview) || locked } settling={commandBusy} opening={elsewhere || (opening && !activePreview)} starting={!elsewhere && composerStarting} stoppable={!elsewhere && composerStoppable} unavailable={!!sessionError} running={!elsewhere && composerRunning} draft={draft} onDraft={updateDraft} onSend={() => void send()} onStop={stop} onCompact={() => void compactConversation()} onExport={() => void exportConversation()} onReloadMcp={() => void reloadSession()} attachments={attachments} onAddImages={files => void addImages(files)} onRemoveImage={id => updateAttachments(attachmentRef.current.filter(item => item.id !== id))} readingImages={readingImages} videos={videoUrls} onAddVideo={addVideoUrl} onRemoveVideo={removeVideoUrl} models={elsewhere ? [] : snapshot.models ?? []} model={elsewhere ? undefined : snapshot.model} modelState={elsewhere ? "ready" : snapshot.modelState ?? "resolving"} onSelectModel={(provider, id) => void selectSessionModel(provider, id)} onSetupModel={onSettings} thinkingLevel={elsewhere ? undefined : snapshot.thinkingLevel} thinkingLevels={elsewhere ? [] : snapshot.thinkingLevels ?? []} onThinkingLevel={level => void selectThinkingLevel(level)} textguard={textguardControl} />
         </div>
         <SessionStatsBar stats={snapshot.stats} timing={timing} firstOutputMs={snapshot.firstOutput?.avgMs} />
         </div>

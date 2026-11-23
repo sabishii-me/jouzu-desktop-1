@@ -56,4 +56,13 @@ describe("rowState (#212)", () => {
     // A saved session the host does not hold is "stopped" in the list: at rest.
     expect(rowState(row({ status: "stopped" }))).toBeNull();
   });
+
+  it("does not call a session running while its runtime only starts or recovers for it", () => {
+    // Opening a saved session starts its runtime; nothing runs until a message does.
+    expect(rowState(row({ status: "starting" }))).toBeNull();
+    expect(rowState(row({ status: "recovering" }))).toBeNull();
+    // A message sent while the runtime starts is a run, with a turn in its startup phase.
+    const turn = { turnId: "t", phase: "starting", startedAt: "2026-11-21T00:00:00.000Z" };
+    expect(rowState(row({ status: "starting", running: true, activeTurn: turn }))).toMatchObject({ kind: "running", turn: { turnId: "t" } });
+  });
 });

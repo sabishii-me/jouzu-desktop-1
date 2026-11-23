@@ -161,6 +161,8 @@ export interface ComposerProps {
   settling?: boolean;
   opening?: boolean;
   starting?: boolean;
+  /** A turn, or a message on its way, that Stop cancels (also while the runtime starts). */
+  stoppable?: boolean;
   unavailable?: boolean;
   running: boolean;
   draft: string;
@@ -219,9 +221,9 @@ function TextGuardControl({ control, result }: { control: NonNullable<ComposerPr
     <ResultMark result={result} align="left" />
   </div>;
 }
-export function Composer({ hero = false, autoFocus = false, textguard, blocked, results = {}, connected, pending, settling = false, opening = false, starting = false, unavailable = false, running, draft, onDraft, onSend, onStop, onCompact, onExport, onReloadMcp, attachments = [], onAddImages, onRemoveImage, readingImages = false, videos = [], onAddVideo, onRemoveVideo, models, model, modelState, onSelectModel, onSetupModel, thinkingLevel, thinkingLevels, onThinkingLevel }: ComposerProps) {
+export function Composer({ hero = false, autoFocus = false, textguard, blocked, results = {}, connected, pending, settling = false, opening = false, starting = false, stoppable = false, unavailable = false, running, draft, onDraft, onSend, onStop, onCompact, onExport, onReloadMcp, attachments = [], onAddImages, onRemoveImage, readingImages = false, videos = [], onAddVideo, onRemoveVideo, models, model, modelState, onSelectModel, onSetupModel, thinkingLevel, thinkingLevels, onThinkingLevel }: ComposerProps) {
   const t = useChatText();
-  const active = running || starting;
+  const active = running || starting || stoppable;
   const imageInput = useRef<HTMLInputElement>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [videoOpen, setVideoOpen] = useState(false);
