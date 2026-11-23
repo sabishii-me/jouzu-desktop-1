@@ -1079,7 +1079,10 @@ add("#33 A draft stays in its own session", "Text typed but not sent in one sess
   const draft = "Draft that belongs to the first session";
   await textbox().fill(draft);
   await freshSession();
-  const other = await textbox().inputValue();
+  // Right after the click the old session can still be on screen with its own draft; only a
+  // draft that is still there once the new session is shown counts (seen on macOS).
+  let other = await textbox().inputValue();
+  for (const until = now() + 3_000; other.includes(draft) && now() < until; other = await textbox().inputValue()) await sleep(100);
   if (other.includes(draft)) c.fail("the draft from another session is in the new session's composer");
   await textbox().fill("");
 }, { langs: ["en"] });

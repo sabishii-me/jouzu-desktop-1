@@ -27,6 +27,8 @@ import { startFixtureServer } from './fixture-server.mjs';
 //     ABN_HOST     a built jouzu-host
 //     ABN_DIST     the built UI
 //     ABN_RUNTIME_APP  a folder with the runtime's bootstrap.mjs (node_modules/jouzu)
+//     ABN_UNIX_LAYOUT  macOS/Linux: run the runtime as an installation there does, from
+//                  <home>/runtime/node/bin/node and <home>/app, without --runtime (#181)
 // Common:
 //   ABN_LANGS    interface languages to run, comma separated (default en,ja)
 //   ABN_ONLY     run only the cases whose names contain this text (several: separate with |)
@@ -186,6 +188,9 @@ function startHost(stack) {
     ? ['--dist', pkg.dist, '--home', paths.home, '--runtime-home', paths.data, '--install', paths.home]
     : stack.managed
       ? ['--dist', resolve(process.env.ABN_DIST), '--home', paths.home, '--runtime-home', paths.data, '--install', sourceInstall(paths.root)]
+      : process.env.ABN_UNIX_LAYOUT
+        // An installation's layout on macOS/Linux (#181): <install>/runtime/node/bin/node and <install>/app; no --runtime.
+        ? (() => { const install = sourceInstall(paths.root); const bin = join(paths.home, 'runtime', 'node', 'bin'); if (!existsSync(join(paths.home, 'app'))) symlinkSync(resolve(process.env.ABN_RUNTIME_APP), join(paths.home, 'app')); if (!existsSync(join(bin, 'node'))) { mkdirSync(bin, { recursive: true }); symlinkSync(process.execPath, join(bin, 'node')); } return ['--dist', resolve(process.env.ABN_DIST), '--home', paths.home, '--runtime-home', paths.data, '--install', install]; })()
       : ['--dist', resolve(process.env.ABN_DIST), '--home', paths.home, '--runtime-home', paths.data, '--install', sourceInstall(paths.root),
         '--runtime', process.execPath, '--runtime-arg', join(resolve(process.env.ABN_RUNTIME_APP), 'bootstrap.mjs'), '--runtime-arg', '--mode', '--runtime-arg', 'rpc'];
   for (const dir of ['localappdata', 'appdata']) mkdirSync(join(paths.root, dir), { recursive: true });
@@ -227,6 +232,19 @@ function processTable() {
   if (windows) {
     const text = execFileSync('powershell.exe', ['-NoProfile', '-Command', 'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)|$($_.ParentProcessId)|$($_.Name)|$($_.CommandLine)" }'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     return text.trim().split(/\r?\n/).map(line => { const [pid, ppid, name, ...args] = line.trim().split('|'); return { pid: Number(pid), ppid: Number(ppid), name, args: args.join('|') }; });
+  }
+  if (process.platform === 'darwin') {
+    // macOS has no /proc: one ps for pid, parent and short name (ucomm), one for full command lines.
+    const ps = format => execFileSync('ps', ['-axww', '-o', format], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).split('\n');
+    const args = new Map();
+    for (const line of ps('pid=,args=')) { const m = line.match(/^\s*(\d+)\s(.*)$/); if (m) args.set(Number(m[1]), m[2].trim()); }
+    return ps('pid=,ppid=,ucomm=').flatMap(line => {
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m) return [];
+      const commandLine = args.get(Number(m[1])) ?? '';
+      // A runtime renames itself "jouzu": on macOS that changes its command line, not its ucomm.
+      return [{ pid: Number(m[1]), ppid: Number(m[2]), name: /^jouzu\b/.test(commandLine) ? 'jouzu' : m[3].trim(), args: commandLine }];
+    });
   }
   return readdirSync('/proc').filter(name => /^\d+$/.test(name)).flatMap(pid => {
     try {
