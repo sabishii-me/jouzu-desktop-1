@@ -17,6 +17,15 @@ export interface WarmView {
 
 const initial: WarmView = { state: "unknown", since: null, error: null };
 
+/**
+ * Whether the loading screen holds. It holds while the runtime starts, and on a
+ * failure too: the screen then shows why and offers a retry, instead of letting
+ * the user into a chat whose first message would stall or fail.
+ */
+export function warmBlocks(view: WarmView): boolean {
+  return view.state === "unknown" || view.state === "starting" || view.state === "failed";
+}
+
 /** Fold one host answer into the view. */
 export function nextWarmView(previous: WarmView, answer: WarmRuntime, now: number): WarmView {
   if (answer.state === "starting") {
