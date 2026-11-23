@@ -22,8 +22,6 @@ name: Desktop release
 # Without `publish`, the run only proves the build and keeps a workflow artifact.
 
 on:
-  push:
-    branches: [claude/project-thread-1l8myg]
   workflow_dispatch:
     inputs:
       version:
@@ -67,7 +65,7 @@ jobs:
         id: check
         shell: bash
         env:
-          INPUT_VERSION: ${{ inputs.version || '1.1.5-rc.2' }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           version="$(node -p "require('./apps/desktop/package.json').version")"
           if [ "$version" != "$INPUT_VERSION" ]; then
