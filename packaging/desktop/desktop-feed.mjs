@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /** Changelog notes are hard-wrapped Markdown. Versions up to 1.1.4 show each line of the feed's
@@ -29,27 +29,55 @@ export function unwrapNotes(notes) {
 	return blocks.map((block, index) => (index && !(block.list && blocks[index - 1].list) ? `\n${block.line}` : block.line)).join('\n');
 }
 
+/** Every platform the desktop ships, with the updater target key, the installer people download
+ * and the update bundle the updater installs. A release carries all of them or is not published,
+ * so the asset names are defined here once and the workflows only copy files to these names. */
+export const PLATFORMS = [
+	{ key: 'windows-x86_64', installer: (v) => `JouzuDesktop_${v}_x64-setup.exe`, update: (v) => `JouzuDesktop_${v}_x64-setup.exe` },
+	{ key: 'darwin-aarch64', installer: (v) => `JouzuDesktop_${v}_aarch64.dmg`, update: (v) => `JouzuDesktop_${v}_aarch64.app.tar.gz` },
+	{ key: 'linux-x86_64', installer: (v) => `JouzuDesktop_${v}_amd64.AppImage`, update: (v) => `JouzuDesktop_${v}_amd64.AppImage` },
+	// The updater looks for `<os>-<arch>-<bundle>` before `<os>-<arch>`, so an installation from
+	// the .deb updates with the next .deb (dpkg, after a password prompt) and not the AppImage.
+	{ key: 'linux-x86_64-deb', installer: (v) => `JouzuDesktop_${v}_amd64.deb`, update: (v) => `JouzuDesktop_${v}_amd64.deb` },
+];
+
+/** Every file of a release, in upload order: installers, update bundles with their signatures. */
+export function releaseAssets(version) {
+	const names = new Set();
+	for (const platform of PLATFORMS) {
+		names.add(platform.installer(version));
+		names.add(platform.update(version));
+		names.add(`${platform.update(version)}.sig`);
+	}
+	return [...names];
+}
+
 /** The update feed is read by the Tauri updater, which looks a platform up by its target key.
- * A platform without an entry simply gets no update. The URL and signature are the only fields
- * the client trusts, so both are validated here rather than assembled in a shell script. */
-export function desktopFeed({ version, notes, pubDate, repository, assetName, signature }) {
+ * Every shipped platform must have its signed update bundle: a feed that misses one would leave
+ * that platform's users behind without saying so. The URL and signature are the only fields the
+ * client trusts, so both are validated here rather than assembled in a shell script. */
+export function desktopFeed({ version, notes, pubDate, repository, signatures }) {
 	if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:-rc\.\d+)?$/.test(version)) throw new Error('Invalid release version');
 	if (typeof repository !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw new Error('Invalid release repository');
-	// A space would have to be percent-encoded in the URL; keep release asset names usable as-is.
-	if (typeof assetName !== 'string' || !/^[A-Za-z0-9._-]+\.exe$/.test(assetName)) throw new Error('Invalid update asset name');
-	if (typeof signature !== 'string' || !signature.trim()) throw new Error('Missing updater signature');
+	if (!signatures || typeof signatures !== 'object') throw new Error('Missing updater signatures');
+	const unknown = Object.keys(signatures).filter((key) => !PLATFORMS.some((platform) => platform.key === key));
+	if (unknown.length) throw new Error(`Unknown update platform: ${unknown.join(', ')}`);
 	const date = new Date(pubDate ?? Date.now());
 	if (Number.isNaN(date.getTime())) throw new Error('Invalid publication date');
+	const platforms = {};
+	for (const platform of PLATFORMS) {
+		const signature = signatures[platform.key];
+		if (typeof signature !== 'string' || !signature.trim()) throw new Error(`Missing updater signature for ${platform.key}`);
+		platforms[platform.key] = {
+			signature: signature.trim(),
+			url: `https://github.com/${repository}/releases/download/v${version}/${platform.update(version)}`,
+		};
+	}
 	return {
 		version,
 		notes: typeof notes === 'string' ? unwrapNotes(notes) : '',
 		pub_date: date.toISOString(),
-		platforms: {
-			'windows-x86_64': {
-				signature: signature.trim(),
-				url: `https://github.com/${repository}/releases/download/v${version}/${assetName}`,
-			},
-		},
+		platforms,
 	};
 }
 
@@ -59,13 +87,21 @@ export function writeDesktopFeed(path, feed) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-	const [version, notesFile, repository, assetName, signatureFile, output] = process.argv.slice(2);
-	if (!output) throw new Error('Usage: node desktop-feed.mjs <version> <notes-file> <owner/repo> <asset-name> <signature-file> <output>');
+	if (process.argv[2] === 'assets') {
+		// One name per line: what a release uploads and what the workflows stage.
+		process.stdout.write(`${releaseAssets(process.argv[3]).join('\n')}\n`);
+		process.exit(0);
+	}
+	const [version, notesFile, repository, releaseDirectory, output] = process.argv.slice(2);
+	if (!output) throw new Error('Usage: node desktop-feed.mjs <version> <notes-file> <owner/repo> <release-dir> <output> | assets <version>');
+	const signatures = Object.fromEntries(PLATFORMS.map((platform) => [
+		platform.key,
+		readFileSync(join(releaseDirectory, `${platform.update(version)}.sig`), 'utf8'),
+	]));
 	writeDesktopFeed(output, desktopFeed({
 		version,
 		notes: readFileSync(notesFile, 'utf8').trim(),
 		repository,
-		assetName,
-		signature: readFileSync(signatureFile, 'utf8'),
+		signatures,
 	}));
 }

@@ -6,11 +6,13 @@ name: Desktop stable release
 #      normal icon (QA packages carry the QA icon, #74);
 #   3. run the full user playbook (the exam from the commit this workflow runs from)
 #      on that build with a real model, on every platform
-#      the desktop ships (Windows today); every scenario and gate must pass;
+#      the desktop ships (Windows x64, macOS Apple Silicon, Linux x64); every scenario and
+#      gate must pass on each;
 #   4. only then publish v<X.Y.Z> and replace the stable feed (desktop-update), with the
 #      CHANGELOG section for X.Y.Z as its notes (stable users may come from an older stable
 #      release, not from the candidate, so the candidate's notes are not enough);
-#   5. SmartScreen (Authenticode) signing goes into step 2 once the certificate exists.
+#   5. SmartScreen (Authenticode) signing and macOS Developer ID signing with notarization go
+#      into step 2 once the certificates exist; until then macOS packages are ad-hoc signed.
 # Nothing here writes to the QA feed.
 
 on:
@@ -157,8 +159,109 @@ jobs:
           path: release/
           if-no-files-found: error
 
+  # The same stable build and exam on macOS and Linux (see the windows job for each step).
+  unix:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            runner: macos-14
+            bundles: app,dmg
+          - platform: linux
+            runner: ubuntu-22.04
+            bundles: appimage,deb
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    environment: desktop-release
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24.22.2'
+      - name: Install the Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: Set the stable version
+        run: node packaging/desktop/set-version.mjs '${{ needs.prepare.outputs.version }}'
+      - name: Install frontend dependencies
+        run: npm ci --prefix apps/desktop
+      - name: Build the UI and the release host
+        working-directory: apps/desktop
+        run: |
+          npm run build
+          npm run build:app
+      - name: Build the stable packages
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          overlay="$RUNNER_TEMP/stable-build.json"
+          echo '{"bundle":{"createUpdaterArtifacts":true}}' > "$overlay"
+          npx tauri build --bundles '${{ matrix.bundles }}' --config "$overlay"
+          version='${{ needs.prepare.outputs.version }}'
+          stage="$GITHUB_WORKSPACE/release"
+          mkdir -p "$stage"
+          cd src-tauri/target/release/bundle
+          one() {
+            local matches=( $1 )
+            if [ "${#matches[@]}" -ne 1 ] || [ ! -f "${matches[0]}" ]; then echo "::error::Expected one $1, found: ${matches[*]}"; exit 1; fi
+            cp "${matches[0]}" "$stage/$2"
+          }
+          if [ '${{ matrix.platform }}' = macos ]; then
+            one 'dmg/*.dmg' "JouzuDesktop_${version}_aarch64.dmg"
+            one 'macos/*.app.tar.gz' "JouzuDesktop_${version}_aarch64.app.tar.gz"
+            one 'macos/*.app.tar.gz.sig' "JouzuDesktop_${version}_aarch64.app.tar.gz.sig"
+            codesign --verify --deep --strict --verbose=2 macos/*.app
+          else
+            one 'appimage/*.AppImage' "JouzuDesktop_${version}_amd64.AppImage"
+            one 'appimage/*.AppImage.sig' "JouzuDesktop_${version}_amd64.AppImage.sig"
+            one 'deb/*.deb' "JouzuDesktop_${version}_amd64.deb"
+            one 'deb/*.deb.sig' "JouzuDesktop_${version}_amd64.deb.sig"
+          fi
+          ls -l "$stage"
+      - name: Provision the official runtime for the exam
+        working-directory: apps/desktop/src-tauri
+        run: JOUZU_EXAM_MANAGED="$RUNNER_TEMP/exam-runtime" cargo test --locked --bins provisions_the_exam_runtime -- --ignored
+      - name: Install the browser test runner
+        working-directory: apps/desktop
+        run: npx playwright install --with-deps chromium
+      - name: Take the exam from the release branch
+        run: |
+          git fetch --no-tags --depth=1 'https://github.com/${{ github.repository }}' '${{ github.sha }}'
+          git checkout FETCH_HEAD -- apps/desktop/e2e apps/desktop/e2e-runtime
+          git log -1 --format='exam from %H' FETCH_HEAD
+      - name: Stable exam (full playbook, real model)
+        working-directory: apps/desktop
+        env:
+          PLAYBOOK_SHISA_API_KEY: ${{ secrets.PLAYBOOK_SHISA_API_KEY }}
+          PLAYBOOK_OPENROUTER_API_KEY: ${{ secrets.PLAYBOOK_OPENROUTER_API_KEY }}
+        run: |
+          if [ -z "$PLAYBOOK_SHISA_API_KEY" ]; then echo '::error::PLAYBOOK_SHISA_API_KEY is not configured for the desktop-release environment'; exit 1; fi
+          export EXAM_MANAGED="$RUNNER_TEMP/exam-runtime"
+          export EXAM_HOST="$PWD/host/target/package/jouzu-host.exe"
+          export EXAM_DIST="$PWD/dist"
+          export EXAM_OUT="$GITHUB_WORKSPACE/release/stable-exam-${{ matrix.platform }}.json"
+          node e2e-runtime/stable-exam.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: jouzu-desktop-stable-${{ matrix.platform }}
+          path: release/
+          if-no-files-found: error
+
   publish:
-    needs: [prepare, windows]
+    needs: [prepare, windows, unix]
     if: ${{ inputs.publish }}
     runs-on: ubuntu-22.04
     environment: desktop-release
@@ -173,16 +276,24 @@ jobs:
           node-version: '24.22.2'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: jouzu-desktop-stable-windows
+          pattern: jouzu-desktop-stable-*
+          merge-multiple: true
           path: release
-      - name: Check the exam and the updater signature
+      - name: Check every platform's exam and updater signature
         run: |
-          node -e "const r=require('./release/stable-exam-windows.json'); if (!r.pass) { console.error('The stable exam did not pass'); process.exit(1) }"
+          for platform in windows macos linux; do
+            node -e "const r=require('./release/stable-exam-$platform.json'); if (!r.pass) { console.error('The stable exam did not pass on $platform'); process.exit(1) }"
+          done
           version='${{ needs.prepare.outputs.version }}'
-          asset="JouzuDesktop_${version}_x64-setup.exe"
+          node packaging/desktop/desktop-feed.mjs assets "$version" > assets.txt
+          while read -r asset; do
+            [ -f "release/$asset" ] || { echo "::error::Missing release file $asset"; exit 1; }
+          done < assets.txt
           public_key="$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').plugins.updater.pubkey")"
-          node packaging/desktop/verify-updater-signature.mjs "release/$asset" "release/$asset.sig" "$public_key"
-          (cd release && sha256sum "$asset" "$asset.sig" > SHA256SUMS.txt)
+          for update in $(grep '\.sig$' assets.txt | sed 's/\.sig$//'); do
+            node packaging/desktop/verify-updater-signature.mjs "release/$update" "release/$update.sig" "$public_key"
+          done
+          (cd release && sha256sum $(cat ../assets.txt) > SHA256SUMS.txt)
       - name: Notes and feed
         env:
           GH_TOKEN: ${{ github.token }}
@@ -192,7 +303,7 @@ jobs:
           version='${{ needs.prepare.outputs.version }}'
           node packaging/desktop/release-notes.mjs CHANGELOG.md "$version" > notes.md
           printf '\n\nQA (%s): %s\n' "$CANDIDATE" "$QA_RESULT" >> notes.md
-          node packaging/desktop/desktop-feed.mjs "$version" notes.md "$GITHUB_REPOSITORY" "JouzuDesktop_${version}_x64-setup.exe" "release/JouzuDesktop_${version}_x64-setup.exe.sig" latest.json
+          node packaging/desktop/desktop-feed.mjs "$version" notes.md "$GITHUB_REPOSITORY" release latest.json
           cat latest.json
       - name: Publish the stable release and replace the stable feed
         env:
@@ -201,8 +312,7 @@ jobs:
           version='${{ needs.prepare.outputs.version }}'
           gh release create "v$version" --repo "$GITHUB_REPOSITORY" --target '${{ needs.prepare.outputs.commit }}' --latest \
             --title "Jouzu Desktop $version" --notes-file notes.md
-          gh release upload "v$version" --repo "$GITHUB_REPOSITORY" \
-            "release/JouzuDesktop_${version}_x64-setup.exe" "release/JouzuDesktop_${version}_x64-setup.exe.sig" release/SHA256SUMS.txt
+          gh release upload "v$version" --repo "$GITHUB_REPOSITORY" $(sed 's|^|release/|' assets.txt) release/SHA256SUMS.txt
           if ! gh release view desktop-update --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release create desktop-update --repo "$GITHUB_REPOSITORY" --target '${{ needs.prepare.outputs.commit }}' --prerelease \
               --title "Jouzu Desktop update feed" --notes "Signed desktop update feed. Do not delete."

@@ -95,9 +95,12 @@ pub fn host_lock_path(home: &Path) -> PathBuf {
     home.join("host.lock")
 }
 
-/// An exclusively held marker for the process lifetime. The handle is opened
-/// without read/write sharing on Windows, so a second host cannot acquire it;
-/// FILE_SHARE_DELETE lets this process remove the file on clean exit.
+/// An exclusively held marker for the process lifetime. On Windows the handle is
+/// opened without read/write sharing, so a second host cannot open it at all;
+/// FILE_SHARE_DELETE lets this process remove the file on clean exit. On macOS and
+/// Linux the file is opened normally and held with an exclusive advisory lock
+/// (`flock`), which every host takes the same way and the kernel drops when the
+/// process ends, so a crashed host never leaves a live lock behind.
 #[derive(Debug)]
 pub struct HostLock {
     path: PathBuf,
@@ -109,28 +112,57 @@ impl HostLock {
         std::fs::create_dir_all(home)
             .map_err(|error| format!("Cannot create host home: {error}"))?;
         let path = host_lock_path(home);
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            // FILE_SHARE_DELETE only: no other process may read or write it.
-            options.share_mode(0x00000004);
-        }
-        match options.open(&path) {
-            Ok(file) => Ok(Self {
+        loop {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // FILE_SHARE_DELETE only: no other process may read or write it.
+                options.share_mode(0x00000004);
+            }
+            let file = match options.open(&path) {
+                Ok(file) => file,
+                Err(error) if is_locked(&error) => return Err(live_host_message(home)),
+                Err(error) => return Err(format!("Cannot lock {}: {error}", path.display())),
+            };
+            #[cfg(not(windows))]
+            {
+                match file.try_lock() {
+                    Ok(()) => {}
+                    Err(std::fs::TryLockError::WouldBlock) => return Err(live_host_message(home)),
+                    Err(std::fs::TryLockError::Error(error)) => {
+                        return Err(format!("Cannot lock {}: {error}", path.display()))
+                    }
+                }
+                // A host that exits removes the file while it still holds the lock. If
+                // that happened between our open and our lock, we hold a file that is no
+                // longer at the path, and the next host would lock a new one: start over.
+                if !same_file(&file, &path) {
+                    continue;
+                }
+            }
+            return Ok(Self {
                 path,
                 file: Some(file),
-            }),
-            Err(error) if is_locked(&error) => Err(live_host_message(home)),
-            Err(error) => Err(format!("Cannot lock {}: {error}", path.display())),
+            });
         }
+    }
+}
+
+#[cfg(not(windows))]
+fn same_file(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+        _ => false,
     }
 }
 
 impl Drop for HostLock {
     fn drop(&mut self) {
-        // The file is open with FILE_SHARE_DELETE, so removing it while held is safe.
+        // Removed while still held: on Windows the handle allows FILE_SHARE_DELETE; on
+        // Unix a host that opened the old file finds it gone after locking and retries.
         let _ = std::fs::remove_file(&self.path);
         self.file.take();
     }
@@ -143,6 +175,7 @@ fn is_locked(error: &std::io::Error) -> bool {
     }
     #[cfg(not(windows))]
     {
+        // On Unix opening never fails because of another host; the lock does.
         let _ = error;
         false
     }

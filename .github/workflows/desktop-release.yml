@@ -3,8 +3,11 @@ name: Desktop release
 # Jouzu Desktop is its own product: a Tauri shell plus the chat UI and its
 # installer. These gates are the desktop's own (ADR 0006).
 #
-# Build gate: typecheck, unit tests, chat/session acceptance tests, native tests,
-# and an unsigned NSIS build. Signing and the feed are release steps only.
+# Build gate, the same on every platform the desktop ships (Windows x64, macOS Apple
+# Silicon, Linux x64): typecheck, unit tests, mocked UI tests, release host and its tests,
+# native tests, the runtime install without a system Node, and the packages. Signing and the
+# feed are release steps only. A release carries every platform or is not published: the
+# publish job needs all of them, and desktop-feed.mjs refuses a feed that misses one.
 # Release gate adds: the updater configuration, the signature, notes, and the
 # published feed. Runtime provisioning is still open (0065); until it lands a
 # shell-only release cannot start chat on a clean machine.
@@ -147,7 +150,7 @@ jobs:
           cargo test --locked --manifest-path host/Cargo.toml
       - name: Native tests
         working-directory: apps/desktop/src-tauri
-        run: cargo test --locked --bins
+        run: cargo test --locked --bins --features terminal-console
       - name: Provision the runtime without a system Node
         working-directory: apps/desktop/src-tauri
         shell: pwsh
@@ -201,15 +204,12 @@ jobs:
             node ../../packaging/desktop/verify-updater-signature.mjs $asset "$asset.sig" $publicKey
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
           }
-          "$((Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLower())  JouzuDesktop_${version}_x64-setup.exe" |
-            Set-Content -LiteralPath SHA256SUMS.txt -Encoding ascii
       - name: Stage the release artifacts flat
         run: |
           $stage = Join-Path $env:RUNNER_TEMP 'release'
           New-Item -ItemType Directory $stage -Force | Out-Null
           Get-ChildItem apps/desktop/src-tauri/target/release/bundle/nsis -Filter 'JouzuDesktop_*' |
             Copy-Item -Destination $stage
-          Copy-Item apps/desktop/SHA256SUMS.txt $stage
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: windows-release
@@ -217,8 +217,148 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # macOS (Apple Silicon) and Linux (x64) packages, through the same gate as Windows. Each
+  # runner is fixed, so a platform's packages are always built the same way.
+  # macOS packages are ad-hoc signed (bundle.macOS.signingIdentity "-") until the Developer
+  # ID certificate and notarization are set up; a downloaded app then needs
+  # `xattr -cr "/Applications/Jouzu Desktop.app"` once before it opens.
+  unix:
+    needs: [prepare, audit]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            runner: macos-14
+            bundles: app,dmg
+          - platform: linux
+            runner: ubuntu-22.04
+            bundles: appimage,deb
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    environment: desktop-release
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24.22.2'
+      - name: Install the Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: Install frontend dependencies
+        run: npm ci --prefix apps/desktop
+      - name: Frontend build and unit tests
+        run: |
+          npm --prefix apps/desktop run build
+          npm --prefix apps/desktop test
+      - name: Install the browser test runner
+        working-directory: apps/desktop
+        run: npx playwright install --with-deps chromium
+      - name: Mocked UI tests
+        working-directory: apps/desktop
+        run: |
+          node node_modules/vite/bin/vite.js > "$RUNNER_TEMP/vite.log" 2>&1 &
+          vite=$!
+          trap 'kill $vite' EXIT
+          for i in $(seq 60); do curl -fs http://localhost:1420 > /dev/null && break; sleep 1; done
+          curl -fs http://localhost:1420 > /dev/null || { cat "$RUNNER_TEMP/vite.log"; echo '::error::Vite did not become ready'; exit 1; }
+          npx playwright test e2e/control-center.spec.ts e2e/onboarding.spec.ts e2e/tools.spec.ts --reporter=line
+      - name: Release host build and tests
+        working-directory: apps/desktop
+        run: |
+          # build:app builds the release host and stages it where the shell bundles it from.
+          npm run build:app
+          cargo test --locked --manifest-path host/Cargo.toml
+      - name: Native tests
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked --bins
+      - name: Provision the runtime without a system Node
+        working-directory: apps/desktop/src-tauri
+        run: |
+          # npm lifecycle scripts invoke `node` by name. Remove every Node directory
+          # from PATH so this proves the installer puts its own Node there.
+          path=''
+          IFS=: read -ra entries <<< "$PATH"
+          for entry in "${entries[@]}"; do
+            [ -x "$entry/node" ] && continue
+            path="${path:+$path:}$entry"
+          done
+          export PATH="$path"
+          if command -v node > /dev/null; then echo '::error::Node is still on PATH; this gate would not prove the fix.'; exit 1; fi
+          cargo test --locked --bins installs_the_official_runtime -- --ignored
+      - name: Build the packages
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          # The same QA overlay as Windows (#74): the QA icon, and the updater artifacts
+          # (macOS .app.tar.gz, Linux .AppImage, each with its .sig) when publishing.
+          overlay="$RUNNER_TEMP/qa-build.json"
+          node -e '
+            const bundle = { icon: ["icons/qa/32x32.png", "icons/qa/128x128.png", "icons/qa/128x128@2x.png", "icons/qa/icon.icns", "icons/qa/icon.ico"] };
+            if (process.env.PUBLISH === "true") bundle.createUpdaterArtifacts = true;
+            require("fs").writeFileSync(process.argv[1], JSON.stringify({ bundle }, null, 2));
+          ' "$overlay"
+          cat "$overlay"
+          npx tauri build --bundles '${{ matrix.bundles }}' --config "$overlay"
+      - name: Name and verify the packages
+        working-directory: apps/desktop/src-tauri/target/release/bundle
+        env:
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          version='${{ needs.prepare.outputs.version }}'
+          stage="$RUNNER_TEMP/release"
+          mkdir -p "$stage"
+          # Exactly one file must match each built name; it is copied to its release name.
+          one() {
+            local matches=( $1 )
+            if [ "${#matches[@]}" -ne 1 ] || [ ! -f "${matches[0]}" ]; then echo "::error::Expected one $1, found: ${matches[*]}"; exit 1; fi
+            cp "${matches[0]}" "$stage/$2"
+            echo "$2 <- ${matches[0]}"
+          }
+          if [ '${{ matrix.platform }}' = macos ]; then
+            one 'dmg/*.dmg' "JouzuDesktop_${version}_aarch64.dmg"
+            update="JouzuDesktop_${version}_aarch64.app.tar.gz"
+            if [ "$PUBLISH" = true ]; then
+              one 'macos/*.app.tar.gz' "$update"
+              one 'macos/*.app.tar.gz.sig' "$update.sig"
+            fi
+            # The ad-hoc signature must cover the whole bundle, the bundled host included.
+            codesign --verify --deep --strict --verbose=2 macos/*.app
+          else
+            update="JouzuDesktop_${version}_amd64.AppImage"
+            one 'appimage/*.AppImage' "$update"
+            one 'deb/*.deb' "JouzuDesktop_${version}_amd64.deb"
+            if [ "$PUBLISH" = true ]; then
+              one 'appimage/*.AppImage.sig' "$update.sig"
+              one 'deb/*.deb.sig' "JouzuDesktop_${version}_amd64.deb.sig"
+              node "$GITHUB_WORKSPACE/packaging/desktop/verify-updater-signature.mjs" "$stage/JouzuDesktop_${version}_amd64.deb" "$stage/JouzuDesktop_${version}_amd64.deb.sig" \
+                "$(node -p "require('$GITHUB_WORKSPACE/apps/desktop/src-tauri/tauri.conf.json').plugins.updater.pubkey")"
+            fi
+          fi
+          if [ "$PUBLISH" = true ]; then
+            public_key="$(node -p "require('$GITHUB_WORKSPACE/apps/desktop/src-tauri/tauri.conf.json').plugins.updater.pubkey")"
+            node "$GITHUB_WORKSPACE/packaging/desktop/verify-updater-signature.mjs" "$stage/$update" "$stage/$update.sig" "$public_key"
+          fi
+          ls -l "$stage"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ matrix.platform }}-release
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
-    needs: [prepare, windows]
+    needs: [prepare, windows, unix]
     if: ${{ inputs.publish }}
     runs-on: ubuntu-22.04
     timeout-minutes: 20
@@ -244,22 +384,32 @@ jobs:
             throw new Error(`Unexpected update endpoint: ${endpoint}`);
           }
           NODE
-      - name: Download the Windows artifacts
+      - name: Download every platform's packages
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name windows-release --dir release
+        run: |
+          for platform in windows macos linux; do
+            gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$platform-release" --dir release
+          done
+          version='${{ needs.prepare.outputs.version }}'
+          # The release is exactly the files desktop-feed.mjs names, every one present.
+          node packaging/desktop/desktop-feed.mjs assets "$version" > assets.txt
+          while read -r asset; do
+            [ -f "release/$asset" ] || { echo "::error::Missing release file $asset"; exit 1; }
+          done < assets.txt
+          (cd release && sha256sum $(cat ../assets.txt) > SHA256SUMS.txt)
+          cat release/SHA256SUMS.txt
       - name: Write the release notes and the feed
         env:
           INPUT_NOTES: ${{ inputs.notes }}
         run: |
           version='${{ needs.prepare.outputs.version }}'
-          asset="JouzuDesktop_${version}_x64-setup.exe"
           if [ -n "$INPUT_NOTES" ]; then
             printf '%s\n' "$INPUT_NOTES" > notes.md
           else
             node packaging/desktop/release-notes.mjs CHANGELOG.md "$version" > notes.md
           fi
-          node packaging/desktop/desktop-feed.mjs "$version" notes.md "$GITHUB_REPOSITORY" "$asset" "release/$asset.sig" latest.json
+          node packaging/desktop/desktop-feed.mjs "$version" notes.md "$GITHUB_REPOSITORY" release latest.json
           cat latest.json
       - name: Check the feeds again before writing
         env:
@@ -277,10 +427,7 @@ jobs:
           tag="v$version"
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
             --title "Jouzu Desktop $version (QA)" --notes-file notes.md
-          gh release upload "$tag" \
-            "release/JouzuDesktop_${version}_x64-setup.exe" \
-            "release/JouzuDesktop_${version}_x64-setup.exe.sig" \
-            "release/SHA256SUMS.txt" \
+          gh release upload "$tag" $(sed 's|^|release/|' assets.txt) release/SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" --clobber
       - name: Replace the QA update feed
         env:

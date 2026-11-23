@@ -8,7 +8,8 @@ Jouzu Desktop has two update feeds:
 | QA | `releases/download/desktop-update-qa/latest.json` | Installations switched to QA in Settings → System |
 
 The installed package and the update channel are independent. The channel is a setting
-(`update-channel.json` in the Desktop folder, `%LOCALAPPDATA%\Shisa.ai\JouzuDesktop`); a
+(`update-channel.json` in the Desktop folder: `%LOCALAPPDATA%\Shisa.ai\JouzuDesktop` on
+Windows, the platform's application data folder on macOS and Linux); a
 missing or unreadable setting means stable, whatever package was installed. Switching it
 changes only which feed the app updates from; the install folder, Jouzu's data and sign-ins
 stay the same.
@@ -22,6 +23,27 @@ QA and stable packages are built from the same code. They differ in exactly thre
 | Version | `X.Y.Z-rc.N` (a release candidate) | `X.Y.Z` |
 | Icon | Jouzu icon with a **QA** badge, set when the package is built | The normal Jouzu icon |
 | Code signing | Updater signature | Updater signature, and SmartScreen (Authenticode) once the certificate is available |
+
+## Platforms
+
+Every release, QA and stable, carries every platform the desktop ships, built on a fixed
+runner per platform. A release that cannot build or pass on one platform is not published.
+`desktop-feed.mjs` names the files once; the workflows copy the built packages to these names.
+
+| Platform | Runner | Download | Updater installs | Feed key |
+| --- | --- | --- | --- | --- |
+| Windows x64 | `windows-latest` | `JouzuDesktop_<v>_x64-setup.exe` | the same installer | `windows-x86_64` |
+| macOS Apple Silicon | `macos-14` | `JouzuDesktop_<v>_aarch64.dmg` | `JouzuDesktop_<v>_aarch64.app.tar.gz` | `darwin-aarch64` |
+| Linux x64 | `ubuntu-22.04` | `JouzuDesktop_<v>_amd64.AppImage` | the AppImage | `linux-x86_64` |
+| Linux x64 (Debian, Ubuntu) | `ubuntu-22.04` | `JouzuDesktop_<v>_amd64.deb` | the next `.deb` (dpkg, asks for a password) | `linux-x86_64-deb` |
+
+- The Linux packages need glibc 2.35 and WebKitGTK 4.1 (Ubuntu 22.04, Debian 12 or newer). The
+  updater looks up `<os>-<arch>-<bundle>` before `<os>-<arch>`, so each installation updates
+  with the package it was installed from.
+- macOS packages are ad-hoc signed until the Developer ID certificate and notarization are set
+  up. Until then a downloaded app opens only after
+  `xattr -cr "/Applications/Jouzu Desktop.app"`.
+- `SHA256SUMS.txt` in each release covers every file.
 
 There is no QA or stable switch inside the app: what a package looks like is decided when it
 is built.

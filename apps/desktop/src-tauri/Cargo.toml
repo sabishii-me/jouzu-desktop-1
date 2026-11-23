@@ -9,6 +9,18 @@ license = "Apache-2.0"
 name = "jouzu-desktop"
 path = "src/main.rs"
 
+# The terminal entry program (`jz`, `jouzu`) that the Windows installer links to. Only the
+# Windows package installs terminal entries, so only Windows builds it: tauri.windows.conf.json
+# turns the feature on, and the macOS and Linux packages do not carry a `console` binary
+# (it would land as /usr/bin/console from the .deb).
+[[bin]]
+name = "console"
+path = "src/bin/console.rs"
+required-features = ["terminal-console"]
+
+[features]
+terminal-console = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

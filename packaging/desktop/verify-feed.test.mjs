@@ -2,7 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { verifyFeed } from './verify-feed.mjs';
 
-const feed = version => JSON.stringify({ version, platforms: { 'windows-x86_64': { url: `https://example.test/v${version}/setup.exe`, signature: 's' } } }, null, 2);
+const feed = version => JSON.stringify({ version, platforms: {
+  'windows-x86_64': { url: `https://example.test/v${version}/setup.exe`, signature: 's' },
+  'darwin-aarch64': { url: `https://example.test/v${version}/app.tar.gz`, signature: 's' },
+} }, null, 2);
 
 function server(answers) {
   const calls = [];
@@ -27,8 +30,8 @@ test('waits through a 404 and a stale feed until the published one is served', a
   const { fetchImpl, calls } = server([404, 404, feed('1.1.0'), feed('1.1.0'), feed('1.1.1')]);
   const result = await verifyFeed({ endpoint: 'https://example.test/latest.json', expected: feed('1.1.1'), fetchImpl, ...clock(), log: () => {} });
   assert.equal(result.attempts, 5);
-  assert.equal(result.asset, 'https://example.test/v1.1.1/setup.exe');
-  assert.ok(calls.some(call => call.method === 'HEAD' && call.url === result.asset));
+  assert.deepEqual(result.assets, ['https://example.test/v1.1.1/setup.exe', 'https://example.test/v1.1.1/app.tar.gz']);
+  for (const asset of result.assets) assert.ok(calls.some(call => call.method === 'HEAD' && call.url === asset));
   // Every read asks past caches.
   assert.equal(new Set(calls.filter(call => call.method === 'GET').map(call => call.url)).size, 5);
 });
@@ -46,5 +49,15 @@ test('fails when the installer the feed names cannot be read', async () => {
   await assert.rejects(
     verifyFeed({ endpoint: 'https://example.test/latest.json', expected: feed('1.1.1'), deadlineMs: 30_000, fetchImpl, ...clock(), log: () => {} }),
     /installer HTTP 404/,
+  );
+});
+
+test('fails when one platform\'s update bundle cannot be read', async () => {
+  const fetchImpl = async (url, options = {}) => options.method === 'HEAD'
+    ? (url.endsWith('app.tar.gz') ? { ok: false, status: 404 } : { ok: true, status: 200 })
+    : { ok: true, status: 200, text: async () => feed('1.1.1') };
+  await assert.rejects(
+    verifyFeed({ endpoint: 'https://example.test/latest.json', expected: feed('1.1.1'), deadlineMs: 30_000, fetchImpl, ...clock(), log: () => {} }),
+    /installer HTTP 404 \(https:\/\/example\.test\/v1\.1\.1\/app\.tar\.gz\)/,
   );
 });

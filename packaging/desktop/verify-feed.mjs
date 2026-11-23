@@ -7,8 +7,6 @@
 // Usage: node verify-feed.mjs <feed URL> <expected latest.json> [deadline seconds]
 import { readFileSync } from 'node:fs';
 
-const PLATFORM = 'windows-x86_64';
-
 export async function verifyFeed({ endpoint, expected, deadlineMs = 300_000, fetchImpl = fetch, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), now = Date.now, log = console.log }) {
   const started = now();
   let wait = 3_000;
@@ -24,14 +22,22 @@ export async function verifyFeed({ endpoint, expected, deadlineMs = 300_000, fet
         const text = await response.text();
         if (text.trim() === expected.trim()) {
           const feed = JSON.parse(text);
-          const asset = feed.platforms?.[PLATFORM]?.url;
-          if (typeof asset !== 'string') throw new Error(`The feed has no ${PLATFORM} installer URL.`);
-          const head = await fetchImpl(asset, { method: 'HEAD', redirect: 'follow' });
-          if (head.ok) {
-            log(`feed and installer readable after ${attempt} attempt(s)`);
-            return { attempts: attempt, asset };
+          // Every platform's update bundle must be readable, not only the first one.
+          const assets = Object.entries(feed.platforms ?? {}).map(([platform, entry]) => {
+            if (typeof entry?.url !== 'string') throw new Error(`The feed has no ${platform} installer URL.`);
+            return entry.url;
+          });
+          if (!assets.length) throw new Error('The feed has no platforms.');
+          const failed = [];
+          for (const asset of assets) {
+            const head = await fetchImpl(asset, { method: 'HEAD', redirect: 'follow' });
+            if (!head.ok) failed.push(`installer HTTP ${head.status} (${asset})`);
           }
-          last = `installer HTTP ${head.status}`;
+          if (!failed.length) {
+            log(`feed and ${assets.length} installer(s) readable after ${attempt} attempt(s)`);
+            return { attempts: attempt, assets };
+          }
+          last = failed.join('; ');
         } else {
           let version = 'unreadable';
           try { version = JSON.parse(text).version; } catch { /* not JSON yet */ }

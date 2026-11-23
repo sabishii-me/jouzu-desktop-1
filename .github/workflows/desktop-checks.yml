@@ -1,7 +1,8 @@
-name: Desktop Windows checks
+name: Desktop checks
 
 # The development gate: what every pull request push must keep passing, kept
-# fast. It proves the code builds and its tests pass in debug. Release builds,
+# fast. It proves the code builds and its tests pass in debug, on every platform the
+# desktop ships (Windows, macOS, Linux). Release builds,
 # installers, dependency audits and the timed playbook belong to the release
 # gate (desktop-release.yml, desktop-stable.yml, dependency-audit.yml).
 # No signing identity, secrets or publication on pull requests.
@@ -69,7 +70,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           New-Item -ItemType Directory host/target/package -Force | Out-Null
           Copy-Item host/target/debug/jouzu-host.exe host/target/package/jouzu-host.exe -Force
-          cargo test --locked --manifest-path src-tauri/Cargo.toml --bins
+          # The terminal entry program is Windows-only (tauri.windows.conf.json); test it here.
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --bins --features terminal-console
       - name: Install browser test runner
         working-directory: apps/desktop
         run: npx playwright install chromium
@@ -88,5 +90,70 @@ jobs:
           } finally { if (-not $vite.HasExited) { Stop-Process -Id $vite.Id } }
           exit $code
 
-
-
+  # macOS and Linux: the same build and tests (packaging scripts are Windows installer
+  # tooling and stay on the Windows job).
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            runner: macos-14
+          - platform: linux
+            runner: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24.22.2'
+      - name: Install the Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: Install frontend dependencies
+        run: npm ci --prefix apps/desktop
+      - name: Frontend build and unit tests
+        run: |
+          npm --prefix apps/desktop run build
+          npm --prefix apps/desktop test
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            apps/desktop/host/target
+            apps/desktop/src-tauri/target
+          key: desktop-debug-${{ runner.os }}-${{ hashFiles('apps/desktop/host/Cargo.lock', 'apps/desktop/src-tauri/Cargo.lock') }}
+          restore-keys: desktop-debug-${{ runner.os }}-
+      - name: Host tests
+        working-directory: apps/desktop
+        run: cargo test --locked --manifest-path host/Cargo.toml
+      - name: Native shell tests
+        working-directory: apps/desktop
+        run: |
+          # The packaged host keeps one name on every platform (scripts/build-app.mjs).
+          cargo build --locked --manifest-path host/Cargo.toml
+          mkdir -p host/target/package
+          cp host/target/debug/jouzu-host host/target/package/jouzu-host.exe
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --bins
+      - name: Install browser test runner
+        working-directory: apps/desktop
+        run: npx playwright install --with-deps chromium
+      - name: Mocked UI tests
+        working-directory: apps/desktop
+        run: |
+          node node_modules/vite/bin/vite.js > "$RUNNER_TEMP/vite.log" 2>&1 &
+          vite=$!
+          trap 'kill $vite' EXIT
+          for i in $(seq 60); do curl -fs http://localhost:1420 > /dev/null && break; sleep 1; done
+          curl -fs http://localhost:1420 > /dev/null || { cat "$RUNNER_TEMP/vite.log"; echo '::error::Vite did not become ready'; exit 1; }
+          npx playwright test e2e/control-center.spec.ts e2e/onboarding.spec.ts e2e/tools.spec.ts --reporter=line
