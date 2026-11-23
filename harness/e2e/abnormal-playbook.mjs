@@ -180,7 +180,9 @@ async function freshSession() {
 let current = null;
 /** What the person sent: a problem line may quote it, and a quote is not the app's own words. */
 const sent = [];
-const ownWords = text => sent.reduce((rest, item) => rest.split(item).join(" "), text).replace(/\s+/g, " ").trim();
+// A folder path the app names (the session's own folder) is the person's data, not the app's words.
+const paths = /(?:[A-Za-z]:\\|\/)[^\s"'「」]+/g;
+const ownWords = text => sent.reduce((rest, item) => rest.split(item).join(" "), text).replace(paths, " ").replace(/\s+/g, " ").trim();
 /**
  * Type and press Send. Send must be usable when the person has typed (the host holds a
  * message until the session is ready); if it is not, the case fails with how long the
