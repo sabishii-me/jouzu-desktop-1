@@ -1,10 +1,9 @@
 import workspaceSource from "./chat-workspace.tsx?raw";
 import { describe, expect, it } from "vitest";
 
-// #186: the divider must be reliably grabbable and keep tracking after the
-// pointer leaves the handle. These are structural guarantees that a static
-// render cannot exercise, so we assert them on the component source — the same
-// approach the repo already uses for composer invariants.
+// #186: the e2e spec exercises the actual drag and width change. This test pins
+// the non-visual affordances around it (role, pointer capture, cancel hooks and
+// the hit-area classes) so a refactor cannot silently remove them.
 describe("the panel divider is a usable drag handle (#186)", () => {
   const separator = workspaceSource.match(/role="separator"[\s\S]*?<\/div>/)?.[0] ?? "";
 
