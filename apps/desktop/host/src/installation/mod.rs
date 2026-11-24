@@ -112,6 +112,12 @@ impl Installer for Managed {
     }
 
     fn install(&self, action: Action, progress: &dyn Fn(Value)) -> Result<String, String> {
+        // A Jouzu started from a terminal (`jz`) runs from these files too and
+        // holds a shared lease on them while it runs. Files it uses are only
+        // replaced while nothing holds one; installing a missing tool replaces
+        // nothing and needs no lease.
+        let replaces = action == Action::Repair || !matches!(self.inspect(), Found::Current { .. });
+        let _lease = if replaces && self.files_present() { Some(lease(&self.root)?) } else { None };
         if action == Action::Repair {
             // The packages are installed again; Node and the tools are checked
             // and replaced only when they are not what this build pins.
@@ -131,6 +137,31 @@ impl Installer for Managed {
     fn tools(&self) -> Value {
         tools::report(&self.root)
     }
+}
+
+/// The exclusive side of the lease a terminal Jouzu holds while it runs
+/// (`updates/sessions.lock`, shared by the console). The system releases it when
+/// the handle closes, including after a crash.
+fn lease(root: &Path) -> Result<std::fs::File, String> {
+    const BUSY: &str = "Jouzu is running in a terminal. Close it, then try again.";
+    let directory = root.join("updates");
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let path = directory.join("sessions.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
+    let file = options.open(&path).map_err(|_| BUSY.to_string())?;
+    #[cfg(not(windows))]
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(BUSY.into()),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.to_string()),
+    }
+    Ok(file)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -155,6 +186,12 @@ impl State {
 struct Inner {
     state: State,
     tools: Value,
+    /// An operation on a `ready` installation that replaces none of the
+    /// runtime's files (installing a missing tool): the state stays `ready`,
+    /// sessions keep running, and this says what runs.
+    operation: Option<(Action, Value)>,
+    /// How the last such operation failed; the installation is still `ready`.
+    error: Option<(Action, String)>,
 }
 
 type Hook = Box<dyn Fn() + Send + Sync>;
@@ -181,7 +218,7 @@ impl Installation {
         let state = State::from_found(installer.inspect());
         Arc::new(Self {
             installer: Box::new(installer),
-            inner: Mutex::new(Inner { state, tools: Value::Null }),
+            inner: Mutex::new(Inner { state, tools: Value::Null, operation: None, error: None }),
             log_home,
             on_change: OnceLock::new(),
             on_ready: OnceLock::new(),
@@ -261,28 +298,41 @@ impl Installation {
 
     /// Start an operation. Answers whether it started: asking while one runs
     /// changes nothing.
+    ///
+    /// On a `ready` installation, `install` and `update` replace nothing that
+    /// runs (the runtime is what this build pins; what is missing is a tool):
+    /// the state stays `ready` and sessions keep running. Anything else
+    /// replaces runtime files: the state is `installing` and runtimes stop.
     pub fn start(self: &Arc<Self>, action: Action) -> bool {
-        let previous = {
+        let (previous, light) = {
             let mut inner = self.lock();
-            if matches!(inner.state, State::Installing { .. }) {
+            if matches!(inner.state, State::Installing { .. }) || inner.operation.is_some() {
                 return false;
             }
             let previous = inner.state.clone();
-            inner.state = State::Installing { action, progress: json!({ "step": "prepare" }) };
-            previous
+            let light = matches!(previous, State::Ready { .. }) && action != Action::Repair;
+            inner.error = None;
+            if light {
+                inner.operation = Some((action, json!({ "step": "prepare" })));
+            } else {
+                inner.state = State::Installing { action, progress: json!({ "step": "prepare" }) };
+            }
+            (previous, light)
         };
-        self.log("info", "installation.start", json!({ "action": action.name(), "from": view_state(&previous) }));
+        self.log("info", "installation.start", json!({ "action": action.name(), "from": view_state(&previous), "replaces": !light }));
         self.changed();
         let installation = self.clone();
-        std::thread::spawn(move || installation.run(action));
+        std::thread::spawn(move || installation.run(action, light));
         true
     }
 
-    fn run(self: &Arc<Self>, action: Action) {
+    fn run(self: &Arc<Self>, action: Action, light: bool) {
         // Whatever runs from the installation holds its files open (on Windows
         // they cannot be replaced then); with nothing running this does nothing.
-        if let Some(hook) = self.before_replace.get() {
-            hook();
+        if !light {
+            if let Some(hook) = self.before_replace.get() {
+                hook();
+            }
         }
         let progress = |value: Value| {
             let step = match value.get("phase").and_then(Value::as_str) {
@@ -297,12 +347,17 @@ impl Installation {
             }
             {
                 let mut inner = self.lock();
-                if let State::Installing { progress, .. } = &mut inner.state {
-                    if *progress == shown {
-                        return;
-                    }
-                    *progress = shown;
+                let current = match (&mut inner.state, light) {
+                    (State::Installing { progress, .. }, false) => progress,
+                    _ => match &mut inner.operation {
+                        Some((_, progress)) => progress,
+                        None => return,
+                    },
+                };
+                if *current == shown {
+                    return;
                 }
+                *current = shown;
             }
             self.changed();
         };
@@ -312,22 +367,35 @@ impl Installation {
         }))
         .unwrap_or_else(|_| Err("The installation stopped unexpectedly.".to_string()));
         let found = self.installer.inspect();
-        let state = match (outcome, found) {
-            (Ok(_), found @ Found::Current { .. }) => State::from_found(found),
-            (Ok(version), found) => State::Failed {
-                action,
-                message: format!("The installation finished but is not usable ({version}, {found:?})."),
-            },
-            (Err(message), _) => State::Failed { action, message },
+        let current = matches!(found, Found::Current { .. });
+        let (state, error) = match (outcome, found) {
+            (Ok(_), found @ Found::Current { .. }) => (State::from_found(found), None),
+            // A tool could not be installed; the runtime still runs.
+            (Err(message), found @ Found::Current { .. }) if light => (State::from_found(found), Some((action, message))),
+            (Ok(version), found) => (
+                State::Failed {
+                    action,
+                    message: format!("The installation finished but is not usable ({version}, {found:?})."),
+                },
+                None,
+            ),
+            (Err(message), _) => (State::Failed { action, message }, None),
         };
-        let ready = matches!(state, State::Ready { .. });
-        match &state {
-            State::Failed { message, .. } => {
+        // A light operation started on a running installation: nothing was
+        // stopped, so nothing has to start again.
+        let ready = current && !light;
+        match (&state, &error) {
+            (State::Failed { message, .. }, _) | (_, Some((_, message))) => {
                 self.log("error", "installation.failed", json!({ "action": action.name(), "error": message }))
             }
-            state => self.log("info", "installation.done", json!({ "action": action.name(), "state": view_state(state) })),
+            (state, None) => self.log("info", "installation.done", json!({ "action": action.name(), "state": view_state(state) })),
         }
-        self.lock().state = state;
+        {
+            let mut inner = self.lock();
+            inner.state = state;
+            inner.operation = None;
+            inner.error = error;
+        }
         self.changed();
         if ready {
             if let Some(hook) = self.on_ready.get() {
@@ -387,6 +455,19 @@ impl Installation {
                 value["version"] = json!(version);
                 value["nodeVersion"] = json!(node_version);
                 value["expectedVersion"] = json!(runtime::expected_version());
+                if let Some((action, progress)) = &inner.operation {
+                    let mut operation = json!({ "action": action.name() });
+                    if let Some(fields) = progress.as_object() {
+                        for (key, item) in fields {
+                            operation[key] = item.clone();
+                        }
+                    }
+                    value["operation"] = operation;
+                }
+                if let Some((action, message)) = &inner.error {
+                    value["action"] = json!(action.name());
+                    value["error"] = json!({ "code": FAILED, "params": { "message": message } });
+                }
             }
             State::Failed { action, message } => {
                 value["action"] = json!(action.name());
@@ -631,6 +712,41 @@ mod tests {
     }
 
     #[test]
+    fn installing_a_tool_on_a_ready_installation_keeps_it_ready_and_its_runtimes_running() {
+        let fake = Arc::new(Fake::default());
+        fake.installed.store(true, Ordering::SeqCst);
+        fake.files.store(true, Ordering::SeqCst);
+        let installation = Installation::new(fake.clone(), None);
+        let (_, ready, stops) = counted(&installation);
+        let gate = fake.gate.lock().unwrap();
+        assert!(installation.start(Action::Install));
+        let view = installation.view();
+        assert_eq!(view["state"], "ready");
+        assert_eq!(view["operation"]["action"], "install");
+        assert!(installation.is_ready(), "sessions keep starting");
+        assert!(!installation.start(Action::Install));
+        drop(gate);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !installation.view()["operation"].is_null() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert_eq!(ready.load(Ordering::SeqCst), 0);
+        // A tool that could not be installed is reported; the runtime still runs.
+        fake.fail.store(true, Ordering::SeqCst);
+        assert!(installation.start(Action::Install));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !installation.view()["operation"].is_null() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let view = installation.view();
+        assert_eq!(view["state"], "ready");
+        assert_eq!(view["error"]["code"], FAILED);
+    }
+
+    #[test]
     fn runtime_files_lost_while_running_are_installed_again() {
         let fake = Arc::new(Fake::default());
         fake.installed.store(true, Ordering::SeqCst);
@@ -653,6 +769,21 @@ mod tests {
         let error = installation.not_ready();
         assert_eq!(error.code, "runtime-not-ready");
         assert_eq!(error.details.unwrap()["installation"]["state"], "absent");
+    }
+
+    #[test]
+    fn files_are_not_replaced_while_a_terminal_jouzu_holds_its_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let held = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open({
+            std::fs::create_dir_all(root.path().join("updates")).unwrap();
+            root.path().join("updates/sessions.lock")
+        }).unwrap();
+        #[cfg(not(windows))]
+        held.lock_shared().unwrap();
+        let error = lease(root.path()).unwrap_err();
+        assert!(error.contains("terminal"), "{error}");
+        drop(held);
+        assert!(lease(root.path()).is_ok());
     }
 
     #[test]
