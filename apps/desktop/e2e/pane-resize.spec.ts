@@ -125,6 +125,28 @@ test("the divider resizes both ways and releases cleanly", async ({ page }) => {
   await expect(pane.getByRole("tab", { name: "Artifacts" })).toBeVisible();
 });
 
+// #186: "Dragging continues when the pointer moves away from the narrow handle".
+test("the drag keeps tracking after the pointer leaves the handle", async ({ page }) => {
+  await openChat(page);
+  await page.getByRole("button", { name: "Toggle artifacts panel" }).click();
+  const box = await page.getByRole("separator", { name: "Resize pane" }).boundingBox();
+  if (!box) throw new Error("separator has no box");
+  const x = box.x + box.width / 2;
+  const y = box.y + Math.min(40, box.height / 2);
+
+  const before = await paneWidth(page, 0);
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  // 40px away is already well outside the 8px hit area; the width must keep
+  // following the pointer rather than stopping when the handle is left.
+  await page.mouse.move(x - 40, y);
+  const away = await paneWidth(page, 0);
+  expect(away).toBeGreaterThan(before + 25);
+  await page.mouse.move(x - 100, y);
+  expect(await paneWidth(page, 0)).toBeGreaterThan(away + 40);
+  await page.mouse.up();
+});
+
 test("the second panel has its own divider and adjacent controls stay clickable", async ({ page }) => {
   await openChat(page);
   await page.getByRole("button", { name: "Toggle artifacts panel" }).click();
@@ -142,13 +164,15 @@ test("the second panel has its own divider and adjacent controls stay clickable"
   expect(await paneWidth(page, 0)).toBeCloseTo(firstBefore, 0);
 });
 
-test("the divider still resizes in a narrow window", async ({ page }) => {
+// #186: supported window sizes must leave the conversation usable.
+test("the divider still resizes in a narrow window and leaves the conversation usable", async ({ page }) => {
   await openChat(page);
   await page.setViewportSize({ width: 900, height: 600 });
   await page.getByRole("button", { name: "Toggle artifacts panel" }).click();
   const before = await paneWidth(page, 0);
   await drag(page, 0, -60);
   expect(await paneWidth(page, 0)).toBeGreaterThan(before + 40);
+  await expect(page.getByLabel("Message Jouzu")).toBeVisible();
 });
 
 test.describe("with display scaling", () => {
