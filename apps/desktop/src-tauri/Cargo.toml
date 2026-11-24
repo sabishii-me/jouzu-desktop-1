@@ -49,18 +49,7 @@ windows = { version = "0.62", default-features = false, features = ["Win32_Found
 
 # Non-blocking runtime pipes and process-group termination for the chat supervisor.
 [target.'cfg(unix)'.dependencies]
+# The start-failure alert on macOS and Linux (Windows uses MessageBoxW): the same rfd that
+# tauri-plugin-dialog already builds.
+rfd = { version = "0.16", default-features = false, features = ["gtk3"] }
 libc = "0.2"
-
-
-
-
-
-
-
-
-
-
-
-
-
-

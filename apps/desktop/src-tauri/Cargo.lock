@@ -1970,6 +1970,7 @@ dependencies = [
  "base64 0.22.1",
  "libc",
  "reqwest 0.12.28",
+ "rfd",
  "semver",
  "serde",
  "serde_json",

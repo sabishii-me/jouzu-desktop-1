@@ -32,9 +32,18 @@ pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
         .arg(&managed)
         .arg("--runtime-home")
         .arg(&runtime_home)
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // On macOS and Linux nothing ends the host when this process dies without running
+    // `stop` (a crash, Force Quit, SIGKILL), and a host left behind would hold the lock
+    // against the next start. The host stops when its standard input closes, and the
+    // pipe's write end stays in the `Child` kept in `HostProcess` for the app's lifetime,
+    // so the system closes it exactly when this process ends. Windows ends the host with
+    // the job object below instead.
+    #[cfg(not(windows))]
+    command.arg("--exit-with-stdin").stdin(Stdio::piped());
+    #[cfg(windows)]
+    command.stdin(Stdio::null());
     // The host is a console program; without this flag Windows opens an empty
     // console window next to the app.
     #[cfg(windows)]
@@ -179,6 +188,13 @@ pub fn show_start_failure(message: &str) {
 #[cfg(not(windows))]
 pub fn show_start_failure(message: &str) {
     eprintln!("Jouzu Desktop could not start: {message}");
+    // The same native alert as on Windows, so a failed start is never silent.
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Jouzu Desktop could not start")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }
 
 /// The UI the host serves. A development build serves the repository's `dist`;

@@ -44,7 +44,9 @@ fn usage() {
          Usage: jouzu-host [--dist <path>] [--home <path>]\n\n\
          --dist  built SPA directory (default: ./dist)\n\
          --home  directory for host.json and logs (default: JOUZU_HOST_HOME,\n\
-                 then %LOCALAPPDATA%\\Shisa.ai\\JouzuDesktop)"
+                 then %LOCALAPPDATA%\\Shisa.ai\\JouzuDesktop)\n\
+         --exit-with-stdin  stop when standard input closes (the window that\n\
+                 started the host is gone, however it ended)"
     );
 }
 
@@ -235,9 +237,7 @@ async fn main() -> ExitCode {
     let app = router(state);
 
     let result = axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(stop_requested(args.iter().any(|value| value == "--exit-with-stdin")))
         .await;
 
     sessions.shutdown();
@@ -254,6 +254,46 @@ async fn main() -> ExitCode {
             eprintln!("host stopped with an error: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The host stops cleanly (sessions shut down, host.json and the lock removed) on Ctrl+C,
+/// on SIGTERM, and, with `--exit-with-stdin`, when its standard input closes. The window
+/// passes that flag and keeps the pipe's write end open for its whole life: when the window
+/// ends in any way (quit, crash, Force Quit, SIGKILL) the system closes the pipe, so the host
+/// never outlives it and never holds the lock against the next start. On Windows the window's
+/// job object (KILL_ON_JOB_CLOSE) already ends the host with it.
+async fn stop_requested(exit_with_stdin: bool) {
+    let stdin_closed = async move {
+        if !exit_with_stdin {
+            return std::future::pending::<()>().await;
+        }
+        let (closed, wait) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buffer = [0u8; 256];
+            let mut input = std::io::stdin();
+            // Anything written is ignored; only the end of the stream matters.
+            while matches!(input.read(&mut buffer), Ok(count) if count > 0) {}
+            let _ = closed.send(());
+        });
+        let _ = wait.await;
+    };
+    #[cfg(unix)]
+    let terminated = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminated = std::future::pending::<()>();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminated => {}
+        _ = stdin_closed => {}
     }
 }
 
