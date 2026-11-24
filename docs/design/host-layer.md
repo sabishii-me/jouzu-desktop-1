@@ -307,7 +307,7 @@ stays with the session and records every outcome, `stopped` included.
 | `configGeneration` | Raised by every configuration change (section 4) |
 | `models` | `generation`, `state` (`updating` / `ready`), `list`, `startModel` |
 | `tools` | `settings` (`tools.json`), `report` (the image report), `state` (`checking` / `ready`) |
-| `installation` | `state` (`absent` / `installing` / `update-required` / `ready` / `failed`); `step` (`node` / `packages` / `verify` / `tools`) and `downloaded`/`total` bytes while installing; `version`, `nodeVersion`, `tools` when ready; `error` (`code`, `params`) when failed |
+| `installation` | `state` (`absent` / `installing` / `update-required` / `ready` / `failed`); `action`, `step` (`node` / `packages` / `verify` / `tools`) and `downloaded`/`total` bytes while installing; `version`, `nodeVersion`, `expectedVersion` when ready; on `ready`, `operation` while a tool is installed without replacing the runtime, and `error` when that failed; `error` (`code`, `params.message`) when failed; `tools` (Windows: the Git Bash and Windows Terminal reports) |
 
 ### 7.3 Events and commands
 
@@ -316,9 +316,14 @@ stays with the session and records every outcome, `stopped` included.
   number; a client catches up by sequence after reconnecting.
 - Commands are HTTP. Each returns acceptance or a typed refusal synchronously;
   the resulting state is read from snapshots.
-- `POST /v1/runtime/install` (also `update` with a version, and `repair`) starts the
-  installation operation; asking while one runs changes nothing. The host starts
-  it on its own at start-up when the installation is `absent` or `update-required`.
+- `POST /v1/runtime/install` (also `update` and `repair`) starts the installation
+  operation; asking while one runs changes nothing. `install` and `update` bring
+  the installation to what this build pins; `repair` also installs the packages
+  again. The host starts it on its own at start-up when the installation is
+  `absent` or `update-required`. An operation that replaces runtime files stops
+  every runtime first (state `installing`); one on a `ready` installation that
+  only adds a missing tool keeps it `ready` and its sessions running
+  (`operation`). Files a terminal Jouzu holds are not replaced while it runs.
   A session start while the installation is not `ready` is refused with
   `runtime-not-ready` and the current `installation`.
 
