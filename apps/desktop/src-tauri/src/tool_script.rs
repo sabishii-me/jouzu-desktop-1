@@ -96,18 +96,6 @@ pub fn failure(output: &Output, fallback: &str) -> String {
         .to_string()
 }
 
-/// Reads the path a helper printed, failing when it is not a file.
-pub fn printed_path(output: &Output, message: &str) -> Result<PathBuf, String> {
-    if !output.status.success() {
-        return Err(failure(output, message));
-    }
-    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    if !path.is_file() {
-        return Err(message.to_string());
-    }
-    Ok(path)
-}
-
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;

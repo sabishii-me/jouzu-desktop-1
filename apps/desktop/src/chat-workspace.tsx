@@ -810,7 +810,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     queuedSwitch.current = null;
     // A connection that is still attaching runs the new session once it is ready.
     // With no connection at all (the workspace's first lease failed, for example
-    // runtime-missing), nothing would ever run the queued request (#87): ask the
+    // runtime-not-ready), nothing would ever run the queued request (#87): ask the
     // host now instead.
     if (!snapshot.connected && connection.current) {
       queueNewSession();

@@ -1,6 +1,5 @@
-import { invoke } from '@tauri-apps/api/core';
 import { messages, type Locale } from './i18n';
-import { ComponentSection, describe, useComponent, type ComponentApi } from './components/component-row';
+import { ComponentSection, describe } from './components/component-row';
 
 interface Environment { path: string; git: string; bash: string }
 export interface GitBashState {
@@ -19,10 +18,10 @@ export interface GitBashState {
 const version = (reported?: string) => reported?.replace(/^git version\s+/i, '') ?? '';
 
 
-/** The Git Bash component: the copy in use, and the other copy the user can move to. */
-export function GitBashSection({ locale, api }: { locale: Locale; api: ComponentApi<GitBashState> }) {
+/** The Git Bash component: the copy in use, as the host's installation reports it, and the
+ * copy Jouzu installs when it is not there. */
+export function GitBashSection({ locale, state, busy, error, install }: { locale: Locale; state: GitBashState | null; busy: boolean; error: string | null; install: () => void }) {
   const t = messages[locale];
-  const { state, busy, error, run } = api;
   if (!state) return <ComponentSection title={t.gitBash} status={t.checking} busy={busy} error={error} installLabel={t.gitBashInstall} />;
   const own = state.bundled ?? state.managed;
   const installed = Boolean(state.effective);
@@ -40,11 +39,7 @@ export function GitBashSection({ locale, api }: { locale: Locale; api: Component
     tone={installed ? 'ok' : 'missing'}
     note={installed ? undefined : t.gitBashRequired}
     busy={busy} error={error}
-    install={own ? undefined : () => void run(() => invoke<GitBashState>('git_bash_install'))}
+    install={own ? undefined : install}
     installLabel={ownBroken ? t.gitBashRepair : `${t.gitBashInstall} (${t.recommended})`}
   />;
-}
-
-export function useGitBash(): ComponentApi<GitBashState> {
-  return useComponent<GitBashState>('git_bash');
 }

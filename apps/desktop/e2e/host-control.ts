@@ -10,6 +10,8 @@ export type HostStub = {
   device(data: Record<string, unknown>): void;
   emit(event: string, data: Record<string, unknown>): void;
   onCancel(cancel: () => void): () => void;
+  /** Set the runtime installation the host reports (`AppView.installation`) and publish it. */
+  installation(value: Record<string, unknown> | null): void;
 };
 
 /**
@@ -27,7 +29,14 @@ export type HostStub = {
  */
 export async function stubHost(
   page: Page,
-  options: { control: (body: any, host: HostStub) => unknown; workspaces?: Workspace[] },
+  options: {
+    control: (body: any, host: HostStub) => unknown;
+    workspaces?: Workspace[];
+    /** The runtime installation the host starts with. Absent: a host given its runtime. */
+    installation?: Record<string, unknown>;
+    /** `POST /v1/runtime/{action}`: the stub's installation answers through `host.installation`. */
+    runtime?: (action: string, host: HostStub) => void;
+  },
 ) {
   const workspaces = [...(options.workspaces ?? [])];
   // Events wait here until the window's stream next connects. The stub answers
@@ -38,14 +47,15 @@ export async function stubHost(
   const cancels = new Set<() => void>();
   const send = (event: string, data: Record<string, unknown>) => { seq += 1; queued.push(`id: ${seq}\nevent: ${event}\ndata: ${JSON.stringify({ ...data, seq })}\n\n`); };
   let modelReady = true;
-  const view: { revision: number; config: { running: any; queued: any[]; lastResult: Record<string, unknown> }; settings: any } =
-    { revision: 0, config: { running: null, queued: [], lastResult: {} }, settings: null };
+  const view: { revision: number; config: { running: any; queued: any[]; lastResult: Record<string, unknown> }; settings: any; installation?: Record<string, unknown> | null } =
+    { revision: 0, config: { running: null, queued: [], lastResult: {} }, settings: null, installation: options.installation ?? null };
   const publish = () => { view.revision += 1; send("app.updated", JSON.parse(JSON.stringify(view))); };
   const host: HostStub = {
     // A device code belongs to the running sign-in, as the host reports it.
     device(data) { if (view.config.running) { view.config.running.device = data; publish(); } },
     emit(event, data) { send(event, data); },
     onCancel(cancel) { cancels.add(cancel); return () => cancels.delete(cancel); },
+    installation(value) { view.installation = value; publish(); },
   };
   let chain: Promise<unknown> = Promise.resolve();
   let next = 0;
@@ -106,6 +116,12 @@ export async function stubHost(
     if (path === "/v1/sessions" || path === "/v1/sessions/persisted") return route.fulfill(json({ sessions: [] }));
     if (path === "/v1/models") { await chain; return route.fulfill(json({ models: modelReady ? [{ provider: "fixture", id: "model", name: "Fixture model" }] : [] })); }
     if (path === "/v1/runtime/warm") return route.fulfill(json({ state: "off" }));
+    const runtime = /^\/v1\/runtime\/(install|update|repair)$/.exec(path);
+    if (runtime && method === "POST") {
+      const started = view.installation?.state !== "installing";
+      if (started) options.runtime?.(runtime[1], host);
+      return route.fulfill(json({ started, installation: view.installation }, 202));
+    }
     if (path === "/v1/artifacts/counts") return route.fulfill(json({ counts: {} }));
     return route.fulfill(json({ error: { code: "not-found", message: `No stub for ${method} ${path}` } }, 404));
   });

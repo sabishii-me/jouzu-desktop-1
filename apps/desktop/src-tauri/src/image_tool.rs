@@ -2,28 +2,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-/// The desktop's own pi extension, installed into the agent's extension folder.
-const MANIFEST: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../packaging/desktop/extensions/jouzu-image/package.json"
-));
-const EXTENSION: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../packaging/desktop/extensions/jouzu-image/index.js"
-));
-const SHISA: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../packaging/desktop/extensions/jouzu-image/providers/shisa.mjs"
-));
-const RUNTIME_PROVIDERS: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../packaging/desktop/extensions/jouzu-image/providers/runtime.mjs"
-));
-const ARTIFACTS: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../packaging/desktop/extensions/jouzu-image/artifacts.mjs"
-));
-
 const SIZES: [&str; 3] = ["1K", "2K", "4K"];
 const DEFAULT_PROVIDER: &str = "shisa";
 const DEFAULT_SIZE: &str = "1K";
@@ -32,19 +10,6 @@ const REVIEW_TOOLS: [&str; 1] = ["generate_image"];
 
 fn agent_dir(home: &Path) -> PathBuf {
     home.join("agent")
-}
-
-/// Write the extension into the Jouzu home's agent folder, where the runtime loads it.
-/// Idempotent: a newer desktop replaces the files.
-pub fn ensure(home: &Path) -> Result<(), String> {
-    let directory = agent_dir(home).join("extensions").join("jouzu-image");
-    std::fs::create_dir_all(directory.join("providers")).map_err(|error| format!("Could not create the image extension: {error}"))?;
-    std::fs::write(directory.join("package.json"), MANIFEST).map_err(|error| error.to_string())?;
-    std::fs::write(directory.join("index.js"), EXTENSION).map_err(|error| error.to_string())?;
-    std::fs::write(directory.join("providers").join("shisa.mjs"), SHISA).map_err(|error| error.to_string())?;
-    std::fs::write(directory.join("providers").join("runtime.mjs"), RUNTIME_PROVIDERS).map_err(|error| error.to_string())?;
-    std::fs::write(directory.join("artifacts.mjs"), ARTIFACTS).map_err(|error| error.to_string())?;
-    Ok(())
 }
 
 fn tools_path(home: &Path) -> PathBuf {
@@ -123,7 +88,7 @@ pub fn save_tools(home: &Path, image: &serde_json::Value) -> Result<serde_json::
 
 /// Run the extension's CLI entry with the same home the runtime uses.
 fn run_cli(managed: &Path, args: &[&str]) -> Result<serde_json::Value, String> {
-    let node = crate::runtime_install::node_executable(managed);
+    let node = crate::managed_paths::node_executable(managed);
     if !node.is_file() {
         return Err("The runtime is not installed yet.".into());
     }
@@ -204,32 +169,9 @@ pub async fn image_models(provider: String) -> Result<serde_json::Value, String>
         .map_err(|_| "The image tool could not be started.".to_string())?
 }
 
-/// Called after a runtime install and on app start, so existing installs get it too.
-#[tauri::command]
-pub fn image_tool_ensure() -> Result<(), String> {
-    let home = crate::runtime::effective_home()?;
-    ensure(&home)?;
-    // The desktop's other extension is installed at the same moments.
-    crate::attribution_extension::ensure(&home)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_extension_lands_where_pi_looks_for_it() {
-        let managed = tempfile::tempdir().unwrap();
-        ensure(managed.path()).unwrap();
-        let directory = managed.path().join("agent/extensions/jouzu-image");
-        assert!(directory.join("package.json").is_file());
-        assert!(directory.join("index.js").is_file());
-        assert!(directory.join("providers/shisa.mjs").is_file());
-        assert!(directory.join("providers/runtime.mjs").is_file());
-        assert!(directory.join("artifacts.mjs").is_file());
-        let manifest = std::fs::read_to_string(directory.join("package.json")).unwrap();
-        assert!(manifest.contains("pi"));
-    }
 
     #[test]
     fn tools_settings_round_trip_with_defaults() {

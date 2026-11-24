@@ -10,11 +10,6 @@ use tauri::Manager;
 
 pub struct HostProcess(pub Mutex<Option<(Child, isize)>>);
 
-/// Where this app's host listens and the token that opens its API. The host
-/// hands the token only to this process (its first stdout line); it is never in
-/// a file the agent's tools could read (#130).
-static HOST_API: Mutex<Option<(u64, String)>> = Mutex::new(None);
-
 pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
     let managed = crate::runtime::managed_root()?;
     let runtime_home = crate::runtime::effective_home()?;
@@ -87,7 +82,6 @@ pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
     if let Err(error) = check_build(value.get("build").and_then(Value::as_str)) {
         return failed(&mut child, error);
     }
-    *HOST_API.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((port, token.clone()));
     app.manage(HostProcess(Mutex::new(Some((child, job)))));
     Ok(format!("http://127.0.0.1:{port}/?token={token}"))
 }
@@ -259,70 +253,4 @@ fn host_binary(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         }
     }
     Err("Could not find jouzu-host.exe".into())
-}
-
-/// Ask the running host to stop every session before an update swaps the runtime.
-///
-/// Async, because its callers are async commands running on Tauri's Tokio
-/// runtime: a blocking HTTP client there starts and drops a runtime of its own,
-/// which panics, and the prepare screen never finished (#221).
-/// With no host running there is no session to stop.
-pub async fn stop_sessions() -> Result<(), String> {
-    let Some((port, token)) = HOST_API
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-    else {
-        return Ok(());
-    };
-    reqwest::Client::new()
-        .post(format!("http://127.0.0.1:{port}/v1/sessions/stop-all"))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-
-    /// The prepare screen and the runtime update stop sessions from an async
-    /// command, on Tauri's Tokio runtime. That must neither panic (#221) nor fail
-    /// when there is no host to ask.
-    #[test]
-    fn stopping_sessions_from_an_async_command() {
-        // No host: nothing is running, so there is nothing to stop.
-        *HOST_API.lock().unwrap() = None;
-        assert_eq!(tauri::async_runtime::block_on(stop_sessions()), Ok(()));
-
-        // A running host is asked once, with its token, to stop every session.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = stream.read(&mut buffer).unwrap();
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-            }
-            stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-            String::from_utf8_lossy(&request).to_string()
-        });
-        *HOST_API.lock().unwrap() = Some((u64::from(port), "secret".to_string()));
-        let stopped = tauri::async_runtime::block_on(stop_sessions());
-        *HOST_API.lock().unwrap() = None;
-        assert_eq!(stopped, Ok(()));
-        let request = server.join().unwrap();
-        assert!(request.starts_with("POST /v1/sessions/stop-all "), "{request}");
-        assert!(request.to_ascii_lowercase().contains("authorization: bearer secret"), "{request}");
-    }
 }

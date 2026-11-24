@@ -120,10 +120,10 @@ jobs:
           Copy-Item -LiteralPath $built -Destination "../../release/JouzuDesktop_${version}_x64-setup.exe"
           Copy-Item -LiteralPath "$built.sig" -Destination "../../release/JouzuDesktop_${version}_x64-setup.exe.sig"
       - name: Provision the official runtime for the exam
-        working-directory: apps/desktop/src-tauri
+        working-directory: apps/desktop/host
         run: |
           $env:JOUZU_EXAM_MANAGED = Join-Path $env:RUNNER_TEMP 'exam-runtime'
-          cargo test --locked --bins provisions_the_exam_runtime -- --ignored
+          cargo test --locked --lib provisions_the_exam_runtime -- --ignored
       - name: Install the browser test runner
         working-directory: apps/desktop
         run: npx playwright install chromium

@@ -134,7 +134,7 @@ jobs:
               try { Invoke-WebRequest http://localhost:1420 -TimeoutSec 2 | Out-Null; $ready = $true; break } catch { Start-Sleep 1 }
             }
             if (-not $ready) { throw 'Vite did not become ready' }
-            npx playwright test e2e/control-center.spec.ts e2e/onboarding.spec.ts e2e/tools.spec.ts --reporter=line
+            npx playwright test e2e/control-center.spec.ts e2e/onboarding.spec.ts e2e/tools.spec.ts e2e/installation.spec.ts --reporter=line
             $code = $LASTEXITCODE
           } finally { if (-not $vite.HasExited) { Stop-Process -Id $vite.Id } }
           exit $code
@@ -149,7 +149,7 @@ jobs:
         working-directory: apps/desktop/src-tauri
         run: cargo test --locked --bins
       - name: Provision the runtime without a system Node
-        working-directory: apps/desktop/src-tauri
+        working-directory: apps/desktop/host
         shell: pwsh
         run: |
           # npm lifecycle scripts invoke `node` by name. Remove every Node directory
@@ -160,7 +160,7 @@ jobs:
             $directory -and -not ($nodeDirs | Where-Object { $directory -ieq $_ })
           }) -join ';'
           if (Get-Command node -ErrorAction SilentlyContinue) { throw 'Node is still on PATH; this gate would not prove the fix.' }
-          cargo test --locked --bins installs_the_official_runtime -- --ignored
+          cargo test --locked --lib installs_the_official_runtime -- --ignored
       - name: Build the installer
         working-directory: apps/desktop
         env:
