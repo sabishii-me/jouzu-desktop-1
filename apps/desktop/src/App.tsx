@@ -407,7 +407,11 @@ export function App() {
             ? "macos"
             : "linux";
         setState({ platform, recent: recent as unknown as Workspace[], ready: true, bash: false, bundled_git: false });
-        setRuntimePresent(true);
+        // The folder list says nothing about the runtime. In the app only the runtime
+        // report below decides; when it answered first (a first run on macOS or Linux),
+        // marking the runtime present here skipped the prepare screen and the first
+        // session failed with "runtime files are missing".
+        if (!api.capabilities.native) setRuntimePresent(true);
       } catch (error) {
         fail("folders", error);
       }
