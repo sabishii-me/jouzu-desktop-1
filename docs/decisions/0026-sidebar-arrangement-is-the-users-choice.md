@@ -5,11 +5,17 @@ Date: 2026-11-24
 
 ## Context
 
-The sidebar is a session list, and today it has one hardcoded shape: one group per
-workspace, ordered by the most recent session (or by name, from an icon button),
-archived sessions hidden (another icon button). There is no way to see sessions from
-every workspace in one list, no way to arrange the list by hand, and no way to see only
-archived sessions.
+The sidebar header already has its controls: search, an archive toggle, a sort toggle
+and add folder. Each toggle carries two states, and grouping has no control at all:
+
+- Archive: hide or show, and the button only appears once something is archived. There
+  is no "archived only".
+- Sort: most recent or by name. There is no manual order, and the icon does not say
+  which of the two is active.
+- Grouping: fixed at one group per workspace.
+- The list cannot be reordered by hand.
+
+So the controls exist; what is missing is the set of choices behind them.
 
 Issue #19 reports that with many workspaces the default workspace scrolls out of view,
 and its "Expected behaviour" asks for it to be pinned. Three changes implemented that:
@@ -26,18 +32,21 @@ order, is the user's call.
 
 ## Decision
 
-The sidebar header has one arrangement menu with three settings:
+Each of the three settings becomes a menu on its control, with the full set of choices
+and the active one marked. No new vocabulary, no second place to look:
 
 - **Group by** — `Workspace`: one group per workspace (today's shape). `Workspace Tree`:
   workspaces nested by their folder path. `In one list`: sessions from every workspace in
-  one list, each row naming its workspace.
+  one list, each row naming its workspace. This is the one setting without a control
+  today; it gets one beside the others.
 - **Order by** — `Manual`: the user drags groups and sessions into the order they want,
   and the order is kept. `Last updated`: the most recently active first (today's shape).
+  The sort icon opens this instead of flipping between two states.
 - **Filter sessions** — `Hide archived` (default), `All conversations` (show archived),
-  `Archived only`.
-
+  `Archived only`. The archive icon opens this instead of toggling; it stays hidden while
+  nothing is archived and the filter is the default, as it is now.
 - Defaults are today's behaviour: group by workspace, order by last updated, hide
-  archived. A user who never opens the menu sees no change.
+  archived. A user who changes no setting sees no change.
 - The arrangement is a client preference, kept with the sidebar's other preferences
   (collapsed groups, drafts), not host state.
 - No workspace is special. The default workspace is one group among the others: no
