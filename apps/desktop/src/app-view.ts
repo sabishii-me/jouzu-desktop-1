@@ -1,9 +1,10 @@
 /**
  * The host's app-wide snapshot (`AppView`): configuration operations, the
- * current settings, the configuration generation, the runtimes' models for it
- * and the tools. The host owns all of it and publishes it again whenever any
- * of it changes; this module only follows the snapshot and sends commands.
- * Nothing here polls, queues, retries or keeps a copy of its own.
+ * current settings, the configuration generation, the runtimes' models for it,
+ * the tools and the runtime installation. The host owns all of it and
+ * publishes it again whenever any of it changes; this module only follows the
+ * snapshot and sends commands. Nothing here polls, queues, retries or keeps a
+ * copy of its own.
  */
 import { useSyncExternalStore } from "react";
 import type { HostClient } from "./api/host-client";
@@ -68,6 +69,27 @@ export interface ToolsView {
   state: "checking" | "ready";
 }
 
+/** The runtime installation as the host reports it (ADR 0029). */
+export interface Installation {
+  state: "absent" | "installing" | "update-required" | "ready" | "failed";
+  /** The operation running, or the one that failed. */
+  action?: "install" | "update" | "repair";
+  /** While installing: what runs now, with real byte counts for the Node download. */
+  step?: "prepare" | "node" | "packages" | "verify" | "tools";
+  downloaded?: number;
+  total?: number | null;
+  tool?: string;
+  version?: string | null;
+  nodeVersion?: string | null;
+  expectedVersion?: string;
+  /** `failed`: why. `ready`: why the last operation on it (a tool) failed. */
+  error?: { code: string; params: { message?: string } };
+  /** `ready`: an operation that replaces nothing that runs (installing a tool). */
+  operation?: { action: "install" | "update" | "repair"; step?: string; tool?: string };
+  /** Windows: the Git Bash and Windows Terminal reports for Settings; `null` elsewhere. */
+  tools?: { git: unknown; terminal: unknown } | null;
+}
+
 export interface AppView {
   revision: number;
   config: { running: ConfigRunning | null; queued: ConfigQueued[]; lastResult: Partial<Record<ConfigKind, ConfigResult>> };
@@ -79,6 +101,8 @@ export interface AppView {
   configGeneration?: number;
   models?: ModelsView;
   tools?: ToolsView;
+  /** `null` (or absent) when the host runs a runtime it was given, which it does not install. */
+  installation?: Installation | null;
 }
 
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
@@ -159,6 +183,9 @@ export function parseAppView(value: unknown): AppView & { settingsError: Error |
       if (record(entry) && typeof entry.text === "string") providerAuth[id] = { refusedAt: typeof entry.refusedAt === "string" ? entry.refusedAt : "", text: entry.text };
     }
   }
+  const installation = record(value.installation) && typeof value.installation.state === "string"
+    ? value.installation as unknown as Installation
+    : null;
   const models = parseModels(value.models);
   const tools = parseTools(value.tools);
   return {
@@ -170,6 +197,7 @@ export function parseAppView(value: unknown): AppView & { settingsError: Error |
     ...(typeof value.configGeneration === "number" ? { configGeneration: value.configGeneration } : {}),
     ...(models ? { models } : {}),
     ...(tools ? { tools } : {}),
+    installation,
   };
 }
 
@@ -264,6 +292,34 @@ export async function runConfig(kind: ConfigKind, body: Record<string, unknown> 
       listeners.delete(onChange);
       resolve(result!);
       return true;
+    };
+    const onChange = () => { check(); };
+    listeners.add(onChange);
+    check();
+  });
+}
+
+/** Whether the runtime can run: installed, or given to the host. */
+export function installationReady(current: AppView | null): boolean {
+  return !!current && (!current.installation || current.installation.state === "ready");
+}
+
+/** Ask the host to install, update or repair the runtime. Resolves once the
+ *  snapshot reports it `ready`; rejects with the host's reason when it failed. */
+export async function runRuntimeOperation(action: "install" | "update" | "repair"): Promise<void> {
+  // The host publishes the operation's start before it answers: a snapshot
+  // newer than this one is about this operation or a later one.
+  const before = view?.revision ?? -1;
+  await host().runtimeOperation(action);
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (!view) return;
+      const installation = view.installation;
+      if (!installation) { listeners.delete(onChange); resolve(); return; }
+      if (view.revision <= before || installation.state === "installing" || installation.operation) return;
+      listeners.delete(onChange);
+      if (installation.state === "ready" && !installation.error) resolve();
+      else reject(new Error(installation.error?.params.message ?? "The installation did not finish."));
     };
     const onChange = () => { check(); };
     listeners.add(onChange);

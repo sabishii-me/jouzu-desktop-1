@@ -14,9 +14,12 @@ macro_rules! packaged {
 const IMAGE: &[(&str, &str)] = &[
     ("package.json", packaged!("jouzu-image/package.json")),
     ("index.js", packaged!("jouzu-image/index.js")),
-    ("providers/shisa.mjs", packaged!("jouzu-image/providers/shisa.mjs")),
-    ("providers/runtime.mjs", packaged!("jouzu-image/providers/runtime.mjs")),
+    ("report.mjs", packaged!("jouzu-image/report.mjs")),
     ("artifacts.mjs", packaged!("jouzu-image/artifacts.mjs")),
+    ("providers/errors.mjs", packaged!("jouzu-image/providers/errors.mjs")),
+    ("providers/shisa.mjs", packaged!("jouzu-image/providers/shisa.mjs")),
+    ("providers/codex.mjs", packaged!("jouzu-image/providers/codex.mjs")),
+    ("providers/runtime.mjs", packaged!("jouzu-image/providers/runtime.mjs")),
 ];
 
 /// Commit attribution ("Mark commits made by the agent", Settings > Tools, off by
@@ -58,7 +61,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         ensure(home.path()).unwrap();
         let image = home.path().join("agent/extensions/jouzu-image");
-        for file in ["package.json", "index.js", "providers/shisa.mjs", "providers/runtime.mjs", "artifacts.mjs"] {
+        for (file, _) in IMAGE {
             assert!(image.join(file).is_file(), "{file}");
         }
         assert!(std::fs::read_to_string(image.join("package.json")).unwrap().contains("pi"));
@@ -67,6 +70,32 @@ mod tests {
             assert!(attribution.join(file).is_file(), "{file}");
         }
         assert!(!ATTRIBUTION[2].1.contains('\r'), "the hook must stay LF for sh");
+    }
+
+    /// Every file of each packaged extension is carried: a file added to the
+    /// extension and missing here would leave the runtime without it.
+    #[test]
+    fn every_packaged_file_is_carried() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packaging/desktop/extensions");
+        for (name, files) in [("jouzu-image", IMAGE), ("jouzu-attribution", ATTRIBUTION)] {
+            let mut packaged = Vec::new();
+            let mut pending = vec![root.join(name)];
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(&directory).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else {
+                        let relative = path.strip_prefix(root.join(name)).unwrap().to_string_lossy().replace('\\', "/");
+                        packaged.push(relative);
+                    }
+                }
+            }
+            packaged.sort();
+            let mut carried: Vec<String> = files.iter().map(|(file, _)| file.to_string()).collect();
+            carried.sort();
+            assert_eq!(carried, packaged, "{name}");
+        }
     }
 
     #[test]

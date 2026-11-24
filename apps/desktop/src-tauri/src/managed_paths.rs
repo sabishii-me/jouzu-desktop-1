@@ -1,7 +1,18 @@
 //! Where an installation keeps its files. Both binaries resolve this the same way, so the app's
 //! console and a terminal entry read the same installation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// The Node executable inside the installation the host keeps under `root`:
+/// `node.exe` on Windows, `bin/node` in the official Unix tarball.
+pub fn node_executable(root: &Path) -> PathBuf {
+    let directory = root.join("runtime").join("node");
+    if cfg!(windows) {
+        directory.join("node.exe")
+    } else {
+        directory.join("bin").join("node")
+    }
+}
 
 pub fn managed_root() -> Result<PathBuf, String> {
     // A development run keeps everything under the directory it names, so nothing it writes can be

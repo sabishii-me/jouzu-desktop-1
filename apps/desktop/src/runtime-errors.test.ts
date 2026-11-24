@@ -31,8 +31,8 @@ test("errors read as sentences, never as class-prefixed exceptions", async () =>
   expect(describeError(new Error("Submission retention limit reached"))).toBe(CAPACITY_MESSAGE);
 });
 
-test("a missing bundled runtime says what is missing, not 'try again'", async () => {
+test("a session refused while the runtime installs keeps the host's sentence", async () => {
   const { describeError } = await import("./runtime-errors");
   const { ApiError } = await import("./api/jouzu-api");
-  expect(describeError(new ApiError("runtime-missing", "Jouzu's bundled Node.js is missing (C:\\x\\node.exe). Reinstall Jouzu to restore it."))).toMatch(/bundled Node\.js is missing/);
+  expect(describeError(new ApiError("runtime-not-ready", "Jouzu's runtime is not installed yet."))).toBe("Jouzu's runtime is not installed yet.");
 });

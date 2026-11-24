@@ -29,7 +29,7 @@ pub fn install_root_for_executable(executable: &Path) -> Result<PathBuf, String>
 
 /// A root is usable when the provisioned runtime and app are both there.
 fn usable(root: &Path) -> bool {
-    crate::runtime_install::node_executable(&root).is_file() && root.join("app/bootstrap.mjs").is_file()
+    crate::managed_paths::node_executable(&root).is_file() && root.join("app/bootstrap.mjs").is_file()
 }
 
 /// Where the runtime lives. The desktop release carries no runtime (ADR 0003), so a normal
@@ -147,7 +147,7 @@ mod root_tests {
     fn picks_the_root_that_holds_the_runtime() {
         let empty = tempfile::tempdir().unwrap();
         let provisioned = tempfile::tempdir().unwrap();
-        let node = crate::runtime_install::node_executable(provisioned.path());
+        let node = crate::managed_paths::node_executable(provisioned.path());
         std::fs::create_dir_all(node.parent().unwrap()).unwrap();
         std::fs::write(node, b"node").unwrap();
         std::fs::create_dir_all(provisioned.path().join("app")).unwrap();

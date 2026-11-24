@@ -162,6 +162,11 @@ export class HostClient {
     return this.request<unknown>("/v1/app");
   }
 
+  /** Install, update or repair the runtime; the outcome arrives in the snapshot's `installation`. */
+  runtimeOperation(action: "install" | "update" | "repair"): Promise<{ started: boolean; installation: unknown }> {
+    return this.request<{ started: boolean; installation: unknown }>(`/v1/runtime/${action}`, { method: "POST" });
+  }
+
   /** Queue one configuration operation; the outcome arrives in the snapshot. */
   configEnqueue(kind: string, body: Record<string, unknown> = {}): Promise<{ operationId: string; position: number }> {
     return this.request<{ operationId: string; position: number }>(`/v1/config/${encodeURIComponent(kind)}`, {
