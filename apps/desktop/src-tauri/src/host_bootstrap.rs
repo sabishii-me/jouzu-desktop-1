@@ -20,10 +20,9 @@ pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
     let runtime_home = crate::runtime::effective_home()?;
     let dist = dist_dir(app)?;
     let binary = host_binary(app)?;
-    let info_path = managed.join("host.json");
-    // A previous host may have left discovery behind. Never navigate to that
-    // stale port while the new host is starting.
-    let _ = std::fs::remove_file(&info_path);
+    // host.json is the host's: the new host replaces whatever a dead one left once it
+    // holds the home, and a live host's file stays (it names that host when this start
+    // fails). The window never reads it; it learns the port from the ready line.
     let mut command = Command::new(&binary);
     command
         .arg("--dist")

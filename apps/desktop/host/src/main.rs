@@ -89,6 +89,9 @@ async fn main() -> ExitCode {
     // One live host per home. Refuse before binding or touching host.json; a host owned
     // by a window waits for the previous window's host, which is already stopping.
     let exit_with_stdin = args.iter().any(|value| value == "--exit-with-stdin");
+    // Watched from before the wait for the home: a window that ends while its host is
+    // still waiting takes that host with it.
+    let stdin_closed = exit_with_stdin.then(watch_stdin);
     let locked = if exit_with_stdin {
         HostLock::acquire_after_previous(&home)
     } else {
@@ -101,6 +104,9 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    HOLDS_HOME.store(true, std::sync::atomic::Ordering::SeqCst);
+    // This host owns the home now: discovery left by a host that died describes nothing.
+    let _ = std::fs::remove_file(jouzu_host::host_file_path(&home));
     // The shell passes the Jouzu home; on its own the host resolves it the same way.
     let runtime_home = arg_value(&args, "--runtime-home")
         .map(PathBuf::from)
@@ -245,7 +251,7 @@ async fn main() -> ExitCode {
 
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            stop_requested(exit_with_stdin).await;
+            stop_requested(stdin_closed).await;
             jouzu_host::begin_shutdown();
         })
         .await;
@@ -267,27 +273,40 @@ async fn main() -> ExitCode {
     }
 }
 
-/// The host stops cleanly (sessions shut down, host.json and the lock removed) on Ctrl+C,
-/// on SIGTERM, and, with `--exit-with-stdin`, when its standard input closes. The window
-/// passes that flag and keeps the pipe's write end open for its whole life: when the window
-/// ends in any way (quit, crash, Force Quit, SIGKILL) the system closes the pipe, so the host
-/// never outlives it and never holds the lock against the next start. On Windows the window's
-/// job object (KILL_ON_JOB_CLOSE) already ends the host with it.
-async fn stop_requested(exit_with_stdin: bool) {
-    let stdin_closed = async move {
-        if !exit_with_stdin {
-            return std::future::pending::<()>().await;
+static HOLDS_HOME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// With `--exit-with-stdin`, the window starts the host with a pipe and keeps the write
+/// end open for its whole life: when the window ends in any way (quit, crash, Force Quit,
+/// SIGKILL) the system closes the pipe. Before this host holds the home there is nothing
+/// to clean up, so it simply exits; after, it stops cleanly (see `stop_requested`).
+fn watch_stdin() -> tokio::sync::oneshot::Receiver<()> {
+    let (closed, wait) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buffer = [0u8; 256];
+        let mut input = std::io::stdin();
+        // Anything written is ignored; only the end of the stream matters.
+        while matches!(input.read(&mut buffer), Ok(count) if count > 0) {}
+        if !HOLDS_HOME.load(std::sync::atomic::Ordering::SeqCst) {
+            std::process::exit(0);
         }
-        let (closed, wait) = tokio::sync::oneshot::channel::<()>();
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buffer = [0u8; 256];
-            let mut input = std::io::stdin();
-            // Anything written is ignored; only the end of the stream matters.
-            while matches!(input.read(&mut buffer), Ok(count) if count > 0) {}
-            let _ = closed.send(());
-        });
-        let _ = wait.await;
+        let _ = closed.send(());
+    });
+    wait
+}
+
+/// The host stops cleanly (sessions shut down, host.json and the lock removed) on Ctrl+C,
+/// on SIGTERM, and, with `--exit-with-stdin`, when its standard input closes, so it never
+/// outlives its window or holds the home against the next start. On Windows the window's
+/// job object (KILL_ON_JOB_CLOSE) already ends the host with it.
+async fn stop_requested(stdin_closed: Option<tokio::sync::oneshot::Receiver<()>>) {
+    let stdin_closed = async move {
+        match stdin_closed {
+            Some(closed) => {
+                let _ = closed.await;
+            }
+            None => std::future::pending::<()>().await,
+        }
     };
     #[cfg(unix)]
     let terminated = async {

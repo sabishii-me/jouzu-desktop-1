@@ -168,3 +168,52 @@ fn a_new_window_host_starts_once_the_previous_one_has_stopped() {
     drop(next.child.stdin.take());
     assert!(wait_for_exit(&mut next.child, "the next host kept running").success());
 }
+
+/// The window ends while its host is still waiting for the previous one: that host must
+/// end too, without ever starting, and leave the home to the host that holds it.
+#[cfg(not(windows))]
+#[test]
+fn a_waiting_host_ends_with_its_window() {
+    let root = tempfile::tempdir().unwrap();
+    let dist = dist_in(root.path());
+    let home = root.path().join("home");
+    let mut first = ready(start_window_host(&dist, &home));
+    let discovery = std::fs::read(home.join("host.json")).unwrap();
+
+    let mut waiting = start_window_host(&dist, &home);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(waiting.try_wait().unwrap().is_none(), "the second host did not wait");
+    // Its window is gone.
+    drop(waiting.stdin.take());
+    let status = wait_for_exit(&mut waiting, "the waiting host outlived its window");
+    assert!(status.success(), "{status}");
+    let mut said = String::new();
+    std::io::Read::read_to_string(&mut waiting.stdout.take().unwrap(), &mut said).unwrap();
+    assert!(said.is_empty(), "the waiting host started: {said}");
+
+    // The live host and its discovery are untouched.
+    assert!(first.child.try_wait().unwrap().is_none());
+    assert_eq!(std::fs::read(home.join("host.json")).unwrap(), discovery);
+    drop(first.child.stdin.take());
+    assert!(wait_for_exit(&mut first.child, "the first host kept running").success());
+    assert!(!home.join("host.json").exists());
+    assert!(!home.join("host.lock").exists());
+}
+
+/// A host that died without cleaning up left host.json behind. The next host owns the
+/// home and drops it before it describes itself.
+#[test]
+fn discovery_left_by_a_dead_host_is_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let dist = dist_in(root.path());
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("host.json"), r#"{"pid":999999,"port":1}"#).unwrap();
+    let mut host = ready(start_window_host(&dist, &home));
+    let info: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("host.json")).unwrap()).unwrap();
+    assert_eq!(info["port"].as_u64(), Some(u64::from(host.port)));
+    assert_eq!(info["pid"].as_u64(), Some(u64::from(host.child.id())));
+    drop(host.child.stdin.take());
+    assert!(wait_for_exit(&mut host.child, "the host kept running").success());
+}
