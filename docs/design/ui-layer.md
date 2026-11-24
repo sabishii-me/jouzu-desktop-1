@@ -130,8 +130,11 @@ sessions keep their own runtime's list.
 
 ## 7. Start page and MCP
 
-- **The app cannot work** (host unreachable, runtime not installed): the start
-  page says so in one line with the one action that fixes it.
+- **The app cannot work** (host unreachable): the start page says so in one line
+  with the one action that fixes it.
+- **The runtime is not ready**: the prepare page renders `AppView.installation`
+  (step and real progress); a failure shows its reason and Retry, which asks the
+  host to install again. The workspace opens when the installation is `ready`.
 - **An MCP server needs attention** (for example sign-in): its entry in the MCP
   menu shows the state and the action. It is not shown in the conversation and is
   not repeated each time a runtime starts.
@@ -166,6 +169,8 @@ else comes from host snapshots.
 - The notice list in `session-alerts` built from about 14 inputs, and the code
   that parses runtime text.
 - Hard-coded English strings.
+- `runtimePresent`, `needsPrepare` and the calls to the shell's runtime commands;
+  the chat's own "runtime files are missing" branch.
 
 ## 11. UI steps
 
