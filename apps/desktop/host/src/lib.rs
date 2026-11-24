@@ -6436,12 +6436,15 @@ mod session_tests {
         let pool = manager.enable_warm_runtime().expect("warm pool");
         let folder = std::fs::canonicalize(workspace.path()).unwrap();
         pool.aim(&folder);
-        // The first is ready, then the spare starts and becomes ready.
+        // The first is ready, then the spare starts and becomes ready. Aimed at a folder the
+        // pool keeps filling up to its capacity, and a fast runtime can pass two between two
+        // polls, so the test waits for at least two rather than for exactly two.
+        let warm = |pool: &crate::runtime::warm::WarmPool| pool.status()["warm"].as_u64().unwrap_or(0);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !(pool.status()["warm"] == 2 && pool.status()["state"] == "ready") && Instant::now() < deadline {
+        while !(warm(&pool) >= 2 && pool.status()["state"] == "ready") && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert_eq!(pool.status()["warm"], 2, "{}", pool.status());
+        assert!(warm(&pool) >= 2, "{}", pool.status());
         let first = manager.create_pending(workspace.path().to_str().unwrap(), None, Some("a".into())).unwrap();
         first.attach_early();
         let second = manager.create_pending(workspace.path().to_str().unwrap(), None, Some("b".into())).unwrap();
