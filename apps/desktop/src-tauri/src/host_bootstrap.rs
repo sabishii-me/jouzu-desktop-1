@@ -33,7 +33,7 @@ pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
         .arg("--runtime-home")
         .arg(&runtime_home)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     // On macOS and Linux nothing ends the host when this process dies without running
     // `stop` (a crash, Force Quit, SIGKILL), and a host left behind would hold the lock
     // against the next start. The host stops when its standard input closes, and the
@@ -64,6 +64,19 @@ pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
         }
     };
 
+    // The host's last stderr line explains a failed start (for example, why its home is
+    // held). Read to the end so the host never blocks on a full pipe.
+    let said = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+                .filter(|line| !line.trim().is_empty())
+                .last()
+        })
+    });
+
     // The host's first stdout line says where it listens and gives the token.
     // Whatever it writes after that is read and dropped so it never blocks.
     let (ready, line) = std::sync::mpsc::channel::<String>();
@@ -77,24 +90,29 @@ pub fn start(app: &tauri::AppHandle) -> Result<String, String> {
             let _ = std::io::copy(&mut reader, &mut std::io::sink());
         });
     }
-    let failed = |child: &mut Child, error: String| -> Result<String, String> {
+    // Ends the host, then says why it did not start, in its own words when it gave any.
+    let failed = |child: &mut Child, summary: &str| -> Result<String, String> {
         let _ = child.kill();
         let _ = child.wait();
         close_job(job);
-        Err(error)
+        let detail = said.and_then(|reader| reader.join().ok().flatten());
+        Err(match detail {
+            Some(detail) => format!("{summary}\n\n{}", detail.trim()),
+            None => summary.to_string(),
+        })
     };
     let first = match line.recv_timeout(Duration::from_secs(15)) {
         Ok(first) => first,
-        Err(_) => return failed(&mut child, "The host did not start in time".into()),
+        Err(_) => return failed(&mut child, "The Jouzu host did not start within 15 seconds."),
     };
     let value = serde_json::from_str::<Value>(first.trim()).unwrap_or(Value::Null);
     let port = value.get("port").and_then(Value::as_u64);
     let token = value.get("token").and_then(Value::as_str).map(str::to_string);
     let (Some(port), Some(token)) = (port, token) else {
-        return failed(&mut child, "The host stopped before it was ready".into());
+        return failed(&mut child, "The Jouzu host stopped before it was ready.");
     };
     if let Err(error) = check_build(value.get("build").and_then(Value::as_str)) {
-        return failed(&mut child, error);
+        return failed(&mut child, &error);
     }
     *HOST_API.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((port, token.clone()));
     app.manage(HostProcess(Mutex::new(Some((child, job)))));
@@ -109,6 +127,12 @@ pub fn stop(app: &tauri::AppHandle) {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some((child, job)) = child.as_mut() {
+            // On macOS and Linux, closing the host's standard input asks it to stop: it
+            // ends its streams, shuts its sessions down and removes host.json and its lock,
+            // the same way it stops when this process dies. Windows ends it with the job.
+            #[cfg(not(windows))]
+            drop(child.stdin.take());
+            #[cfg(windows)]
             let _ = child.kill();
             let _ = child.wait();
             close_job(*job);

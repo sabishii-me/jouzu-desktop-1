@@ -86,8 +86,15 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // One live host per home. Refuse before binding or touching host.json.
-    let _lock = match HostLock::acquire(&home) {
+    // One live host per home. Refuse before binding or touching host.json; a host owned
+    // by a window waits for the previous window's host, which is already stopping.
+    let exit_with_stdin = args.iter().any(|value| value == "--exit-with-stdin");
+    let locked = if exit_with_stdin {
+        HostLock::acquire_after_previous(&home)
+    } else {
+        HostLock::acquire(&home)
+    };
+    let _lock = match locked {
         Ok(lock) => lock,
         Err(error) => {
             eprintln!("{error}");
@@ -237,7 +244,10 @@ async fn main() -> ExitCode {
     let app = router(state);
 
     let result = axum::serve(listener, app)
-        .with_graceful_shutdown(stop_requested(args.iter().any(|value| value == "--exit-with-stdin")))
+        .with_graceful_shutdown(async move {
+            stop_requested(exit_with_stdin).await;
+            jouzu_host::begin_shutdown();
+        })
         .await;
 
     sessions.shutdown();

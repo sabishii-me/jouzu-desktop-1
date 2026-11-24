@@ -108,7 +108,23 @@ pub struct HostLock {
 }
 
 impl HostLock {
+    /// Takes the lock, or refuses at once while another host holds it.
     pub fn acquire(home: &Path) -> Result<Self, String> {
+        Self::take(home, false)
+    }
+
+    /// Takes the lock once the previous holder lets go. For a host owned by a window
+    /// (`--exit-with-stdin`): the app runs one window at a time, so a holder can only be
+    /// the host of a window that has already ended, which stops on its own when its pipe
+    /// closes. Reopening the app right after a Force Quit waits for that instead of failing.
+    /// On Windows the previous window's job object ends its host, and this is `acquire`.
+    pub fn acquire_after_previous(home: &Path) -> Result<Self, String> {
+        Self::take(home, true)
+    }
+
+    fn take(home: &Path, wait: bool) -> Result<Self, String> {
+        #[cfg(windows)]
+        let _ = wait;
         std::fs::create_dir_all(home)
             .map_err(|error| format!("Cannot create host home: {error}"))?;
         let path = host_lock_path(home);
@@ -130,6 +146,12 @@ impl HostLock {
             {
                 match file.try_lock() {
                     Ok(()) => {}
+                    Err(std::fs::TryLockError::WouldBlock) if wait => {
+                        // Said once, so a window that gives up waiting can tell why.
+                        eprintln!("Waiting for the previous jouzu-host to stop. {}", live_host_message(home));
+                        file.lock()
+                            .map_err(|error| format!("Cannot lock {}: {error}", path.display()))?;
+                    }
                     Err(std::fs::TryLockError::WouldBlock) => return Err(live_host_message(home)),
                     Err(std::fs::TryLockError::Error(error)) => {
                         return Err(format!("Cannot lock {}: {error}", path.display()))
@@ -265,6 +287,20 @@ pub fn log(home: &Path, level: &str, event: &str, fields: Value) {
 /// The host's first and only stdout line, for the process that started it:
 /// where it listens and the token that opens its API. It is the one place the
 /// token leaves the process.
+static STOPPING: std::sync::LazyLock<tokio::sync::watch::Sender<bool>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(false).0);
+
+/// The host is stopping: every event stream ends now. Without this, a graceful
+/// shutdown waits for clients to hang up, and an open window never does.
+pub fn begin_shutdown() {
+    STOPPING.send_replace(true);
+}
+
+async fn stopping() {
+    let mut stopping = STOPPING.subscribe();
+    let _ = stopping.wait_for(|stopping| *stopping).await;
+}
+
 pub fn ready_line(port: u16, token: &str) -> String {
     json!({ "event": "ready", "port": port, "token": token, "build": BUILD_ID }).to_string()
 }
@@ -1055,8 +1091,17 @@ async fn session_events(
             last = event.id;
             yield Ok::<_, Infallible>(sse_event(event));
         }
+        let stop = stopping();
+        tokio::pin!(stop);
         loop {
-            match receiver.recv().await {
+            // A stopping host ends its streams instead of waiting for clients that
+            // never hang up, so it exits as soon as it is asked to.
+            let next = tokio::select! {
+                _ = &mut stop => None,
+                next = receiver.recv() => Some(next),
+            };
+            let Some(next) = next else { break };
+            match next {
                 Ok(event) if event.id > last => {
                     last = event.id;
                     yield Ok::<_, Infallible>(sse_event(event));
@@ -1226,8 +1271,15 @@ async fn global_events(
                 }
             }
         }
+        let stop = stopping();
+        tokio::pin!(stop);
         loop {
-            match receiver.recv().await {
+            let next = tokio::select! {
+                _ = &mut stop => None,
+                next = receiver.recv() => Some(next),
+            };
+            let Some(next) = next else { break };
+            match next {
                 Ok(event) if event.seq > last => {
                     last = event.seq;
                     if withheld(&sessions, viewer.as_deref(), &event) { continue; }
@@ -2995,6 +3047,31 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
         drop(results);
         let _ = std::fs::remove_dir_all(home.as_path());
+    }
+
+    /// Reopening the app right after a Force Quit: the previous window's host is still
+    /// stopping. The new host waits for it to let go and then starts, instead of failing.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_window_host_waits_for_the_previous_host_to_let_go() {
+        let home = tempfile::tempdir().unwrap();
+        let previous = HostLock::acquire(home.path()).unwrap();
+        let path = home.path().to_path_buf();
+        let (taken, waited) = std::sync::mpsc::channel();
+        let next = std::thread::spawn(move || {
+            let lock = HostLock::acquire_after_previous(&path);
+            let _ = taken.send(());
+            lock
+        });
+        assert!(
+            waited.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "the lock was taken while the previous host held it"
+        );
+        drop(previous);
+        let lock = next.join().unwrap().unwrap();
+        assert!(host_lock_path(home.path()).exists());
+        drop(lock);
+        assert!(!host_lock_path(home.path()).exists());
     }
 }
 
