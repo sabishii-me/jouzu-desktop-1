@@ -36,6 +36,7 @@ import { SessionRowStatus, rowStateText } from "./session-row-status";
 import { useWarmRuntime, warmBlocks, type WarmView } from "./warm-runtime";
 import { composerTurn } from "./composer-state";
 import { newId, copyText } from "./secure-context";
+import { resizedPaneWidth } from "./pane-resize";
 
 function defaultPaneWidth() {
   return Math.min(960, Math.max(480, Math.round(window.innerWidth / 2)));
@@ -1361,12 +1362,23 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const move = (event: PointerEvent) => {
       const current = resizingPane.current;
       if (!current) return;
-      setPanes(list => list.map((pane, index) => index === current.index ? { ...pane, width: Math.min(960, Math.max(360, current.startWidth + (current.startX - event.clientX))) } : pane));
+      setPanes(list => list.map((pane, index) => index === current.index
+        ? { ...pane, width: resizedPaneWidth(current.startWidth, current.startX, event.clientX) }
+        : pane));
     };
+    // A drag ends on release, on cancellation (e.g. the OS takes over the gesture),
+    // or when the pointer is lost. Leaving any of these out strands the drag.
     const stop = () => { resizingPane.current = null; };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop);
-    return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stop); };
+    window.addEventListener("pointercancel", stop);
+    window.addEventListener("lostpointercapture", stop);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      window.removeEventListener("lostpointercapture", stop);
+    };
   }, []);
   useEffect(() => {
     let alive = true;
@@ -1733,7 +1745,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
               {pane.active === "start" ? <PanelStart onOpen={id => openPaneView(index, id)} /> : pane.active === "artifacts" ? <ArtifactsPanel embedded sessionId={artifactsSessionId} workspace={selectedSessionWorkspacePath} references={outputReferences} /> : pane.active === "files" ? <FilesPanel key={selectedSessionWorkspacePath} path={selectedSessionWorkspacePath} /> : null}
             </TabsContent>
           </Tabs>
-          <div role="separator" aria-orientation="vertical" aria-label={t.resizePane} className="absolute left-0 top-0 h-full w-1 cursor-col-resize hover:bg-primary/30" onPointerDown={event => { resizingPane.current = { index, startX: event.clientX, startWidth: pane.width }; event.preventDefault(); }} />
+          <div role="separator" aria-orientation="vertical" aria-label={t.resizePane} className="absolute -left-1 top-0 z-10 h-full w-2 cursor-col-resize touch-none select-none hover:bg-primary/20" onPointerDown={event => {
+            resizingPane.current = { index, startX: event.clientX, startWidth: pane.width };
+            // Capture keeps pointer events flowing to this element (and up to the
+            // window listener) after the pointer leaves the narrow handle.
+            event.currentTarget.setPointerCapture(event.pointerId);
+            event.preventDefault();
+          }} />
         </aside>)}
       </div>}
     </section>
