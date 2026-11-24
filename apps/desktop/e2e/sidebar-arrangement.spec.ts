@@ -57,9 +57,9 @@ async function setup(page: Page, language = "en") {
   await expect(page.locator("[data-sidebar-mode]")).toBeVisible();
 }
 
-const control = (page: Page, label: string) => page.getByRole("button", { name: label, exact: true });
-const choose = async (page: Page, label: string, option: string) => {
-  await control(page, label).click();
+const arrange = (page: Page, label = "Arrange sessions") => page.getByRole("button", { name: label, exact: true });
+const choose = async (page: Page, option: string, label = "Arrange sessions") => {
+  await arrange(page, label).click();
   await page.getByRole("menuitemradio", { name: option, exact: true }).click();
 };
 const groups = (page: Page) => page.locator("[data-sidebar-group]");
@@ -76,7 +76,7 @@ test("the sidebar starts grouped by workspace, newest first, archived hidden", a
 
 test("one list shows every workspace's sessions in one list, each row naming its workspace", async ({ page }) => {
   await setup(page);
-  await choose(page, "Group by", "In one list");
+  await choose(page, "In one list");
   await expect(page.locator("[data-sidebar-mode]")).toHaveAttribute("data-sidebar-mode", "list");
   await expect(groups(page)).toHaveCount(0);
   expect(await titles(page)).toEqual(["demo-new session", "alpha session", "demo-old session"]);
@@ -87,7 +87,7 @@ test("one list shows every workspace's sessions in one list, each row naming its
 
 test("the tree nests a workspace under the workspace whose folder holds it", async ({ page }) => {
   await setup(page);
-  await choose(page, "Group by", "Workspace tree");
+  await choose(page, "Workspace tree");
   const depth = await groups(page).evaluateAll(nodes => nodes.map(node => [node.getAttribute("data-sidebar-group"), node.getAttribute("data-group-depth")]));
   expect(depth).toEqual([["c:/projects/demo", "0"], ["c:/projects/demo/packages/alpha", "1"], ["c:/projects/other", "0"]]);
   await page.locator("aside").screenshot({ path: "test-results/sidebar-arrangement-tree.png" });
@@ -95,17 +95,17 @@ test("the tree nests a workspace under the workspace whose folder holds it", asy
 
 test("the filter shows archived sessions and only archived sessions", async ({ page }) => {
   await setup(page);
-  await choose(page, "Filter sessions", "All conversations");
+  await choose(page, "All conversations");
   expect(await titles(page)).toContain("other session");
-  await choose(page, "Filter sessions", "Archived only");
+  await choose(page, "Archived only");
   expect(await titles(page)).toEqual(["other session"]);
-  await choose(page, "Filter sessions", "Hide archived");
+  await choose(page, "Hide archived");
   expect(await titles(page)).not.toContain("other session");
 });
 
 test("a manual order is kept across a reload, for groups and for sessions", async ({ page }) => {
   await setup(page);
-  await choose(page, "Order by", "Manual");
+  await choose(page, "Manual");
   // Moving the older session up reorders its own group only.
   await rows(page).filter({ hasText: "demo-old session" }).locator("button").first().focus();
   await page.keyboard.press("Alt+ArrowUp");
@@ -125,11 +125,11 @@ test("a manual order is kept across a reload, for groups and for sessions", asyn
 
 test("the choice is remembered and the menu marks the active one", async ({ page }) => {
   await setup(page);
-  await choose(page, "Group by", "In one list");
-  await control(page, "Group by").click();
+  await choose(page, "In one list");
+  await arrange(page).click();
   await expect(page.getByRole("menuitemradio", { name: "In one list", exact: true })).toHaveAttribute("aria-checked", "true");
   await expect(page.getByRole("menuitemradio", { name: "Workspace", exact: true })).toHaveAttribute("aria-checked", "false");
-  await page.locator("aside").screenshot({ path: "test-results/sidebar-arrangement-menu.png" });
+  await page.screenshot({ path: "test-results/sidebar-arrangement-menu.png" });
   await page.keyboard.press("Escape");
   await expect(page.getByRole("menuitemradio", { name: "In one list", exact: true })).toHaveCount(0);
 
@@ -139,7 +139,7 @@ test("the choice is remembered and the menu marks the active one", async ({ page
 
 test("the arrangement speaks the interface language", async ({ page }) => {
   await setup(page, "ja");
-  await control(page, "グループ").click();
+  await arrange(page, "セッションの並べ方").click();
   await expect(page.getByRole("menuitemradio", { name: "ワークスペースツリー", exact: true })).toBeVisible();
   await page.getByRole("menuitemradio", { name: "ワークスペースツリー", exact: true }).click();
   await expect(page.locator("[data-sidebar-mode]")).toHaveAttribute("data-sidebar-mode", "groups");

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { ArrowUpCircle, ArrowUpDown, Archive, ArchiveRestore, Check, ChevronDown, ChevronRight, Copy, FolderOpen, FolderPlus, Images, Layers, MessageSquare, MoreHorizontal, PanelLeft, Columns2, PanelRight, Pencil, Pin, Plus, RefreshCw, Search, Settings, Sparkles, X } from "lucide-react";
+import { ArrowUpCircle, Archive, ArchiveRestore, Check, ChevronDown, ChevronRight, Copy, FolderOpen, FolderPlus, Images, MessageSquare, MoreHorizontal, PanelLeft, Columns2, PanelRight, Pencil, Pin, Plus, RefreshCw, Search, Settings, SlidersHorizontal, Sparkles, X } from "lucide-react";
 import { Button } from "./components/ui/button";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuSeparator, DropdownMenuTrigger } from "./components/ui/dropdown-menu";
 import { Input } from "./components/ui/input";
 import { McpMenu } from "./mcp-menu";
 import { ChatConversation, type EarlierHistory } from "./chat-conversation";
@@ -8,7 +9,7 @@ import { AgentAction, turnLabel } from "./chat-live";
 import { Composer } from "./composer";
 import { changedFiles, snapshotComplete, type WorkspaceSnapshot } from "./workspace-diff";
 import { loadCollapsed, saveCollapsed, toggleCollapsed } from "./sidebar-state";
-import { buildSidebar, loadArrangement, loadManualOrder, manualFromModel, moveBefore, moveWithin, pathKey, saveArrangement, saveManualOrder, type Arrangement, type ManualOrder, type OrderBy, type SidebarGroup } from "./sidebar-arrangement";
+import { buildSidebar, loadArrangement, loadManualOrder, manualFromModel, moveBefore, moveWithin, pathKey, saveArrangement, saveManualOrder, type Arrangement, type GroupBy, type ManualOrder, type OrderBy, type SessionFilter, type SidebarGroup } from "./sidebar-arrangement";
 import { ArtifactsPanel } from "./artifacts-panel";
 import { useApi } from "./api/context";
 import type { JouzuApi } from "./api/jouzu-api";
@@ -91,15 +92,6 @@ const sessionIdFromFile = (path?: string): string | undefined => {
   const name = path?.replaceAll("\\", "/").split("/").filter(Boolean).at(-1)?.replace(/\.jsonl$/u, "") ?? "";
   return /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu.exec(name)?.[1];
 };
-function MenuHeading({ label }: { label: string }) {
-  return <p className="px-2 pb-1 pt-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</p>;
-}
-/** One choice in a sidebar arrangement menu; the active one is marked and announced. */
-function MenuChoice({ label, checked, onPick }: { label: string; checked: boolean; onPick: () => void }) {
-  return <button type="button" role="menuitemradio" aria-checked={checked} onClick={onPick} className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent focus-visible:bg-accent">
-    <span className="min-w-0 flex-1 truncate">{label}</span>{checked && <Check className="size-3.5 shrink-0 text-primary" />}
-  </button>;
-}
 function relativeTime(updated: number) {
   const seconds = Math.max(0, Math.round(Date.now() / 1000 - updated));
   if (seconds < 60) return "now";
@@ -288,7 +280,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // to arrange, and a preference that cannot be stored holds for this session.
   const [arrangement, setArrangement] = useState<Arrangement>(() => loadArrangement());
   const [manual, setManual] = useState<ManualOrder>(() => loadManualOrder());
-  const [menu, setMenu] = useState<"group" | "order" | "filter" | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerSpace, setPickerSpace] = useState<number | null>(null);
   const picker = useRef<HTMLDivElement>(null);
@@ -1298,15 +1289,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     query: search,
     label: workspace => workspaceLabel(workspace, t),
   }), [workspaces, sessions, arrangement, manual, search, t]);
-  const arrangementRoot = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!menu) return;
-    const close = (event: MouseEvent) => { if (!arrangementRoot.current?.contains(event.target as Node)) setMenu(null); };
-    const escape = (event: KeyboardEvent) => { if (event.key === "Escape") setMenu(null); };
-    document.addEventListener("mousedown", close);
-    document.addEventListener("keydown", escape);
-    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", escape); };
-  }, [menu]);
   const changeArrangement = (next: Partial<Arrangement>) => {
     const value = { ...arrangement, ...next };
     setArrangement(value);
@@ -1319,6 +1301,34 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     if (next === "manual" && arrangement.orderBy !== "manual") reorder(manualFromModel(model));
     changeArrangement({ orderBy: next });
   };
+  // One control, one menu: grouping, order and filter are three sections of the
+  // same choice (0026, 0027). The popover, focus and dismissal belong to the
+  // primitive, not to this view.
+  const arrangementMenu = (label: string) =>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild><Button variant="ghost" className="size-7 p-0" aria-label={label}><SlidersHorizontal className="size-3.5" /></Button></DropdownMenuTrigger>
+      <DropdownMenuContent align="end" aria-label={label} className="w-60">
+        <DropdownMenuLabel>{t.groupBy}</DropdownMenuLabel>
+        <DropdownMenuRadioGroup value={arrangement.groupBy} onValueChange={value => changeArrangement({ groupBy: value as GroupBy })}>
+          <DropdownMenuRadioItem value="workspace">{t.groupWorkspace}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="tree">{t.groupTree}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="one-list">{t.groupOneList}</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>{t.orderBy}</DropdownMenuLabel>
+        <DropdownMenuRadioGroup value={arrangement.orderBy} onValueChange={value => chooseOrder(value as OrderBy)}>
+          <DropdownMenuRadioItem value="manual">{t.orderManual}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="updated">{t.orderUpdated}</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>{t.filterSessions}</DropdownMenuLabel>
+        <DropdownMenuRadioGroup value={arrangement.filter} onValueChange={value => changeArrangement({ filter: value as SessionFilter })}>
+          <DropdownMenuRadioItem value="hide-archived">{t.filterHideArchived}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="all">{t.filterAll}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="archived-only">{t.filterArchivedOnly}</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>;
   // A host session the runtime has not written yet is its list row by its id (#177).
   const boundRow = snapshot.sessionFile ?? (snapshot.sessionId && !hero ? liveRowKey(snapshot.sessionId) : "");
   const activeSession = normalizedPath(boundRow);
@@ -1492,7 +1502,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     [conversationProjection.messages, artifactsSessionId],
   );
   const conversationKey = selectedSession ?? snapshot.sessionId ?? path;
-  const hasArchived = sessions.some(session => session.archived);
   const selectedWorkspace = sessions.find(session => normalizedPath(session.path) === selectedKey)?.workspace;
   useEffect(() => { if (selectedSession) selectedRowRef.current?.scrollIntoView({ block: "nearest" }); }, [selectedSession]);
   const showingAttached = selectedKey === activeSession;
@@ -1705,34 +1714,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       <div className="px-2 pb-2"><Button variant={appView === "artifacts" ? "default" : "ghost"} className="w-full justify-start gap-2" aria-pressed={appView === "artifacts"} onClick={() => setAppView(appView === "artifacts" ? "chat" : "artifacts")}><Images className="size-4" />{t.artifacts}</Button></div>
       <div className="flex items-center justify-between border-t border-border px-3 py-2">
         <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t.workspaces}</h2>
-        <div ref={arrangementRoot} className="flex items-center gap-1">
+        <div className="flex items-center gap-1">
           <Button variant="ghost" className="size-7 p-0" aria-label={t.searchWorkspaces} aria-pressed={searchOpen} onClick={() => { setSearchOpen(value => !value); if (searchOpen) setSearch(""); }}><Search className="size-3.5" /></Button>
-          {(hasArchived || arrangement.filter !== "hide-archived") && <div className="relative">
-            <Button variant="ghost" className="size-7 p-0" aria-label={t.filterSessions} aria-haspopup="menu" aria-expanded={menu === "filter"} onClick={() => setMenu(menu === "filter" ? null : "filter")}><Archive className="size-3.5" /></Button>
-            {menu === "filter" && <div role="menu" aria-label={t.filterSessions} className="absolute right-0 top-full z-40 mt-1 w-56 rounded-xl border border-border bg-popover p-1 text-sm shadow-xl">
-              <MenuHeading label={t.filterSessions} />
-              <MenuChoice label={t.filterHideArchived} checked={arrangement.filter === "hide-archived"} onPick={() => { changeArrangement({ filter: "hide-archived" }); setMenu(null); }} />
-              <MenuChoice label={t.filterAll} checked={arrangement.filter === "all"} onPick={() => { changeArrangement({ filter: "all" }); setMenu(null); }} />
-              <MenuChoice label={t.filterArchivedOnly} checked={arrangement.filter === "archived-only"} onPick={() => { changeArrangement({ filter: "archived-only" }); setMenu(null); }} />
-            </div>}
-          </div>}
-          <div className="relative">
-            <Button variant="ghost" className="size-7 p-0" aria-label={t.orderBy} aria-haspopup="menu" aria-expanded={menu === "order"} onClick={() => setMenu(menu === "order" ? null : "order")}><ArrowUpDown className="size-3.5" /></Button>
-            {menu === "order" && <div role="menu" aria-label={t.orderBy} className="absolute right-0 top-full z-40 mt-1 w-56 rounded-xl border border-border bg-popover p-1 text-sm shadow-xl">
-              <MenuHeading label={t.orderBy} />
-              <MenuChoice label={t.orderManual} checked={arrangement.orderBy === "manual"} onPick={() => { chooseOrder("manual"); setMenu(null); }} />
-              <MenuChoice label={t.orderUpdated} checked={arrangement.orderBy === "updated"} onPick={() => { chooseOrder("updated"); setMenu(null); }} />
-            </div>}
-          </div>
-          <div className="relative">
-            <Button variant="ghost" className="size-7 p-0" aria-label={t.groupBy} aria-haspopup="menu" aria-expanded={menu === "group"} onClick={() => setMenu(menu === "group" ? null : "group")}><Layers className="size-3.5" /></Button>
-            {menu === "group" && <div role="menu" aria-label={t.groupBy} className="absolute right-0 top-full z-40 mt-1 w-56 rounded-xl border border-border bg-popover p-1 text-sm shadow-xl">
-              <MenuHeading label={t.groupBy} />
-              <MenuChoice label={t.groupWorkspace} checked={arrangement.groupBy === "workspace"} onPick={() => { changeArrangement({ groupBy: "workspace" }); setMenu(null); }} />
-              <MenuChoice label={t.groupTree} checked={arrangement.groupBy === "tree"} onPick={() => { changeArrangement({ groupBy: "tree" }); setMenu(null); }} />
-              <MenuChoice label={t.groupOneList} checked={arrangement.groupBy === "one-list"} onPick={() => { changeArrangement({ groupBy: "one-list" }); setMenu(null); }} />
-            </div>}
-          </div>
+          {arrangementMenu(t.arrangeSessions)}
           <Button variant="ghost" className="size-7 p-0" aria-label={t.addFolder} onClick={onAddFolder}><FolderPlus className="size-3.5" /></Button>
         </div>
       </div>
