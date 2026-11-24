@@ -9,6 +9,18 @@ license = "Apache-2.0"
 name = "jouzu-desktop"
 path = "src/main.rs"
 
+# The terminal entry program (`jz`, `jouzu`) that the Windows installer links to. Only the
+# Windows package installs terminal entries, so only Windows builds it: tauri.windows.conf.json
+# turns the feature on, and the macOS and Linux packages do not carry a `console` binary
+# (it would land as /usr/bin/console from the .deb).
+[[bin]]
+name = "console"
+path = "src/bin/console.rs"
+required-features = ["terminal-console"]
+
+[features]
+terminal-console = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -37,18 +49,7 @@ windows = { version = "0.62", default-features = false, features = ["Win32_Found
 
 # Non-blocking runtime pipes and process-group termination for the chat supervisor.
 [target.'cfg(unix)'.dependencies]
+# The start-failure alert on macOS and Linux (Windows uses MessageBoxW): the same rfd that
+# tauri-plugin-dialog already builds.
+rfd = { version = "0.16", default-features = false, features = ["gtk3"] }
 libc = "0.2"
-
-
-
-
-
-
-
-
-
-
-
-
-
-

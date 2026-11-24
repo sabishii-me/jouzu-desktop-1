@@ -44,7 +44,9 @@ fn usage() {
          Usage: jouzu-host [--dist <path>] [--home <path>]\n\n\
          --dist  built SPA directory (default: ./dist)\n\
          --home  directory for host.json and logs (default: JOUZU_HOST_HOME,\n\
-                 then %LOCALAPPDATA%\\Shisa.ai\\JouzuDesktop)"
+                 then %LOCALAPPDATA%\\Shisa.ai\\JouzuDesktop)\n\
+         --exit-with-stdin  stop when standard input closes (the window that\n\
+                 started the host is gone, however it ended)"
     );
 }
 
@@ -84,14 +86,27 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // One live host per home. Refuse before binding or touching host.json.
-    let _lock = match HostLock::acquire(&home) {
+    // One live host per home. Refuse before binding or touching host.json; a host owned
+    // by a window waits for the previous window's host, which is already stopping.
+    let exit_with_stdin = args.iter().any(|value| value == "--exit-with-stdin");
+    // Watched from before the wait for the home: a window that ends while its host is
+    // still waiting takes that host with it.
+    let stdin_closed = exit_with_stdin.then(watch_stdin);
+    let locked = if exit_with_stdin {
+        HostLock::acquire_after_previous(&home)
+    } else {
+        HostLock::acquire(&home)
+    };
+    let _lock = match locked {
         Ok(lock) => lock,
         Err(error) => {
             eprintln!("{error}");
             return ExitCode::FAILURE;
         }
     };
+    HOLDS_HOME.store(true, std::sync::atomic::Ordering::SeqCst);
+    // This host owns the home now: discovery left by a host that died describes nothing.
+    let _ = std::fs::remove_file(jouzu_host::host_file_path(&home));
     // The shell passes the Jouzu home; on its own the host resolves it the same way.
     let runtime_home = arg_value(&args, "--runtime-home")
         .map(PathBuf::from)
@@ -271,8 +286,9 @@ async fn main() -> ExitCode {
     let app = router(state);
 
     let result = axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            stop_requested(stdin_closed).await;
+            jouzu_host::begin_shutdown();
         })
         .await;
 
@@ -290,6 +306,59 @@ async fn main() -> ExitCode {
             eprintln!("host stopped with an error: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+static HOLDS_HOME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// With `--exit-with-stdin`, the window starts the host with a pipe and keeps the write
+/// end open for its whole life: when the window ends in any way (quit, crash, Force Quit,
+/// SIGKILL) the system closes the pipe. Before this host holds the home there is nothing
+/// to clean up, so it simply exits; after, it stops cleanly (see `stop_requested`).
+fn watch_stdin() -> tokio::sync::oneshot::Receiver<()> {
+    let (closed, wait) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buffer = [0u8; 256];
+        let mut input = std::io::stdin();
+        // Anything written is ignored; only the end of the stream matters.
+        while matches!(input.read(&mut buffer), Ok(count) if count > 0) {}
+        if !HOLDS_HOME.load(std::sync::atomic::Ordering::SeqCst) {
+            std::process::exit(0);
+        }
+        let _ = closed.send(());
+    });
+    wait
+}
+
+/// The host stops cleanly (sessions shut down, host.json and the lock removed) on Ctrl+C,
+/// on SIGTERM, and, with `--exit-with-stdin`, when its standard input closes, so it never
+/// outlives its window or holds the home against the next start. On Windows the window's
+/// job object (KILL_ON_JOB_CLOSE) already ends the host with it.
+async fn stop_requested(stdin_closed: Option<tokio::sync::oneshot::Receiver<()>>) {
+    let stdin_closed = async move {
+        match stdin_closed {
+            Some(closed) => {
+                let _ = closed.await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(unix)]
+    let terminated = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminated = std::future::pending::<()>();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminated => {}
+        _ = stdin_closed => {}
     }
 }
 
