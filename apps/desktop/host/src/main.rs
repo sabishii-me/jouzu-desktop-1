@@ -144,6 +144,11 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The installation under the host home, unless the host was given its
+    // runtime (ADR 0026). It is checked now; installing starts below.
+    let installation = runtime
+        .is_none()
+        .then(|| jouzu_host::installation::Installation::managed(&managed, &runtime_home));
     let sessions = std::sync::Arc::new(match runtime {
         Some(spec) => SessionManager::new(
             Some(spec),
@@ -162,9 +167,36 @@ async fn main() -> ExitCode {
             Some(events.clone()),
         ),
     });
+    if let Some(installation) = &installation {
+        sessions.use_installation(installation.clone());
+        control.watch_installation(installation.clone());
+        // The operation runs on a thread of its own; the sessions it stops and
+        // the warm runtime it starts live on this runtime.
+        let handle = tokio::runtime::Handle::current();
+        {
+            let sessions = sessions.clone();
+            let handle = handle.clone();
+            installation.before_replace(move || {
+                let _runtime = handle.enter();
+                sessions.stop_all();
+            });
+        }
+        {
+            let sessions = sessions.clone();
+            installation.on_ready(move || {
+                let _runtime = handle.enter();
+                sessions.runtime_installed();
+            });
+        }
+    }
     // Start a runtime now, while the window shows loading, not when the user
-    // sends the first message.
+    // sends the first message. Without a `ready` installation it starts when
+    // the installation becomes `ready`.
     sessions.enable_warm_runtime();
+    // Installs or updates the runtime when it is not `ready`; no client has to ask.
+    if let Some(installation) = &installation {
+        installation.begin();
+    }
     {
         let sessions = sessions.clone();
         tokio::spawn(async move {
@@ -181,6 +213,10 @@ async fn main() -> ExitCode {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 sessions.reap_idle(limits);
+                // Runtime files removed while the host runs are installed again.
+                if let Some(installation) = sessions.installation() {
+                    installation.verify();
+                }
             }
         });
     }

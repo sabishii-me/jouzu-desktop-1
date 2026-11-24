@@ -304,6 +304,8 @@ pub struct ControlManager {
     /// The rest of AppView, owned elsewhere: the configuration generation, the
     /// runtimes' models and the tools (`SessionManager::app_parts`).
     parts: OnceLock<Box<dyn Fn() -> Map<String, Value> + Send + Sync>>,
+    /// The runtime installation, shown as `AppView.installation` (ADR 0029).
+    installation: OnceLock<Arc<crate::installation::Installation>>,
 }
 
 impl ControlManager {
@@ -330,6 +332,7 @@ impl ControlManager {
             after_change: OnceLock::new(),
             providers: OnceLock::new(),
             parts: OnceLock::new(),
+            installation: OnceLock::new(),
         })
     }
 
@@ -350,6 +353,22 @@ impl ControlManager {
             }
         });
         let _ = self.providers.set(providers);
+    }
+
+    /// Set once by the host when it starts: `AppView.installation` follows it.
+    pub fn watch_installation(self: &Arc<Self>, installation: Arc<crate::installation::Installation>) {
+        let manager = Arc::downgrade(self);
+        installation.on_change(move || {
+            if let Some(manager) = manager.upgrade() {
+                let mut queue = manager.lock();
+                manager.publish(&mut queue);
+            }
+        });
+        let _ = self.installation.set(installation);
+    }
+
+    fn installation_view(&self) -> Value {
+        self.installation.get().map_or(Value::Null, |installation| installation.view())
     }
 
     fn provider_view(&self) -> Value {
@@ -395,10 +414,10 @@ impl ControlManager {
     /// The configuration part of `AppView`: what runs, what waits, the last result
     /// of each kind, and the current settings.
     pub fn view(&self) -> Value {
-        Self::render(&self.lock(), self.provider_view(), self.parts_view())
+        Self::render(&self.lock(), self.provider_view(), self.installation_view(), self.parts_view())
     }
 
-    fn render(queue: &Queue, providers: Value, parts: Map<String, Value>) -> Value {
+    fn render(queue: &Queue, providers: Value, installation: Value, parts: Map<String, Value>) -> Value {
         let running = queue.running.as_ref().map(|running| {
             let mut value = json!({
                 "operationId": running.id,
@@ -433,6 +452,8 @@ impl ControlManager {
             "settings": queue.settings,
             // Providers whose latest reply refused the stored key or sign-in.
             "providerAuth": providers,
+            // The runtime installation; `null` when the host was given its runtime.
+            "installation": installation,
         });
         if let Some(object) = view.as_object_mut() {
             object.extend(parts);
@@ -443,7 +464,10 @@ impl ControlManager {
     fn publish(&self, queue: &mut Queue) {
         queue.revision += 1;
         if let Some(hub) = &self.hub {
-            hub.publish_control("app.updated", Self::render(queue, self.provider_view(), self.parts_view()));
+            hub.publish_control(
+                "app.updated",
+                Self::render(queue, self.provider_view(), self.installation_view(), self.parts_view()),
+            );
         }
     }
 
