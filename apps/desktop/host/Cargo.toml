@@ -23,6 +23,9 @@ sha2 = "0.10"
 hex = "0.4"
 if-addrs = "0.13"
 futures-util = "0.3"
+# The runtime installation downloads Node from nodejs.org (ADR 0026).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+semver = "1"
 
 [dev-dependencies]
 tempfile = "3"

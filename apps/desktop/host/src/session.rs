@@ -6176,6 +6176,9 @@ pub struct SessionManager {
     persisted_cache: Mutex<Option<Vec<Value>>>,
     /// Configuration changes so far: only the latest one's re-read runs.
     reload_epoch: Arc<AtomicU64>,
+    /// The runtime installation (ADR 0026). When set, no runtime starts while
+    /// it is not `ready`.
+    installation: std::sync::OnceLock<Arc<crate::installation::Installation>>,
 }
 
 /// How long after a configuration change open sessions wait before they
@@ -6310,6 +6313,34 @@ impl SessionManager {
             holders: Mutex::new(HashMap::new()),
             persisted_cache: Mutex::new(None),
             reload_epoch: Arc::new(AtomicU64::new(0)),
+            installation: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Set once by the host when it starts: runtimes start only while the
+    /// installation is `ready`.
+    pub fn use_installation(&self, installation: Arc<crate::installation::Installation>) {
+        let _ = self.installation.set(installation);
+    }
+
+    pub fn installation(&self) -> Option<Arc<crate::installation::Installation>> {
+        self.installation.get().cloned()
+    }
+
+    /// The installation became `ready` (first install, update or repair): start
+    /// the warm runtime again, so the next new session is ready at once.
+    pub fn runtime_installed(&self) {
+        if self.config.get().is_none() {
+            // Finding the runtime starts the pool when it is wanted.
+            let _ = self.config();
+            return;
+        }
+        if let Some(pool) = self.warm_runtime() {
+            pool.resume();
+        } else if self.warm_wanted.load(Ordering::SeqCst) {
+            if let Some(config) = self.config.get() {
+                Self::start_warm(config);
+            }
         }
     }
 
@@ -6339,6 +6370,10 @@ impl SessionManager {
             return Some(config);
         }
         let managed = self.managed.as_ref()?;
+        // Files of an installation that is not `ready` may be half written.
+        if self.installation.get().is_some_and(|installation| !installation.is_ready()) {
+            return None;
+        }
         let spec = RuntimeSpec::from_managed(&managed.root)?;
         let mut found = false;
         let config = self.config.get_or_init(|| {
@@ -6700,16 +6735,12 @@ impl SessionManager {
     }
 
     pub fn status(&self) -> Value {
-        let app_version = std::fs::read(self.home.join("app").join("package.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|value| value.get("version").and_then(Value::as_str).map(str::to_string));
         json!({
             "hostVersion": env!("CARGO_PKG_VERSION"),
             "runtimeHome": self.runtime_home.to_string_lossy(),
-            "appVersion": app_version,
-            "node": managed_node_path(&self.home).is_file(),
-            "app": self.home.join("app").join("bootstrap.mjs").is_file(),
+            // Whether the runtime is installed is the installation's to say
+            // (ADR 0026); a host given its runtime has none.
+            "installation": self.installation.get().map(|installation| installation.view()),
             // The bash sessions start with: the one given to the host, else the
             // same lookup each spawn makes (bundled Git Bash on Windows, the
             // system bash on macOS and Linux).
@@ -6721,8 +6752,6 @@ impl SessionManager {
                 .filter(|bash| bash.is_file())
                 .or_else(|| find_bash(&self.home))
                 .is_some(),
-            "git": self.home.join("runtime").join("git").exists(),
-            "terminal": self.home.join("runtime").join("terminal").exists(),
             "warmRuntime": self.warm_runtime().map(|pool| pool.status()),
         })
     }
@@ -7483,6 +7512,11 @@ impl SessionManager {
                 sessions.remove(&existing.id);
             }
         }
+        if let Some(installation) = self.installation.get() {
+            if !installation.verify() {
+                return Err(installation.not_ready());
+            }
+        }
         let config = self.config().cloned().ok_or_else(|| {
             // Without a `--runtime`, the host runs the bundled Node and app; say
             // which one is missing rather than falling back to anything else.
@@ -7834,6 +7868,9 @@ pub struct ApiError {
     pub code: &'static str,
     pub message: String,
     pub retryable: bool,
+    /// Fields added to the error object (for example the current
+    /// `installation` with `runtime-not-ready`).
+    pub details: Option<Value>,
 }
 
 impl ApiError {
@@ -7848,6 +7885,7 @@ impl ApiError {
             code,
             message: message.into(),
             retryable,
+            details: None,
         }
     }
 
@@ -7881,17 +7919,17 @@ impl ApiError {
 
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        (
-            self.status,
-            axum::Json(json!({
-                "error": {
-                    "code": self.code,
-                    "message": self.message,
-                    "retryable": self.retryable,
-                }
-            })),
-        )
-            .into_response()
+        let mut error = json!({
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+        });
+        if let Some(Value::Object(details)) = self.details {
+            for (key, value) in details {
+                error[key] = value;
+            }
+        }
+        (self.status, axum::Json(json!({ "error": error }))).into_response()
     }
 }
 

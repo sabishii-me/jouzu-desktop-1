@@ -17,6 +17,7 @@ pub mod awake;
 pub mod control;
 mod environment;
 pub mod events;
+pub mod installation;
 mod files;
 pub mod known_models;
 pub mod provider_answers;
@@ -249,6 +250,7 @@ pub fn router(state: AppState) -> Router {
         .route("/status", get(host_status))
         .route("/timing", axum::routing::post(record_ui_timing))
         .route("/runtime/warm", get(warm_runtime).post(aim_warm_runtime))
+        .route("/runtime/{action}", axum::routing::post(runtime_operation))
         .route("/environment", get(read_environment))
         .route("/capabilities", get(capabilities))
         .route("/web-access", get(web_access_snapshot).put(update_web_access))
@@ -1349,6 +1351,30 @@ struct WarmQuery {
 struct AimWarmRequest {
     #[serde(rename = "workspacePath")]
     workspace_path: String,
+}
+
+/// Install, update or repair the runtime (ADR 0026). Answers at once; the
+/// operation's progress and outcome are in `AppView.installation`. Asking while
+/// one runs changes nothing.
+async fn runtime_operation(
+    State(state): State<AppState>,
+    AxumPath(action): AxumPath<String>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let action = installation::Action::parse(&action)
+        .ok_or_else(|| ApiError::bad_request("Unknown runtime operation"))?;
+    let installation = state.sessions.installation().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "runtime-not-managed",
+            "This host runs a runtime it was given; it has no installation to change.",
+            false,
+        )
+    })?;
+    let started = installation.start(action);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "started": started, "installation": installation.view() })),
+    ))
 }
 
 /// The client opened a workspace: warm the runtime for it.
@@ -5800,53 +5826,222 @@ mod session_tests {
         manager.stop_all();
     }
 
-    /// Issue #87: on a first launch the desktop starts the host, then installs
-    /// the managed runtime. The host must pick the runtime up once it exists,
-    /// for sessions and for the warm pool, without being restarted.
-    #[tokio::test]
-    async fn a_managed_runtime_installed_after_the_host_started_is_picked_up() {
-        let managed = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
+    /// An installation that "installs" the fake runtime: the fixture as the
+    /// bundled Node's script and as the app's entry. Held by `gate` while it runs.
+    struct FixtureInstaller {
+        root: PathBuf,
+        gate: Arc<std::sync::Mutex<()>>,
+    }
+
+    impl FixtureInstaller {
+        fn present(&self) -> bool {
+            crate::session::managed_node_path(&self.root).is_file()
+                && self.root.join("app/bootstrap.mjs").is_file()
+        }
+    }
+
+    impl installation::Installer for FixtureInstaller {
+        fn inspect(&self) -> installation::Found {
+            if self.present() {
+                installation::Found::Current { version: "0.2.5".into(), node_version: None }
+            } else {
+                installation::Found::Absent
+            }
+        }
+        fn files_present(&self) -> bool {
+            self.present()
+        }
+        fn install(
+            &self,
+            _action: installation::Action,
+            progress: &dyn Fn(Value),
+        ) -> Result<String, String> {
+            progress(json!({ "phase": "packages" }));
+            let _gate = self.gate.lock().unwrap();
+            let node = crate::session::managed_node_path(&self.root);
+            if !node.is_file() {
+                std::fs::create_dir_all(node.parent().unwrap()).unwrap();
+                std::fs::copy(RuntimeSpec::node_script(&fixture()).program, &node).unwrap();
+            }
+            std::fs::create_dir_all(self.root.join("app")).unwrap();
+            std::fs::copy(fixture(), self.root.join("app/bootstrap.mjs")).unwrap();
+            Ok("0.2.5".into())
+        }
+    }
+
+    /// A managed host as `main` wires it, with the fixture installer.
+    fn installed_manager(
+        managed: &std::path::Path,
+    ) -> (Arc<SessionManager>, Arc<installation::Installation>, Arc<std::sync::Mutex<()>>) {
         let manager = Arc::new(SessionManager::managed(
-            managed.path().to_path_buf(),
-            managed.path().to_path_buf(),
-            managed.path().join("data"),
+            managed.to_path_buf(),
+            managed.to_path_buf(),
+            managed.join("data"),
             None,
             50,
             None,
         ));
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let installation = installation::Installation::new(
+            FixtureInstaller { root: managed.to_path_buf(), gate: gate.clone() },
+            None,
+        );
+        manager.use_installation(installation.clone());
+        let handle = tokio::runtime::Handle::current();
+        {
+            let manager = manager.clone();
+            let handle = handle.clone();
+            installation.before_replace(move || {
+                let _runtime = handle.enter();
+                manager.stop_all();
+            });
+        }
+        {
+            let manager = manager.clone();
+            installation.on_ready(move || {
+                let _runtime = handle.enter();
+                manager.runtime_installed();
+            });
+        }
+        (manager, installation, gate)
+    }
+
+    async fn wait_installed(installation: &installation::Installation) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !installation.is_ready() {
+            assert!(Instant::now() < deadline, "{}", installation.view());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// ADR 0026 (and #87): on a first launch the host installs the runtime
+    /// itself. A session asked for meanwhile is refused with the installation's
+    /// state, not with missing files; once it is `ready`, the warm runtime
+    /// starts and sessions run, without a host restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_host_installs_the_runtime_and_refuses_sessions_until_it_is_ready() {
+        let managed = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (manager, installation, gate) = installed_manager(managed.path());
+        assert_eq!(installation.view()["state"], "absent");
         // The host binary asks for a warm runtime at start, before the install.
         assert!(manager.enable_warm_runtime().is_none());
-        assert!(manager.node_executable().is_none());
+        let held = gate.lock().unwrap();
+        installation.begin();
         let error = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .err()
-            .expect("no runtime yet");
-        assert_eq!(error.code, "runtime-missing", "{}", error.message);
+            .expect("not installed yet");
+        assert_eq!(error.code, "runtime-not-ready", "{}", error.message);
+        assert_eq!(error.details.as_ref().unwrap()["installation"]["state"], "installing");
+        // Files written while the installation runs are not used yet.
+        assert!(manager.node_executable().is_none());
+        drop(held);
+        wait_installed(&installation).await;
 
-        // What the first-run preparation writes: the bundled Node, then the app.
-        let node = crate::session::managed_node_path(managed.path());
-        std::fs::create_dir_all(node.parent().unwrap()).unwrap();
-        std::fs::copy(RuntimeSpec::node_script(&fixture()).program, &node).unwrap();
-        let app = managed.path().join("app");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::copy(fixture(), app.join("bootstrap.mjs")).unwrap();
-
+        let pool = manager.warm_runtime().expect("the warm pool started with the installation");
+        let status = pool.wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(status["state"], "ready", "{status}");
         let session = manager
             .create_pending(workspace.path().to_str().unwrap(), None, None)
             .expect("the installed runtime is used");
-        assert_eq!(manager.node_executable(), Some(node));
-        // Tools that load the runtime's packages find them in this app, not
-        // next to the data home.
-        assert_eq!(manager.runtime_app(), Some(app.clone()));
-        let pool = manager.warm_runtime().expect("the warm pool started with the runtime");
-        let status = pool.wait_settled(Duration::from_secs(10)).await;
-        assert_eq!(status["state"], "ready", "{status}");
+        assert_eq!(manager.runtime_app(), Some(managed.path().join("app")));
         session.attach_early();
         wait_model_state(&session, "ready").await;
         session.send("first", "hello").unwrap();
         wait_status(&session, Status::Idle).await;
         manager.stop_all();
+    }
+
+    /// The runtime's files disappear while the host runs: the next session
+    /// start finds that out, the installation is installed again on its own,
+    /// and the warm runtime comes back with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_files_removed_while_the_host_runs_are_installed_again() {
+        let managed = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (manager, installation, _gate) = installed_manager(managed.path());
+        manager.enable_warm_runtime();
+        installation.begin();
+        wait_installed(&installation).await;
+        manager.warm_runtime().unwrap().wait_settled(Duration::from_secs(10)).await;
+
+        std::fs::remove_dir_all(managed.path().join("app")).unwrap();
+        let error = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .err()
+            .expect("the files are gone");
+        assert_eq!(error.code, "runtime-not-ready");
+        wait_installed(&installation).await;
+        let status = manager.warm_runtime().unwrap().wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(status["state"], "ready", "{status}");
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .expect("installed again");
+        session.attach_early();
+        wait_model_state(&session, "ready").await;
+        manager.stop_all();
+    }
+
+    /// Any client can see and start the installation: `AppView.installation`
+    /// and `POST /v1/runtime/{action}`. A host given its runtime has none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clients_see_the_installation_and_can_ask_for_it() {
+        let managed = tempfile::tempdir().unwrap();
+        let (sessions, installation, gate) = installed_manager(managed.path());
+        let control = Arc::new(
+            control::ControlManager::new(managed.path(), managed.path(), None, &managed.path().join("data"), None)
+                .expect("control manager"),
+        );
+        control.watch_installation(installation.clone());
+        let state = AppState {
+            token: Arc::new("a".repeat(64)),
+            port: 40123,
+            dist: managed.path().to_path_buf(),
+            started: Instant::now(),
+            version: "0.1.0".to_string(),
+            sessions,
+            control,
+            events: events::EventHub::new(),
+            web: Arc::new(web_access::WebAccess::disabled()),
+        };
+        let (status, _, body) = call(router(state.clone()), request(Method::GET, "/v1/app").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["installation"]["state"], "absent");
+
+        let held = gate.lock().unwrap();
+        let (status, _, body) = call(router(state.clone()), request(Method::POST, "/v1/runtime/install").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let answer: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(answer["started"], true);
+        assert_eq!(answer["installation"]["state"], "installing");
+        // Asking again while it runs changes nothing.
+        let (_, _, body) = call(router(state.clone()), request(Method::POST, "/v1/runtime/repair").body(Body::empty()).unwrap()).await;
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["started"], false);
+        let (status, _, body) = call(
+            router(state.clone()),
+            request(Method::POST, "/v1/sessions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "workspacePath": managed.path() }).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let refusal: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(refusal["error"]["code"], "runtime-not-ready");
+        assert_eq!(refusal["error"]["installation"]["state"], "installing");
+        drop(held);
+        wait_installed(&installation).await;
+        let (_, _, body) = call(router(state.clone()), request(Method::GET, "/v1/app").body(Body::empty()).unwrap()).await;
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["installation"]["state"], "ready");
+        let (status, _, _) = call(router(state.clone()), request(Method::POST, "/v1/runtime/unknown").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        state.sessions.stop_all();
+
+        let (given, _home, _workspace) = manager(50);
+        let (status, _, body) = call(app(given), request(Method::POST, "/v1/runtime/install").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("runtime-not-managed"));
     }
 
     /// The warm runtime a session took dies while attaching. The session's hold
