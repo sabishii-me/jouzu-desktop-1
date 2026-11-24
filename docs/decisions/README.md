@@ -33,6 +33,7 @@ Records 0001–0012 come from the former planning repository (migrated 2026-11-1
 | [0023](0023-problems-fixed-at-the-root.md) | Problems are recorded, then fixed at the root | Accepted |
 | [0024](0024-no-launcher.md) | Desktop has no launcher | Accepted |
 | [0025](0025-desktop-on-tauri-mobile-native.md) | Desktop stays on Tauri; phones and tablets get native apps | Accepted |
+| [0026](0026-runtime-installation-owned-by-host.md) | The host owns the runtime installation | Accepted; in progress |
 
 ## Adding a record
 

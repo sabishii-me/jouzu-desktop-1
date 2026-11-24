@@ -30,6 +30,7 @@ describes no screens; what a person sees is in the UI document.
 | Queue of messages sent during a run | host `Session.queue` | UI-local queue |
 | Configuration operations | host `ConfigQueue` | One operation at a time with `409`, partly queued in the UI, bypassed by environment save |
 | Errors | host error slots (section 6) | UI builds one notice list from about 14 inputs |
+| Runtime installation: present, current, being installed ([0026](../decisions/0026-runtime-installation-owned-by-host.md)) | host `Installation`, in `AppView.installation` | Shell: `runtime_report`, `runtime_install`, `jouzu_update`, `git_bash_install`, `terminal_install`, `repair_jouzu`, `image_tool_ensure`, its own `active.json` reader. Host: runtime files looked up again at each start (`runtime-missing`), a second `active.json` reader, `/v1/status` file checks. UI: `runtimePresent` |
 
 ## 3. Runs
 
@@ -264,6 +265,7 @@ stays with the session and records every outcome, `stopped` included.
 | `settings` | Current settings |
 | `config` | `running`, `queued[]`, `lastResult[kind]` |
 | `startup` | State and cause |
+| `installation` | `state` (`absent` / `installing` / `update-required` / `ready` / `failed`); `step` (`node` / `packages` / `verify` / `tools`) and `downloaded`/`total` bytes while installing; `version`, `nodeVersion`, `tools` when ready; `error` (`code`, `params`) when failed |
 
 ### 7.3 Events and commands
 
@@ -272,6 +274,11 @@ stays with the session and records every outcome, `stopped` included.
   number; a client catches up by sequence after reconnecting.
 - Commands are HTTP. Each returns acceptance or a typed refusal synchronously;
   the resulting state is read from snapshots.
+- `POST /v1/runtime/install` (also `update` with a version, and `repair`) starts the
+  installation operation; asking while one runs changes nothing. The host starts
+  it on its own at start-up when the installation is `absent` or `update-required`.
+  A session start while the installation is not `ready` is refused with
+  `runtime-not-ready` and the current `installation`.
 
 ## 8. Host code to remove
 
