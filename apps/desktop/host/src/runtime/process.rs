@@ -1,6 +1,7 @@
-//! Spawn one runtime process inside a Job Object.
+//! Spawn one runtime process inside a Job Object (Windows) or its own
+//! process group (elsewhere).
 //!
-//! The child is created suspended so it cannot run user code before it is
+//! On Windows the child is created suspended so it cannot run user code before it is
 //! assigned to the job, then resumed. stdio stays with the supervisor.
 
 use std::{io, process::Stdio, sync::Arc};
@@ -40,6 +41,9 @@ pub fn spawn(spec: &SpawnSpec) -> io::Result<Spawned> {
         };
         command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW | priority);
     }
+    // The runtime leads its own process group, which the job owns.
+    #[cfg(not(windows))]
+    command.process_group(0);
 
     let child = command.spawn()?;
     let pid = child.id().unwrap_or_default();
@@ -55,9 +59,7 @@ pub fn spawn(spec: &SpawnSpec) -> io::Result<Spawned> {
     }
 
     #[cfg(not(windows))]
-    {
-        let _ = &child;
-    }
+    job.assign(pid)?;
 
     Ok(Spawned { child, job, pid })
 }
