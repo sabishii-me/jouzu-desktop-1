@@ -552,7 +552,7 @@ export function App() {
       <div className="w-full max-w-xl space-y-3">
         <div className="flex items-baseline justify-between"><span className="text-sm font-medium">{prepareError ? t.prepareFailed : step === "node" ? t.prepareNode : step === "packages" ? t.preparePackages : step === "verify" ? t.prepareVerify : step === "tools" ? t.prepareTools : t.prepareTitle}</span><span className="text-xs text-muted-foreground">{step === "node" && total ? `${Math.round(downloaded / 1048576)} / ${Math.round(total / 1048576)} MB` : ""}</span></div>
         <Progress value={step === "packages" && !prepareError ? null : preparePercent} className="h-2.5" />
-        <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground"><span className="break-all">{prepareError ? prepareError : t.prepareHint}</span>{prepareError && <Button variant="outline" onClick={() => void runtimeOperation("install")}>{t.retry}</Button>}</div>
+        <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground"><span className="break-all">{prepareError ? prepareError : t.prepareHint}</span>{prepareError && <Button variant="outline" onClick={() => void runtimeOperation(installation?.state === "failed" ? installation.action ?? "install" : "install")}>{t.retry}</Button>}</div>
       </div>
     </div>
   </main>;

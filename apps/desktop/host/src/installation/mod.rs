@@ -71,6 +71,17 @@ pub trait Installer: Send + Sync + 'static {
     /// Whether the files a session starts from are still there. Cheap: called
     /// on every session start.
     fn files_present(&self) -> bool;
+    /// Whether the tools the runtime uses (Jouzu's Git Bash on Windows) are
+    /// still there. Cheap, like [`Installer::files_present`].
+    fn tools_present(&self) -> bool {
+        true
+    }
+    /// Hold the runtime's files for an operation that replaces them: a terminal
+    /// Jouzu holds a shared lease on them while it runs. `None` when there is
+    /// nothing to hold.
+    fn hold(&self) -> Result<Option<Box<dyn std::any::Any + Send>>, String> {
+        Ok(None)
+    }
     /// Bring the installation to what this build pins. Blocking.
     fn install(&self, action: Action, progress: &dyn Fn(Value)) -> Result<String, String>;
     /// What a `ready` installation refreshes at each host start (the desktop's
@@ -111,13 +122,21 @@ impl Installer for Managed {
             && self.root.join("app").join("bootstrap.mjs").is_file()
     }
 
-    fn install(&self, action: Action, progress: &dyn Fn(Value)) -> Result<String, String> {
+    fn tools_present(&self) -> bool {
+        tools::git_present(&self.root)
+    }
+
+    fn hold(&self) -> Result<Option<Box<dyn std::any::Any + Send>>, String> {
         // A Jouzu started from a terminal (`jz`) runs from these files too and
-        // holds a shared lease on them while it runs. Files it uses are only
-        // replaced while nothing holds one; installing a missing tool replaces
-        // nothing and needs no lease.
-        let replaces = action == Action::Repair || !matches!(self.inspect(), Found::Current { .. });
-        let _lease = if replaces && self.files_present() { Some(lease(&self.root)?) } else { None };
+        // holds a shared lease on them while it runs. With no files, nothing
+        // runs from them.
+        if !self.files_present() {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(lease(&self.root)?)))
+    }
+
+    fn install(&self, action: Action, progress: &dyn Fn(Value)) -> Result<String, String> {
         if action == Action::Repair {
             // The packages are installed again; Node and the tools are checked
             // and replaced only when they are not what this build pins.
@@ -305,28 +324,53 @@ impl Installation {
     /// replaces runtime files: the state is `installing` and runtimes stop.
     pub fn start(self: &Arc<Self>, action: Action) -> bool {
         let (previous, light) = {
-            let mut inner = self.lock();
+            let inner = self.lock();
             if matches!(inner.state, State::Installing { .. }) || inner.operation.is_some() {
                 return false;
             }
-            let previous = inner.state.clone();
-            let light = matches!(previous, State::Ready { .. }) && action != Action::Repair;
+            let light = matches!(inner.state, State::Ready { .. }) && action != Action::Repair;
+            (inner.state.clone(), light)
+        };
+        // Files a terminal Jouzu runs from are not replaced under it, and what
+        // runs here is stopped only once they can be: a refused operation
+        // changes nothing that runs.
+        let hold = if light {
+            None
+        } else {
+            match self.installer.hold() {
+                Ok(hold) => hold,
+                Err(message) => {
+                    self.log("warn", "installation.held", json!({ "action": action.name(), "error": message }));
+                    {
+                        let mut inner = self.lock();
+                        if matches!(inner.state, State::Ready { .. }) {
+                            inner.error = Some((action, message));
+                        } else {
+                            inner.state = State::Failed { action, message };
+                        }
+                    }
+                    self.changed();
+                    return true;
+                }
+            }
+        };
+        {
+            let mut inner = self.lock();
             inner.error = None;
             if light {
                 inner.operation = Some((action, json!({ "step": "prepare" })));
             } else {
                 inner.state = State::Installing { action, progress: json!({ "step": "prepare" }) };
             }
-            (previous, light)
-        };
+        }
         self.log("info", "installation.start", json!({ "action": action.name(), "from": view_state(&previous), "replaces": !light }));
         self.changed();
         let installation = self.clone();
-        std::thread::spawn(move || installation.run(action, light));
+        std::thread::spawn(move || installation.run(action, light, hold));
         true
     }
 
-    fn run(self: &Arc<Self>, action: Action, light: bool) {
+    fn run(self: &Arc<Self>, action: Action, light: bool, hold: Option<Box<dyn std::any::Any + Send>>) {
         // Whatever runs from the installation holds its files open (on Windows
         // they cannot be replaced then); with nothing running this does nothing.
         if !light {
@@ -366,6 +410,7 @@ impl Installation {
             self.installer.install(action, &progress)
         }))
         .unwrap_or_else(|_| Err("The installation stopped unexpectedly.".to_string()));
+        drop(hold);
         let found = self.installer.inspect();
         let current = matches!(found, Found::Current { .. });
         let (state, error) = match (outcome, found) {
@@ -414,6 +459,9 @@ impl Installation {
             return false;
         }
         if self.installer.files_present() {
+            if !self.installer.tools_present() {
+                self.tool_lost();
+            }
             return true;
         }
         let found = self.installer.inspect();
@@ -431,6 +479,23 @@ impl Installation {
         }
         self.start(Action::Install);
         false
+    }
+
+    /// A tool the runtime uses disappeared while the host runs (#158): Settings
+    /// shows it missing, and it is installed again on its own, beside running
+    /// sessions, as the runtime's own files are. One that could not be
+    /// installed is left to the person (Settings shows why) instead of being
+    /// tried again at every check.
+    fn tool_lost(self: &Arc<Self>) {
+        {
+            let inner = self.lock();
+            if inner.operation.is_some() || inner.error.is_some() {
+                return;
+            }
+        }
+        self.log("warn", "installation.tool_lost", json!({}));
+        self.read_tools();
+        self.start(Action::Install);
     }
 
     /// `AppView.installation`.
@@ -513,6 +578,10 @@ mod tests {
         outdated: AtomicBool,
         files: AtomicBool,
         fail: AtomicBool,
+        /// A tool the runtime uses is gone.
+        tool_lost: AtomicBool,
+        /// A terminal Jouzu holds the files.
+        held: AtomicBool,
         installs: AtomicUsize,
         repairs: AtomicUsize,
         /// Held while installing, so a test can look at the `installing` state.
@@ -532,6 +601,15 @@ mod tests {
         fn files_present(&self) -> bool {
             self.files.load(Ordering::SeqCst)
         }
+        fn tools_present(&self) -> bool {
+            !self.tool_lost.load(Ordering::SeqCst)
+        }
+        fn hold(&self) -> Result<Option<Box<dyn std::any::Any + Send>>, String> {
+            if self.held.load(Ordering::SeqCst) {
+                return Err("Jouzu is running in a terminal. Close it, then try again.".into());
+            }
+            Ok(None)
+        }
         fn install(&self, action: Action, progress: &dyn Fn(Value)) -> Result<String, String> {
             progress(json!({ "phase": "node", "downloaded": 10, "total": 100 }));
             let _gate = self.gate.lock().unwrap();
@@ -545,6 +623,7 @@ mod tests {
             self.installed.store(true, Ordering::SeqCst);
             self.outdated.store(false, Ordering::SeqCst);
             self.files.store(true, Ordering::SeqCst);
+            self.tool_lost.store(false, Ordering::SeqCst);
             Ok("0.2.5".into())
         }
     }
@@ -760,6 +839,71 @@ mod tests {
         assert_eq!(settle(&installation)["state"], "ready");
         assert_eq!(fake.installs.load(Ordering::SeqCst), 1);
         assert!(installation.verify());
+    }
+
+    /// #158: Jouzu's Git Bash removed while the host runs.
+    #[test]
+    fn a_tool_lost_while_running_is_installed_again_beside_running_sessions() {
+        let fake = Arc::new(Fake::default());
+        fake.installed.store(true, Ordering::SeqCst);
+        fake.files.store(true, Ordering::SeqCst);
+        let installation = Installation::new(fake.clone(), None);
+        let (_, ready, stops) = counted(&installation);
+        fake.tool_lost.store(true, Ordering::SeqCst);
+        assert!(installation.verify(), "sessions keep starting");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.tool_lost.load(Ordering::SeqCst) || !installation.view()["operation"].is_null() {
+            assert!(Instant::now() < deadline, "the tool was not installed again");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(installation.view()["state"], "ready");
+        assert_eq!(fake.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert_eq!(ready.load(Ordering::SeqCst), 0);
+        // One that cannot be installed is reported once, not tried at every check.
+        fake.fail.store(true, Ordering::SeqCst);
+        fake.tool_lost.store(true, Ordering::SeqCst);
+        assert!(installation.verify());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while installation.view()["error"].is_null() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(installation.verify());
+        assert!(installation.verify());
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(fake.installs.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_repair_refused_by_a_terminal_jouzu_stops_nothing_and_stays_ready() {
+        let fake = Arc::new(Fake::default());
+        fake.installed.store(true, Ordering::SeqCst);
+        fake.files.store(true, Ordering::SeqCst);
+        fake.held.store(true, Ordering::SeqCst);
+        let installation = Installation::new(fake.clone(), None);
+        let (_, _, stops) = counted(&installation);
+        installation.start(Action::Repair);
+        let view = installation.view();
+        assert_eq!(view["state"], "ready", "{view}");
+        assert!(view["error"]["params"]["message"].as_str().unwrap().contains("terminal"), "{view}");
+        assert!(installation.is_ready());
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.installs.load(Ordering::SeqCst), 0);
+        // Closed: the same repair goes ahead.
+        fake.held.store(false, Ordering::SeqCst);
+        assert!(installation.start(Action::Repair));
+        assert_eq!(settle(&installation)["state"], "ready");
+        assert!(installation.view()["error"].is_null());
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        // An installation that cannot run anyway fails with the reason.
+        fake.outdated.store(true, Ordering::SeqCst);
+        let blocked = Installation::new(fake.clone(), None);
+        fake.held.store(true, Ordering::SeqCst);
+        blocked.start(Action::Update);
+        let view = blocked.view();
+        assert_eq!(view["state"], "failed", "{view}");
+        assert_eq!(view["action"], "update");
     }
 
     #[test]
