@@ -31,7 +31,7 @@ turns it off.
 | | Read-only | Workspace (default) | Unattended | Full access |
 |---|---|---|---|---|
 | Writes | None (own temporary folder only) | Workspace and own temporary folder, minus protected locations | As Workspace | Unrestricted |
-| Reads | Whole machine minus credential folders | As Read-only | As Read-only | Unrestricted |
+| Reads | Whole machine; secrets masked before they reach the model | As Read-only | As Read-only | Unrestricted |
 | Command network | Off | A list of common development domains; others ask | As Workspace | Unrestricted |
 | Crossing the boundary | Asks the person; approval allows that one action and does not change the level | Asks the person: allow once, or for this folder or domain for the rest of the session | Never asks: refused, the reason goes to the model and is recorded in the session | No boundary |
 | Tools covered | Commands in the sandbox; file tools checked against the same boundary | As Read-only | As Read-only | None |
@@ -49,8 +49,14 @@ rather than asking on every command; the way out is an explicit switch to Full a
   Read-only while the sandbox is unavailable, which the question states): the installation, the data home, and anything in
   the workspace that runs outside the sandbox later (git hooks and git configuration such as
   `.git/hooks`, `.git/config` and `.gitattributes`, and the runtime's own extension and
-  settings folders). Credential folders (`~/.ssh`, cloud credentials, Jouzu's keys) are never
-  readable. Only Full access lifts this; approving a boundary crossing never does.
+  settings folders). Only Full access lifts this; approving a boundary crossing never does.
+- Reading is safe rather than blocked. Commands may read credentials (`~/.ssh`, cloud
+  credentials) so that ordinary work such as `git push` keeps working. What the agent's
+  tools return is screened on the machine before it goes to the model: secrets in it (keys,
+  tokens, credential files) are masked. Secrets are protected by not leaving the machine,
+  not by hiding files. Which layer owns the screening, and how it relates to TextGuard's
+  content check in the runtime, is settled before it is built and recorded then; it is not
+  a second, unrelated content check.
 - Only a person approves, in the UI. Neither the agent nor a model approves anything, and
   no path lets the agent change the level or its approvals. This includes the host's own
   API: a call from inside the sandbox is refused (the host authenticates its callers and the
@@ -86,11 +92,11 @@ execution) is listed from the runtime's actual tools and covered:
 
 - Commands (shells and any background or delegated execution) run under the sandbox
   identity.
-- File tools run as before and are checked against the same boundary: `write` and `edit`
-  against the writable folders and protected locations, `read`, search and listing against
-  the credential folders. The check uses the real path with junctions and links resolved,
-  not the path as given. Reading keeps working when the sandbox is unavailable, because it
-  cannot change anything.
+- File tools run as before. `write` and `edit` are checked against the writable folders
+  and protected locations, using the real path with junctions and links resolved, not the
+  path as given. Reading tools are not restricted; their results are screened like every
+  tool's. Reading keeps working when the sandbox is unavailable, because it cannot change
+  anything.
 
 A boundary question is asked through the runtime's extension UI request and relayed by the
 host to the UI.
@@ -114,8 +120,8 @@ outbound filtering. The choice is made on these requirements and recorded with i
 
 - Git, npm, Node and Python work inside, in PowerShell and in Git Bash (each a hypothesis
   until shown).
-- Commands writing outside the boundary or reading credential folders are refused by the
-  operating system, not by a check in the extension.
+- Commands writing outside the boundary are refused by the operating system, not by a
+  check in the extension.
 - Grants made on the person's folders are recorded and removed on uninstall.
 - Junction, symbolic-link and hard-link escapes are refused, for commands and file tools
   alike, and are part of the prototype's tests.
@@ -139,8 +145,8 @@ outbound filtering. The choice is made on these requirements and recorded with i
   measured, not assumed.
 - It does not let a model review boundary crossings, and it has no "ask every step" level:
   with the sandbox in place that only adds interruptions; Read-only is the careful choice.
-- The concrete lists of development domains, protected locations and credential folders
-  do not exist yet. They come with the prototype, derived from what the tools and the
+- The concrete lists of development domains and protected locations, and what counts as a
+  secret to mask, do not exist yet. They come with the prototype, derived from what the tools and the
   runtime actually use, and are then kept in [`../design/host-layer.md`](../design/host-layer.md);
   changing them does not need a new record.
 - The Windows mechanism is a hypothesis until the prototype confirms it. If it fails, this
