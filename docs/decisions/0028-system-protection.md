@@ -1,4 +1,4 @@
-# 0028 — The agent's commands run inside a sandbox the host owns
+# 0028 — The agent's tools run at a permission level the host owns
 
 Status: Proposed (this pull request; merging accepts it). Windows first; macOS and Linux
 follow in their own records once their platform support (#183) is in.
@@ -24,69 +24,60 @@ model calls stay outside, only what the tools execute is inside.
 
 ## Decision
 
-**What is protected.** One boundary: everything the agent's tools execute or change on
-disk. It covers shell commands and every process they start, and the file tools that
-change files.
+**Four permission levels.** The person picks one; a new session starts at **Workspace**.
+The first three run the tools inside the sandbox with different settings; the fourth
+turns it off.
 
-- Writes are denied by default. A tool may write only inside the session's folder, a
-  temporary folder of its own, and folders the person adds. Inside those, anything the
-  runtime or the host will later run or trust as configuration (the runtime's extension
-  and settings folders a workspace can carry, for example) stays read-only, so nothing
-  written in the sandbox runs outside it later. The concrete list is derived from what the
-  runtime and the host actually load, and kept in [`../design/host-layer.md`](../design/host-layer.md).
-- The installation, the runtime, Desktop's extensions and the data home are never writable
-  from the sandbox, wherever they are. This includes the folders the runtime protects from
-  its own file tools (jouzu#62), so the two never disagree.
-- Network for tool commands is either allowed or blocked, as the person chose. The
-  agent's model calls are not tool commands and are never affected.
-- Tool commands get an environment built from an allow-list. Credentials the runtime holds
-  (provider keys in its environment) are not passed to them.
-- Reads stay open: closing them breaks ordinary development tools.
-  Confidentiality comes from blocking the network, not from hiding files.
+| | Read-only | Workspace (default) | Unattended | Full access |
+|---|---|---|---|---|
+| Writes | None (own temporary folder only) | Workspace and own temporary folder, minus protected locations | As Workspace | Unrestricted |
+| Reads | Whole machine minus credential folders | As Read-only | As Read-only | Unrestricted |
+| Command network | Off | A list of common development domains; others ask | As Workspace | Unrestricted |
+| Crossing the boundary | Asks the person; approval allows that one action and does not change the level | Asks the person: allow once, or for this folder or domain for the rest of the session | Never asks: refused, the reason goes to the model and is recorded in the session | No boundary |
+| Tools covered | `bash`, `powershell` in the sandbox; `write`/`edit` refused and asked | `bash`, `powershell` in the sandbox; `write`/`edit` checked against the same boundary | As Workspace | None |
+| Sandbox unavailable | Every command asks first | Every command asks first | Every command refused | Not affected |
+| The person sees | Level name and "will not change files" | Level name, workspace path, network scope | Level name and the count of refusals, with details | A prominent risk marker, always visible |
+| Switching to it | Any time; applies from the next tool call | Any time; the default for new sessions | Any time; switching away lists what was refused meanwhile | Confirmed against the risk every time; never remembered as the default |
 
-**Who owns it.** The host ([0014](0014-three-layers-single-owner.md)).
+In every case where the sandbox is unavailable, the person is told why and how to fix it.
+Nothing falls back to running unprotected without the person's knowledge.
 
-- The host owns the policy (writable folders, network, on or off) and whether the sandbox is
-  available, and reports both in its views.
-- The host's sandbox launcher creates the boundary for each command and reads the current
-  policy from the host when it does. The runtime keeps no copy of the policy.
-- Desktop's extension routes the tools through that launcher. Shell commands run under it;
-  `write` and `edit` perform their change through it too, so there is one enforcement point
-  (the operating system), not a second path check written in JavaScript.
-- The runtime is not changed. Anything the extension API cannot guarantee (for example that
-  Desktop's tools cannot be replaced by another extension) is a runtime gap
-  ([0015](0015-runtime-facts-relayed-not-reinterpreted.md)), recorded and raised, not worked
-  around.
+**Rules shared by all levels.**
 
-**Windows requirements.** The backend is chosen against these, not the other way round:
+- Protected locations (the installation, the data home, `.git/hooks` in the workspace) are
+  never writable and credential folders (`~/.ssh`, cloud credentials, Jouzu's keys) never
+  readable. Only Full access lifts this; approving a boundary crossing never does.
+- Only a person approves, in the UI. Neither the agent nor a model approves anything, and
+  no path lets the agent change the level.
+- TextGuard is a separate setting with its own owner (the runtime) and does not change
+  with the level.
 
-- Write isolation works for a normal user: no administrator rights, no Developer Mode.
-- Blocking the network may need one administrator step at install; without it the host
-  reports the network as not isolated.
-- Git, npm, Node and Python run normally inside, in PowerShell and in Git Bash.
-- The policy comes only from the host, from a location the sandbox cannot write.
+**Who owns it.** The host ([0014](0014-three-layers-single-owner.md)). The host owns the
+level, the session's approvals and whether the sandbox is available, and reports them in
+its views. It hands the configuration for the current level to Desktop's extension and the
+sandbox backend; neither keeps it as its own state, and it is never read from a file the
+agent can write. The UI shows the level and requests a change; it does not hold the level.
+
+**Where it plugs in.** The runtime is not changed. Desktop's extension uses the runtime's
+public tool-override API, the only integration point that needs no runtime change, to run
+`bash` and `powershell` in the sandbox and to check `write` and `edit`. A boundary question
+is asked through the runtime's extension UI request and relayed by the host to the UI.
+Anything the API cannot guarantee (for example that Desktop's tools cannot be replaced by
+another extension) is a runtime gap ([0015](0015-runtime-facts-relayed-not-reinterpreted.md)),
+recorded and raised, not worked around.
+
+**Windows backend.** One backend serves the three sandboxed levels with different
+configuration, so the prototype validates all four levels on it rather than one level
+first. Candidates: sandbox-runtime's Windows support (alpha: a separate sandbox user,
+write-restricted token, file ACLs and outbound filtering; needs an administrator once at
+install) and a write-restricted token with a Desktop-owned SID and folder ACLs. The choice
+is made on these requirements and recorded with its evidence:
+
+- Git, npm, Node and Python work inside, in PowerShell and Git Bash.
+- Reads of credential folders and writes outside the boundary are refused by the operating
+  system, not by a check in the extension.
 - Grants made on the person's folders are recorded and removed on uninstall.
-- The cost per command is measured on the person's machines and does not slow a session
-  noticeably.
-
-Candidate backends, evaluated in the prototype on those requirements: sandbox-runtime
-(open source, Windows support in alpha, separate sandbox user, needs administrator once)
-and a write-restricted token with a Desktop-owned SID and folder ACLs (no administrator
-needed for writes). The record is amended with the choice and the evidence.
-
-**Default and failure.** On by default. When the sandbox cannot be created, a command is
-refused with a typed reason at its own scope ([0017](0017-errors-at-their-scope.md)); it is
-never run unprotected instead. Running without protection is only ever the person's
-explicit choice.
-
-**What the person sees.** The sandbox's settings and TextGuard's modes stay independent.
-Each keeps its own owner and state: TextGuard's in the runtime (relayed
-as reported), the sandbox's in the host. The UI shows what each reports and infers nothing.
-Whether and how the two are grouped for the person, and which controls they get, are open; they are decided with the product owner before the UI is
-built, and recorded then.
-
-Only the person changes the policy, adds a writable folder or lowers protection. No path
-lets the agent do it.
+- The cost per command is measured on real machines and does not slow a session noticeably.
 
 ## Does not mean
 
@@ -95,14 +86,17 @@ lets the agent do it.
   implying otherwise.
 - It is not a list of blocked paths or commands patched one by one. A gap found later is
   fixed by moving the boundary, not by adding a special case.
-- It does not merge TextGuard into the sandbox or their state into one source. Flow is run
-  control, not protection, and keeps its own panel.
+- It does not tie TextGuard to the levels or merge their state. Flow is run control, not
+  permissions, and keeps its own panel.
 - It does not fix the shell. PowerShell and Git Bash are both tried inside the sandbox;
   whichever works is used.
-- It does not change readiness: the sandbox is created per command, so a new session is
+- It does not change readiness: the sandbox is applied per tool call, so a new session is
   still ready at once ([0016](0016-new-session-ready-at-once.md)). The cost per command is
   measured, not assumed.
-- It does not decide a domain allow-list for the network. If blocking everything proves too
-  strict in use, that is a later decision.
+- It does not let a model review boundary crossings, and it has no "ask every step" level:
+  with the sandbox in place that only adds interruptions; Read-only is the careful choice.
+- The concrete list of development domains, protected locations and credential folders is
+  kept in [`../design/host-layer.md`](../design/host-layer.md), derived from what the tools
+  and the runtime actually use; changing it does not need a new record.
 - The Windows mechanism is a hypothesis until the prototype confirms it. If it fails, this
   record is revised before anything is built on it.
