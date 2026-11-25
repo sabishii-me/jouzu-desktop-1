@@ -37,7 +37,7 @@ change files.
 - The installation, the runtime, Desktop's extensions and the data home are never writable
   from the sandbox, wherever they are. This includes the folders the runtime protects from
   its own file tools (jouzu#62), so the two never disagree.
-- Network for tool commands is either allowed or blocked, per protection level. The
+- Network for tool commands is either allowed or blocked, as the person chose. The
   agent's model calls are not tool commands and are never affected.
 - Tool commands get an environment built from an allow-list. Credentials the runtime holds
   (provider keys in its environment) are not passed to them.
@@ -46,7 +46,7 @@ change files.
 
 **Who owns it.** The host ([0014](0014-three-layers-single-owner.md)).
 
-- The host owns the policy (level, writable folders, network) and whether the sandbox is
+- The host owns the policy (writable folders, network, on or off) and whether the sandbox is
   available, and reports both in its views.
 - The host's sandbox launcher creates the boundary for each command and reads the current
   policy from the host when it does. The runtime keeps no copy of the policy.
@@ -60,9 +60,9 @@ change files.
 
 **Windows requirements.** The backend is chosen against these, not the other way round:
 
-- Standard protection works for a normal user: no administrator rights, no Developer Mode.
-- Strict protection (network blocked) may need one administrator step at install; without
-  it the host reports the network as not isolated and Strict as unavailable.
+- Write isolation works for a normal user: no administrator rights, no Developer Mode.
+- Blocking the network may need one administrator step at install; without it the host
+  reports the network as not isolated.
 - Git, npm, Node and Python run normally inside, in PowerShell and in Git Bash.
 - The policy comes only from the host, from a location the sandbox cannot write.
 - Grants made on the person's folders are recorded and removed on uninstall.
@@ -79,18 +79,14 @@ refused with a typed reason at its own scope ([0017](0017-errors-at-their-scope.
 never run unprotected instead. Running without protection is only ever the person's
 explicit choice.
 
-**What the person sees.** One concept, **Protection**, with one control in the composer and
-one kind of "blocked" notice. TextGuard and the sandbox are its two mechanisms. Each keeps
-its own owner and state: TextGuard's in the runtime (relayed as reported), the sandbox's in
-the host. The UI shows what each reports and infers nothing. Levels:
+**What the person sees.** The sandbox and TextGuard are presented together, not as two
+unrelated features. Each keeps its own owner and state: TextGuard's in the runtime (relayed
+as reported), the sandbox's in the host. The UI shows what each reports and infers nothing.
+Which controls the person gets, whether there are levels, and how any choice maps onto the
+sandbox and TextGuard are open; they are decided with the product owner before the UI is
+built, and recorded then.
 
-| Level | Sandbox | TextGuard |
-|---|---|---|
-| Standard (default) | Writes isolated; network allowed | On |
-| Strict | Writes isolated; network blocked | Strict |
-| Off | Off | Off |
-
-Only the person changes the level, adds a writable folder or lowers protection. No path
+Only the person changes the policy, adds a writable folder or lowers protection. No path
 lets the agent do it.
 
 ## Does not mean
