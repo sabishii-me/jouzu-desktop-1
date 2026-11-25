@@ -79,11 +79,10 @@ refused with a typed reason at its own scope ([0017](0017-errors-at-their-scope.
 never run unprotected instead. Running without protection is only ever the person's
 explicit choice.
 
-**What the person sees.** The sandbox and TextGuard are presented together, not as two
-unrelated features. Each keeps its own owner and state: TextGuard's in the runtime (relayed
+**What the person sees.** The sandbox's settings and TextGuard's modes stay independent.
+Each keeps its own owner and state: TextGuard's in the runtime (relayed
 as reported), the sandbox's in the host. The UI shows what each reports and infers nothing.
-Which controls the person gets, whether there are levels, and how any choice maps onto the
-sandbox and TextGuard are open; they are decided with the product owner before the UI is
+Whether and how the two are grouped for the person, and which controls they get, are open; they are decided with the product owner before the UI is
 built, and recorded then.
 
 Only the person changes the policy, adds a writable folder or lowers protection. No path
