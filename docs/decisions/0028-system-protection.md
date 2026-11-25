@@ -35,7 +35,7 @@ turns it off.
 | Command network | Off | A list of common development domains; others ask | As Workspace | Unrestricted |
 | Crossing the boundary | Asks the person; approval allows that one action and does not change the level | Asks the person: allow once, or for this folder or domain for the rest of the session | Never asks: refused, the reason goes to the model and is recorded in the session | No boundary |
 | Tools covered | Every tool that runs a command or touches files, executed in the sandbox | As Read-only | As Read-only | None |
-| Sandbox unavailable | Every covered tool refused | As Read-only | As Read-only | Not affected |
+| Sandbox unavailable | Commands and file changes refused; reading files still works | As Read-only | As Read-only | Not affected |
 | The person sees | Level name and "changes no files without your approval" | Level name, workspace path, network scope | Level name and the count of refusals, with details | A prominent risk marker, always visible |
 | Switching to it | Any time; applies from the next tool call | Any time; the default for new sessions | Any time; switching away lists what was refused meanwhile | Confirmed against the risk every time; never remembered as the default |
 
@@ -82,9 +82,15 @@ agent can write. The UI shows the level and requests a change; it does not hold 
 public tool-override API, the only integration point that needs no runtime change. Every
 tool the runtime gives the agent that runs a command or touches the filesystem (shells,
 `read`, `write`, `edit`, search and listing tools, and any background or delegated
-execution) is listed from the runtime's actual tools and executed under the sandbox
-identity. There is no path check in the extension standing in for the operating system:
-a checked path can be swapped for a junction or link before it is opened. A boundary question
+execution) is listed from the runtime's actual tools and covered:
+
+- Commands and anything that changes files run under the sandbox identity. There is no
+  path check standing in for the operating system there: a checked path can be swapped for
+  a junction or link before it is opened.
+- Tools that only read (`read`, search, listing) run as before and check the file they
+  actually opened (its real path after opening), not the path they were given, against the
+  credential folders. A link swap cannot redirect them, and reading costs no extra process.
+  They keep working when the sandbox is unavailable, because they cannot change anything. A boundary question
 is asked through the runtime's extension UI request and relayed by the host to the UI.
 
 - Precondition: Desktop's tools cannot be replaced by another extension. If one could, the
@@ -106,8 +112,8 @@ outbound filtering. The choice is made on these requirements and recorded with i
 
 - Git, npm, Node and Python work inside, in PowerShell and in Git Bash (each a hypothesis
   until shown).
-- Reads of credential folders and writes outside the boundary are refused by the operating
-  system for every covered tool, not by a check in the extension.
+- Writes outside the boundary, and commands reading credential folders, are refused by the
+  operating system, not by a check in the extension.
 - Grants made on the person's folders are recorded and removed on uninstall.
 - Junction, symbolic-link and hard-link escapes are refused, for commands and file tools
   alike, and are part of the prototype's tests.
