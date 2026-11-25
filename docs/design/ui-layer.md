@@ -78,6 +78,12 @@ ever appears in the composer's place, and only one at a time.
 - **The window loses its connection to the host**: the header shows
   "Reconnecting…" and the composer is dimmed. The session keeps running in the
   host and the window catches up on reconnect. This is not a session error.
+- The sidebar's grouping, order and filter are the user's choice
+  ([0026](../decisions/0026-sidebar-arrangement-is-the-users-choice.md)): group by
+  workspace, by folder tree or in one list; order by hand or by last update; hide
+  archived, show all, or archived only. The defaults are workspace, last update and
+  hidden, so a user who changes nothing sees the list as before. A hand-made order is
+  the user's own and is kept; no workspace is pinned.
 - The sidebar row shows whether a session is running or has ended; nothing else.
   The row and the status line both read the host's run state; the UI never
   infers run state from the shape of the transcript. Only a saved transcript shown
