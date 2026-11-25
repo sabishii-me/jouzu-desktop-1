@@ -33,7 +33,7 @@ turns it off.
 | Writes | None (own temporary folder only) | Workspace and own temporary folder, minus protected locations | As Workspace | Unrestricted |
 | Reads | Whole machine; secrets masked before they reach the model | As Read-only | As Read-only | Unrestricted |
 | Command network | Off | A list of common development domains; others ask | As Workspace | Unrestricted |
-| Crossing the boundary | Asks the person; approval allows that one action and does not change the level | Asks the person: allow once, or for this folder or domain for the rest of the session | Never asks: refused, the reason goes to the model and is recorded in the session | No boundary |
+| Crossing the boundary | Asks the person; approval grants what the request names (a folder, a domain) to that one invocation and does not change the level | Asks the person: grant the named folder or domain to that one invocation, or to this session | Never asks: refused, the reason goes to the model and is recorded in the session | No boundary |
 | Tools covered | Commands in the sandbox; file tools checked against the same boundary | As Read-only | As Read-only | None |
 | Sandbox unavailable | Every command asks first and, if approved, runs without the sandbox (the question says so); reading files still works | Commands and file changes refused; reading files still works | As Workspace | Not affected |
 | The person sees | Level name and "changes no files without your approval" | Level name, workspace path, network scope | Level name and the count of refusals, with details | A prominent risk marker, always visible |
@@ -53,8 +53,10 @@ rather than asking on every command; the way out is an explicit switch to Full a
 - Reading is safe rather than blocked. Commands may read credentials (`~/.ssh`, cloud
   credentials) so that ordinary work such as `git push` keeps working. What the agent's
   tools return is screened on the machine before it goes to the model: secrets in it (keys,
-  tokens, credential files) are masked. Secrets are protected by not leaving the machine,
-  not by hiding files. Which layer owns the screening, and how it relates to TextGuard's
+  tokens, credential files) are masked. This is best-effort protection against secrets
+  reaching the model by accident. It does not stop a command that deliberately sends a
+  readable secret to an allowed domain, or encodes it first; that is a known limit of
+  readable credentials, stated rather than implied away. Which layer owns the screening, and how it relates to TextGuard's
   content check in the runtime, is settled before it is built and recorded then; it is not
   a second, unrelated content check.
 - Only a person approves, in the UI. Neither the agent nor a model approves anything, and
@@ -65,6 +67,13 @@ rather than asking on every command; the way out is an explicit switch to Full a
   It never shows a description written by the model in place of the request.
 - A level change applies from the next tool call. Processes already running keep the level
   they started with until they end.
+- An approval grants exactly the folder or domain the request names, to that invocation and
+  the processes it starts (or to the session, if chosen), and nothing else. It never runs a
+  command unrestricted, and protected locations stay denied. If the backend cannot express
+  the grant, the request is refused, not run without the sandbox.
+- Grants are isolated per session: a folder or domain approved in one session is not usable
+  from another, including an Unattended one. After a crash, leftover grants are removed
+  before any sandboxed command runs again.
 - Every process a tool starts belongs to its session (on Windows, the session runtime's
   job) and ends with it. An approval "for the rest of the session" is both a record in the
   host and an operating-system grant; when the session ends both are removed, and the host
@@ -123,8 +132,16 @@ outbound filtering. The choice is made on these requirements and recorded with i
 - Commands writing outside the boundary are refused by the operating system, not by a
   check in the extension.
 - Grants made on the person's folders are recorded and removed on uninstall.
+- Grants are per session (two sessions running at once cannot use each other's), and are
+  gone after the session ends and after a crash and restart.
+- A sandboxed process cannot obtain the host's or the person's authority through other
+  processes: inherited handles, opening other processes, local IPC, or window messages on
+  the person's desktop.
 - Junction, symbolic-link and hard-link escapes are refused, for commands and file tools
-  alike, and are part of the prototype's tests.
+  alike, and are part of the prototype's tests, including a junction swapped in while a
+  file tool runs and a hard link to a protected file created beforehand. If a file tool's
+  check is shown to be escapable, the file tool's change is moved under the sandbox
+  identity.
 - The cost per command is measured on real machines and does not slow a session noticeably.
 
 ## Does not mean
