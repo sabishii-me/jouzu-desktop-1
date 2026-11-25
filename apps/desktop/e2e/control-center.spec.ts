@@ -72,7 +72,7 @@ for (const legacy of [false,true]) {
 const updateStub = (config: {
   jouzuVersion: string; jouzuTarget: string; jouzuNotes?: string;
   desktopVersion: string; desktopTarget?: string; desktopAvailable: boolean;
-  configured: [boolean, boolean]; failInstall?: boolean; desktopCheckFails?: boolean;
+  configured: [boolean, boolean]; failInstall?: boolean; desktopCheckFails?: boolean; desktopDowngrade?: boolean;
 }) => {
   const callbacks: Record<number, Function> = {};
   const listeners: Record<string, number[]> = {};
@@ -111,7 +111,7 @@ const updateStub = (config: {
       if (command === 'update_check') {
         if (config.desktopCheckFails) throw new Error('network');
         return config.desktopAvailable
-        ? { version: config.desktopTarget, notes: 'Desktop only', channel: 'stable', downgrade: false }
+        ? { version: config.desktopTarget, notes: 'Desktop only', channel: 'stable', downgrade: !!config.desktopDowngrade }
         : null;
       }
       if (command === 'update_install') return new Promise(() => {});
@@ -148,6 +148,24 @@ test('the System section shows both update rows with their state and notes', asy
   await expect(desktop.getByRole('button')).toHaveCount(0);
   // The check's outcome reaches the log, because the interface is where that check runs.
   expect(await page.evaluate(() => (window as any).__logs)).toContain('desktop update check result=current');
+});
+
+test('an older Stable build is offered as a downgrade, not an update (#176)', async ({ page }) => {
+  await page.addInitScript(updateStub, {
+    jouzuVersion: '0.1.17', jouzuTarget: '0.1.18', desktopVersion: '1.1.4-rc.1', desktopTarget: '1.0.23',
+    desktopAvailable: true, desktopDowngrade: true, configured: [true, true],
+  });
+  const dialog = await openSystem(page);
+  const desktop = dialog.locator('section[aria-label="Jouzu Desktop"]');
+  await expect(desktop.getByText('Back to Stable (older than this build) 1.0.23')).toBeVisible();
+  await expect(desktop.getByRole('button', { name: 'Install Stable', exact: true })).toBeVisible();
+  await expect(desktop.getByText('Update available')).toHaveCount(0);
+  await expect(desktop.getByText("What's new")).toHaveCount(0);
+  // The confirmation says what will happen: an older build, then a restart.
+  await desktop.getByRole('button', { name: 'Install Stable', exact: true }).click();
+  const confirm = page.getByRole('dialog');
+  await expect(confirm.getByRole('heading', { name: 'Install Stable', exact: true })).toBeVisible();
+  await expect(confirm.getByText('This installs a version older than the one you are running. Jouzu Desktop restarts after installing.')).toBeVisible();
 });
 
 test('a failed update check is reported and recorded', async ({ page }) => {

@@ -7,7 +7,7 @@ import { ProviderPicker } from "./components/ui/provider-picker";
 import { recoveryText } from "./recovery-text";
 import { describeError } from "./runtime-errors";
 import { NoticeRow } from "./session-alerts-view";
-import { UpdatePreview } from "./update-preview";
+import { hasUpdateNotice, UpdatePreview } from "./update-preview";
 import { GitBashSection, useGitBash } from "./git-bash-section";
 import { TerminalSection } from "./terminal-section";
 import { CommandEntrySection } from "./command-entry-section";
@@ -368,7 +368,8 @@ export function App() {
   }
   function openUpdatePanel() {
     // A waiting update is not a question to re-ask: the header opens the System list on the row that has it.
-    setUpdateFocus(jouzuUpdater.version ? 0 : 1);
+    // An older Stable offer is not an update and must not claim the header's attention.
+    setUpdateFocus(jouzuUpdater.version ? 0 : updater.version && !updater.downgrade ? 1 : null);
     setSettingsTab("system");
     setSettingsOpen(true);
   }
@@ -707,6 +708,7 @@ export function App() {
                   
                   <UpdatePreview locale={locale} focusIndex={updateFocus} live={{
                     phases:[jouzuUpdater.phase === 'preparing' || jouzuUpdater.phase === 'verifying' || jouzuUpdater.phase === 'activating' || jouzuUpdater.phase === 'staged' ? 'installing' : jouzuUpdater.phase as 'idle'|'checking'|'available'|'current'|'downloading'|'installing'|'complete'|'error', updater.phase],
+                    downgrade:[false, updater.downgrade],
                     versions:[components?.jouzu ?? t.unavailable, version ? (components?.commit && components.commit !== 'unknown' ? `${version} · ${components.commit} · ${components.build ?? ''}` : version) : t.unavailable],
                     targets:[jouzuUpdater.version,updater.version],
                     progress:jouzuUpdater.busy?jouzuUpdater.progress:updater.progress,
@@ -714,7 +716,7 @@ export function App() {
                     errors:[jouzuUpdater.error,updater.error],
                     notes:[jouzuUpdater.notes ?? '',updater.notes ?? ''],
                     sources:[jouzuUpdater.notesSource ?? '', ''],
-                    channel: updater.channel && components?.desktopUpdaterConfigured ? { value: updater.channel, set: value => void updater.setChannel(value), downgrade: updater.downgrade } : undefined,
+                    channel: updater.channel && components?.desktopUpdaterConfigured ? { value: updater.channel, set: value => void updater.setChannel(value) } : undefined,
                     repair: components?.jouzu || import.meta.env.DEV ? undefined : { label: recoveryText[locale].action, run: () => { void (async () => {
                       if (!await confirm(recoveryText[locale].description, {title: recoveryText[locale].title, kind: "warning"})) return;
                       setOperation("saving"); setError(null);
@@ -800,7 +802,7 @@ export function App() {
 
         onSettings={() => setSettingsOpen(true)}
         onUpdate={openUpdatePanel}
-        updateAvailable={!!(updater.version || jouzuUpdater.version)}
+        updateAvailable={hasUpdateNotice(jouzuUpdater.version, updater.version, updater.downgrade)}
         updateBusy={updater.busy || jouzuUpdater.busy}
       />
     </div>}
