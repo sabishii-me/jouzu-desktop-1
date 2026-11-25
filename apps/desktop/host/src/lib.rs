@@ -1738,16 +1738,11 @@ async fn capabilities(
     }))
 }
 
+/// The default workspace in the same form the workspace list uses. The folder
+/// and its name live in one place (`session::default_workspace_path`), so the
+/// capability cannot name a different spelling of it (#239).
 fn default_workspace() -> Option<String> {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    let base = if cfg!(windows) {
-        PathBuf::from(home).join("Documents")
-    } else {
-        PathBuf::from(home)
-    };
-    let path = base.join("Jouzu").join("default-workspace");
-    std::fs::create_dir_all(&path).ok()?;
-    Some(path.to_string_lossy().into_owned())
+    crate::session::workspace_text(&crate::session::default_workspace_path()?)
 }
 
 #[derive(Deserialize)]
@@ -4350,6 +4345,98 @@ mod session_tests {
         assert_eq!(session.status(), Status::Cancelled);
         assert!(session.runtime_pid().is_none());
         assert!(manager.list().is_empty());
+    }
+
+    /// The stored identity is a path other programs accept: a verbatim disk
+    /// path loses its prefix, and a verbatim network path keeps its `\\`
+    /// rather than turning into `UNC\...`.
+    #[test]
+    fn a_verbatim_path_loses_only_the_verbatim_prefix() {
+        assert_eq!(crate::session::canonical_path(r"\\?\C:\work"), r"C:\work");
+        assert_eq!(
+            crate::session::canonical_path(r"\\?\UNC\server\share\work"),
+            r"\\server\share\work"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workspace_is_listed_by_its_real_path() {
+        let (manager, home, workspace) = manager(50);
+        let real = workspace.path().join("real");
+        std::fs::create_dir_all(real.join("nested")).unwrap();
+        // A saved list keeps the tests from creating the user's default
+        // workspace just to make the list non-empty.
+        let other = workspace.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let seed = json!([{
+            "id": "seed",
+            "path": other.to_string_lossy(),
+            "environment": { "kind": "windows" },
+        }]);
+        std::fs::write(home.path().join("recent.json"), seed.to_string()).unwrap();
+        let roundabout = real.join("nested").join("..");
+        let added = manager
+            .add_workspaces(&[roundabout.to_string_lossy().into_owned()])
+            .unwrap();
+        let expected = crate::session::workspace_text(&real).unwrap();
+        let matching = added
+            .iter()
+            .filter(|value| value["path"] == json!(expected))
+            .count();
+        assert_eq!(matching, 1, "{added:?}");
+        let listed = manager.workspaces();
+        let matching = listed
+            .iter()
+            .filter(|value| value["path"] == json!(expected))
+            .count();
+        assert_eq!(matching, 1, "{listed:?}");
+    }
+
+    /// #239: on macOS a home under `/var` reaches the same folder as its real
+    /// `/private/var` path. A file written before this fix holds both spellings,
+    /// and both reaching the same folder must list as one workspace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_folder_through_a_link_is_one_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let (manager, home, workspace) = manager(50);
+        let real = workspace.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = workspace.path().join("link");
+        symlink(&real, &link).unwrap();
+        let expected = crate::session::workspace_text(&real).unwrap();
+        // A saved list keeps the test from creating the user's default
+        // workspace just to make the list non-empty.
+        let other = workspace.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let seed = json!([{
+            "id": "seed",
+            "path": other.to_string_lossy(),
+            "environment": { "kind": "windows" },
+        }]);
+        std::fs::write(home.path().join("recent.json"), seed.to_string()).unwrap();
+
+        let added = manager
+            .add_workspaces(&[
+                link.to_string_lossy().into_owned(),
+                real.to_string_lossy().into_owned(),
+            ])
+            .unwrap();
+        let matching = added
+            .iter()
+            .filter(|value| value["path"] == json!(expected))
+            .count();
+        assert_eq!(matching, 1, "{added:?}");
+
+        let older = json!([
+            { "id": format!("windows:{}", link.display()), "path": link.to_string_lossy(), "environment": { "kind": "windows" } },
+            { "id": format!("windows:{}", real.display()), "path": real.to_string_lossy(), "environment": { "kind": "windows" } },
+        ]);
+        std::fs::write(home.path().join("recent.json"), older.to_string()).unwrap();
+        let listed = manager.workspaces();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0]["path"], json!(expected), "{listed:?}");
     }
 
     #[tokio::test]

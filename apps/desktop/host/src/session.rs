@@ -16,7 +16,38 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, SecondsFormat, Utc};
 
 pub(crate) fn canonical_path(path: &str) -> String {
+    // Windows `canonicalize` writes `\\?\C:\x` for a disk path and
+    // `\\?\UNC\server\share` for a network path. Other programs accept
+    // neither form, and dropping only the prefix would turn the second into
+    // `UNC\server\share`, which is not a path at all.
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
     path.strip_prefix("\\\\?\\").unwrap_or(path).to_string()
+}
+
+/// The folder the default workspace lives in, created if needed. A home reached
+/// through a link gives the link's path here; `workspace_text` resolves it to
+/// the folder itself (#239).
+pub(crate) fn default_workspace_path() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let base = if cfg!(windows) {
+        PathBuf::from(home).join("Documents")
+    } else {
+        PathBuf::from(home)
+    };
+    let path = base.join("Jouzu").join("default-workspace");
+    std::fs::create_dir_all(&path).ok()?;
+    Some(path)
+}
+
+/// A workspace's identity: the folder's real path, in the form the rest of the
+/// host stores and compares (`canonical_path`). Two spellings that reach the
+/// same folder, such as a path through a symbolic link and its real path, are
+/// one workspace (#239).
+pub(crate) fn workspace_text(path: &Path) -> Option<String> {
+    let real = path.canonicalize().ok()?;
+    real.is_dir().then(|| canonical_path(&real.to_string_lossy()))
 }
 
 /// The folder a session file says it belongs to (its header's `cwd`), exactly as
@@ -6396,24 +6427,16 @@ impl SessionManager {
         self.home.join("recent.json")
     }
 
-    fn default_workspace(&self) -> Option<PathBuf> {
-        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-        let base = if cfg!(windows) {
-            PathBuf::from(home).join("Documents")
-        } else {
-            PathBuf::from(home)
-        };
-        let path = base.join("Jouzu").join("default-workspace");
-        std::fs::create_dir_all(&path).ok()?;
-        Some(path)
-    }
-
-    fn workspace_value(&self, path: &str) -> Value {
-        json!({
+    /// A workspace as the API lists it. The identity is decided here, so a
+    /// caller that hands over a link's path still stores the folder itself
+    /// (#239).
+    fn workspace_value(&self, path: &str) -> Option<Value> {
+        let path = workspace_text(Path::new(path))?;
+        Some(json!({
             "id": format!("windows:{path}"),
             "path": path,
             "environment": { "kind": "windows" },
-        })
+        }))
     }
 
     fn session_file(&self, session_path: &str) -> Result<PathBuf, ApiError> {
@@ -6747,22 +6770,35 @@ impl SessionManager {
         allowed
     }
 
-    pub fn workspaces(&self) -> Vec<Value> {        let mut values: Vec<Value> = std::fs::read(self.recent_path())
+    pub fn workspaces(&self) -> Vec<Value> {
+        let mut values: Vec<Value> = Vec::new();
+        for stored in std::fs::read(self.recent_path())
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).ok())
             .unwrap_or_default()
-            .into_iter()
-            .filter(|value| {
-                value
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .is_some_and(|path| Path::new(path).is_dir())
-            })
-            .collect();
+        {
+            let Some(path) = stored.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            // A workspace's identity is the folder, not the spelling that
+            // reached it: `/var/...` and `/private/var/...` on macOS, or one
+            // folder through a link and through its real path, are one
+            // workspace (#239). A folder that is gone is left out of the list
+            // but stays in the file, so it returns when the folder does.
+            let Some(workspace) = self.workspace_value(path) else {
+                continue;
+            };
+            if values.iter().any(|known| known.get("path") == workspace.get("path")) {
+                continue;
+            }
+            values.push(workspace);
+        }
         if values.is_empty() {
-            if let Some(path) = self.default_workspace() {
-                values.push(self.workspace_value(&path.to_string_lossy()));
-                let _ = self.write_workspaces(&values);
+            if let Some(path) = default_workspace_path() {
+                if let Some(value) = self.workspace_value(&path.to_string_lossy()) {
+                    values.push(value);
+                    let _ = self.write_workspaces(&values);
+                }
             }
         }
         values
@@ -6783,20 +6819,16 @@ impl SessionManager {
         let mut workspaces = self.workspaces();
         for path in paths {
             let path = path.trim();
-            if path.is_empty() || !Path::new(path).is_dir() {
+            if path.is_empty() {
                 continue;
             }
-            let lower = path.replace('\\', "/").to_lowercase();
-            if workspaces.iter().any(|value| {
-                value
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(|existing| existing.replace('\\', "/").to_lowercase() == lower)
-                    .unwrap_or(false)
-            }) {
+            let Some(value) = self.workspace_value(path) else {
+                continue;
+            };
+            if workspaces.iter().any(|known| known.get("path") == value.get("path")) {
                 continue;
             }
-            workspaces.push(self.workspace_value(path));
+            workspaces.push(value);
         }
         self.write_workspaces(&workspaces)?;
         Ok(workspaces)
