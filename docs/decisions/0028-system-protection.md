@@ -90,8 +90,10 @@ execution) is listed from the runtime's actual tools and covered:
   the credential folders. The check is made on the file actually opened (its real path after
   opening), not on the path given, so a junction or link swapped in between does not
   redirect it, and it costs no extra process. Reading keeps working when the sandbox is
-  unavailable, because it cannot change anything. A boundary question
-is asked through the runtime's extension UI request and relayed by the host to the UI.
+  unavailable, because it cannot change anything.
+
+A boundary question is asked through the runtime's extension UI request and relayed by the
+host to the UI.
 
 - Precondition: Desktop's tools cannot be replaced by another extension. If one could, the
   boundary would silently disappear. The prototype proves it; if the runtime cannot
