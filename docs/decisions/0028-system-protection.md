@@ -35,20 +35,35 @@ turns it off.
 | Command network | Off | A list of common development domains; others ask | As Workspace | Unrestricted |
 | Crossing the boundary | Asks the person; approval allows that one action and does not change the level | Asks the person: allow once, or for this folder or domain for the rest of the session | Never asks: refused, the reason goes to the model and is recorded in the session | No boundary |
 | Tools covered | `bash`, `powershell` in the sandbox; `write`/`edit` refused and asked | `bash`, `powershell` in the sandbox; `write`/`edit` checked against the same boundary | As Workspace | None |
-| Sandbox unavailable | Every command asks first | Every command asks first | Every command refused | Not affected |
-| The person sees | Level name and "will not change files" | Level name, workspace path, network scope | Level name and the count of refusals, with details | A prominent risk marker, always visible |
+| Sandbox unavailable | Every command asks first | Every command refused | Every command refused | Not affected |
+| The person sees | Level name and "changes no files without your approval" | Level name, workspace path, network scope | Level name and the count of refusals, with details | A prominent risk marker, always visible |
 | Switching to it | Any time; applies from the next tool call | Any time; the default for new sessions | Any time; switching away lists what was refused meanwhile | Confirmed against the risk every time; never remembered as the default |
 
 In every case where the sandbox is unavailable, the person is told why and how to fix it.
-Nothing falls back to running unprotected without the person's knowledge.
+Nothing falls back to running unprotected without the person's knowledge. Workspace refuses
+rather than asking on every command, which would make the default level unusable; the
+person can switch to Full access knowingly.
 
 **Rules shared by all levels.**
 
-- Protected locations (the installation, the data home, `.git/hooks` in the workspace) are
-  never writable and credential folders (`~/.ssh`, cloud credentials, Jouzu's keys) never
+- Protected locations are never writable: the installation, the data home, and anything in
+  the workspace that runs outside the sandbox later (git hooks and git configuration such as
+  `.git/hooks`, `.git/config` and `.gitattributes`, and the runtime's own extension and
+  settings folders). Credential folders (`~/.ssh`, cloud credentials, Jouzu's keys) are never
   readable. Only Full access lifts this; approving a boundary crossing never does.
 - Only a person approves, in the UI. Neither the agent nor a model approves anything, and
-  no path lets the agent change the level.
+  no path lets the agent change the level or its approvals. This includes the host's own
+  API: a call from inside the sandbox is refused (the host authenticates its callers and the
+  sandbox cannot reach it), so a command cannot raise its own level.
+- A question shows the literal request: the exact command, the absolute path, the domain.
+  It never shows a description written by the model in place of the request.
+- A level change applies from the next tool call. Processes already running keep the level
+  they started with. Approvals "for the rest
+  of the session" live in the host's memory and end when the session or the host ends.
+- MCP servers run outside the sandbox. Each server's tool calls are asked about unless the
+  person has chosen to allow that server; asking is the default. The person sees which
+  servers are allowed. The prototype confirms that the runtime lets Desktop ask before an
+  MCP call; if it does not, that is raised with the runtime.
 - TextGuard is a separate setting with its own owner (the runtime) and does not change
   with the level.
 
@@ -62,18 +77,26 @@ agent can write. The UI shows the level and requests a change; it does not hold 
 public tool-override API, the only integration point that needs no runtime change, to run
 `bash` and `powershell` in the sandbox and to check `write` and `edit`. A boundary question
 is asked through the runtime's extension UI request and relayed by the host to the UI.
-Anything the API cannot guarantee (for example that Desktop's tools cannot be replaced by
-another extension) is a runtime gap ([0015](0015-runtime-facts-relayed-not-reinterpreted.md)),
-recorded and raised, not worked around.
+
+- Precondition: Desktop's tools cannot be replaced by another extension. If one could, the
+  boundary would silently disappear. The prototype proves it; if the runtime cannot
+  guarantee it, it is raised with the runtime as a requirement, and until then the host
+  reports the level as not enforced.
+- Anything else the API cannot guarantee is a runtime gap
+  ([0015](0015-runtime-facts-relayed-not-reinterpreted.md)), recorded and raised, not worked
+  around.
 
 **Windows backend.** One backend serves the three sandboxed levels with different
 configuration, so the prototype validates all four levels on it rather than one level
 first. Candidate mechanisms: a separate sandbox user with a write-restricted token, file
 ACLs and outbound filtering (needs an administrator once at install), and a
-write-restricted token with a Desktop-owned SID and folder ACLs. The choice
-is made on these requirements and recorded with its evidence:
+write-restricted token with a Desktop-owned SID and folder ACLs. The second runs as the
+person, so it restricts writes only: reads and network stay the person's. It can serve the
+levels' write column but not their read and network columns; those need a separate user and
+outbound filtering. The choice is made on these requirements and recorded with its evidence:
 
-- Git, npm, Node and Python work inside, in PowerShell and Git Bash.
+- Git, npm, Node and Python work inside, in PowerShell and in Git Bash (each a hypothesis
+  until shown).
 - Reads of credential folders and writes outside the boundary are refused by the operating
   system, not by a check in the extension.
 - Grants made on the person's folders are recorded and removed on uninstall.
@@ -82,8 +105,10 @@ is made on these requirements and recorded with its evidence:
 ## Does not mean
 
 - It does not sandbox the runtime process, the model calls, MCP servers or third-party
-  extensions. They run outside the boundary, as before; this record says so rather than
-  implying otherwise.
+  extensions. They run outside the boundary. MCP calls are asked about (above); a
+  third-party extension that adds a tool able to write or run commands makes the level
+  unenforced for that tool, and the host shows that beside the level rather than implying
+  a guarantee.
 - It is not a list of blocked paths or commands patched one by one. A gap found later is
   fixed by moving the boundary, not by adding a special case.
 - It does not tie TextGuard to the levels or merge their state. Flow is run control, not
@@ -95,8 +120,9 @@ is made on these requirements and recorded with its evidence:
   measured, not assumed.
 - It does not let a model review boundary crossings, and it has no "ask every step" level:
   with the sandbox in place that only adds interruptions; Read-only is the careful choice.
-- The concrete list of development domains, protected locations and credential folders is
-  kept in [`../design/host-layer.md`](../design/host-layer.md), derived from what the tools
-  and the runtime actually use; changing it does not need a new record.
+- The concrete lists of development domains, protected locations and credential folders
+  do not exist yet. They come with the prototype, derived from what the tools and the
+  runtime actually use, and are then kept in [`../design/host-layer.md`](../design/host-layer.md);
+  changing them does not need a new record.
 - The Windows mechanism is a hypothesis until the prototype confirms it. If it fails, this
   record is revised before anything is built on it.
