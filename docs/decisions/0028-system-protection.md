@@ -58,10 +58,15 @@ change files.
   ([0015](0015-runtime-facts-relayed-not-reinterpreted.md)), recorded and raised, not worked
   around.
 
-**Windows mechanism.** Each command runs under a write-restricted token with a
-Desktop-owned synthetic SID; only folders granted to that SID are writable. This needs no
-administrator rights. Blocking the network needs a one-time administrator step (a separate
-local user and a firewall rule); without it the host reports the network as not isolated.
+**Mechanism.** The extension follows the pattern of the runtime's earlier sandbox example
+extension (tool override plus an operating-system sandbox), with two differences: it covers
+`powershell` and the file tools as well as `bash`, and it never falls back to running
+unprotected. The sandbox itself is Anthropic's open-source sandbox-runtime (srt), not one
+we write. Its configuration is written by the host to a location the sandbox cannot write,
+never to a file the agent can change. On Windows, srt runs commands as a separate sandbox
+user with a write-restricted token, file ACLs and kernel-level outbound filtering, which
+needs a one-time administrator step at install. If srt's Windows backend does not hold up
+in the prototype, the fallback is the restricted-token design OpenAI uses for Codex.
 Grants made on the person's folders are recorded so they can be removed on uninstall.
 
 **Default and failure.** On by default. When the sandbox cannot be created, a command is
@@ -99,5 +104,7 @@ lets the agent do it.
   measured, not assumed.
 - It does not decide a domain allow-list for the network. If blocking everything proves too
   strict in use, that is a later decision.
+- It does not adopt the runtime's old sandbox extension as-is: it was bash-only, disabled
+  on Windows, fell back to no sandbox and read its configuration from an agent-writable file.
 - The Windows mechanism is a hypothesis until the prototype confirms it. If it fails, this
   record is revised before anything is built on it.
