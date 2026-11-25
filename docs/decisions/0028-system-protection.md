@@ -35,14 +35,13 @@ turns it off.
 | Command network | Off | A list of common development domains; others ask | As Workspace | Unrestricted |
 | Crossing the boundary | Asks the person; approval allows that one action and does not change the level | Asks the person: allow once, or for this folder or domain for the rest of the session | Never asks: refused, the reason goes to the model and is recorded in the session | No boundary |
 | Tools covered | Every tool that runs a command or touches files, executed in the sandbox | As Read-only | As Read-only | None |
-| Sandbox unavailable | Commands and file changes refused; reading files still works | As Read-only | As Read-only | Not affected |
+| Sandbox unavailable | Every command asks first; reading files still works | Commands and file changes refused; reading files still works | As Workspace | Not affected |
 | The person sees | Level name and "changes no files without your approval" | Level name, workspace path, network scope | Level name and the count of refusals, with details | A prominent risk marker, always visible |
 | Switching to it | Any time; applies from the next tool call | Any time; the default for new sessions | Any time; switching away lists what was refused meanwhile | Confirmed against the risk every time; never remembered as the default |
 
 In every case where the sandbox is unavailable, the person is told why and how to fix it.
-Nothing ever runs unprotected at a sandboxed level, even with approval: an approved action
-outside the sandbox could read credentials or change protected locations, which no approval
-may allow. The way out is an explicit switch to Full access.
+Nothing runs unprotected without the person's knowledge. Workspace and Unattended refuse
+rather than asking on every command; the way out is an explicit switch to Full access.
 
 **Rules shared by all levels.**
 
