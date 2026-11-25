@@ -19,7 +19,7 @@ command does; that needs a boundary enforced by the operating system.
 The runtime's public extension API lets an extension register a tool under the name of a
 built-in one (`bash`, `powershell`, `write`, `edit`, …) and replace how it executes. Desktop
 already ships its own extensions this way. So the boundary can be drawn around the tools
-alone, with no change to the runtime, as other coding agents do: the agent process and its
+alone, with no change to the runtime: the agent process and its
 model calls stay outside, only what the tools execute is inside.
 
 ## Decision
@@ -41,7 +41,7 @@ change files.
   agent's model calls are not tool commands and are never affected.
 - Tool commands get an environment built from an allow-list. Credentials the runtime holds
   (provider keys in its environment) are not passed to them.
-- Reads stay open, as in other agents: closing them breaks ordinary development tools.
+- Reads stay open: closing them breaks ordinary development tools.
   Confidentiality comes from blocking the network, not from hiding files.
 
 **Who owns it.** The host ([0014](0014-three-layers-single-owner.md)).
@@ -58,16 +58,21 @@ change files.
   ([0015](0015-runtime-facts-relayed-not-reinterpreted.md)), recorded and raised, not worked
   around.
 
-**Mechanism.** The extension follows the pattern of the runtime's earlier sandbox example
-extension (tool override plus an operating-system sandbox), with two differences: it covers
-`powershell` and the file tools as well as `bash`, and it never falls back to running
-unprotected. The sandbox itself is Anthropic's open-source sandbox-runtime (srt), not one
-we write. Its configuration is written by the host to a location the sandbox cannot write,
-never to a file the agent can change. On Windows, srt runs commands as a separate sandbox
-user with a write-restricted token, file ACLs and kernel-level outbound filtering, which
-needs a one-time administrator step at install. If srt's Windows backend does not hold up
-in the prototype, the fallback is the restricted-token design OpenAI uses for Codex.
-Grants made on the person's folders are recorded so they can be removed on uninstall.
+**Windows requirements.** The backend is chosen against these, not the other way round:
+
+- Standard protection works for a normal user: no administrator rights, no Developer Mode.
+- Strict protection (network blocked) may need one administrator step at install; without
+  it the host reports the network as not isolated and Strict as unavailable.
+- Git, npm, Node and Python run normally inside, in PowerShell and in Git Bash.
+- The policy comes only from the host, from a location the sandbox cannot write.
+- Grants made on the person's folders are recorded and removed on uninstall.
+- The cost per command is measured on the person's machines and does not slow a session
+  noticeably.
+
+Candidate backends, evaluated in the prototype on those requirements: sandbox-runtime
+(open source, Windows support in alpha, separate sandbox user, needs administrator once)
+and a write-restricted token with a Desktop-owned SID and folder ACLs (no administrator
+needed for writes). The record is amended with the choice and the evidence.
 
 **Default and failure.** On by default. When the sandbox cannot be created, a command is
 refused with a typed reason at its own scope ([0017](0017-errors-at-their-scope.md)); it is
@@ -104,7 +109,5 @@ lets the agent do it.
   measured, not assumed.
 - It does not decide a domain allow-list for the network. If blocking everything proves too
   strict in use, that is a later decision.
-- It does not adopt the runtime's old sandbox extension as-is: it was bash-only, disabled
-  on Windows, fell back to no sandbox and read its configuration from an agent-writable file.
 - The Windows mechanism is a hypothesis until the prototype confirms it. If it fails, this
   record is revised before anything is built on it.
