@@ -68,9 +68,9 @@ recorded and raised, not worked around.
 
 **Windows backend.** One backend serves the three sandboxed levels with different
 configuration, so the prototype validates all four levels on it rather than one level
-first. Candidates: sandbox-runtime's Windows support (alpha: a separate sandbox user,
-write-restricted token, file ACLs and outbound filtering; needs an administrator once at
-install) and a write-restricted token with a Desktop-owned SID and folder ACLs. The choice
+first. Candidate mechanisms: a separate sandbox user with a write-restricted token, file
+ACLs and outbound filtering (needs an administrator once at install), and a
+write-restricted token with a Desktop-owned SID and folder ACLs. The choice
 is made on these requirements and recorded with its evidence:
 
 - Git, npm, Node and Python work inside, in PowerShell and Git Bash.
