@@ -35,7 +35,7 @@ turns it off.
 | Command network | Off | A list of common development domains; others ask | As Workspace | Unrestricted |
 | Crossing the boundary | Asks the person; approval allows that one action and does not change the level | Asks the person: allow once, or for this folder or domain for the rest of the session | Never asks: refused, the reason goes to the model and is recorded in the session | No boundary |
 | Tools covered | Commands in the sandbox; file tools checked against the same boundary | As Read-only | As Read-only | None |
-| Sandbox unavailable | Every command asks first; reading files still works | Commands and file changes refused; reading files still works | As Workspace | Not affected |
+| Sandbox unavailable | Every command asks first and, if approved, runs without the sandbox (the question says so); reading files still works | Commands and file changes refused; reading files still works | As Workspace | Not affected |
 | The person sees | Level name and "changes no files without your approval" | Level name, workspace path, network scope | Level name and the count of refusals, with details | A prominent risk marker, always visible |
 | Switching to it | Any time; applies from the next tool call | Any time; the default for new sessions | Any time; switching away lists what was refused meanwhile | Confirmed against the risk every time; never remembered as the default |
 
@@ -45,7 +45,8 @@ rather than asking on every command; the way out is an explicit switch to Full a
 
 **Rules shared by all levels.**
 
-- Protected locations are never writable: the installation, the data home, and anything in
+- Protected locations are never writable (except by a command the person approves in
+  Read-only while the sandbox is unavailable, which the question states): the installation, the data home, and anything in
   the workspace that runs outside the sandbox later (git hooks and git configuration such as
   `.git/hooks`, `.git/config` and `.gitattributes`, and the runtime's own extension and
   settings folders). Credential folders (`~/.ssh`, cloud credentials, Jouzu's keys) are never
@@ -87,10 +88,9 @@ execution) is listed from the runtime's actual tools and covered:
   identity.
 - File tools run as before and are checked against the same boundary: `write` and `edit`
   against the writable folders and protected locations, `read`, search and listing against
-  the credential folders. The check is made on the file actually opened (its real path after
-  opening), not on the path given, so a junction or link swapped in between does not
-  redirect it, and it costs no extra process. Reading keeps working when the sandbox is
-  unavailable, because it cannot change anything.
+  the credential folders. The check uses the real path with junctions and links resolved,
+  not the path as given. Reading keeps working when the sandbox is unavailable, because it
+  cannot change anything.
 
 A boundary question is asked through the runtime's extension UI request and relayed by the
 host to the UI.
