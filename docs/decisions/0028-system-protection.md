@@ -34,15 +34,15 @@ turns it off.
 | Reads | Whole machine minus credential folders | As Read-only | As Read-only | Unrestricted |
 | Command network | Off | A list of common development domains; others ask | As Workspace | Unrestricted |
 | Crossing the boundary | Asks the person; approval allows that one action and does not change the level | Asks the person: allow once, or for this folder or domain for the rest of the session | Never asks: refused, the reason goes to the model and is recorded in the session | No boundary |
-| Tools covered | `bash`, `powershell` in the sandbox; `write`/`edit` refused and asked | `bash`, `powershell` in the sandbox; `write`/`edit` checked against the same boundary | As Workspace | None |
-| Sandbox unavailable | Every command asks first | Every command refused | Every command refused | Not affected |
+| Tools covered | Every tool that runs a command or touches files, executed in the sandbox | As Read-only | As Read-only | None |
+| Sandbox unavailable | Every covered tool refused | As Read-only | As Read-only | Not affected |
 | The person sees | Level name and "changes no files without your approval" | Level name, workspace path, network scope | Level name and the count of refusals, with details | A prominent risk marker, always visible |
 | Switching to it | Any time; applies from the next tool call | Any time; the default for new sessions | Any time; switching away lists what was refused meanwhile | Confirmed against the risk every time; never remembered as the default |
 
 In every case where the sandbox is unavailable, the person is told why and how to fix it.
-Nothing falls back to running unprotected without the person's knowledge. Workspace refuses
-rather than asking on every command, which would make the default level unusable; the
-person can switch to Full access knowingly.
+Nothing ever runs unprotected at a sandboxed level, even with approval: an approved action
+outside the sandbox could read credentials or change protected locations, which no approval
+may allow. The way out is an explicit switch to Full access.
 
 **Rules shared by all levels.**
 
@@ -58,10 +58,15 @@ person can switch to Full access knowingly.
 - A question shows the literal request: the exact command, the absolute path, the domain.
   It never shows a description written by the model in place of the request.
 - A level change applies from the next tool call. Processes already running keep the level
-  they started with. Approvals "for the rest
-  of the session" live in the host's memory and end when the session or the host ends.
+  they started with until they end.
+- Every process a tool starts belongs to its session (on Windows, the session runtime's
+  job) and ends with it. An approval "for the rest of the session" is both a record in the
+  host and an operating-system grant; when the session ends both are removed, and the host
+  removes any grant left by a crash when it starts again. A record expiring is not enough;
+  the access itself is revoked.
 - MCP servers run outside the sandbox. Each server's tool calls are asked about unless the
-  person has chosen to allow that server; asking is the default. The person sees which
+  person has chosen to allow that server; asking is the default. In Unattended, calls to a
+  server that is not allowed are refused and recorded, never left waiting. The person sees which
   servers are allowed. The prototype confirms that the runtime lets Desktop ask before an
   MCP call; if it does not, that is raised with the runtime.
 - TextGuard is a separate setting with its own owner (the runtime) and does not change
@@ -74,8 +79,12 @@ sandbox backend; neither keeps it as its own state, and it is never read from a 
 agent can write. The UI shows the level and requests a change; it does not hold the level.
 
 **Where it plugs in.** The runtime is not changed. Desktop's extension uses the runtime's
-public tool-override API, the only integration point that needs no runtime change, to run
-`bash` and `powershell` in the sandbox and to check `write` and `edit`. A boundary question
+public tool-override API, the only integration point that needs no runtime change. Every
+tool the runtime gives the agent that runs a command or touches the filesystem (shells,
+`read`, `write`, `edit`, search and listing tools, and any background or delegated
+execution) is listed from the runtime's actual tools and executed under the sandbox
+identity. There is no path check in the extension standing in for the operating system:
+a checked path can be swapped for a junction or link before it is opened. A boundary question
 is asked through the runtime's extension UI request and relayed by the host to the UI.
 
 - Precondition: Desktop's tools cannot be replaced by another extension. If one could, the
@@ -98,8 +107,10 @@ outbound filtering. The choice is made on these requirements and recorded with i
 - Git, npm, Node and Python work inside, in PowerShell and in Git Bash (each a hypothesis
   until shown).
 - Reads of credential folders and writes outside the boundary are refused by the operating
-  system, not by a check in the extension.
+  system for every covered tool, not by a check in the extension.
 - Grants made on the person's folders are recorded and removed on uninstall.
+- Junction, symbolic-link and hard-link escapes are refused, for commands and file tools
+  alike, and are part of the prototype's tests.
 - The cost per command is measured on real machines and does not slow a session noticeably.
 
 ## Does not mean
