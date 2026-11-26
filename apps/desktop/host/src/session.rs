@@ -6212,7 +6212,7 @@ pub struct SessionManager {
     persisted_cache: Mutex<Option<Vec<Value>>>,
     /// Configuration changes so far: only the latest one's re-read runs.
     reload_epoch: Arc<AtomicU64>,
-    /// The runtime installation (ADR 0026). When set, no runtime starts while
+    /// The runtime installation (ADR 0029). When set, no runtime starts while
     /// it is not `ready`.
     installation: std::sync::OnceLock<Arc<crate::installation::Installation>>,
 }
@@ -6767,7 +6767,7 @@ impl SessionManager {
             "hostVersion": env!("CARGO_PKG_VERSION"),
             "runtimeHome": self.runtime_home.to_string_lossy(),
             // Whether the runtime is installed is the installation's to say
-            // (ADR 0026); a host given its runtime has none.
+            // (ADR 0029); a host given its runtime has none.
             "installation": self.installation.get().map(|installation| installation.view()),
             // The bash sessions start with: the one given to the host, else the
             // same lookup each spawn makes (bundled Git Bash on Windows, the

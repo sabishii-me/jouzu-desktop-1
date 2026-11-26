@@ -1437,7 +1437,7 @@ struct AimWarmRequest {
     workspace_path: String,
 }
 
-/// Install, update or repair the runtime (ADR 0026). Answers at once; the
+/// Install, update or repair the runtime (ADR 0029). Answers at once; the
 /// operation's progress and outcome are in `AppView.installation`. Asking while
 /// one runs changes nothing.
 async fn runtime_operation(
@@ -6210,7 +6210,7 @@ mod session_tests {
         }
     }
 
-    /// ADR 0026 (and #87): on a first launch the host installs the runtime
+    /// ADR 0029 (and #87): on a first launch the host installs the runtime
     /// itself. A session asked for meanwhile is refused with the installation's
     /// state, not with missing files; once it is `ready`, the warm runtime
     /// starts and sessions run, without a host restart.

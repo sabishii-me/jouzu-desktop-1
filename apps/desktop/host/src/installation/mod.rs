@@ -1,4 +1,4 @@
-//! The runtime installation, owned by the host (ADR 0026).
+//! The runtime installation, owned by the host (ADR 0029).
 //!
 //! The desktop release carries no runtime (ADR 0003): Node, the Jouzu package
 //! and, on Windows, Git Bash and Windows Terminal are installed into the data

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 /**
- * A real host on a home with no runtime installs it on its own (ADR 0026). Here
+ * A real host on a home with no runtime installs it on its own (ADR 0029). Here
  * it cannot reach the network: the window shows the installation's failure
  * with the reason and Retry, and Retry asks the host again. It never shows the
  * workspace with "runtime files are missing" (#87).

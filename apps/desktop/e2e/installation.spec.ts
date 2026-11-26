@@ -1,7 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { UI_BASE, stubHost, type HostStub } from './host-control';
 
-// The runtime installation is the host's (ADR 0026): the window renders
+// The runtime installation is the host's (ADR 0029): the window renders
 // `AppView.installation` and nothing else about it. These run the same in the
 // desktop window and in a browser, which has no shell to ask.
 

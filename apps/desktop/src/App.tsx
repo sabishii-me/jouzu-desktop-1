@@ -186,7 +186,7 @@ export function App() {
   const [providerQuery, setProviderQuery] = useState("");
   const [addingConnection, setAddingConnection] = useState(false);
   const [query, setQuery] = useState("");
-  // The runtime installation is the host's (ADR 0026): the prepare page and the
+  // The runtime installation is the host's (ADR 0029): the prepare page and the
   // Settings rows render it, and nothing here keeps a copy.
   const installation = appView?.installation ?? null;
   const runtimeReady = installationReady(appView);

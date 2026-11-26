@@ -296,7 +296,7 @@ fn mcp_config() -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn component_versions(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     // The updater flags describe the shell. The runtime's version is the host's to report
-    // (AppView.installation, ADR 0026).
+    // (AppView.installation, ADR 0029).
     let desktop_updater = app
         .config()
         .plugins

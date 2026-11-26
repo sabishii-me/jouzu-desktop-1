@@ -145,7 +145,7 @@ async fn main() -> ExitCode {
         }
     };
     // The installation under the host home, unless the host was given its
-    // runtime (ADR 0026). It is checked now; installing starts below.
+    // runtime (ADR 0029). It is checked now; installing starts below.
     let installation = runtime
         .is_none()
         .then(|| jouzu_host::installation::Installation::managed(&managed, &runtime_home));

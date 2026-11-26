@@ -231,8 +231,8 @@ jobs:
           fi
           ls -l "$stage"
       - name: Provision the official runtime for the exam
-        working-directory: apps/desktop/src-tauri
-        run: JOUZU_EXAM_MANAGED="$RUNNER_TEMP/exam-runtime" cargo test --locked --bins provisions_the_exam_runtime -- --ignored
+        working-directory: apps/desktop/host
+        run: JOUZU_EXAM_MANAGED="$RUNNER_TEMP/exam-runtime" cargo test --locked --lib provisions_the_exam_runtime -- --ignored
       - name: Install the browser test runner
         working-directory: apps/desktop
         run: npx playwright install --with-deps chromium
