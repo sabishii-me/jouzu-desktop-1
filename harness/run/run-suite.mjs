@@ -45,6 +45,15 @@ const reruns = plan.reruns ?? 3;
 const resultsFile = join(out, 'results.jsonl');
 let port = Number(process.env.ABN_PORT ?? 9400);
 
+// ---- Entry check: a normal user account. As root or an administrator the app can write
+// read-only files, so 'Settings file cannot be written' could not test anything (2026-11-26:
+// every case runs everywhere, as a normal user). ----
+function elevated() {
+  if (process.platform === 'win32') { try { execFileSync('net', ['session'], { stdio: 'ignore' }); return true; } catch { return false; } }
+  return typeof process.getuid === 'function' && process.getuid() === 0;
+}
+if (elevated() && !process.env.RUN_SELFTEST) { console.error('Entry criterion not met: this account is root or an administrator. Run the suite as a normal user.'); process.exit(2); }
+
 // ---- The cases, from the playbook itself. ----
 const listed = JSON.parse(execFileSync(process.execPath, [playbook], { env: { ...process.env, PLAYBOOK_LIST: '1', PLAYBOOK_SHOTS: join(out, '.list') }, encoding: 'utf8' }));
 // ABN_ONLY matches by contained text: one name inside another would run two cases at once.

@@ -470,5 +470,12 @@
       "evidence": "screenshots; process listings; host log lines"
     }
   ],
-  "declaredSkipsNote": "None declared. Two cases skip themselves on some machines and are reported as ERROR until the product owner declares a skip: 'Settings file cannot be written' (skips when run as root/administrator, e.g. the cloud Linux container) and '#173 An environment change reaches the open session' (the case skips itself off Windows)."
+  "severity": {
+    "S1": "data loss, app crash or unusable, security, wasting the user's money (for example tokens spent)",
+    "S2": "core function broken with no workaround (send, sessions, sign-in, image tool silently off)",
+    "S3": "broken with a workaround, or the UI shows a wrong state",
+    "S4": "cosmetic or wording"
+  },
+  "runAs": "a normal user account (not root, not an administrator) on every machine; the runner refuses to start otherwise",
+  "frozen": false
 }

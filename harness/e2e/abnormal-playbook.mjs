@@ -923,9 +923,8 @@ add("#162 Waiting messages come back paused after a restart", "A message waiting
 }, { langs: ["en"] });
 
 add("#173 An environment change reaches the open session", "A variable changed in Settings > Environment is used by the session already open, without restarting the app.", async c => {
-  // Desktop keeps environment overrides in Windows' protected storage; other systems refuse
-  // the save by design (#183).
-  if (process.platform !== "win32") { c.record.skipped = true; c.note("environment overrides are stored only on Windows"); return; }
+  // Runs on every platform (product owner, 2026-11-26): a system where the save is refused
+  // fails this case like any other.
   await chatSession();
   await fault({ requireKey: "rotated-secret" });
   const before = ask();

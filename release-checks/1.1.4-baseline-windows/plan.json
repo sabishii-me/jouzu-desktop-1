@@ -1,5 +1,5 @@
 {
-  "planId": "1.1.4-baseline-windows v1",
+  "planId": "1.1.4-baseline-windows v2 (frozen 2026-11-26)",
   "version": "1.1.4",
   "purpose": "Record the per-case results of the released 1.1.4 on native Windows, which exist only as totals. Run only if the per-case results of the 2026-11-23 runs cannot be recovered from the test machines. These results become the Windows baseline for 1.1.5.",
   "package": "JouzuDesktop_1.1.4_x64-setup.exe from release v1.1.4, unpacked (7z x), never installed",
@@ -16,5 +16,13 @@
   "confirmation": [],
   "declaredSkips": [],
   "baselines": {},
-  "acceptance": []
+  "acceptance": [],
+  "severity": {
+    "S1": "data loss, app crash or unusable, security, wasting the user's money (for example tokens spent)",
+    "S2": "core function broken with no workaround (send, sessions, sign-in, image tool silently off)",
+    "S3": "broken with a workaround, or the UI shows a wrong state",
+    "S4": "cosmetic or wording"
+  },
+  "runAs": "a normal user account (not root, not an administrator) on every machine; the runner refuses to start otherwise",
+  "frozen": true
 }
