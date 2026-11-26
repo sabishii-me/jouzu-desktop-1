@@ -3144,6 +3144,11 @@ impl Session {
                     .unwrap_or("")
                     .to_string();
                 let ok = value.get("isError").and_then(Value::as_bool) != Some(true);
+                // A refused image call may have written the refusal into the
+                // image report: read it, so Settings shows it.
+                if !ok && value.get("toolName").and_then(Value::as_str) == Some("generate_image") {
+                    self.config.known.read_image_report();
+                }
                 self.add_to_step_reply(json!({
                     "type": "toolResult",
                     "toolCallId": call_id,
@@ -7643,6 +7648,7 @@ impl SessionManager {
             )
         });
         pool.keep_models_in(config.known.clone());
+        config.known.read_reports_in(config.runtime_home.join("agent"));
         pool.fill();
         log(&config.home, "info", "runtime.warm_start", pool.status());
         // The app is starting and its loading screen waits for this runtime.
@@ -7670,6 +7676,11 @@ impl SessionManager {
             Some(text) if same_place(Path::new(&text), workspace) => text,
             _ => plain,
         }
+    }
+
+    /// The runtimes' latest answers about models and image providers.
+    pub fn known_models(&self) -> Option<Arc<KnownModels>> {
+        self.config.get().map(|config| config.known.clone())
     }
 
     /// A configuration change: the runtimes' earlier answers about models no

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { knownModels, SessionStore, type SessionPort } from "./session-store";
+import { setAppViewForTest } from "./app-view";
 import type { ApiEvent, HistoryPage } from "./api/jouzu-api";
 
 function fakeSession(): SessionPort & { emit: (event: ApiEvent) => void; sent: unknown[]; stopped: boolean } {
@@ -567,15 +568,12 @@ describe("SessionStore", () => {
       const api = { models: { select: async (_session: string, provider: string, id: string) => { selected.push(`${provider}/${id}`); } } };
       const feed = (target: SessionStore, value: ApiEvent) => (target as unknown as { handle: (event: ApiEvent) => void }).handle(value);
       const listed = [{ provider: "p", id: "runtime-pick", name: "Runtime pick" }, { provider: "p", id: "remembered", name: "Remembered" }];
-      const store = SessionStore.attach({ ...fakeSession(), sessionPath: "/new-1.jsonl" }, undefined, api as never, true);
+      const store = SessionStore.attach({ ...fakeSession(), sessionPath: "/new-1.jsonl" }, undefined, api as never);
       // Before the runtime answers: the host's expected model and the runtimes' last list.
       feed(store, event(1, "session.updated", { model: { state: "resolving", expected: listed[1] }, models: listed }));
       expect(store.snapshot.modelState).toBe("resolving");
       expect(store.snapshot.model).toBe("Remembered");
       expect(store.snapshot.models).toHaveLength(2);
-      // The next new session shows them from its first frame.
-      expect(knownModels.models).toHaveLength(2);
-      expect(knownModels.model).toBe("Remembered");
       // The pick is the host's to hand over (at creation): the store asks nothing.
       feed(store, event(2, "session.updated", { model: { ...listed[1], state: "ready" }, models: listed }));
       await Promise.resolve();
@@ -583,6 +581,32 @@ describe("SessionStore", () => {
       expect(store.snapshot.model).toBe("Remembered");
       store.dispose();
     } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("offers a new session the host's list for the current configuration, and none while it updates", () => {
+    const stored = new Map<string, string>([["jouzu.chat.model", JSON.stringify({ provider: "p", id: "remembered" })]]);
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => stored.get(key) ?? null,
+      setItem: (key: string, value: string) => { stored.set(key, value); },
+      removeItem: (key: string) => { stored.delete(key); },
+    });
+    try {
+      const listed = [{ provider: "p", id: "runtime-pick", name: "Runtime pick" }, { provider: "p", id: "remembered", name: "Remembered" }];
+      const view = (state: "ready" | "updating") => ({ revision: 1, config: { running: null, queued: [], lastResult: {} }, settings: null, models: { generation: 3, state, list: listed, startModel: listed[0] } });
+      setAppViewForTest(view("ready"));
+      expect(knownModels.updating).toBe(false);
+      expect(knownModels.models).toHaveLength(2);
+      expect(knownModels.model).toBe("Remembered");
+      // A configuration change: no older list is offered.
+      setAppViewForTest(view("updating"));
+      expect(knownModels.updating).toBe(true);
+      expect(knownModels.models).toEqual([]);
+      stored.clear();
+      expect(knownModels.model).toBe("Runtime pick");
+    } finally {
+      setAppViewForTest(null);
       vi.unstubAllGlobals();
     }
   });

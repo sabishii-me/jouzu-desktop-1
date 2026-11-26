@@ -366,12 +366,17 @@ export class HostClient {
     });
   }
 
-  tools(): Promise<{ path: string; exists: boolean; settings: Record<string, unknown> }> {
+  tools(): Promise<Record<string, unknown>> {
     return this.request("/v1/tools");
   }
 
-  async saveTools(image: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return this.request("/v1/tools", { method: "PUT", body: JSON.stringify({ image }) });
+  /** Only the fields given are saved. */
+  async saveTools(change: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.request("/v1/tools", { method: "PATCH", body: JSON.stringify({ image: change }) });
+  }
+
+  refreshTools(): Promise<Record<string, unknown>> {
+    return this.request("/v1/tools/refresh", { method: "POST" });
   }
 
   attribution(): Promise<AttributionSettings> {
@@ -380,14 +385,6 @@ export class HostClient {
 
   saveAttribution(change: Partial<AttributionSettings>): Promise<AttributionSettings> {
     return this.request("/v1/attribution", { method: "PUT", body: JSON.stringify(change) });
-  }
-
-  toolProviders(): Promise<{ providers: Array<{ id: string; label: string; available?: boolean; reason?: string; models?: unknown }> }> {
-    return this.request("/v1/tools/providers");
-  }
-
-  toolModels(provider: string): Promise<{ models: unknown }> {
-    return this.request(`/v1/tools/models?${new URLSearchParams({ provider })}`);
   }
 
   mcp(): Promise<{ path: string; exists: boolean; servers: Array<{ name: string; transport: string }> }> {

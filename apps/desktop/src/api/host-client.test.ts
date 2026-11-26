@@ -87,8 +87,7 @@ describe("HostClient", () => {
     const calls: Call[] = [];
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(input), init });
-      if (String(input).endsWith("/v1/tools/providers")) return response({ providers: [{ id: "shisa", label: "Shisa" }] });
-      if (String(input).includes("/v1/tools/models")) return response({ models: ["m"] });
+      if (String(input).endsWith("/v1/tools/refresh")) return response({ settings: {}, report: null, state: "checking" });
       if (String(input).endsWith("/v1/mcp")) return response({ path: "mcp.json", exists: false, servers: [] });
       if (String(input).endsWith("/v1/tools")) return response({ path: "tools.json", exists: false, settings: {} });
       return response({});
@@ -96,17 +95,18 @@ describe("HostClient", () => {
     const client = new HostClient({ baseUrl: "http://host", fetchImpl });
     await client.tools();
     await client.saveTools({ provider: "shisa" });
-    await client.toolProviders();
-    await client.toolModels("shisa");
+    await client.refreshTools();
     await client.mcp();
     expect(calls.map(call => call.url)).toEqual([
       "http://host/v1/tools",
       "http://host/v1/tools",
-      "http://host/v1/tools/providers",
-      "http://host/v1/tools/models?provider=shisa",
+      "http://host/v1/tools/refresh",
       "http://host/v1/mcp",
     ]);
+    // Only the changed field is sent.
+    expect(calls[1].init?.method).toBe("PATCH");
     expect(JSON.parse(String(calls[1].init?.body))).toEqual({ image: { provider: "shisa" } });
+    expect(calls[2].init?.method).toBe("POST");
   });
 
   test("unwraps session stats and maps error envelopes", async () => {

@@ -28,21 +28,29 @@ import {
   type TurnStep,
 } from "./chat-types";
 import { newId } from "./secure-context";
+import { currentAppView } from "./app-view";
 
 /**
- * The host's latest model list and the model a new session is expected to show:
- * what the host last relayed from the runtimes. A new session shows it from the
- * first frame, before the host has even answered its creation; the host's own
- * snapshot replaces it at once.
+ * The runtimes' model list for the current configuration and the model a new
+ * session is expected to show, as the host publishes them in AppView. A new
+ * session shows them from the first frame, before the host has even answered
+ * its creation; the session's own snapshot replaces them at once. While the
+ * configuration is being applied (`updating`) no list is offered: an older one
+ * would offer models the new configuration may not have.
  */
-const lastKnown: { models: ChatModel[]; startModel?: string } = { models: [] };
 export const knownModels = {
-  get models(): ChatModel[] { return lastKnown.models; },
-  /** The remembered pick when the runtimes list it, else the model a new session last started on. */
+  get updating(): boolean { return currentAppView()?.models?.state !== "ready"; },
+  get models(): ChatModel[] {
+    const view = currentAppView()?.models;
+    return view?.state === "ready" ? view.list.map(modelOf).filter((model): model is ChatModel => !!model) : [];
+  },
+  /** The remembered pick when the runtimes list it, else the model a new session starts on. */
   get model(): string | undefined {
+    const view = currentAppView()?.models;
     const preferred = readModelPreference();
-    const picked = preferred && lastKnown.models.find(model => model.provider === preferred.provider && model.id === preferred.id);
-    return picked?.name ?? lastKnown.startModel;
+    const picked = preferred && view?.list.find(model => model.provider === preferred.provider && model.id === preferred.id);
+    const start = view?.startModel;
+    return picked?.name ?? (start ? start.name || start.id : undefined);
   },
 };
 
@@ -275,8 +283,6 @@ export class SessionStore {
     readonly session: SessionPort,
     private readonly onDispose?: () => void,
     api?: JouzuApi,
-    /** A new conversation (not a saved one). */
-    private readonly fresh = false,
   ) {
     this.api = api;
     // The file is known from the attach: a send right after opening a saved
@@ -292,13 +298,13 @@ export class SessionStore {
 
   static async open(api: JouzuApi, workspacePath: string, sessionPath?: string): Promise<SessionStore> {
     const session = await HostChatSession.open(api, workspacePath, sessionPath);
-    const store = SessionStore.attach(session, undefined, api, sessionPath === undefined);
+    const store = SessionStore.attach(session, undefined, api);
     await store.load();
     return store;
   }
 
-  static attach(session: SessionPort, onDispose?: () => void, api?: JouzuApi, fresh = false): SessionStore {
-    const store = new SessionStore(session, onDispose, api, fresh);
+  static attach(session: SessionPort, onDispose?: () => void, api?: JouzuApi): SessionStore {
+    const store = new SessionStore(session, onDispose, api);
     if (api) {
       store.resume();
     } else {
@@ -753,8 +759,6 @@ export class SessionStore {
     const id = shown ? text(shown.id) : undefined;
     const label = provider && id ? text(shown?.name) ?? id : undefined;
     const models = Array.isArray(data.models) ? data.models.map(modelOf).filter((model): model is ChatModel => !!model) : undefined;
-    if (models?.length) lastKnown.models = models;
-    if (this.fresh && modelState === "ready" && label) lastKnown.startModel = label;
     this.update({
       ...(selected ? { modelState, model: label, modelProvider: provider, modelId: id } : {}),
       ...(models ? { models } : {}),

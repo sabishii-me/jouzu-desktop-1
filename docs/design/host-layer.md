@@ -128,6 +128,45 @@ describes no screens; what a person sees is in the UI document.
   makes it read catalogs, credentials and model settings anew: idle sessions at
   once, busy ones when their run ends. A message sent meanwhile waits as at
   start. A new conversation nothing was said in keeps the model it showed.
+- **Configuration generation.** Every configuration write goes through the
+  queue (section 5), so only the host knows that configuration changed. Each
+  change raises `AppView.configGeneration`, forgets the runtimes' earlier
+  answers and recycles the warm runtime. `AppView.models` is `updating` from
+  that moment until a runtime started under the new generation answered
+  `get_available_models`; then it is `ready` with that list and the start model.
+  Each answer for the current generation publishes `app.updated`; a late answer
+  from an older runtime is not taken. A client renders `AppView.models` and never
+  polls, refetches or keeps a list of its own; while `updating` it offers no
+  list. `GET /v1/models` still asks a ready warm runtime directly.
+
+### 4.1 Tools and the image report
+
+| Fact | Single owner | Where |
+|---|---|---|
+| The user's choices (switch, provider, model, size, images per call, reviewed tools) | host | `agent/tools.json`, written only by the host (`PATCH /v1/tools`) and read by the extension at every turn and call |
+| Which added providers can make images, their models and sizes, and the defaults | the `jouzu-image` extension, inside a runtime | `agent/jouzu-image/report.json`, written only by the extension |
+| Credentials | the runtime | the extension asks `getProviderAuth(id)`; a runtime provider counts as added only when `getProviderAuthStatus(id).configured` |
+
+- **Refresh.** When the first warm runtime of a new generation is ready, the
+  host sends it the extension command `/jouzu-image-refresh <token>` as an RPC
+  `prompt` (an extension command runs at once, answers `handled`, starts no turn
+  and writes nothing to the session file). The token names this host process
+  and the generation. The host then reads the report and takes it only when it
+  carries the current token. `POST /v1/tools/refresh` (Check again) sends the
+  same command with `--recheck`.
+- **Write-back.** A generation refused for a lasting reason (plan, credit,
+  sign-in) is written into the report by the extension, with a fingerprint of
+  the credential it was refused for; the provider is not offered again with that
+  credential until Check again or a new sign-in. The host reads the report again
+  when a `generate_image` call ends in an error.
+- **AppView.tools** is `{ settings, report, state }`: `checking` until the report
+  for the current generation arrived (the last report stays for reference),
+  then `ready`. `GET /v1/tools` returns the same block.
+- **Saving** is `PATCH /v1/tools` with only the fields that changed. The host
+  checks types and ranges only: an empty provider or model means "not chosen",
+  and turning the switch off is `{ "enabled": false }` whatever else is saved.
+  Whether a choice can be used is the report's answer, not the host's. Saving
+  restarts nothing.
 
 ## 5. Configuration queue
 
@@ -264,6 +303,9 @@ stays with the session and records every outcome, `stopped` included.
 | `settings` | Current settings |
 | `config` | `running`, `queued[]`, `lastResult[kind]` |
 | `startup` | State and cause |
+| `configGeneration` | Raised by every configuration change (section 4) |
+| `models` | `generation`, `state` (`updating` / `ready`), `list`, `startModel` |
+| `tools` | `settings` (`tools.json`), `report` (the image report), `state` (`checking` / `ready`) |
 
 ### 7.3 Events and commands
 
