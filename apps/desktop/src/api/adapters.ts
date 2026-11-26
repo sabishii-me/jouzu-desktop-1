@@ -119,9 +119,8 @@ function hostGroups(client: HostClient) {
 
   const tools: ToolsApi = {
     settings: () => client.tools(),
-    save: image => client.saveTools(image),
-    providers: () => client.toolProviders(),
-    models: provider => client.toolModels(provider),
+    save: change => client.saveTools(change),
+    refresh: () => client.refreshTools(),
   };
 
   const mcp: McpApi = {
