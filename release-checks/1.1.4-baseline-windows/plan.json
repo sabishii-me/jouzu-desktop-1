@@ -1,0 +1,20 @@
+{
+  "planId": "1.1.4-baseline-windows v1",
+  "version": "1.1.4",
+  "purpose": "Record the per-case results of the released 1.1.4 on native Windows, which exist only as totals. Run only if the per-case results of the 2026-11-23 runs cannot be recovered from the test machines. These results become the Windows baseline for 1.1.5.",
+  "package": "JouzuDesktop_1.1.4_x64-setup.exe from release v1.1.4, unpacked (7z x), never installed",
+  "machines": {
+    "windows-en": [
+      "en"
+    ],
+    "windows-ja": [
+      "ja"
+    ]
+  },
+  "caseTimeoutMinutes": 10,
+  "reruns": 3,
+  "confirmation": [],
+  "declaredSkips": [],
+  "baselines": {},
+  "acceptance": []
+}

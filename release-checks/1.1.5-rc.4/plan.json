@@ -1,0 +1,474 @@
+{
+  "planId": "1.1.5-rc.4 v1 (draft until the product owner approves)",
+  "version": "1.1.5-rc.4",
+  "purpose": "First full run under the release test procedure: suite A (every case) on every machine, suite B (confirmation of each fix in rc.4), suites C and D (acceptance of new features, install and update).",
+  "machines": {
+    "windows-en": [
+      "en"
+    ],
+    "windows-ja": [
+      "ja"
+    ],
+    "macos": [
+      "en",
+      "ja"
+    ],
+    "linux-cloud": [
+      "en",
+      "ja"
+    ],
+    "windows-upgrade": [
+      "en",
+      "ja"
+    ]
+  },
+  "caseTimeoutMinutes": 10,
+  "reruns": 3,
+  "confirmation": [
+    "#173 An environment change reaches the open session",
+    "#162 Waiting messages come back paused after a restart",
+    "Settings file cannot be written"
+  ],
+  "confirmationNote": "Suite cases that confirm a fix in rc.4. Keep only those whose fix is in rc.4; add the case of every other fix before the plan is frozen.",
+  "declaredSkips": [],
+  "baselineVersion": "1.1.4",
+  "baselines": {
+    "linux": {
+      "en": "../baselines/1.1.4/linux-cloud-source.txt",
+      "ja": "../baselines/1.1.4/linux-cloud-source.txt"
+    },
+    "windows": {
+      "en": "../baselines/1.1.4/windows-en.txt",
+      "ja": "../baselines/1.1.4/windows-ja.txt"
+    }
+  },
+  "acceptance": [
+    {
+      "id": "B-01",
+      "suite": "B",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "onlyIfFixedInThisRc": true,
+      "title": "Confirmation of the fix: Removing the chosen image provider silently turns off image generation while Settings > Tools still shows Shisa.AI",
+      "steps": [
+        "Do the steps under 'What happens' in the issue filed for this finding, on this build",
+        "Sign in to Shisa.AI and to ChatGPT.",
+        "In Settings > Tools, choose ChatGPT (gpt-image-2) as the image provider.",
+        "Remove ChatGPT from Model providers."
+      ],
+      "expected": [
+        "One rule decides which image provider is in effect, and the Tools card and the extension both use it. When the saved provider is removed, the choice falls back to a usable provider that the card shows and lets the user change, or the card says plainly that no provider is available. Image generation is never off while the card shows it as on."
+      ],
+      "evidence": "screenshot of the end state and of each step that the issue shows"
+    },
+    {
+      "id": "B-03",
+      "suite": "B",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "onlyIfFixedInThisRc": true,
+      "title": "Confirmation of the fix: The Shisa.AI sign-in failure message covers the button to try again",
+      "steps": [
+        "Do the steps under 'What happens' in the issue filed for this finding, on this build"
+      ],
+      "expected": [
+        "The failure message never covers the action that recovers from it. It sits beside the button, or the button stays reachable."
+      ],
+      "evidence": "screenshot of the end state and of each step that the issue shows"
+    },
+    {
+      "id": "B-04",
+      "suite": "B",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "onlyIfFixedInThisRc": true,
+      "title": "Confirmation of the fix: After a reload, an old sign-in failure is shown as if it had just happened",
+      "steps": [
+        "Do the steps under 'What happens' in the issue filed for this finding, on this build"
+      ],
+      "expected": [
+        "A failure message belongs to the attempt that produced it. After a reload the provider shows its current state (signed in or not), and an earlier failure is either gone or clearly marked with when it happened."
+      ],
+      "evidence": "screenshot of the end state and of each step that the issue shows"
+    },
+    {
+      "id": "B-05",
+      "suite": "B",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "onlyIfFixedInThisRc": true,
+      "title": "Confirmation of the fix: Signing in to ChatGPT changes the New session default model",
+      "steps": [
+        "Do the steps under 'What happens' in the issue filed for this finding, on this build"
+      ],
+      "expected": [
+        "Adding a provider makes its models available. It never changes the user's chosen default model. The default changes only when the user picks another one, or when the chosen model is no longer available. In that case the UI says so."
+      ],
+      "evidence": "screenshot of the end state and of each step that the issue shows"
+    },
+    {
+      "id": "B-06",
+      "suite": "B",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "onlyIfFixedInThisRc": true,
+      "title": "Confirmation of the fix: The same provider is shown under three different names, and an OAuth sign-in is shown as \"Key saved\"",
+      "steps": [
+        "Do the steps under 'What happens' in the issue filed for this finding, on this build"
+      ],
+      "expected": [
+        "One display name per provider, used everywhere. The provider's state describes how it is connected (signed in vs key saved)."
+      ],
+      "evidence": "screenshot of the end state and of each step that the issue shows"
+    },
+    {
+      "id": "B-07",
+      "suite": "B",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "onlyIfFixedInThisRc": true,
+      "title": "Confirmation of the fix: At a window width of 800 px the review card overflows and its Deny button is cut off",
+      "steps": [
+        "Do the steps under 'What happens' in the issue filed for this finding, on this build"
+      ],
+      "expected": [
+        "The review card fits the conversation at any supported window width. Its buttons wrap and are always visible and reachable."
+      ],
+      "evidence": "screenshot of the end state and of each step that the issue shows"
+    },
+    {
+      "id": "B-08",
+      "suite": "B",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "onlyIfFixedInThisRc": true,
+      "title": "Confirmation of the fix: When the image extension is not loaded, the host's image refresh command is sent to the model as a user message",
+      "steps": [
+        "Do the steps under 'What happens' in the issue filed for this finding, on this build"
+      ],
+      "expected": [
+        "The host sends the refresh only to a runtime where the extension is loaded (for example, it checks the runtime's command list first). A missing extension shows up as a clear image tool state, never as a model turn."
+      ],
+      "evidence": "screenshot of the end state and of each step that the issue shows"
+    },
+    {
+      "id": "B-15",
+      "suite": "B",
+      "platforms": [
+        "macos"
+      ],
+      "onlyIfFixedInThisRc": true,
+      "title": "Confirmation of the fix: macOS: saving an environment variable fails with \"Secure environment storage is not available\"",
+      "steps": [
+        "Do the steps under 'What happens' in the issue filed for this finding, on this build"
+      ],
+      "expected": [
+        "Environment variables can be saved on every supported platform, for example in the macOS Keychain. If a platform really has no secure storage, the Settings card says so before the user types a value, not after Save."
+      ],
+      "evidence": "screenshot of the end state and of each step that the issue shows"
+    },
+    {
+      "id": "B-17",
+      "suite": "B",
+      "platforms": [
+        "macos"
+      ],
+      "onlyIfFixedInThisRc": true,
+      "title": "Confirmation of the fix: macOS: the window shows Windows-style minimize, maximize and close buttons",
+      "steps": [
+        "Do the steps under 'What happens' in the issue filed for this finding, on this build"
+      ],
+      "expected": [
+        "On macOS the window uses the native controls (traffic lights, top left) and the title bar leaves space for them."
+      ],
+      "evidence": "screenshot of the end state and of each step that the issue shows"
+    },
+    {
+      "id": "B-18",
+      "suite": "B",
+      "platforms": [
+        "macos"
+      ],
+      "onlyIfFixedInThisRc": true,
+      "title": "Confirmation of the fix: Turning image generation off without a provider fails with \"provider is required\"",
+      "steps": [
+        "Do the steps under 'What happens' in the issue filed for this finding, on this build"
+      ],
+      "expected": [
+        "Turning a tool off never needs a provider. If saving fails, the message says what the user can do."
+      ],
+      "evidence": "screenshot of the end state and of each step that the issue shows"
+    },
+    {
+      "id": "D-mac-1",
+      "suite": "D",
+      "machines": [
+        "macos"
+      ],
+      "platforms": [
+        "macos"
+      ],
+      "title": "First run of the DMG app installs the runtime on its own",
+      "steps": [
+        "Copy the .app from the DMG to R/pkg and clear its quarantine attribute",
+        "Start it with a throwaway home: HOME=R/home-fresh, run the app's MacOS binary",
+        "Wait on the start page until it is ready",
+        "Open a new session and send one message with any model the fresh home offers"
+      ],
+      "expected": [
+        "The start page shows install steps with progress",
+        "No 'runtime missing' message and no Retry button",
+        "The start page reaches ready",
+        "Runtime files are created only under R/home-fresh"
+      ],
+      "evidence": "screenshots of install progress and ready state; a listing of R/home-fresh"
+    },
+    {
+      "id": "D-mac-2",
+      "suite": "D",
+      "machines": [
+        "macos"
+      ],
+      "platforms": [
+        "macos"
+      ],
+      "title": "Quitting or killing the app leaves no host or runtime",
+      "steps": [
+        "With the app from D-mac-1 running, press Cmd+Q",
+        "List processes whose command line contains R",
+        "Start it again, then kill -9 the app process",
+        "After 5 s list processes again"
+      ],
+      "expected": [
+        "After Cmd+Q no jouzu-host or runtime process from R is running",
+        "5 s after kill -9 no jouzu-host or runtime process from R is running"
+      ],
+      "evidence": "the two process listings"
+    },
+    {
+      "id": "D-mac-3",
+      "suite": "D",
+      "machines": [
+        "macos"
+      ],
+      "platforms": [
+        "macos"
+      ],
+      "title": "Runtime files deleted while the app runs are reinstalled",
+      "steps": [
+        "With the app running on R/home-fresh, delete the runtime's files under that home",
+        "Watch the start page / status for up to 60 s",
+        "Open a session and send one message"
+      ],
+      "expected": [
+        "The app shows that it is reinstalling the runtime",
+        "The runtime is back within 60 s",
+        "The session replies"
+      ],
+      "evidence": "screenshots during and after reinstall"
+    },
+    {
+      "id": "C-mac-239",
+      "suite": "C",
+      "machines": [
+        "macos"
+      ],
+      "platforms": [
+        "macos"
+      ],
+      "title": "#239 A folder opened through a symlink is listed once",
+      "steps": [
+        "Make a symlink to a workspace folder",
+        "Open the folder once by its real path and once through the symlink"
+      ],
+      "expected": [
+        "The sidebar lists the workspace once"
+      ],
+      "evidence": "screenshot of the sidebar"
+    },
+    {
+      "id": "C-mac-image-free",
+      "suite": "C",
+      "machines": [
+        "macos"
+      ],
+      "platforms": [
+        "macos"
+      ],
+      "title": "Image tool with a free Shisa.AI account",
+      "steps": [
+        "In the throwaway home, sign in with the free Shisa.AI account (the product owner signs in when asked)",
+        "Open Settings > Tools",
+        "In a chat, ask for an image"
+      ],
+      "expected": [
+        "Settings > Tools shows Shisa.AI as the provider and says the plan has no image generation",
+        "The chat answer gives that reason",
+        "Chat keeps working after it"
+      ],
+      "evidence": "screenshots of Settings > Tools and the chat"
+    },
+    {
+      "id": "C-mac-models",
+      "suite": "C",
+      "machines": [
+        "macos"
+      ],
+      "platforms": [
+        "macos"
+      ],
+      "title": "Model list follows sign-in without a restart",
+      "steps": [
+        "Note the New session model list",
+        "Sign in",
+        "Open the New session model list",
+        "Sign out",
+        "Open the list again"
+      ],
+      "expected": [
+        "After sign-in the list has the account's models without a restart",
+        "After sign-out those models are gone"
+      ],
+      "evidence": "screenshots of the three lists"
+    },
+    {
+      "id": "D-upg-1",
+      "suite": "D",
+      "machines": [
+        "windows-upgrade"
+      ],
+      "platforms": [
+        "windows"
+      ],
+      "title": "In-place update 1.1.4 -> rc.4 keeps data and sign-ins",
+      "steps": [
+        "As a second Windows user with 1.1.4 installed and used (sessions, a sign-in, a setting changed)",
+        "Update through the QA channel to rc.4",
+        "Open the app"
+      ],
+      "expected": [
+        "All sessions are listed and open",
+        "Sign-ins are kept",
+        "Changed settings are kept",
+        "What's new shows the rc.4 notes as paragraphs and list items"
+      ],
+      "evidence": "screenshots before and after"
+    },
+    {
+      "id": "D-upg-2",
+      "suite": "D",
+      "machines": [
+        "windows-upgrade"
+      ],
+      "platforms": [
+        "windows"
+      ],
+      "title": "In-place update rc.2 -> rc.4 keeps data, sign-ins and the runtime",
+      "steps": [
+        "With rc.2 installed and used, update through the QA channel to rc.4",
+        "Open the app",
+        "Look at the runtime version and install log"
+      ],
+      "expected": [
+        "All sessions, sign-ins and settings are kept",
+        "Runtime 0.2.5 is kept, not downloaded again",
+        "A session running when the update started was stopped first; the window does not stay on 'Preparing Jouzu'"
+      ],
+      "evidence": "screenshots; the host log lines about the runtime"
+    },
+    {
+      "id": "D-upg-3",
+      "suite": "D",
+      "machines": [
+        "windows-upgrade"
+      ],
+      "platforms": [
+        "windows"
+      ],
+      "title": "Install folder after the update",
+      "steps": [
+        "After D-upg-1 or D-upg-2, list the install folder",
+        "Open Settings > System"
+      ],
+      "expected": [
+        "No files left from the old version (for example an old icon)",
+        "Jouzu's Git Bash is present and in use",
+        "The commit shown has no 'dirty'"
+      ],
+      "evidence": "folder listing; screenshot of Settings > System"
+    },
+    {
+      "id": "C-win-image",
+      "suite": "C",
+      "machines": [
+        "windows-en"
+      ],
+      "platforms": [
+        "windows"
+      ],
+      "title": "Image tool with a paid Shisa.AI account and with ChatGPT",
+      "steps": [
+        "Start the unpacked rc.4 host and UI on a throwaway home",
+        "Sign in to Shisa.AI (paid) and ChatGPT in that home",
+        "Open Settings > Tools",
+        "Ask for an image in en and in ja",
+        "Choose the other provider and ask again",
+        "Turn the tool off and ask again in the next turn",
+        "Remove the chosen provider and open Settings > Tools"
+      ],
+      "expected": [
+        "Settings > Tools shows the provider in use",
+        "An image is generated",
+        "With both signed in the provider can be chosen",
+        "With the tool off it is not offered in the next turn",
+        "After removing the chosen provider, Settings > Tools shows the provider now in effect, or that none is"
+      ],
+      "evidence": "screenshots of each step"
+    },
+    {
+      "id": "D-linux-1",
+      "suite": "D",
+      "machines": [
+        "linux-cloud"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "title": "AppImage and .deb first run, quit and kill",
+      "steps": [
+        "Run the AppImage with a throwaway home",
+        "Install the .deb with apt in a clean container and start it with a throwaway home",
+        "Close the window; then start again and kill -9 the app",
+        "Delete the runtime files while the app runs"
+      ],
+      "expected": [
+        "Both reach ready with install progress shown, no 'missing' and no Retry",
+        "After closing and 5 s after kill -9 no host or runtime is left",
+        "The runtime is reinstalled within 60 s and a session replies"
+      ],
+      "evidence": "screenshots; process listings; host log lines"
+    }
+  ],
+  "declaredSkipsNote": "None declared. Two cases skip themselves on some machines and are reported as ERROR until the product owner declares a skip: 'Settings file cannot be written' (skips when run as root/administrator, e.g. the cloud Linux container) and '#173 An environment change reaches the open session' (the case skips itself off Windows)."
+}

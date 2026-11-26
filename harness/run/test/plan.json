@@ -1,0 +1,14 @@
+{
+  "planId": "selftest",
+  "version": "selftest",
+  "caseTimeoutMinutes": 0.1,
+  "reruns": 3,
+  "confirmation": ["Fails"],
+  "declaredSkips": [{ "case": "Skips with a planned reason", "reason": "declared in the plan" }],
+  "baselineVersion": "previous",
+  "baselines": { "linux": "baseline.txt", "windows": "baseline.txt", "macos": "baseline.txt" },
+  "acceptance": [
+    { "id": "C1", "suite": "C", "title": "Something new works", "steps": ["Open it"], "expected": ["It opens"] },
+    { "id": "C2", "suite": "C", "title": "Not recorded yet", "steps": ["Open it"], "expected": ["It opens"] }
+  ]
+}

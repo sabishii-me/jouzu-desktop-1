@@ -1,0 +1,63 @@
+PASS [en] Provider rejects the key while sending
+PASS [en] Provider rate-limits the request
+PASS [en] Provider fails with a server error
+PASS [en] Provider unreachable (network down)
+PASS [en] Model removed by the provider
+PASS [en] Reply cut off mid-stream
+PASS [en] Provider slow to answer (8 s to first word)
+PASS [en] Nothing moves while a reply runs
+PASS [en] Stop right after Send
+PASS [en] Stop while the provider has not answered
+PASS [en] Stop while the reply is writing
+PASS [en] Stop while a new session's runtime is still starting
+PASS [en] Stop with a message waiting in the queue
+PASS [en] Runtime killed while the session is idle
+PASS [en] Runtime killed while the reply is writing
+PASS [en] Runtime keeps crashing
+PASS [en] Runtime slow to start: a new session is sendable at once
+PASS [en] Computer asleep for 30 s during a reply
+PASS [en] Very long message (300 KB)
+PASS [en] Long unbroken token in a message
+FAIL [en] Image the model refuses: after the cause was fixed, the next message got no reply within 30 s; problems still shown outside the old reply after recovery: No replyWhat is 46 × 7? Reply with only the number. | The session was not reloaded.
+PASS [en] A file that is not an image, named .png
+PASS [en] Rapid settings changes
+SKIP [en] Settings file cannot be written
+PASS [en] Missing tools.json
+PASS [en] Old and damaged saved sessions
+PASS [en] #233 Opening a saved session does not show it as Running
+FAIL [en] #212 A background session's live state shows in the list: a session writing in the background shows "null", not running; a finished background reply shows "null", not finished
+PASS [en] #214 A finished reply is not shown as Interrupted
+FAIL [en] #177 #179 Send while a new session's runtime starts: #177: the session sent while its runtime starts is not in the list within 2 s; #179: Steer is offered while the session's runtime starts; #179: the composer says Jouzu reads it at its next step while nothing runs
+FAIL [en] #162 Waiting messages come back paused after a restart: the waiting message is gone or not paused with Continue after the restart
+SKIP [en] #173 An environment change reaches the open session
+FAIL [en] #171 A custom connection can be removed: no Remove connection for a custom connection
+FAIL [en] #174 A session whose folder was deleted: the reason does not name the folder: "The runtime could not open this session.
+FAIL [en] #178 A provider server error is not called no network: both say the same: "The provider did not answer"
+FAIL [en] #205 #168 Settings show no dirty build and no launcher: #168: the Model providers page speaks of a launcher; #168: the Tools page speaks of a launcher; #168: the Appearance page speaks of a launcher; #168: the Environment page speaks of a launcher; #168: the Language page speaks of a launcher; #168: the System page speaks of a launcher
+FAIL [en] #208 Commit marking can be switched on and kept: the case could not finish: locator.click: Timeout 30000ms exceeded.
+PASS [en] #130 The host token is in no file
+PASS [en] #33 A draft stays in its own session
+PASS [en] #26 Settings stay open when clicking beside them
+PASS [en] #119 An image in a sent message stays after switching sessions
+PASS [ja] Provider rejects the key while sending
+PASS [ja] Provider rate-limits the request
+PASS [ja] Provider fails with a server error
+PASS [ja] Provider unreachable (network down)
+PASS [ja] Model removed by the provider
+PASS [ja] Reply cut off mid-stream
+PASS [ja] Provider slow to answer (8 s to first word)
+PASS [ja] Runtime killed while the session is idle
+PASS [ja] Runtime killed while the reply is writing
+PASS [ja] Runtime keeps crashing
+PASS [ja] Very long message (300 KB)
+FAIL [ja] Image the model refuses: after the cause was fixed, the next message got no reply within 30 s; problems still shown outside the old reply after recovery: 応答なしWhat is 33 × 7? Reply with only the number. | セッションは再読み込みされませんでした。
+PASS [ja] A file that is not an image, named .png
+SKIP [ja] Settings file cannot be written
+PASS [ja] Old and damaged saved sessions
+PASS [ja] #233 Opening a saved session does not show it as Running
+FAIL [ja] #212 A background session's live state shows in the list: a session writing in the background shows "null", not running; a finished background reply shows "null", not finished
+PASS [ja] #214 A finished reply is not shown as Interrupted
+FAIL [ja] #177 #179 Send while a new session's runtime starts: #179: Steer is offered while the session's runtime starts
+FAIL [ja] #174 A session whose folder was deleted: Restart session is offered for a missing folder
+FAIL [ja] #178 A provider server error is not called no network: both say the same: "プロバイダーから応答がありません"
+FAIL [ja] #205 #168 Settings show no dirty build and no launcher: #168: the モデルプロバイダー page speaks of a launcher; #168: the ツール page speaks of a launcher; #168: the 外観 page speaks of a launcher; #168: the 環境変数 page speaks of a launcher; #168: the 言語 page speaks of a launcher; #168: the システム page speaks of a launcher

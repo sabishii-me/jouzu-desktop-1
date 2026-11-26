@@ -54,11 +54,13 @@ async function connect(url, timeout = 60_000) {
     await new Promise(resolve => setTimeout(resolve, 1_000));
   }
 }
-const { connected: browser, found: page } = await connect(process.env.PLAYBOOK_CDP ?? "http://127.0.0.1:9223");
+// PLAYBOOK_LIST=1: print the cases (name and languages) as JSON and exit; nothing is started.
+const listOnly = Boolean(process.env.PLAYBOOK_LIST);
+const { connected: browser, found: page } = listOnly ? { connected: null, found: null } : await connect(process.env.PLAYBOOK_CDP ?? "http://127.0.0.1:9223");
 const result = { startedAt: new Date().toISOString(), lang, cases: [], errors: [] };
 const now = () => Date.now();
 const sleep = ms => page.waitForTimeout(ms);
-page.on("pageerror", error => result.errors.push(`page error: ${String(error)}`));
+page?.on("pageerror", error => result.errors.push(`page error: ${String(error)}`));
 
 // ---- The world ----
 const post = (base, path, body = {}) => fetch(base + path, { method: "POST", body: JSON.stringify(body) }).then(response => response.json());
@@ -1195,6 +1197,10 @@ function tinyPng() {
 }
 
 // ---- Run ----
+if (listOnly) {
+  console.log(JSON.stringify(cases.map(item => ({ name: item.name, why: item.why, langs: item.langs }))));
+  process.exit(0);
+}
 // The installed app's window cannot be given a language before it loads: set it as the app
 // keeps it and load again.
 await page.waitForLoadState("domcontentloaded").catch(() => {});
