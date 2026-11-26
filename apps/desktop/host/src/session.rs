@@ -6744,7 +6744,9 @@ impl SessionManager {
                 .filter(|bash| bash.is_file())
                 .or_else(|| find_bash(&self.home))
                 .is_some(),
-            "git": self.home.join("runtime").join("git").exists(),
+            // Jouzu installs its own Git only on Windows; on macOS and Linux sessions use
+            // the system's, as the shell's runtime report does (#183).
+            "git": !cfg!(windows) || self.home.join("runtime").join("git").exists(),
             "terminal": self.home.join("runtime").join("terminal").exists(),
             "warmRuntime": self.warm_runtime().map(|pool| pool.status()),
         })

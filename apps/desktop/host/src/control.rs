@@ -599,11 +599,13 @@ impl ControlManager {
         {
             command.creation_flags(0x08000000);
         }
+        #[cfg(not(windows))]
+        command.process_group(0);
         let mut child = command
             .spawn()
             .map_err(|_| unavailable("Cannot start the configuration service".into()))?;
-        // The child's tree belongs to a job on Windows; elsewhere the child itself
-        // is killed (`kill_on_drop`, `start_kill`).
+        // The child's tree belongs to a job: a Job Object on Windows, its own
+        // process group elsewhere.
         let job = crate::runtime::job::Job::new()
             .map_err(|_| unavailable("Cannot own the configuration process".into()))?;
         #[cfg(windows)]
@@ -614,6 +616,9 @@ impl ControlManager {
             job.assign(handle)
                 .map_err(|_| unavailable("Cannot own the configuration process".into()))?;
         }
+        #[cfg(not(windows))]
+        job.assign(child.id().unwrap_or_default())
+            .map_err(|_| unavailable("Cannot own the configuration process".into()))?;
 
         // Written beside the wait below, so a child that never reads its input
         // still meets the deadline and Cancel.
@@ -662,7 +667,7 @@ impl ControlManager {
             TimedOut,
         }
         let stop = tokio::select! {
-            status = child.wait() => Stop::Exited(status),
+            status = job.wait(&mut child) => Stop::Exited(status),
             _ = cancel.notified() => Stop::Cancelled,
             _ = tokio::time::sleep(TIMEOUT) => Stop::TimedOut,
         };
@@ -674,7 +679,7 @@ impl ControlManager {
                 // whole job goes. That is the documented loss in ADR 0012.
                 job.terminate();
                 let _ = child.start_kill();
-                let _ = child.wait().await;
+                let _ = job.wait(&mut child).await;
                 if let Some(task) = stderr_task {
                     task.abort();
                     let _ = task.await;

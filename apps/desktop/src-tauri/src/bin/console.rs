@@ -113,7 +113,10 @@ fn run_entry(entry: &str, executable: &Path, forwarded: &[OsString], managed: &P
 /// The session itself: the managed Node runs the slot's starter, which prepares Jouzu's home and hands
 /// the arguments on. One command serves both contracts, so an entry behaves like the window.
 fn session(root: &Path, app: &Path, bash: &Path) -> Command {
-    let mut command = Command::new(root.join("runtime/node/node.exe"));
+    // The managed Node's layout (runtime_install::node_executable): `node.exe` on Windows,
+    // `bin/node` from the official Unix tarball.
+    let node = if cfg!(windows) { "runtime/node/node.exe" } else { "runtime/node/bin/node" };
+    let mut command = Command::new(root.join(node));
     command.arg(node_path::node_path(&app.join("bootstrap.mjs")));
     command.env("JOUZU_LAUNCHER_BASH", bash);
     command.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());

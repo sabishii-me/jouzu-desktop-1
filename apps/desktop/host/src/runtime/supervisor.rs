@@ -86,7 +86,7 @@ impl RuntimeSupervisor {
         let wait = supervisor.clone();
         let wait_events = events;
         tokio::spawn(async move {
-            let status = spawned.child.wait().await;
+            let status = wait.job.wait(&mut spawned.child).await;
             wait.fail_pending("runtime exited");
             let code = status.ok().and_then(|status| status.code());
             let _ = wait_events.send(RuntimeEvent::Exited(code)).await;
