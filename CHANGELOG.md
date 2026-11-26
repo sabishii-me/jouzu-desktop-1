@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.5-rc.3 - 2026-11-26
+
+Third release candidate for 1.1.5, on the QA channel. It follows 1.1.5-rc.2.
+
+- Jouzu Desktop is released for macOS (Apple Silicon, `.dmg`) and Linux (x64 `.AppImage` and
+  `.deb`) next to Windows. The macOS app is not notarized yet: after copying it to
+  Applications, open it once with `xattr -cr "/Applications/Jouzu Desktop.app"`. Closing the
+  window on macOS and Linux ends the app and every runtime it started (#183).
+- The app installs, updates and repairs Jouzu itself and shows each step with its progress. A
+  first start no longer reports Jouzu as missing while it is still being installed, and
+  Jouzu files that go missing while the app runs are installed again.
+- The image tool is rebuilt: Settings → Tools shows which image provider is used (Shisa or
+  ChatGPT), whether your plan allows images, and why not when it does not (#249).
+- Signing in to a provider updates the model list of new sessions without restarting the app.
+- The sidebar lists workspaces by recent use and has one menu for grouping, order and filter
+  (#19). A folder reached through a symbolic link is listed once (#239).
+- The divider between the conversation and the side panel can be dragged again (#186).
+- An older Stable build is no longer offered as an update (#176).
+
 ## 1.1.5-rc.2 - 2026-11-23
 
 Second release candidate for 1.1.5, on the QA channel. It replaces 1.1.5-rc.1, which did not
