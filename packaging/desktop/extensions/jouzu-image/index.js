@@ -16,6 +16,7 @@
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { saveArtifact } from "./artifacts.mjs";
+import { chosen } from "./choice.mjs";
 import codex from "./providers/codex.mjs";
 import { coded } from "./providers/errors.mjs";
 import { runtimeProviders } from "./providers/runtime.mjs";
@@ -74,17 +75,17 @@ export function resolve(current, report, input = {}) {
   const image = current.image;
   if (!image.enabled) throw coded("other", "Image generation is off in Settings → Tools.");
   if (!report) throw coded("other", "Image providers are still being checked.");
-  const providerId = input.provider || image.provider || report.defaults?.provider;
-  const entry = report.providers.find(provider => provider.id === providerId);
-  if (!providerId || !entry) throw coded("other", providerId ? `${providerId} is not added as an image provider.` : "No image provider can make images.");
+  // What applies when the call names nothing: the same rule the Tools card shows.
+  const fallback = chosen(image, report);
+  const entry = input.provider ? report.providers.find(provider => provider.id === input.provider) : fallback.provider;
+  if (!entry) throw coded("other", input.provider ? `${input.provider} is not added as an image provider.` : "No image provider can make images.");
   if (!entry.usable) throw coded(entry.code ?? "other", `${entry.label}: ${entry.reason ?? "cannot make images now."}`);
-  const settingsModel = providerId === image.provider ? image.model : "";
-  const modelId = input.model || settingsModel || entry.models[0]?.id;
+  const modelId = input.model || (entry === fallback.provider ? fallback.model?.id : entry.models[0]?.id);
   const model = entry.models.find(candidate => candidate.id === modelId);
   if (!model) throw coded("other", `${entry.label} does not offer the image model ${modelId}.`);
   let size = null;
   if (model.sizes.length) {
-    size = input.size || image.size;
+    size = input.size || (model === fallback.model ? fallback.size : model.sizes.includes(image.size) ? image.size : model.sizes[0]);
     if (!model.sizes.includes(size)) throw coded("other", `${model.id} does not make ${size} images. It makes ${model.sizes.join(", ")}.`);
   }
   const images = input.count === undefined ? 1 : Number(input.count);

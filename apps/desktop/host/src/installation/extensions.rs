@@ -15,6 +15,8 @@ const IMAGE: &[(&str, &str)] = &[
     ("package.json", packaged!("jouzu-image/package.json")),
     ("index.js", packaged!("jouzu-image/index.js")),
     ("report.mjs", packaged!("jouzu-image/report.mjs")),
+    ("choice.mjs", packaged!("jouzu-image/choice.mjs")),
+    ("choice.d.mts", packaged!("jouzu-image/choice.d.mts")),
     ("artifacts.mjs", packaged!("jouzu-image/artifacts.mjs")),
     ("providers/errors.mjs", packaged!("jouzu-image/providers/errors.mjs")),
     ("providers/shisa.mjs", packaged!("jouzu-image/providers/shisa.mjs")),

@@ -7,6 +7,8 @@ import { Label } from "./components/ui/label";
 import { Switch } from "./components/ui/switch";
 import { ErrorLine } from "./session-alerts-view";
 import { fill, useChatText, type ChatText } from "./chat-text";
+// The rule for what is in effect is the image tool's own, so the card shows what a call uses.
+import { chosen } from "../../../packaging/desktop/extensions/jouzu-image/choice.mjs";
 
 /** Why an added image provider cannot make images, in the interface language. */
 function imageWhy(t: ChatText, code: string | undefined): string {
@@ -33,13 +35,6 @@ export function imageCardState(tools: ToolsView | undefined): ImageCardState {
   if (!tools || tools.state === "checking" || !tools.report) return "checking";
   if (!tools.report.providers.length) return "none-added";
   return tools.report.usable ? "usable" : "none-usable";
-}
-
-/** The provider and model in effect: the saved ones, else the report's defaults. */
-export function chosen(image: ImageSettings, providers: ImageProvider[], defaults: { provider: string; model: string }) {
-  const provider = providers.find(entry => entry.id === (image.provider || defaults.provider));
-  const model = provider?.models.find(entry => entry.id === (image.provider === provider?.id && image.model ? image.model : provider?.models[0]?.id));
-  return { provider, model };
 }
 
 function Why({ t, provider }: { t: ChatText; provider: ImageProvider }) {
@@ -102,7 +97,7 @@ export function ToolsPanel({ onOpenProviders }: { onOpenProviders?: () => void }
   } else {
     const image = tools.settings.image;
     const providers = tools.report.providers;
-    const { provider, model } = chosen(image, providers, tools.report.defaults);
+    const { provider, model, size } = chosen(image, tools.report);
     const usable = providers.filter(entry => entry.usable);
     const sizes = model?.sizes ?? [];
     body = <div data-image-state="usable" className="space-y-4">
@@ -134,7 +129,7 @@ export function ToolsPanel({ onOpenProviders }: { onOpenProviders?: () => void }
           </select>
         </label>}
         {provider?.usable && sizes.length > 0 && <label className="text-sm"><span className="text-muted-foreground">{t.imageSize}</span>
-          <select aria-label={t.imageSize} className={select} value={sizes.includes(image.size) ? image.size : sizes[0]} disabled={busy} onChange={event => void save({ size: event.target.value })}>
+          <select aria-label={t.imageSize} className={select} value={size ?? sizes[0]} disabled={busy} onChange={event => void save({ size: event.target.value })}>
             {sizes.map(size => <option key={size} value={size}>{size}</option>)}
           </select>
         </label>}

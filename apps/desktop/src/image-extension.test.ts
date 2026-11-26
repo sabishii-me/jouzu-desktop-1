@@ -340,4 +340,23 @@ describe("settings", () => {
     const report = await refresh(registry({ codex: true }));
     expect(resolve(await settings(), report)).toMatchObject({ provider: "openai-codex", model: "gpt-image-2", size: "1K", count: 1 });
   });
+
+  it("keeps a removed provider's choice, uses the default meanwhile, and applies it again when added back", async () => {
+    const saved = { image: { enabled: true, provider: "openai-codex", model: "gpt-image-2", size: "1K" } };
+    agent(saved);
+    const { active, run } = load();
+    await refresh(registry({ shisa: true }));
+    await run("before_agent_start", {});
+    expect(active()).toContain(TOOL);
+    expect(resolve(await settings(), await readReport(dir))).toMatchObject({ provider: "shisa", model: "gemini-3.1-flash-image" });
+    expect(JSON.parse(readFileSync(join(dir, "tools.json"), "utf8"))).toEqual(saved);
+    await refresh(registry({ shisa: true, codex: true }));
+    expect(resolve(await settings(), await readReport(dir))).toMatchObject({ provider: "openai-codex", model: "gpt-image-2" });
+  });
+
+  it("uses the model's first size when it does not make the saved one", async () => {
+    agent({ image: { provider: "openai-codex", size: "2K" } });
+    const report = await refresh(registry({ codex: true }));
+    expect(resolve(await settings(), report)).toMatchObject({ provider: "openai-codex", size: "1K" });
+  });
 });

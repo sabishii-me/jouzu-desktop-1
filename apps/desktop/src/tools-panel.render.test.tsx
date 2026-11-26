@@ -71,6 +71,20 @@ describe("the image generation card", () => {
     expect(markup).toContain("Open Model providers");
   });
 
+  it("with a saved provider that was removed: shows the provider in effect with its model, as the image tool uses it", () => {
+    const markup = render(tools([shisa], "ready", { ...settings.image, provider: "openai-codex", model: "gpt-image-2" }));
+    expect(markup).toContain('data-image-state="usable"');
+    expect(markup).toMatch(/<option value="shisa" selected="">Shisa.AI<\/option>/u);
+    expect(markup).toContain('aria-label="Image model"');
+    expect(markup).toMatch(/<option value="gemini-3.1-flash-image" selected="">/u);
+    expect(markup).not.toContain('role="alert"');
+  });
+
+  it("shows the model's first size when it does not make the saved one", () => {
+    const markup = render(tools([shisa], "ready", { ...settings.image, provider: "shisa", size: "4K" }));
+    expect(markup).toMatch(/<option value="1K" selected="">/u);
+  });
+
   it("is decided by the report alone", () => {
     expect(imageCardState(undefined)).toBe("checking");
     expect(imageCardState(tools(null))).toBe("checking");
