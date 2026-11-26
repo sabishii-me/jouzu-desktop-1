@@ -57,7 +57,7 @@ const declaredSkip = (name) => (plan.declaredSkips ?? []).find(item => item.case
 
 writeFileSync(join(out, 'run.json'), `${JSON.stringify({
   plan: resolve(args.plan), version: plan.version, machine: args.machine, platform, languages,
-  app: Object.fromEntries(['ABN_HOST', 'ABN_DIST', 'ABN_RUNTIME_APP', 'ABN_UNIX_LAYOUT', 'ABN_INSTALL', 'ABN_MANAGED', 'ABN_SHELL'].filter(name => process.env[name]).map(name => [name, process.env[name]])),
+  app: Object.fromEntries(['ABN_HOST', 'ABN_DIST', 'ABN_RUNTIME_APP', 'ABN_UNIX_LAYOUT', 'ABN_INSTALL', 'ABN_MANAGED', 'ABN_SHELL', 'ABN_EXTENSIONS'].filter(name => process.env[name]).map(name => [name, process.env[name]])),
   harness: harnessCommit(), cases: queue.length, startedAt: new Date().toISOString(),
 }, null, 2)}\n`);
 

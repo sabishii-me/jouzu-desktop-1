@@ -30,6 +30,7 @@ import { startFixtureServer } from './fixture-server.mjs';
 //     ABN_UNIX_LAYOUT  macOS/Linux: run the runtime as an installation there does, from
 //                  <home>/runtime/node/bin/node and <home>/app, without --runtime (#181)
 // Common:
+//   ABN_EXTENSIONS the desktop extensions folder to install into the throwaway home (source build or unpacked package)
 //   ABN_LANGS    interface languages to run, comma separated (default en,ja)
 //   ABN_ONLY     run only the cases whose names contain this text (several: separate with |)
 //   ABN_OUT      report folder (default ./abnormal-exam-<time>)
@@ -89,6 +90,10 @@ function makeRoot(fixturePort, pkg) {
       },
     },
   }, null, 2));
+  // A packaged install writes the desktop extensions into the runtime's agent folder; a source
+  // build or an unpacked package does not, so they are copied in (ABN_EXTENSIONS = the package's
+  // packaging/desktop/extensions folder). Without them the image tool's refresh reaches the model.
+  if (process.env.ABN_EXTENSIONS) cpSync(resolve(process.env.ABN_EXTENSIONS), join(data, 'agent', 'extensions'), { recursive: true });
   writeFileSync(join(data, 'agent', 'settings.json'), JSON.stringify({ defaultProvider: 'fixture', defaultModel: 'deterministic' }, null, 2));
   writeFileSync(join(root, 'runtime-delay.json'), '{"ms":0}');
   writeOldSessions(data, workspace);
