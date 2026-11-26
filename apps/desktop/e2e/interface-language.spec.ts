@@ -5,15 +5,13 @@ import { UI_BASE, stubHost, emptyControlState } from "./host-control";
 
 test("the Tools page follows the interface language", async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem("jouzu.ui.language", "ja"));
-  await stubHost(page, { control: () => emptyControlState });
-  const image = { enabled: true, provider: "shisa", model: "gemini-3-pro-image", size: "1K", maxImages: 3 };
-  await page.route("**/v1/tools**", async route => {
-    const url = new URL(route.request().url());
-    const json = (body: unknown) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
-    if (url.pathname === "/v1/tools") return json({ path: "tools.json", exists: true, settings: { image, reviewTools: ["generate_image"] } });
-    if (url.pathname === "/v1/tools/providers") return json({ providers: [{ id: "shisa", label: "Shisa.AI", available: true, models: [{ id: "gemini-3-pro-image", sizes: ["1K"] }] }] });
-    if (url.pathname === "/v1/tools/models") return json({ models: [{ id: "gemini-3-pro-image", sizes: ["1K"] }] });
-    return route.fallback();
+  const shisa = { id: "shisa", label: "Shisa.AI", usable: true, models: [{ id: "gemini-3-pro-image", sizes: ["1K"] }] };
+  await stubHost(page, {
+    control: () => emptyControlState,
+    tools: {
+      image: { provider: "shisa", model: "gemini-3-pro-image" },
+      report: () => ({ usable: true, defaults: { provider: "shisa", model: "gemini-3-pro-image", size: "1K", maxImages: 3 }, providers: [shisa] }),
+    },
   });
   await page.goto(UI_BASE);
   await page.getByRole("button", { name: "設定", exact: true }).first().click();

@@ -21,13 +21,23 @@ export type HostStub = {
  * stub plays the host's queue around it: `POST /v1/config/{kind}` is accepted at
  * once, operations run one at a time, and `app.updated` carries the snapshot.
  * A `modelReady` field in the answer is the fixture's runtime: it answers one
- * model in `/v1/models` unless it is `false`; it is not sent to the window.
+ * model unless it is `false`; it is not sent to the window. Like the host, every
+ * operation that changes configuration raises `configGeneration` and publishes
+ * the models as `updating` and the tools as `checking`, then publishes the
+ * runtime's answers for the new generation: the model list, and the image
+ * report `tools` gives for it. `PATCH /v1/tools` saves the fields sent and
+ * `POST /v1/tools/refresh` asks for the report again.
  * The rest is an idle host: the given folders, no sessions, nothing running.
  * A path not listed here is a 404, as from a host that does not serve it.
  */
 export async function stubHost(
   page: Page,
-  options: { control: (body: any, host: HostStub) => unknown; workspaces?: Workspace[] },
+  options: {
+    control: (body: any, host: HostStub) => unknown;
+    workspaces?: Workspace[];
+    /** The image report for a generation; `null` keeps the tools `checking`. */
+    tools?: { image?: Record<string, unknown>; report: (generation: number) => unknown };
+  },
 ) {
   const workspaces = [...(options.workspaces ?? [])];
   // Events wait here until the window's stream next connects. The stub answers
@@ -38,9 +48,24 @@ export async function stubHost(
   const cancels = new Set<() => void>();
   const send = (event: string, data: Record<string, unknown>) => { seq += 1; queued.push(`id: ${seq}\nevent: ${event}\ndata: ${JSON.stringify({ ...data, seq })}\n\n`); };
   let modelReady = true;
-  const view: { revision: number; config: { running: any; queued: any[]; lastResult: Record<string, unknown> }; settings: any } =
-    { revision: 0, config: { running: null, queued: [], lastResult: {} }, settings: null };
+  const fixtureModel = { provider: "fixture", id: "model", name: "Fixture model" };
+  const image = { enabled: true, provider: "", model: "", size: "1K", maxImages: 3, ...(options.tools?.image ?? {}) };
+  const view: { revision: number; config: { running: any; queued: any[]; lastResult: Record<string, unknown> }; settings: any; configGeneration: number; models: any; tools: any } = {
+    revision: 0,
+    config: { running: null, queued: [], lastResult: {} },
+    settings: null,
+    configGeneration: 0,
+    models: { generation: null, state: "updating", list: [], startModel: null },
+    tools: { settings: { image, reviewTools: ["generate_image"] }, report: null, state: "checking" },
+  };
   const publish = () => { view.revision += 1; send("app.updated", JSON.parse(JSON.stringify(view))); };
+  /** The runtimes of the current generation answer. */
+  const answer = () => {
+    view.models = { generation: view.configGeneration, state: "ready", list: modelReady ? [fixtureModel] : [], startModel: modelReady ? fixtureModel : null };
+    const report = options.tools ? options.tools.report(view.configGeneration) : { usable: false, defaults: { provider: "", model: "", size: "1K", maxImages: 3 }, providers: [] };
+    view.tools = { ...view.tools, report: report ?? view.tools.report, state: report ? "ready" : "checking" };
+    publish();
+  };
   const host: HostStub = {
     // A device code belongs to the running sign-in, as the host reports it.
     device(data) { if (view.config.running) { view.config.running.device = data; publish(); } },
@@ -70,11 +95,19 @@ export async function stubHost(
         const text = String((error as Error)?.message ?? error);
         result = { operationId, ok: false, code: text === "cancelled" ? "config-cancelled" : "config-failed", params: {}, text };
       }
+      // A configuration change: a new generation, nothing answered for it yet.
+      const changed = kind !== "status" && result.ok;
+      if (changed) {
+        view.configGeneration += 1;
+        view.models = { ...view.models, generation: null, state: "updating", list: [] };
+        view.tools = { ...view.tools, state: "checking" };
+      }
       view.config.running = null;
       // The provider the operation was for, as the host records it with the result.
       const provider = typeof body.provider === "string" ? body.provider : null;
       view.config.lastResult[kind] = { ...result, provider, finishedAt: new Date().toISOString() };
       publish();
+      if (changed || view.models.state !== "ready") setTimeout(answer, 50);
     });
     return { operationId, position };
   };
@@ -104,7 +137,14 @@ export async function stubHost(
     }
     if (path === "/v1/environment") return route.fulfill(json({ entries: [] }));
     if (path === "/v1/sessions" || path === "/v1/sessions/persisted") return route.fulfill(json({ sessions: [] }));
-    if (path === "/v1/models") { await chain; return route.fulfill(json({ models: modelReady ? [{ provider: "fixture", id: "model", name: "Fixture model" }] : [] })); }
+    if (path === "/v1/models") { await chain; return route.fulfill(json({ models: modelReady ? [fixtureModel] : [] })); }
+    if (path === "/v1/tools" && method === "GET") return route.fulfill(json(view.tools));
+    if (path === "/v1/tools" && method === "PATCH") {
+      view.tools.settings.image = { ...view.tools.settings.image, ...(request.postDataJSON()?.image ?? {}) };
+      publish();
+      return route.fulfill(json(view.tools));
+    }
+    if (path === "/v1/tools/refresh" && method === "POST") { answer(); return route.fulfill(json(view.tools)); }
     if (path === "/v1/runtime/warm") return route.fulfill(json({ state: "off" }));
     if (path === "/v1/artifacts/counts") return route.fulfill(json({ counts: {} }));
     return route.fulfill(json({ error: { code: "not-found", message: `No stub for ${method} ${path}` } }, 404));
