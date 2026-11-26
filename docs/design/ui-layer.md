@@ -103,6 +103,31 @@ ever appears in the composer's place, and only one at a time.
 - **Several actions in a row**: each button shows its own progress while it waits
   its turn; nothing fails because another action is running.
 
+### 6.1 Tools → Image generation
+
+The card renders `AppView.tools` and decides nothing itself. It is always in
+exactly one state:
+
+| State | Shows | Actions |
+|---|---|---|
+| Checking (no report for this configuration yet) | One line: "Checking…" | None |
+| No provider added | The switch, off and disabled; one line pointing to Model providers | **Open Model providers** |
+| Providers added, none can make images | The switch, off and disabled; one line per provider with its reason (Details holds the service's text) | **Open Model providers**, **Check again** |
+| At least one can make images | The switch; when on: provider, model, size (only for models with sizes), images per call | Each choice saves only itself |
+| The chosen provider cannot make images, another can | As above, with the reason under the provider | **Open Model providers** and **Check again** when a new sign-in or credit can fix it |
+
+Providers nobody added are never listed. A saved switch that is on while
+nothing can make images shows off; the saved choice is kept and applies again
+when a provider can.
+
+### 6.2 Model picker during a configuration change
+
+From a configuration change until the runtimes of the new configuration
+answered (`AppView.models.state` is `updating`), a new session's picker shows
+the current model's name with "Updating…" and does not open, and the model
+setup page is not shown. An older list is never offered in its place. Open
+sessions keep their own runtime's list.
+
 ## 7. Start page and MCP
 
 - **The app cannot work** (host unreachable, runtime not installed): the start
