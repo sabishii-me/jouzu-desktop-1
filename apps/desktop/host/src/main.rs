@@ -219,6 +219,7 @@ async fn main() -> ExitCode {
     }
     // Settings show what replies said about each provider's sign-in.
     state.control.watch_providers(sessions.providers());
+    jouzu_host::connect_app_view(&state.control, &sessions);
     state.control.start();
     // Web access listeners follow the saved scope; addresses can change (DHCP,
     // Tailscale reconnect), so re-check them periodically.

@@ -301,6 +301,9 @@ pub struct ControlManager {
     after_change: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// What replies said about each provider's sign-in, shown with the settings.
     providers: OnceLock<Arc<crate::provider_answers::ProviderAnswers>>,
+    /// The rest of AppView, owned elsewhere: the configuration generation, the
+    /// runtimes' models and the tools (`SessionManager::app_parts`).
+    parts: OnceLock<Box<dyn Fn() -> Map<String, Value> + Send + Sync>>,
 }
 
 impl ControlManager {
@@ -326,6 +329,7 @@ impl ControlManager {
             hub: events,
             after_change: OnceLock::new(),
             providers: OnceLock::new(),
+            parts: OnceLock::new(),
         })
     }
 
@@ -352,6 +356,22 @@ impl ControlManager {
         self.providers.get().map_or_else(|| json!({}), |providers| providers.view())
     }
 
+    /// Set once by the host when it starts: these fields are part of every AppView.
+    pub fn show_parts(&self, parts: impl Fn() -> Map<String, Value> + Send + Sync + 'static) {
+        let _ = self.parts.set(Box::new(parts));
+    }
+
+    fn parts_view(&self) -> Map<String, Value> {
+        self.parts.get().map(|parts| parts()).unwrap_or_default()
+    }
+
+    /// Something AppView shows changed outside the queue (a runtime answered,
+    /// the tools settings were saved): publish it.
+    pub fn notify(&self) {
+        let mut queue = self.lock();
+        self.publish(&mut queue);
+    }
+
     /// Set once by the host when it starts.
     pub fn on_change(&self, action: impl Fn() + Send + Sync + 'static) {
         let _ = self.after_change.set(Box::new(action));
@@ -375,10 +395,10 @@ impl ControlManager {
     /// The configuration part of `AppView`: what runs, what waits, the last result
     /// of each kind, and the current settings.
     pub fn view(&self) -> Value {
-        Self::render(&self.lock(), self.provider_view())
+        Self::render(&self.lock(), self.provider_view(), self.parts_view())
     }
 
-    fn render(queue: &Queue, providers: Value) -> Value {
+    fn render(queue: &Queue, providers: Value, parts: Map<String, Value>) -> Value {
         let running = queue.running.as_ref().map(|running| {
             let mut value = json!({
                 "operationId": running.id,
@@ -407,19 +427,23 @@ impl ControlManager {
                 })
             })
             .collect();
-        json!({
+        let mut view = json!({
             "revision": queue.revision,
             "config": { "running": running, "queued": queued, "lastResult": queue.last },
             "settings": queue.settings,
             // Providers whose latest reply refused the stored key or sign-in.
             "providerAuth": providers,
-        })
+        });
+        if let Some(object) = view.as_object_mut() {
+            object.extend(parts);
+        }
+        view
     }
 
     fn publish(&self, queue: &mut Queue) {
         queue.revision += 1;
         if let Some(hub) = &self.hub {
-            hub.publish_control("app.updated", Self::render(queue, self.provider_view()));
+            hub.publish_control("app.updated", Self::render(queue, self.provider_view(), self.parts_view()));
         }
     }
 

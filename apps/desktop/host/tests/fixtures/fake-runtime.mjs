@@ -267,7 +267,23 @@ function requestUi(text) {
 }
 
 let inputPhase = false;
+// Like the jouzu-image extension: its refresh command writes the image report
+// for the token it was given, runs at once and starts no turn.
+function imageRefresh(id, text) {
+  promptLog(text);
+  const token = String(text).trim().split(/\s+/)[1] ?? null;
+  if (process.env.JOUZU_HOME) {
+    const directory = join(process.env.JOUZU_HOME, "agent", "jouzu-image");
+    mkdirSync(directory, { recursive: true });
+    const usable = process.env.FAKE_IMAGE_USABLE === "1";
+    const providers = usable ? [{ id: "fixture", label: "Fixture", usable: true, models: [{ id: "fixture-image", sizes: ["1K"] }] }] : [];
+    writeFileSync(join(directory, "report.json"), JSON.stringify({ schema: 1, generation: token, computedAt: new Date().toISOString(), usable, defaults: { provider: usable ? "fixture" : "", model: usable ? "fixture-image" : "", size: "1K", maxImages: 3 }, providers }));
+  }
+  response(id, "prompt", { disposition: "handled" });
+}
+
 function prompt(id, text, images) {
+  if (String(text).startsWith("/jouzu-image-refresh")) { imageRefresh(id, text); return; }
   // "/refuse <text>": a slash command the runtime refuses with <text>.
   if (String(text).startsWith("/refuse ")) { promptLog(text); failure(id, "prompt", String(text).slice(8)); return; }
   if (handledPrompts || String(text).startsWith("/flow ")) {
