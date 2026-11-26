@@ -1,33 +1,15 @@
 // @ts-nocheck
+// The jouzu-image extension against a fake runtime registry and mocked
+// endpoints, in an isolated agent folder. Nothing here depends on what any
+// machine has configured.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import extension, { availability, listModels, listProviders, setCredentialReader, setRegistryLoader } from "../../../packaging/desktop/extensions/jouzu-image/index.js";
-import shisa from "../../../packaging/desktop/extensions/jouzu-image/providers/shisa.mjs";
+import extension, { REFRESH, TOOL, refresh, resolve, settings } from "../../../packaging/desktop/extensions/jouzu-image/index.js";
+import { readReport } from "../../../packaging/desktop/extensions/jouzu-image/report.mjs";
+import codex from "../../../packaging/desktop/extensions/jouzu-image/providers/codex.mjs";
 
-function load() {
-  const tools = [];
-  const handlers = new Map();
-  extension({
-    registerTool: tool => tools.push(tool),
-    on: (event, handler) => {
-      const list = handlers.get(event) ?? [];
-      list.push(handler);
-      handlers.set(event, list);
-    },
-  });
-  return { tool: tools[0], handlers };
-}
-
-function homeWith(settings) {
-  const home = mkdtempSync(join(tmpdir(), "jouzu-image-"));
-  mkdirSync(join(home, "agent"), { recursive: true });
-  if (settings) writeFileSync(join(home, "agent", "tools.json"), JSON.stringify(settings));
-  return home;
-}
-
-// A PNG header is enough for the artifact dimension reader.
 function png(width, height, payload = "x") {
   const header = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
   const size = Buffer.alloc(8);
@@ -35,317 +17,327 @@ function png(width, height, payload = "x") {
   size.writeUInt32BE(height, 4);
   return Buffer.concat([header, size, Buffer.from(payload)]);
 }
+const bytes = png(1024, 1024);
+const b64 = bytes.toString("base64");
 
-const bytes = png(2816, 1536);
-const imageBody = () => ({ steps: [{ type: "model_output", content: [{ type: "image", mime_type: "image/png", data: bytes.toString("base64") }] }] });
-const ok = body => ({ ok: true, status: 200, json: async () => body });
+// A ChatGPT access token carries the account id in its payload.
+const codexToken = ["h", Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-test" } })).toString("base64url"), "s"].join(".");
 
-// The runtime's model registry, reduced to what the extension uses.
-const flux = { type: "image", id: "black-forest-labs/flux.2-pro", provider: "openrouter", api: "openrouter-images" };
-const gemini = { type: "image", id: "google/gemini-2.5-flash-image", provider: "openrouter", api: "openrouter-images" };
-function registry({ models = [], available = models, generateImages } = {}) {
+const flux = { type: "image", id: "flux-test", provider: "openrouter" };
+
+/** The runtime's registry, reduced to the public calls the extension makes. */
+function registry({ shisa = false, codex: chatgpt = false, openrouter = false, generateImages } = {}) {
+  const auth = { shisa: shisa && "shisa-token", "openai-codex": chatgpt && codexToken, openrouter: openrouter && "or-key" };
   return {
-    getModelsOfType: (_type, provider) => models.filter(model => !provider || model.provider === provider),
-    getAvailableOfType: async (_type, provider) => available.filter(model => !provider || model.provider === provider),
+    getProviderAuth: async id => (auth[id] ? { auth: { apiKey: auth[id], headers: {} }, source: "stored" } : undefined),
+    getProviderAuthStatus: id => ({ configured: Boolean(auth[id]) }),
+    // The registry lists image models for providers nobody added.
+    getModelsOfType: (_type, provider) => [flux].filter(model => !provider || model.provider === provider),
     getProviderDisplayName: id => (id === "openrouter" ? "OpenRouter" : id),
-    generateImages: generateImages ?? vi.fn(),
+    generateImages: generateImages ?? vi.fn(async () => ({ stopReason: "stop", output: [{ type: "image", data: b64, mimeType: "image/png" }] })),
   };
 }
-const runtimeImage = () => ({ stopReason: "stop", output: [{ type: "image", data: bytes.toString("base64"), mimeType: "image/png" }] });
 
-describe("generate_image extension", () => {
-  let home = null;
-  beforeEach(() => {
-    vi.stubGlobal("fetch", vi.fn());
-    setCredentialReader(async () => ({ type: "oauth", access: "test-token" }));
-    // By default the runtime lists no image models, so only the own Shisa adapter applies.
-    setRegistryLoader(async () => registry());
+const json = (status, body) => ({ ok: status >= 200 && status < 300, status, headers: new Headers(), json: async () => body, text: async () => JSON.stringify(body) });
+
+/** Shisa endpoints: the account's model list and generation. */
+function shisaEndpoints({ models = [{ name: "models/gemini-3.1-flash-image" }], list = 200, generate = 200, error } = {}) {
+  return vi.fn(async (url, init) => {
+    if (String(url).endsWith("/image/models")) return json(list, list === 200 ? { object: "list", data: models } : { error });
+    if (String(url).includes("chatgpt.com")) return json(200, { data: [{ b64_json: b64 }] });
+    return json(generate, generate === 200 ? { steps: [{ content: [{ type: "image", mime_type: "image/png", data: b64 }] }] } : { error });
   });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    if (home) rmSync(home, { recursive: true, force: true });
-    home = null;
-    delete process.env.JOUZU_HOME;
+}
+
+function load() {
+  const tools = [];
+  const handlers = new Map();
+  const commands = new Map();
+  let active = ["read", "bash"];
+  const pi = {
+    registerTool: tool => tools.push(tool),
+    registerCommand: (name, command) => commands.set(name, command),
+    on: (event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
+    getActiveTools: () => [...active],
+    setActiveTools: names => { active = [...names]; },
+  };
+  extension(pi);
+  return {
+    tool: tools[0],
+    commands,
+    active: () => active,
+    run: async (event, payload, ctx) => {
+      let result;
+      for (const handler of handlers.get(event) ?? []) result = await handler(payload, ctx);
+      return result;
+    },
+  };
+}
+
+let dir = null;
+function agent(tools) {
+  const home = mkdtempSync(join(tmpdir(), "jouzu-image-"));
+  dir = join(home, "agent");
+  mkdirSync(dir, { recursive: true });
+  if (tools) writeFileSync(join(dir, "tools.json"), JSON.stringify(tools));
+  process.env.PI_CODING_AGENT_DIR = dir;
+  return dir;
+}
+
+beforeEach(() => {
+  vi.stubGlobal("fetch", shisaEndpoints());
+});
+afterEach(() => {
+  vi.unstubAllGlobals();
+  if (dir) rmSync(join(dir, ".."), { recursive: true, force: true });
+  dir = null;
+  delete process.env.PI_CODING_AGENT_DIR;
+});
+
+describe("the report", () => {
+  it("lists only added providers: Shisa only, ChatGPT only, neither, both", async () => {
+    const cases = [
+      [{ shisa: true }, ["shisa"]],
+      [{ codex: true }, ["openai-codex"]],
+      [{}, []],
+      [{ shisa: true, codex: true }, ["shisa", "openai-codex"]],
+    ];
+    for (const [added, ids] of cases) {
+      agent();
+      const report = await refresh(registry(added), { generation: "g-1" });
+      expect(report.providers.map(provider => provider.id)).toEqual(ids);
+      expect(report.usable).toBe(ids.length > 0);
+      expect(report.generation).toBe("g-1");
+      expect(report.defaults.provider).toBe(ids[0] ?? "");
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
   });
 
-  it("registers one tool with a count, and a review handler", () => {
-    const { tool, handlers } = load();
-    expect(tool.name).toBe("generate_image");
-    expect(Object.keys(tool.parameters.properties)).toEqual(["prompt", "count", "provider", "model", "size"]);
-    expect(handlers.get("tool_call")).toHaveLength(1);
+  it("leaves out a runtime provider the registry lists but nobody added", async () => {
+    agent();
+    expect((await refresh(registry())).providers).toEqual([]);
+    const report = await refresh(registry({ openrouter: true }));
+    expect(report.providers).toEqual([{ id: "openrouter", label: "OpenRouter", usable: true, models: [{ id: "flux-test", sizes: [] }] }]);
   });
 
-  it("blocks a reviewed call when denied, and never reaches the provider", async () => {
-    home = homeWith({ image: { provider: "shisa", model: "m1", size: "1K" }, reviewTools: ["generate_image"] });
-    process.env.JOUZU_HOME = home;
-    const { handlers } = load();
-    const ctx = { ui: { select: vi.fn().mockResolvedValue("Deny") } };
-    const result = await handlers.get("tool_call")[0]({ toolName: "generate_image", input: { prompt: "a cat" } }, ctx);
-    expect(result).toMatchObject({ block: true });
-    expect(fetch).not.toHaveBeenCalled();
-    // Denying again simply asks again; the user may refuse as often as they like.
-    await handlers.get("tool_call")[0]({ toolName: "generate_image", input: { prompt: "a cat" } }, ctx);
-    expect(ctx.ui.select).toHaveBeenCalledTimes(2);
+  it("marks a Shisa plan without images as not allowed when the model list is empty", async () => {
+    agent();
+    vi.stubGlobal("fetch", shisaEndpoints({ models: [] }));
+    const report = await refresh(registry({ shisa: true }));
+    expect(report.usable).toBe(false);
+    expect(report.providers[0]).toMatchObject({ id: "shisa", usable: false, code: "not-allowed" });
   });
 
-  it("names the prompt and the number of paid generations in the review", async () => {
-    home = homeWith({ image: { provider: "shisa", model: "gemini-3-pro-image", size: "2K" } });
-    process.env.JOUZU_HOME = home;
-    const { handlers } = load();
-    const select = vi.fn().mockResolvedValue("Deny");
-    await handlers.get("tool_call")[0]({ toolName: "generate_image", input: { prompt: "三只猫", count: 3 } }, { ui: { select } });
-    const title = select.mock.calls[0][0];
-    const body = JSON.parse(title.split("\n")[1]);
-    expect(body.images).toBe(3);
-    expect(body.prompt).toBe("三只猫");
-    expect(body.provider).toBe("shisa");
+  it("marks an account out of credit at report time", async () => {
+    agent();
+    vi.stubGlobal("fetch", shisaEndpoints({ list: 402, error: { code: "insufficient_balance" } }));
+    expect((await refresh(registry({ shisa: true }))).providers[0]).toMatchObject({ usable: false, code: "no-credit" });
+  });
+
+  it("keeps a provider that cannot be reached as added but unusable", async () => {
+    agent();
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
+    expect((await refresh(registry({ shisa: true }))).providers[0]).toMatchObject({ usable: false, code: "unreachable" });
+  });
+
+  it("is written whole, through a rename, where the host reads it", async () => {
+    agent();
+    await refresh(registry({ shisa: true }), { generation: "g-2" });
+    expect(readdirSync(join(dir, "jouzu-image"))).toEqual(["report.json"]);
+    expect(JSON.parse(readFileSync(join(dir, "jouzu-image", "report.json"), "utf8")).generation).toBe("g-2");
+  });
+
+  it("is refreshed by the command the host sends, which starts no turn", async () => {
+    agent();
+    const { commands } = load();
+    await commands.get(REFRESH).handler("g-7", { modelRegistry: registry({ codex: true }) });
+    const report = await readReport(dir);
+    expect(report.generation).toBe("g-7");
+    expect(report.providers[0]).toMatchObject({ id: "openai-codex", usable: true, models: [{ id: "gpt-image-2", sizes: ["1K"] }] });
+  });
+});
+
+describe("when the tool is in a turn", () => {
+  it("is registered inactive, then added only when the chosen provider can make images", async () => {
+    agent();
+    const { tool, active, run } = load();
+    expect(tool.defaultActive).toBe(false);
+    await run("before_agent_start", {});
+    expect(active()).not.toContain(TOOL);
+    await refresh(registry({ shisa: true }));
+    await run("before_agent_start", {});
+    expect(active()).toContain(TOOL);
+  });
+
+  it("goes away on the next turn when the switch is turned off", async () => {
+    agent({ image: { enabled: true } });
+    const { active, run } = load();
+    await refresh(registry({ shisa: true }));
+    await run("before_agent_start", {});
+    expect(active()).toContain(TOOL);
+    writeFileSync(join(dir, "tools.json"), JSON.stringify({ image: { enabled: false } }));
+    await run("before_agent_start", {});
+    expect(active()).not.toContain(TOOL);
+  });
+
+  it("is absent when the only added provider cannot make images", async () => {
+    agent();
+    vi.stubGlobal("fetch", shisaEndpoints({ models: [] }));
+    const { active, run } = load();
+    await refresh(registry({ shisa: true }));
+    await run("before_agent_start", {});
+    expect(active()).not.toContain(TOOL);
+  });
+});
+
+describe("check, then ask, then run", () => {
+  async function ready(tools = { image: { provider: "shisa" }, reviewTools: [TOOL] }) {
+    agent(tools);
+    await refresh(registry({ shisa: true }));
+    return load();
+  }
+
+  it("blocks a model the provider does not offer without asking", async () => {
+    const { run } = await ready();
+    const select = vi.fn();
+    const result = await run("tool_call", { toolName: TOOL, input: { prompt: "a cat", model: "nope" } }, { ui: { select } });
+    expect(result.block).toBe(true);
+    expect(result.reason).toContain("nope");
+    expect(select).not.toHaveBeenCalled();
+  });
+
+  it("blocks a size the model does not make, and a count over the limit, without asking", async () => {
+    vi.stubGlobal("fetch", shisaEndpoints({ models: [{ name: "gemini-3.1-flash-lite-image" }] }));
+    const { run } = await ready({ image: { provider: "shisa", maxImages: 2 }, reviewTools: [TOOL] });
+    const select = vi.fn();
+    expect((await run("tool_call", { toolName: TOOL, input: { prompt: "x", size: "4K" } }, { ui: { select } })).block).toBe(true);
+    expect((await run("tool_call", { toolName: TOOL, input: { prompt: "x", count: 3 } }, { ui: { select } })).block).toBe(true);
+    expect(select).not.toHaveBeenCalled();
+  });
+
+  it("asks with the values that will be used, and runs with exactly those", async () => {
+    const { run } = await ready();
+    const select = vi.fn(async () => "Approve");
+    const input = { prompt: "a cat", count: 2 };
+    expect(await run("tool_call", { toolName: TOOL, input }, { ui: { select } })).toBeUndefined();
+    const body = JSON.parse(select.mock.calls[0][0].split("\n")[1]);
+    expect(body).toEqual({ tool: TOOL, images: 2, prompt: "a cat", provider: "shisa", model: "gemini-3.1-flash-image", size: "1K" });
+    expect(input).toMatchObject({ provider: "shisa", model: "gemini-3.1-flash-image", size: "1K", count: 2 });
+  });
+
+  it("names no size for a model without a size choice", async () => {
+    agent({ image: { provider: "openrouter" }, reviewTools: [TOOL] });
+    await refresh(registry({ openrouter: true }));
+    const { run } = load();
+    const select = vi.fn(async () => "Approve");
+    const input = { prompt: "x", size: "2K" };
+    await run("tool_call", { toolName: TOOL, input }, { ui: { select } });
+    expect(JSON.parse(select.mock.calls[0][0].split("\n")[1]).size).toBeUndefined();
+    expect(input.size).toBeUndefined();
   });
 
   it("remembers 'approve for this session' until the session restarts", async () => {
-    home = homeWith({ reviewTools: ["generate_image"] });
-    process.env.JOUZU_HOME = home;
-    const { handlers } = load();
-    const select = vi.fn().mockResolvedValue("Approve for this session");
-    const ctx = { ui: { select } };
-    await handlers.get("tool_call")[0]({ toolName: "generate_image", input: { prompt: "a cat" } }, ctx);
-    await handlers.get("tool_call")[0]({ toolName: "generate_image", input: { prompt: "a cat" } }, ctx);
+    const { run } = await ready();
+    const select = vi.fn(async () => "Approve for this session");
+    await run("tool_call", { toolName: TOOL, input: { prompt: "x" } }, { ui: { select } });
+    await run("tool_call", { toolName: TOOL, input: { prompt: "y" } }, { ui: { select } });
     expect(select).toHaveBeenCalledTimes(1);
-    await handlers.get("session_start")[0]({}, {});
-    await handlers.get("tool_call")[0]({ toolName: "generate_image", input: { prompt: "a cat" } }, ctx);
+    await run("session_start", {}, {});
+    await run("tool_call", { toolName: TOOL, input: { prompt: "z" } }, { ui: { select } });
     expect(select).toHaveBeenCalledTimes(2);
   });
 
-  it("saves one artifact with its prompt and dimensions, and returns the image", async () => {
-    home = homeWith({ image: { provider: "shisa", model: "gemini-3-pro-image", size: "2K" } });
-    process.env.JOUZU_HOME = home;
-    vi.mocked(fetch).mockResolvedValue(ok(imageBody()));
-    const { tool } = load();
-    const result = await tool.execute("call-1", { prompt: "a cat" });
-    const body = JSON.parse(vi.mocked(fetch).mock.calls[0][1].body);
-    expect(body.model).toBe("gemini-3-pro-image");
-    expect(body.response_format.image_size).toBe("2K");
-    expect(result.content.filter(block => block.type === "image")).toHaveLength(1);
-    expect(result.content[0].text).toContain('Prompt: "a cat"');
-    expect(result.details).toMatchObject({ prompt: "a cat", provider: "shisa", model: "gemini-3-pro-image", size: "2K", usage: null });
-    expect(result.details.images).toHaveLength(1);
-    const image = result.details.images[0];
-    expect(image.width).toBe(2816);
-    expect(image.height).toBe(1536);
-    expect(image.path.endsWith(`${image.id}.png`)).toBe(true);
-    const sidecar = JSON.parse(readFileSync(join(home, "artifacts", "images", `${image.id}.json`), "utf8"));
-    expect(sidecar).toMatchObject({ kind: "images", prompt: "a cat", prompts: ["a cat"], mimeType: "image/png" });
-    expect(sidecar.source.tool).toBe("generate_image");
+  it("blocks a denied call", async () => {
+    const { run } = await ready();
+    const result = await run("tool_call", { toolName: TOOL, input: { prompt: "x" } }, { ui: { select: async () => "Deny" } });
+    expect(result).toMatchObject({ block: true, reason: "The user declined this tool call." });
   });
 
-  it("defaults to the provider's first model instead of failing on an unset model", async () => {
-    home = homeWith({ image: { provider: "shisa", model: "", size: "1K" } });
-    process.env.JOUZU_HOME = home;
-    vi.mocked(fetch).mockResolvedValueOnce(ok({ models: [{ name: "models/first-model" }] })).mockResolvedValueOnce(ok(imageBody()));
-    const { tool } = load();
-    await tool.execute("call", { prompt: "a cat" });
-    expect(JSON.parse(vi.mocked(fetch).mock.calls[1][1].body).model).toBe("first-model");
-  });
-
-  it("generates the requested count and caps it by the settings", async () => {
-    home = homeWith({ image: { provider: "shisa", model: "m1", size: "1K", maxImages: 2 } });
-    process.env.JOUZU_HOME = home;
-    vi.mocked(fetch).mockResolvedValue(ok(imageBody()));
-    const { tool } = load();
-    const result = await tool.execute("call", { prompt: "a cat", count: 5 });
-    expect(fetch).toHaveBeenCalledTimes(2);
+  it("saves each image as an artifact and returns it", async () => {
+    const { tool, run } = await ready({ image: { provider: "shisa" }, reviewTools: [] });
+    const input = { prompt: "a cat", count: 2 };
+    await run("tool_call", { toolName: TOOL, input }, { ui: {} });
+    const result = await tool.execute("call-1", input, undefined, undefined, { modelRegistry: registry({ shisa: true }) });
     expect(result.details.images).toHaveLength(2);
-    expect(result.content.filter(block => block.type === "image")).toHaveLength(2);
+    expect(result.details.images[0]).toMatchObject({ width: 1024, height: 1024, mimeType: "image/png" });
+    const sidecars = readdirSync(join(dir, "..", "artifacts", "images")).filter(name => name.endsWith(".json"));
+    expect(sidecars).toHaveLength(1);
   });
 
-  it("reuses the artifact id for identical bytes and appends the prompt", async () => {
-    home = homeWith({ image: { provider: "shisa", model: "m1", size: "1K" } });
-    process.env.JOUZU_HOME = home;
-    vi.mocked(fetch).mockResolvedValue(ok(imageBody()));
-    const { tool } = load();
-    const first = await tool.execute("call-1", { prompt: "a cat" });
-    const second = await tool.execute("call-2", { prompt: "a cat again" });
-    expect(second.details.images[0].id).toBe(first.details.images[0].id);
-    const files = readdirSync(join(home, "artifacts", "images")).filter(name => name.endsWith(".png"));
-    expect(files).toHaveLength(1);
-    const sidecar = JSON.parse(readFileSync(join(home, "artifacts", "images", `${first.details.images[0].id}.json`), "utf8"));
-    expect(sidecar.prompts).toEqual(["a cat", "a cat again"]);
+  it("writes a plan refusal back, so the tool goes away until the sign-in changes or Check again", async () => {
+    const { tool, run, active } = await ready({ image: { provider: "shisa" }, reviewTools: [] });
+    vi.stubGlobal("fetch", shisaEndpoints({ generate: 403, error: { code: "model_not_in_plan", message: "Model not in plan" } }));
+    const input = { prompt: "x" };
+    await run("tool_call", { toolName: TOOL, input }, { ui: {} });
+    await expect(tool.execute("call-1", input, undefined, undefined, { modelRegistry: registry({ shisa: true }) })).rejects.toThrow("plan does not include");
+    const report = await readReport(dir);
+    expect(report.providers[0]).toMatchObject({ usable: false, code: "not-allowed" });
+    expect(report.providers[0].refusedWith).toMatch(/^[0-9a-f]{16}$/);
+    await run("before_agent_start", {});
+    expect(active()).not.toContain(TOOL);
+    // A refresh for another reason keeps the refusal for the same credential.
+    vi.stubGlobal("fetch", shisaEndpoints());
+    expect((await refresh(registry({ shisa: true }))).providers[0].usable).toBe(false);
+    // Check again asks the service again.
+    expect((await refresh(registry({ shisa: true }), { recheck: true })).providers[0].usable).toBe(true);
   });
 
-  it("reports a missing runtime credential as a sign-in problem", async () => {
-    home = homeWith({ image: { provider: "shisa", model: "m1", size: "1K" } });
-    process.env.JOUZU_HOME = home;
-    setCredentialReader(async () => undefined);
-    const { tool } = load();
-    await expect(tool.execute("call", { prompt: "a cat" })).rejects.toThrow("Sign in to Shisa.AI");
-  });
-
-  it("falls back to a size the chosen model accepts", async () => {
-    home = homeWith({ image: { provider: "shisa", model: "gemini-3.1-flash-lite-image", size: "1K" } });
-    process.env.JOUZU_HOME = home;
-    vi.mocked(fetch).mockResolvedValue(ok(imageBody()));
-    const { tool } = load();
-    const result = await tool.execute("call", { prompt: "a cat", size: "4K" });
-    expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1].body).response_format.image_size).toBe("1K");
-    expect(result.details.size).toBe("1K");
-  });
-
-  it("lists the runtime's image providers beside Shisa, each usable with its models or with the reason it is not", async () => {
-    vi.mocked(fetch).mockResolvedValue(ok({ models: [{ name: "models/gemini-3.1-flash-lite-image" }] }));
-    const providers = await listProviders(registry({ models: [flux, gemini], available: [] }));
-    expect(providers).toEqual([
-      { id: "shisa", label: "Shisa.AI", available: true, models: [{ id: "gemini-3.1-flash-lite-image", sizes: ["1K"] }] },
-      { id: "openrouter", label: "OpenRouter", available: false, code: "no-credential", reason: "No credential for OpenRouter. Add one under Model providers to generate images with it." },
-    ]);
-    const usable = await listProviders(registry({ models: [flux, gemini] }));
-    // The runtime's image API takes no size, so its models offer none.
-    expect(usable[1]).toEqual({ id: "openrouter", label: "OpenRouter", available: true, models: [{ id: flux.id, sizes: [] }, { id: gemini.id, sizes: [] }] });
-    const models = await listModels(registry({ models: [flux, gemini] }), "openrouter");
-    expect(models).toEqual([{ id: flux.id, sizes: [] }, { id: gemini.id, sizes: [] }]);
-  });
-
-  it("marks Shisa unavailable without a credential, with the reason, instead of hiding it", async () => {
-    setCredentialReader(async () => undefined);
-    const providers = await listProviders(registry());
-    expect(providers).toEqual([{ id: "shisa", label: "Shisa.AI", available: false, code: "no-credential", reason: "Sign in to Shisa.AI or set SHISA_API_KEY to generate images." }]);
-  });
-
-  it("generates with a runtime provider through the runtime's registry, never its own request", async () => {
-    home = homeWith({ image: { provider: "openrouter", model: gemini.id, size: "2K", maxImages: 2 } });
-    process.env.JOUZU_HOME = home;
-    const generateImages = vi.fn().mockResolvedValue(runtimeImage());
-    const modelRegistry = registry({ models: [flux, gemini], generateImages });
-    const { tool } = load();
-    const result = await tool.execute("call", { prompt: "a cat", count: 2 }, undefined, undefined, { modelRegistry });
-    expect(fetch).not.toHaveBeenCalled();
-    expect(generateImages).toHaveBeenCalledTimes(2);
-    expect(generateImages.mock.calls[0][0]).toBe(gemini);
-    expect(generateImages.mock.calls[0][1]).toEqual({ input: [{ type: "text", text: "a cat" }] });
-    expect(result.details).toMatchObject({ provider: "openrouter", model: gemini.id, size: null });
-    expect(result.details.images).toHaveLength(2);
-    expect(result.content[0].text).not.toContain("Size:");
-    const sidecar = JSON.parse(readFileSync(join(home, "artifacts", "images", `${result.details.images[0].id}.json`), "utf8"));
-    expect(sidecar.source).toMatchObject({ provider: "openrouter", model: gemini.id });
-  });
-
-  it("starts from the requested provider's first model, not the configured provider's model", async () => {
-    home = homeWith({ image: { provider: "shisa", model: "gemini-3-pro-image", size: "1K" } });
-    process.env.JOUZU_HOME = home;
-    const generateImages = vi.fn().mockResolvedValue(runtimeImage());
-    const { tool } = load();
-    const result = await tool.execute("call", { prompt: "a cat", provider: "openrouter" }, undefined, undefined, { modelRegistry: registry({ models: [flux, gemini], generateImages }) });
-    expect(generateImages.mock.calls[0][0]).toBe(flux);
-    expect(result.details.model).toBe(flux.id);
-  });
-
-  it("names the missing credential of a runtime provider instead of failing silently", async () => {
-    home = homeWith({ image: { provider: "openrouter", model: flux.id } });
-    process.env.JOUZU_HOME = home;
-    const generateImages = vi.fn();
-    const { tool } = load();
-    await expect(tool.execute("call", { prompt: "a cat" }, undefined, undefined, { modelRegistry: registry({ models: [flux], available: [], generateImages }) }))
-      .rejects.toThrow("No credential for OpenRouter");
-    expect(generateImages).not.toHaveBeenCalled();
-  });
-
-  it("reports the runtime's own error for a failed generation", async () => {
-    home = homeWith({ image: { provider: "openrouter", model: flux.id } });
-    process.env.JOUZU_HOME = home;
-    const generateImages = vi.fn().mockResolvedValue({ stopReason: "error", output: [], errorMessage: "402 Insufficient credits" });
-    const { tool } = load();
-    await expect(tool.execute("call", { prompt: "a cat" }, undefined, undefined, { modelRegistry: registry({ models: [flux], generateImages }) }))
-      .rejects.toThrow("402 Insufficient credits");
-  });
-
-  it("does not name a size in the review of a runtime provider's call", async () => {
-    home = homeWith({ image: { provider: "openrouter", model: flux.id, size: "2K" } });
-    process.env.JOUZU_HOME = home;
-    const { handlers } = load();
-    const select = vi.fn().mockResolvedValue("Deny");
-    await handlers.get("tool_call")[0]({ toolName: "generate_image", input: { prompt: "a cat" } }, { ui: { select }, modelRegistry: registry({ models: [flux] }) });
-    const body = JSON.parse(select.mock.calls[0][0].split("\n")[1]);
-    expect(body).toMatchObject({ provider: "openrouter", model: flux.id });
-    expect(body).not.toHaveProperty("size");
-  });
-
-  it("refuses a provider neither the runtime nor the desktop knows", async () => {
-    home = homeWith({ image: { provider: "nobody" } });
-    process.env.JOUZU_HOME = home;
-    const { tool } = load();
-    await expect(tool.execute("call", { prompt: "a cat" }, undefined, undefined, { modelRegistry: registry({ models: [flux] }) })).rejects.toThrow("Unknown image provider: nobody");
+  it("does not write back a passing failure", async () => {
+    const { tool, run } = await ready({ image: { provider: "shisa" }, reviewTools: [] });
+    vi.stubGlobal("fetch", shisaEndpoints({ generate: 503 }));
+    const input = { prompt: "x" };
+    await run("tool_call", { toolName: TOOL, input }, { ui: {} });
+    await expect(tool.execute("call-1", input, undefined, undefined, { modelRegistry: registry({ shisa: true }) })).rejects.toThrow("busy");
+    expect((await readReport(dir)).providers[0].usable).toBe(true);
   });
 });
 
-// #64: the Tools page offers a provider only when it can generate images now.
-describe("image provider availability", () => {
-  beforeEach(() => vi.stubGlobal("fetch", vi.fn()));
-  afterEach(() => vi.unstubAllGlobals());
+describe("ChatGPT images", () => {
+  const credential = { token: codexToken, headers: {}, account: "acct-test" };
+  const answer = (status, body) => vi.stubGlobal("fetch", vi.fn(async () => json(status, body)));
 
-  it("is unavailable without a credential, and says how to get one", async () => {
-    setCredentialReader(async () => undefined);
-    const result = await availability(shisa);
-    expect(result).toEqual({ available: false, code: "no-credential", reason: "Sign in to Shisa.AI or set SHISA_API_KEY to generate images." });
-    expect(fetch).not.toHaveBeenCalled();
+  it("returns the image, sending the account id", async () => {
+    answer(200, { data: [{ b64_json: b64 }] });
+    expect(await codex.generate(credential, { model: "gpt-image-2", size: "1K", prompt: "x" })).toEqual({ data: b64, mime: "image/png" });
+    const [url, init] = fetch.mock.calls[0];
+    expect(url).toBe("https://chatgpt.com/backend-api/codex/images/generations");
+    expect(init.headers["chatgpt-account-id"]).toBe("acct-test");
+    expect(JSON.parse(init.body)).toMatchObject({ model: "gpt-image-2", size: "1024x1024" });
   });
 
-  it("says a refused sign-in by its code, for the desktop to word", async () => {
-    setCredentialReader(async () => ({ type: "oauth", access: "expired" }));
-    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 401, json: async () => ({}) });
-    expect(await availability(shisa)).toEqual({ available: false, code: "sign-in-refused", reason: "Sign in to Shisa.AI again to generate images." });
+  it("maps 401 to a refused sign-in", async () => {
+    answer(401, { error: { message: "expired" } });
+    await expect(codex.generate(credential, { prompt: "x" })).rejects.toMatchObject({ code: "sign-in-refused" });
   });
 
-  it("reads the router's error code before its status", async () => {
-    setCredentialReader(async () => ({ type: "oauth", access: "t" }));
-    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 403, json: async () => ({ error: { code: "model_not_in_plan" } }) });
-    expect(await availability(shisa)).toMatchObject({ available: false, code: "not-allowed" });
-    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 429, json: async () => ({ error: { code: "free_allowance_exhausted" } }) });
-    expect(await availability(shisa)).toMatchObject({ available: false, code: "no-credit" });
-    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 402, json: async () => ({ error: { code: "insufficient_balance" } }) });
-    expect(await availability(shisa)).toMatchObject({ available: false, code: "no-credit" });
+  it("maps a usage limit to no credit, and a plan without images to not allowed", async () => {
+    answer(429, { error: { code: "usage_limit_reached" } });
+    await expect(codex.generate(credential, { prompt: "x" })).rejects.toMatchObject({ code: "no-credit" });
+    answer(403, { error: { code: "usage_not_included" } });
+    await expect(codex.generate(credential, { prompt: "x" })).rejects.toMatchObject({ code: "not-allowed" });
   });
 
-  it("is unavailable when the account cannot use image generation", async () => {
-    setCredentialReader(async () => ({ type: "oauth", access: "t" }));
-    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 403, json: async () => ({ code: 311 }) });
-    expect(await availability(shisa)).toEqual({ available: false, code: "not-allowed", reason: "This account cannot use image generation (shisa/image)." });
+  it("maps an answer it does not recognise to unreachable, keeping the raw text", async () => {
+    answer(200, { something: "else" });
+    await expect(codex.generate(credential, { prompt: "x" })).rejects.toMatchObject({ code: "unreachable", detail: expect.stringContaining("something") });
+    answer(502, { oops: true });
+    await expect(codex.generate(credential, { prompt: "x" })).rejects.toMatchObject({ code: "unreachable" });
   });
 
-  it("is unavailable when the account lists no image models", async () => {
-    setCredentialReader(async () => ({ type: "oauth", access: "t" }));
-    vi.mocked(fetch).mockResolvedValue(ok({ models: [] }));
-    expect(await availability(shisa)).toEqual({ available: false, code: "no-models", reason: "This account has no image models." });
-  });
-
-  it("is unavailable, not an error, when the provider cannot be reached", async () => {
-    setCredentialReader(async () => ({ type: "oauth", access: "t" }));
-    vi.mocked(fetch).mockRejectedValue(new TypeError("fetch failed"));
-    expect(await availability(shisa)).toEqual({ available: false, code: "unreachable", reason: "Shisa.AI could not be reached." });
-  });
-
-  it("is available with the account's models and their sizes", async () => {
-    setCredentialReader(async () => ({ type: "oauth", access: "t" }));
-    vi.mocked(fetch).mockResolvedValue(ok({ models: [{ name: "models/gemini-3.1-flash-lite-image" }] }));
-    expect(await availability(shisa)).toEqual({ available: true, models: [{ id: "gemini-3.1-flash-lite-image", sizes: ["1K"] }] });
+  it("is not added without a ChatGPT sign-in", async () => {
+    expect(await codex.credential(registry())).toBeUndefined();
   });
 });
 
-// The Shisa credential follows Jouzu's rule: sign-out, then SHISA_API_KEY, then an unexpired sign-in.
-describe("Shisa credential", () => {
-  const runtime = ({ signedOut = false, login = undefined } = {}) => async () => ({
-    isShisaSignedOut: () => signedOut,
-    readShisaLoginToken: () => login,
+describe("settings", () => {
+  it("reads an empty provider and model as not chosen", async () => {
+    agent({ image: { enabled: false, provider: "", model: "" } });
+    expect((await settings()).image).toEqual({ enabled: false, provider: "", model: "", size: "1K", maxImages: 3 });
   });
 
-  it("prefers SHISA_API_KEY over a sign-in", async () => {
-    const credential = await shisa.credential({ env: { SHISA_API_KEY: " key " }, agentDir: "a", runtimeModule: runtime({ login: "login" }) });
-    expect(credential).toEqual({ type: "api_key", key: "key" });
-  });
-
-  it("uses the runtime's sign-in token, which is absent once expired", async () => {
-    expect(await shisa.credential({ env: {}, agentDir: "a", runtimeModule: runtime({ login: "login" }) })).toEqual({ type: "oauth", access: "login" });
-    expect(await shisa.credential({ env: {}, agentDir: "a", runtimeModule: runtime() })).toBeUndefined();
-  });
-
-  it("has no credential after a local sign-out, even with SHISA_API_KEY", async () => {
-    expect(await shisa.credential({ env: { SHISA_API_KEY: "key" }, agentDir: "a", runtimeModule: runtime({ signedOut: true, login: "login" }) })).toBeUndefined();
+  it("uses the report's default provider when none is chosen", async () => {
+    agent();
+    const report = await refresh(registry({ codex: true }));
+    expect(resolve(await settings(), report)).toMatchObject({ provider: "openai-codex", model: "gpt-image-2", size: "1K", count: 1 });
   });
 });

@@ -1,41 +1,48 @@
-// Image providers that the runtime's own model catalog knows about.
+// Image providers that the runtime's own model registry lists (`type: "image"`).
 //
-// The runtime lists image models (`type: "image"`) per provider and generates
-// with them through its model registry, resolving the provider's credential
-// itself. This tool never reads, refreshes or stores those credentials; adding
-// a provider means giving the runtime a credential for it, or registering one
-// the way the runtime documents (an extension or models.json).
-//
-// The registry is the runtime's `ModelRegistry`: `ctx.modelRegistry` inside a
-// session, or one built from the same agent directory for the Tools page.
+// The runtime resolves their credentials and generates through its public
+// `generateImages`; this file never reads or stores a credential. A provider
+// counts as added only when the runtime has a credential configured for it
+// (`getProviderAuthStatus(id).configured`): the registry lists image models for
+// providers nobody added, so the list alone says nothing about the user.
+// These models take no size setting.
+import { coded } from "./errors.mjs";
 
-/** Every provider the runtime lists image models for, with whether it can be used now. */
-export async function listRuntimeProviders(registry) {
-  const ids = [...new Set(registry.getModelsOfType("image").map(model => model.provider))];
-  const available = new Set((await registry.getAvailableOfType("image")).map(model => model.provider));
-  return ids.map(id => ({ id, label: registry.getProviderDisplayName(id), available: available.has(id) }));
+/** One provider object per runtime image provider, except the ids in `skip`. */
+export function runtimeProviders(registry, skip = []) {
+  const ids = [...new Set(registry.getModelsOfType("image").map(model => model.provider))].filter(id => !skip.includes(id));
+  return ids.map(id => runtimeProvider(registry, id));
 }
 
-export function hasRuntimeProvider(registry, id) {
-  return registry.getModelsOfType("image", id).length > 0;
-}
-
-/** The runtime's image API takes no size setting, so these models list none. */
-export function listRuntimeModels(registry, id) {
-  return registry.getModelsOfType("image", id).map(model => ({ id: model.id, sizes: [] }));
-}
-
-export async function generateWithRuntime(registry, { provider, model, prompt, signal }) {
-  const models = registry.getModelsOfType("image", provider);
-  const label = registry.getProviderDisplayName(provider);
-  const chosen = model ? models.find(entry => entry.id === model) : models[0];
-  if (!chosen) throw new Error(model ? `${label} has no image model ${model}.` : `${label} lists no image models.`);
-  if (!(await registry.getAvailableOfType("image", provider)).length) {
-    throw new Error(`No credential for ${label}. Add one under Model providers to generate images with it.`);
-  }
-  const result = await registry.generateImages(chosen, { input: [{ type: "text", text: prompt }] }, signal ? { signal } : undefined);
-  if (result.stopReason !== "stop") throw new Error(result.errorMessage || `Image generation with ${label} failed.`);
-  const images = result.output.filter(block => block.type === "image" && typeof block.data === "string");
-  if (!images.length) throw new Error("The answer contained no image.");
-  return { model: chosen.id, images: images.map(image => ({ data: image.data, mime: image.mimeType ?? "image/png" })) };
+function runtimeProvider(registry, id) {
+  const label = registry.getProviderDisplayName?.(id) ?? id;
+  return {
+    id,
+    label,
+    async credential(current) {
+      return current.getProviderAuthStatus?.(id)?.configured ? { registry: current } : undefined;
+    },
+    sizes() {
+      return [];
+    },
+    async listModels(credential) {
+      const models = credential.registry.getModelsOfType("image", id);
+      if (!models.length) throw coded("not-allowed", `${label} lists no image models.`);
+      return models.map(model => ({ id: model.id, sizes: [] }));
+    },
+    async generate(credential, { model, prompt, signal }) {
+      const chosen = credential.registry.getModelsOfType("image", id).find(entry => entry.id === model);
+      if (!chosen) throw coded("other", `${label} has no image model ${model}.`);
+      let result;
+      try {
+        result = await credential.registry.generateImages(chosen, { input: [{ type: "text", text: prompt }] }, signal ? { signal } : undefined);
+      } catch (error) {
+        throw coded("other", `Image generation with ${label} failed.`, String(error?.message ?? error));
+      }
+      if (result?.stopReason !== "stop") throw coded("other", `Image generation with ${label} failed.`, result?.errorMessage);
+      const image = (result.output ?? []).find(block => block.type === "image" && typeof block.data === "string");
+      if (!image) throw coded("other", "The answer contained no image.");
+      return { data: image.data, mime: image.mimeType ?? "image/png" };
+    },
+  };
 }
