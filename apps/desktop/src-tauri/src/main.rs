@@ -2,7 +2,6 @@
 
 mod artifacts;
 mod attachments;
-mod active_app;
 mod tool_script;
 mod terminal;
 mod git_environment;
@@ -10,18 +9,10 @@ mod logs;
 mod command_path;
 mod managed_paths;
 mod host_bootstrap;
-mod recovery;
-mod runtime_install;
-mod runtime_policy;
 mod model_catalog;
-mod node_path;
 mod renderer;
-mod update_lock;
-mod jouzu_update;
 mod environment;
 mod runtime;
-mod image_tool;
-mod attribution_extension;
 mod update_channel;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -263,73 +254,9 @@ fn forget_workspace(app: tauri::AppHandle, id: String) -> Result<(), String> {
     Ok(())
 }
 
-fn hidden_node_version(node: &std::path::Path) -> Option<String> {
-    let mut command = std::process::Command::new(node);
-    command.arg("--version");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    command.output().ok().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-#[tauri::command]
-fn runtime_report(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    let root = runtime::application_root(&app)?;
-    let managed = runtime::managed_root()?;
-    let app_path = active_app::resolve_app(&root, &managed)?;
-    let metadata: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(app_path.join("node_modules/jouzu/package.json"))
-            .map_err(|_| "Runtime metadata is unavailable")?,
-    )
-    .map_err(|_| "Runtime metadata is invalid")?;
-    let version = metadata
-        .get("version")
-        .and_then(|value| value.as_str())
-        .ok_or("Runtime version is missing")?;
-    Ok(serde_json::json!({
-        "version": version,
-        "expectedVersion": crate::runtime_install::expected_version(),
-        "versionCurrent": crate::runtime_policy::is_current(version),
-        "minimumVersion": crate::runtime_policy::MINIMUM_VERSION,
-        "verifiedVersions": crate::runtime_policy::VERIFIED_VERSIONS,
-        "mandatory": crate::runtime_policy::is_mandatory(version),
-        "root": root.to_string_lossy(),
-        "app": app_path.to_string_lossy(),
-        "node": crate::runtime_install::node_executable(&root).is_file(),
-        "nodeVersion": hidden_node_version(&crate::runtime_install::node_executable(&root)),
-        "nodeCurrent": crate::runtime_install::node_version_ok(&root),
-        // Jouzu's own Git Bash, not just its folder: a reinstall over an older
-        // version runs the old uninstaller, which deletes `installed` but leaves
-        // the archive and the folder behind (#158). Elsewhere the system bash is used.
-        "git": !cfg!(windows) || root.join("runtime/git/installed/bin/bash.exe").is_file(),
-        "terminal": root.join("runtime/terminal").exists(),
-    }))
-}
-
 #[tauri::command]
 fn model_catalog() -> Result<serde_json::Value, String> {
     crate::model_catalog::load()
-}
-
-#[tauri::command]
-async fn runtime_install(
-    app: tauri::AppHandle,
-) -> Result<serde_json::Value, String> {
-    let managed = runtime::managed_root()?;
-    // An update replaces node_modules underneath every live runtime. Stop the
-    // sessions first; otherwise the old process keeps the old files mapped and
-    // the user has to quit the whole app before a session can start again.
-    host_bootstrap::stop_sessions().await?;
-    let handle = app.clone();
-    let version = tauri::async_runtime::spawn_blocking(move || {
-        let emit = |value: serde_json::Value| { let _ = tauri::Emitter::emit(&handle, "runtime-install-progress", value); };
-        runtime_install::install(&managed, &emit)
-    })
-    .await
-    .map_err(|_| "Runtime installation failed".to_string())??;
-    Ok(serde_json::json!({ "version": version }))
 }
 
 #[tauri::command]
@@ -368,8 +295,8 @@ fn mcp_config() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 fn component_versions(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    // The updater flags describe the shell. A missing, broken or outdated runtime must not
-    // disable them; that is the only way a broken install can still update itself.
+    // The updater flags describe the shell. The runtime's version is the host's to report
+    // (AppView.installation, ADR 0029).
     let desktop_updater = app
         .config()
         .plugins
@@ -380,71 +307,12 @@ fn component_versions(app: tauri::AppHandle) -> Result<serde_json::Value, String
                 && value["endpoints"].as_array().is_some_and(|a| !a.is_empty())
         })
         .unwrap_or(false);
-    let root = runtime::application_root(&app).ok();
-    let value = root
-        .as_ref()
-        .and_then(|root| {
-            let managed = runtime::managed_root().ok()?;
-            active_app::resolve_app(root, &managed).ok()
-        })
-        .and_then(|path| std::fs::read(path.join("node_modules/jouzu/package.json")).ok())
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .unwrap_or(serde_json::Value::Null);
-    let jouzu_updater = root.as_ref().is_some_and(|root| {
-        root.join("jouzu-update.json").is_file()
-            && root.join("runtime/desktop-tools/update-service.mjs").is_file()
-    });
     Ok(serde_json::json!({
-        "jouzuUpdaterConfigured": jouzu_updater,
-        "jouzu": value.get("version").and_then(|v| v.as_str()),
         "development": cfg!(debug_assertions),
         "desktopUpdaterConfigured": desktop_updater,
         "build": env!("JOUZU_BUILD_ID"),
         "commit": env!("JOUZU_COMMIT"),
     }))
-}
-
-#[tauri::command]
-fn console_repair_needed(app: tauri::AppHandle) -> Result<bool, String> {
-    let root = runtime::application_root(&app)?;
-    // The console is drawn by the terminal Jouzu ships, so a machine that does not have that copy yet
-    // installs it before Jouzu starts, whatever terminal it already has.
-    Ok(!terminal::bundled_copy(&root))
-}
-
-#[tauri::command]
-fn terminal(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    terminal::report(&runtime::application_root(&app)?)
-}
-
-#[tauri::command]
-async fn terminal_install(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    let root = runtime::application_root(&app)?;
-    let outcome = tauri::async_runtime::spawn_blocking(move || terminal::install(&root)).await;
-    if let Ok(managed) = runtime::managed_root() {
-        let result = match &outcome {
-            Ok(Ok(path)) => format!("installed {}", path.display()),
-            Ok(Err(error)) => format!("failed {error}"),
-            Err(_) => "failed task".to_string(),
-        };
-        logs::append(&managed, "desktop.log", &format!("windows terminal install {result}"));
-    }
-    outcome.map_err(|_| "Windows Terminal installation failed".to_string())??;
-    terminal::report(&runtime::application_root(&app)?)
-}
-
-#[tauri::command]
-fn git_bash(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    git_environment::report(&runtime::application_root(&app)?)
-}
-
-#[tauri::command]
-async fn git_bash_install(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    let root = runtime::application_root(&app)?;
-    tauri::async_runtime::spawn_blocking(move || git_environment::install(&root))
-        .await
-        .map_err(|_| "Git Bash installation failed".to_string())??;
-    git_environment::report(&runtime::application_root(&app)?)
 }
 
 /// The webview loads a development server when the frontend is not embedded, and a user runs no such
@@ -605,16 +473,12 @@ fn main() {
             update_channel::update_check,
             update_channel::update_install,
             model_catalog,
-            runtime_report,
-            runtime_install,
             mcp_config,
-            image_tool::image_tool_ensure,
             artifacts::artifact_list,
             artifacts::artifact_read,
             artifacts::artifact_delete,
             artifacts::artifact_store_copy,
             artifacts::artifact_counts,
-            recovery::repair_jouzu,
             diagnostics,
             crash_dismiss,
             log_event,
@@ -624,12 +488,6 @@ fn main() {
             command_entry_use,
             command_entry_remove,
             command_entry_repair,
-            jouzu_update::jouzu_update,
-                            terminal,
-            terminal_install,
-            git_bash,
-            git_bash_install,
-            console_repair_needed,
             environment::environment_read,
             environment::environment_save,
 

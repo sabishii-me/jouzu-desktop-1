@@ -32,6 +32,8 @@ fn hidden(command: &mut Command) {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 fn http(url: &str, limit: u64) -> Result<Vec<u8>, String> {
@@ -161,22 +163,6 @@ fn version_matches(actual: &str) -> bool {
     actual.trim() == format!("v{NODE_VERSION}")
 }
 
-/// Whether the managed Node is the pinned, patched build.
-pub fn node_version_ok(root: &Path) -> bool {
-    let executable = node_executable(root);
-    if !executable.is_file() {
-        return false;
-    }
-    let mut command = std::process::Command::new(executable);
-    command.arg("--version");
-    hidden(&mut command);
-    command
-        .output()
-        .ok()
-        .map(|output| version_matches(&String::from_utf8_lossy(&output.stdout)))
-        .unwrap_or(false)
-}
-
 fn ensure_node(managed: &Path, progress: Progress) -> Result<PathBuf, String> {
     let node = managed.join("runtime").join("node");
     let executable = node_executable(managed);
@@ -184,7 +170,7 @@ fn ensure_node(managed: &Path, progress: Progress) -> Result<PathBuf, String> {
         // A Node folder is kept only when it is whole: the right version, and
         // the npm it ships with (a cleanup can leave node.exe alone; the runtime
         // could then never be installed again).
-        if node_version_ok(managed) && npm_cli(&executable).is_file() {
+        if node_whole(managed) {
             return Ok(executable);
         }
         // A runtime provisioned by an older build keeps its Node; replace it so a
@@ -335,15 +321,14 @@ fn installed_version(app: &Path) -> Result<String, String> {
         .ok_or_else(|| "The installed package has no version.".to_string())
 }
 
-fn check_health(managed: &Path, node: &Path) -> Result<(), String> {
+fn check_health(managed: &Path, home: &Path, node: &Path) -> Result<(), String> {
     let bootstrap = managed.join("app").join("bootstrap.mjs");
-    let home = crate::runtime::effective_home()?;
-    std::fs::create_dir_all(&home).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(home).map_err(|error| error.to_string())?;
     let mut command = Command::new(node);
     command
         .arg(&bootstrap)
         .arg("--version")
-        .env("JOUZU_HOME", &home)
+        .env("JOUZU_HOME", home)
         .env("JOUZU_NO_UPDATE", "1")
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_PATH");
@@ -364,7 +349,7 @@ fn check_health(managed: &Path, node: &Path) -> Result<(), String> {
 }
 
 /// The setup service is what onboarding talks to next, so it must answer.
-fn check_control(managed: &Path, node: &Path) -> Result<(), String> {
+fn check_control(managed: &Path, home: &Path, node: &Path) -> Result<(), String> {
     let mut command = Command::new(node);
     command
         .arg("--input-type=module")
@@ -373,7 +358,7 @@ fn check_control(managed: &Path, node: &Path) -> Result<(), String> {
         .arg("--")
         .arg(managed)
         .arg(managed.join("app"))
-        .env("JOUZU_HOME", crate::runtime::effective_home()?)
+        .env("JOUZU_HOME", home)
         .env("JOUZU_NO_UPDATE", "1")
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_PATH")
@@ -405,7 +390,7 @@ fn check_control(managed: &Path, node: &Path) -> Result<(), String> {
 }
 
 /// Install Node and the official npm package, refusing to touch a working install.
-fn install_runtime(managed: &Path, progress: Progress) -> Result<String, String> {
+fn install_runtime(managed: &Path, home: &Path, progress: Progress) -> Result<String, String> {
     let app = managed.join("app");
     if app.join("bootstrap.mjs").is_file() {
         return Err("A runtime is already installed. Update it instead.".into());
@@ -419,7 +404,7 @@ fn install_runtime(managed: &Path, progress: Progress) -> Result<String, String>
     progress(serde_json::json!({ "phase": "verify" }));
     std::fs::write(app.join("bootstrap.mjs"), BOOTSTRAP).map_err(|error| error.to_string())?;
     let version = installed_version(&app)?;
-    if let Err(error) = check_health(managed, &node).and_then(|_| check_control(managed, &node)) {
+    if let Err(error) = check_health(managed, home, &node).and_then(|_| check_control(managed, home, &node)) {
         let _ = std::fs::remove_dir_all(&app);
         return Err(error);
     }
@@ -432,7 +417,9 @@ pub fn expected_version() -> &'static str {
 }
 
 /// Install Node, the official npm package and the tools the workspace needs.
-pub fn install(managed: &Path, progress: Progress) -> Result<String, String> {
+/// `managed` holds the installation (Node, app, tools); `home` is Jouzu's data
+/// home, where the desktop's extensions go.
+pub fn install(managed: &Path, home: &Path, progress: Progress) -> Result<String, String> {
     // The app may already be installed while its Node is old; replace Node first.
     let node = ensure_node(managed, progress)?;
     let app = managed.join("app");
@@ -445,9 +432,7 @@ pub fn install(managed: &Path, progress: Progress) -> Result<String, String> {
             // pinned package into the existing app so an app update can move 0.2.4 → 0.2.5.
             progress(serde_json::json!({ "phase": "packages" }));
             npm_install(&node, &app, progress)?;
-            if let Err(error) = check_health(managed, &node).and_then(|_| check_control(managed, &node)) {
-                return Err(error);
-            }
+            check_health(managed, home, &node).and_then(|_| check_control(managed, home, &node))?;
             let updated = installed_version(&app)?;
             if updated != JOUZU_VERSION {
                 return Err(format!("The runtime update left version {updated}; expected {JOUZU_VERSION}."));
@@ -455,12 +440,10 @@ pub fn install(managed: &Path, progress: Progress) -> Result<String, String> {
             updated
         }
     } else {
-        install_runtime(managed, progress)?
+        install_runtime(managed, home, progress)?
     };
-    write_tool_scripts(managed)?;
     install_tools(managed, progress)?;
-    crate::image_tool::ensure(&crate::runtime::effective_home()?)?;
-    crate::attribution_extension::ensure(&crate::runtime::effective_home()?)?;
+    super::extensions::ensure(home)?;
     Ok(version)
 }
 
@@ -469,16 +452,42 @@ fn install_tools(managed: &Path, progress: Progress) -> Result<(), String> {
     #[cfg(windows)]
     {
         progress(serde_json::json!({ "phase": "tools", "tool": "git" }));
-        crate::git_environment::install(managed)?;
+        super::tools::install_git(managed)?;
         progress(serde_json::json!({ "phase": "tools", "tool": "terminal" }));
-        crate::terminal::install(managed)?;
+        super::tools::install_terminal(managed)?;
     }
+    #[cfg(not(windows))]
+    let _ = (managed, progress);
     Ok(())
 }
 
-/// These helpers are the desktop's own; the npm package does not carry them.
-pub(crate) fn write_tool_scripts(managed: &Path) -> Result<(), String> {
-    crate::tool_script::write_all(managed)
+/// The installed package's version, when the app is there.
+pub fn app_version(managed: &Path) -> Option<String> {
+    let app = managed.join("app");
+    app.join("bootstrap.mjs").is_file().then(|| installed_version(&app).ok()).flatten()
+}
+
+/// What `node --version` prints for the managed Node, when it runs.
+pub fn node_version(managed: &Path) -> Option<String> {
+    let executable = node_executable(managed);
+    if !executable.is_file() {
+        return None;
+    }
+    let mut command = Command::new(executable);
+    command.arg("--version");
+    hidden(&mut command);
+    let output = command.output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+/// Whether the pinned Node is installed with the npm it ships with.
+pub fn node_whole(managed: &Path) -> bool {
+    node_version(managed).is_some_and(|version| version_matches(&version))
+        && npm_cli(&node_executable(managed)).is_file()
 }
 
 #[cfg(test)]
@@ -518,7 +527,7 @@ mod tests {
         let managed = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(managed.path().join("app")).unwrap();
         std::fs::write(managed.path().join("app/bootstrap.mjs"), b"existing").unwrap();
-        let error = install_runtime(managed.path(), &|_| {}).unwrap_err();
+        let error = install_runtime(managed.path(), &managed.path().join("data"), &|_| {}).unwrap_err();
         assert!(error.contains("already installed"), "{error}");
         assert_eq!(std::fs::read(managed.path().join("app/bootstrap.mjs")).unwrap(), b"existing");
     }
@@ -528,7 +537,7 @@ mod tests {
     #[ignore]
     fn installs_the_official_runtime() {
         let managed = tempfile::tempdir().unwrap();
-        let version = install_runtime(managed.path(), &|_| {}).unwrap();
+        let version = install_runtime(managed.path(), &managed.path().join("data"), &|_| {}).unwrap();
         assert!(node_executable(managed.path()).is_file());
         assert!(managed.path().join("app/bootstrap.mjs").is_file());
         assert!(managed.path().join("app/node_modules/jouzu/package.json").is_file());
@@ -546,7 +555,7 @@ mod tests {
         };
         let managed = std::path::PathBuf::from(managed);
         std::fs::create_dir_all(&managed).unwrap();
-        install_runtime(&managed, &|_| {}).unwrap();
+        install_runtime(&managed, &managed.join("data"), &|_| {}).unwrap();
         assert!(node_executable(&managed).is_file());
         assert!(managed.join("app/bootstrap.mjs").is_file());
     }

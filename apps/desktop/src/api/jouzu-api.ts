@@ -25,7 +25,7 @@ export type ApiErrorCode =
   | "prompt-resolved"
   | "prompt-expired"
   | "runtime-unavailable"
-  | "runtime-missing"
+  | "runtime-not-ready"
   | "runtime-error"
   | "runtime-timeout"
   | "internal";

@@ -10,6 +10,8 @@ export type HostStub = {
   device(data: Record<string, unknown>): void;
   emit(event: string, data: Record<string, unknown>): void;
   onCancel(cancel: () => void): () => void;
+  /** Set the runtime installation the host reports (`AppView.installation`) and publish it. */
+  installation(value: Record<string, unknown> | null): void;
 };
 
 /**
@@ -37,6 +39,10 @@ export async function stubHost(
     workspaces?: Workspace[];
     /** The image report for a generation; `null` keeps the tools `checking`. */
     tools?: { image?: Record<string, unknown>; report: (generation: number) => unknown };
+    /** The runtime installation the host starts with. Absent: a host given its runtime. */
+    installation?: Record<string, unknown>;
+    /** `POST /v1/runtime/{action}`: the stub's installation answers through `host.installation`. */
+    runtime?: (action: string, host: HostStub) => void;
   },
 ) {
   const workspaces = [...(options.workspaces ?? [])];
@@ -50,13 +56,14 @@ export async function stubHost(
   let modelReady = true;
   const fixtureModel = { provider: "fixture", id: "model", name: "Fixture model" };
   const image = { enabled: true, provider: "", model: "", size: "1K", maxImages: 3, ...(options.tools?.image ?? {}) };
-  const view: { revision: number; config: { running: any; queued: any[]; lastResult: Record<string, unknown> }; settings: any; configGeneration: number; models: any; tools: any } = {
+  const view: { revision: number; config: { running: any; queued: any[]; lastResult: Record<string, unknown> }; settings: any; configGeneration: number; models: any; tools: any; installation?: Record<string, unknown> | null } = {
     revision: 0,
     config: { running: null, queued: [], lastResult: {} },
     settings: null,
     configGeneration: 0,
     models: { generation: null, state: "updating", list: [], startModel: null },
     tools: { settings: { image, reviewTools: ["generate_image"] }, report: null, state: "checking" },
+    installation: options.installation ?? null,
   };
   const publish = () => { view.revision += 1; send("app.updated", JSON.parse(JSON.stringify(view))); };
   /** The runtimes of the current generation answer. */
@@ -71,6 +78,7 @@ export async function stubHost(
     device(data) { if (view.config.running) { view.config.running.device = data; publish(); } },
     emit(event, data) { send(event, data); },
     onCancel(cancel) { cancels.add(cancel); return () => cancels.delete(cancel); },
+    installation(value) { view.installation = value; publish(); },
   };
   let chain: Promise<unknown> = Promise.resolve();
   let next = 0;
@@ -146,6 +154,12 @@ export async function stubHost(
     }
     if (path === "/v1/tools/refresh" && method === "POST") { answer(); return route.fulfill(json(view.tools)); }
     if (path === "/v1/runtime/warm") return route.fulfill(json({ state: "off" }));
+    const runtime = /^\/v1\/runtime\/(install|update|repair)$/.exec(path);
+    if (runtime && method === "POST") {
+      const started = view.installation?.state !== "installing";
+      if (started) options.runtime?.(runtime[1], host);
+      return route.fulfill(json({ started, installation: view.installation }, 202));
+    }
     if (path === "/v1/artifacts/counts") return route.fulfill(json({ counts: {} }));
     return route.fulfill(json({ error: { code: "not-found", message: `No stub for ${method} ${path}` } }, 404));
   });

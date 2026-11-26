@@ -1,5 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
-import { ComponentSection, describe, useComponent } from './components/component-row';
+import { ComponentSection, describe } from './components/component-row';
 import { messages, type Locale } from './i18n';
 
 interface Terminal { path: string; version: string }
@@ -14,9 +13,8 @@ export interface TerminalState {
 }
 
 /** The Windows Terminal component: the host of the console window. */
-export function TerminalSection({ locale }: { locale: Locale }) {
+export function TerminalSection({ locale, state, busy, error, install }: { locale: Locale; state: TerminalState | null; busy: boolean; error: string | null; install: () => void }) {
   const t = messages[locale];
-  const { state, busy, error, run } = useComponent<TerminalState>('terminal');
   if (!state) return <ComponentSection title={t.windowsTerminal} status={t.checking} busy={busy} error={error} installLabel={t.terminalInstall} />;
   const installed = Boolean(state.effective);
   const usingSystem = installed && state.effective === state.system?.path;
@@ -28,7 +26,7 @@ export function TerminalSection({ locale }: { locale: Locale }) {
     status={installed ? describe([usingSystem ? t.terminalSystem : t.terminalBundled, detail?.version]) : broken ? t.terminalBroken : t.terminalMissing}
     tone={installed ? 'ok' : 'missing'}
     busy={busy} error={error}
-    install={state.bundled ? undefined : () => void run(() => invoke<TerminalState>('terminal_install'))}
+    install={state.bundled ? undefined : install}
     installLabel={broken ? t.terminalRepair : `${t.terminalInstall} (${t.recommended})`}
   />;
 }

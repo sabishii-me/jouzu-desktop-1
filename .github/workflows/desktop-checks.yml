@@ -85,7 +85,7 @@ jobs:
               try { Invoke-WebRequest http://localhost:1420 -TimeoutSec 2 | Out-Null; $ready = $true; break } catch { Start-Sleep 1 }
             }
             if (-not $ready) { throw 'Vite did not become ready' }
-            npx playwright test e2e/control-center.spec.ts e2e/onboarding.spec.ts e2e/tools.spec.ts --reporter=line
+            npx playwright test e2e/control-center.spec.ts e2e/onboarding.spec.ts e2e/tools.spec.ts e2e/installation.spec.ts --reporter=line
             $code = $LASTEXITCODE
           } finally { if (-not $vite.HasExited) { Stop-Process -Id $vite.Id } }
           exit $code
@@ -156,4 +156,4 @@ jobs:
           trap 'kill $vite' EXIT
           for i in $(seq 60); do curl -fs http://localhost:1420 > /dev/null && break; sleep 1; done
           curl -fs http://localhost:1420 > /dev/null || { cat "$RUNNER_TEMP/vite.log"; echo '::error::Vite did not become ready'; exit 1; }
-          npx playwright test e2e/control-center.spec.ts e2e/onboarding.spec.ts e2e/tools.spec.ts --reporter=line
+          npx playwright test e2e/control-center.spec.ts e2e/onboarding.spec.ts e2e/tools.spec.ts e2e/installation.spec.ts --reporter=line

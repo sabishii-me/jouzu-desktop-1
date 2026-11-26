@@ -8,17 +8,16 @@ import { recoveryText } from "./recovery-text";
 import { describeError } from "./runtime-errors";
 import { NoticeRow } from "./session-alerts-view";
 import { hasUpdateNotice, UpdatePreview } from "./update-preview";
-import { GitBashSection, useGitBash } from "./git-bash-section";
-import { TerminalSection } from "./terminal-section";
+import { GitBashSection, type GitBashState } from "./git-bash-section";
+import { TerminalSection, type TerminalState } from "./terminal-section";
 import { CommandEntrySection } from "./command-entry-section";
-import { ComponentSection, useComponent } from "./components/component-row";
+import { ComponentSection } from "./components/component-row";
 import { ReportSection } from "./report-section";
-import { useJouzuUpdate } from "./use-jouzu-update";
 import { useDesktopUpdate } from "./use-desktop-update";
 import { Label } from "./components/ui/label";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ARTIFACT_FIELDS, ARTIFACT_LANGUAGES, RESPONSE_LANGUAGES, artifactPolicyFor, artifactPreset, catalogChangeSummary, type ArtifactLanguage } from "./control-state";
-import { cancelConfig, configFailure, configPending, currentAppView, enqueueConfig, heldCatalog as heldCatalogOf, runConfig, useAppView, useAppViewFailure, type ConfigKind, type ConfigResult } from "./app-view";
+import { cancelConfig, configFailure, configPending, currentAppView, enqueueConfig, installationReady, runRuntimeOperation, heldCatalog as heldCatalogOf, runConfig, useAppView, useAppViewFailure, type ConfigKind, type ConfigResult } from "./app-view";
 import { DetailsPopover } from "./control-result";
 import { useApi } from "./api/context";
 import type { WarmView } from "./warm-runtime";
@@ -47,15 +46,7 @@ import { type Workspace } from "./history";
 import { parseDiagnostics, type Diagnostics } from "./diagnostics";
 import { copyText } from "./secure-context";
 interface ShellState { platform: "windows" | "macos" | "linux"; recent: Workspace[]; ready: boolean; bash: boolean; bundled_git: boolean }
-interface Components { jouzu: string | null; development: boolean; desktopUpdaterConfigured?: boolean; jouzuUpdaterConfigured?: boolean; build?: string; commit?: string }
-interface RuntimeReport { status?: string; version: string | null; expectedVersion?: string; versionCurrent?: boolean; minimumVersion?: string; verifiedVersions?: string[]; mandatory?: boolean; root: string | null; app: string | null; node: boolean; nodeVersion: string | null; nodeCurrent: boolean; git: boolean; terminal: boolean }
-/** The prepare screen runs when the runtime must be updated, its Node is not the
- * pinned one, or Jouzu's own Git Bash is gone (#158: Setup run over an install
- * from 1.1.4 or earlier deletes it). The install extracts Git again from the
- * archive it downloaded on first run, or downloads the pinned release. */
-function needsPrepare(report: RuntimeReport | null | undefined): boolean {
-  return report?.mandatory === true || report?.nodeCurrent === false || report?.git === false;
-}
+interface Components { development: boolean; desktopUpdaterConfigured?: boolean; build?: string; commit?: string }
 type Theme = "dark" | "light" | "system";
 
 export function App() {
@@ -184,14 +175,7 @@ export function App() {
   const [version, setVersion] = useState<string | null>(null);
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
   const [components, setComponents] = useState<Components | null>(null);
-  const jouzuUpdater = useJouzuUpdate(components?.jouzuUpdaterConfigured === true, () => {
-    void invoke<Components>("component_versions").then(setComponents).catch(error => fail("settings", error));
-    // A runtime update is only visible to a fresh supervised process.
-    requestSessionRestart();
-  }, native);
   const updater = useDesktopUpdate(components?.desktopUpdaterConfigured === true);
-  const gitBash = useGitBash();
-  const runtime = useComponent<RuntimeReport>("runtime_report");
   const [settingsTab,setSettingsTab] = useState("providers");
   // Where a header jump lands in the System list: the row that has something waiting.
   const [updateFocus,setUpdateFocus] = useState<number | null>(null);
@@ -202,11 +186,17 @@ export function App() {
   const [providerQuery, setProviderQuery] = useState("");
   const [addingConnection, setAddingConnection] = useState(false);
   const [query, setQuery] = useState("");
-  // One state machine: the runtime is an input to it, not a second screen.
-  // null = still probing, false = onboarding installs it, true = the service can run.
-  const [runtimePresent, setRuntimePresent] = useState<boolean | null>(null);
-  // One prepare surface: real download bytes, then package and verification phases.
-  const [prepare, setPrepare] = useState<{ phase: string; downloaded: number; total: number | null; error: string | null }>({ phase: "", downloaded: 0, total: null, error: null });
+  // The runtime installation is the host's (ADR 0029): the prepare page and the
+  // Settings rows render it, and nothing here keeps a copy.
+  const installation = appView?.installation ?? null;
+  const runtimeReady = installationReady(appView);
+  const installBusy = installation?.state === "installing" || !!installation?.operation;
+  const [installAsked, setInstallAsked] = useState<string | null>(null);
+  async function runtimeOperation(action: "install" | "update" | "repair") {
+    setInstallAsked(null);
+    try { await runRuntimeOperation(action); }
+    catch (failure) { setInstallAsked(describeError(failure)); }
+  }
   // A sign-in waiting for the person, as the host reports the running operation.
   const running = appView?.config.running ?? null;
   const runningDevice = running?.device;
@@ -313,32 +303,22 @@ export function App() {
     if (chatBusy) setRestartPending(true);
     else setSessionRevision(value => value + 1);
   }
-  /** The prepare screen: one automatic install, no choices. */
-  async function runPrepare() {
-    setPrepare({ phase: "start", downloaded: 0, total: null, error: null });
-    try {
-      await invoke<string>("runtime_install");
-      const report = await invoke<RuntimeReport>("runtime_report");
-      if (needsPrepare(report)) throw new Error(`The runtime update did not finish (${report?.version ?? "unknown"}).`);
-      setRuntimePresent(true);
-      // First run uses Core, as Jouzu's does: the interface language never selects the
-      // Japanese-first profile. A profile already chosen (a repair, a reinstall) is kept.
+  // When the installation becomes ready (a first install, an update, a repair):
+  // a first run uses Core, as Jouzu's does: the interface language never
+  // selects the Japanese-first profile. A profile already chosen is kept. A
+  // runtime update is only visible to fresh session processes.
+  const installedOnce = useRef<boolean | null>(null);
+  useEffect(() => {
+    if (!appView) return;
+    const previous = installedOnce.current;
+    installedOnce.current = runtimeReady;
+    if (previous !== false || !runtimeReady) return;
+    requestSessionRestart();
+    void (async () => {
       const read = await runConfig("status");
       if (read.ok && currentAppView()?.settings?.profile === null) await configure("profile", { profile: "core" });
-      void loadComponents();
-    } catch (error) {
-      prepareStarted.current = false;
-      setPrepare(current => ({ ...current, error: describeError(error) }));
-    }
-  }
-
-  const prepareStarted = useRef(false);
-  useEffect(() => {
-    if (runtimePresent !== false) { prepareStarted.current = false; return; }
-    if (prepareStarted.current) return;
-    prepareStarted.current = true;
-    void runPrepare();
-  }, [runtimePresent]);
+    })();
+  }, [runtimeReady, appView === null]);
   async function openDeviceUrl(value: string) {
     // Only the two documented sign-in origins may reach the system browser.
     const url = new URL(value);
@@ -350,7 +330,7 @@ export function App() {
   function openUpdatePanel() {
     // A waiting update is not a question to re-ask: the header opens the System list on the row that has it.
     // An older Stable offer is not an update and must not claim the header's attention.
-    setUpdateFocus(jouzuUpdater.version ? 0 : updater.version && !updater.downgrade ? 1 : null);
+    setUpdateFocus(installation?.state === "update-required" ? 0 : updater.version && !updater.downgrade ? 1 : null);
     setSettingsTab("system");
     setSettingsOpen(true);
   }
@@ -389,7 +369,6 @@ export function App() {
             ? "macos"
             : "linux";
         setState({ platform, recent: recent as unknown as Workspace[], ready: true, bash: false, bundled_git: false });
-        setRuntimePresent(true);
       } catch (error) {
         fail("folders", error);
       }
@@ -397,31 +376,8 @@ export function App() {
     if (api.capabilities.native) {
       void refreshDiagnostics();
       getVersion().then(setVersion).catch(error => fail("settings", error));
-      void invoke<RuntimeReport>("runtime_report").then(report => {
-        if (needsPrepare(report)) { setRuntimePresent(false); return; }
-        setRuntimePresent(true);
-        void (async () => { try { await invoke("image_tool_ensure"); } catch { /* the tool is optional on a fixture */ } })();
-        void loadComponents();
-      }).catch(error => {
-        // Only a missing runtime belongs to onboarding; any other report failure
-        // (an unsupported probe, a broken fixture) must not hide the workspace.
-        if (String(error).includes("application files are missing")) setRuntimePresent(false);
-        else setRuntimePresent(true);
-      });
+      void loadComponents();
     }
-  }, []);
-  // The prepare screen only mirrors the installer's own events; it never guesses progress.
-  useEffect(() => {
-    if (!native) return;
-    const pending = listen<{ phase: string; downloaded?: number; total?: number | null }>("runtime-install-progress", event => {
-      setPrepare(current => ({
-        ...current,
-        phase: event.payload.phase,
-        downloaded: event.payload.downloaded ?? current.downloaded,
-        total: event.payload.total ?? current.total,
-      }));
-    });
-    return () => { pending.then(unlisten => unlisten()).catch(() => {}); };
   }, []);
   // When the window's code first runs: the gap from host start to here is the webview's.
   useEffect(() => { api.runtime.mark?.("ui.boot"); }, []);
@@ -463,7 +419,7 @@ export function App() {
   }, [restartPending, chatBusy]);
   async function repairConsole(): Promise<boolean> {
     setRepair({ error: null });
-    try { await invoke("terminal_install"); setRepair(null); return true; }
+    try { await runRuntimeOperation("install"); setRepair(null); return true; }
     catch (failure) { setRepair({ error: String(failure) }); return false; }
   }
   async function launchTerminal(path: string) {
@@ -472,8 +428,10 @@ export function App() {
     try {
       if (needsSetup) return;
       setOperation("launching");
-      // A console this machine cannot draw correctly is repaired before Jouzu starts, not instead of it.
-      if ((await invoke<boolean>("console_repair_needed").catch(() => false)) === true && !(await repairConsole())) return;
+      // The console is drawn by the terminal Jouzu ships: a machine that does not
+      // have that copy yet gets it before Jouzu starts, not instead of it.
+      const terminal = installation?.tools?.terminal as TerminalState | null | undefined;
+      if (terminal && !terminal.bundled && !(await repairConsole())) return;
       await invoke("launch_jouzu", { path });
       setNotice("requested");
       await refresh();
@@ -563,16 +521,20 @@ export function App() {
     </section>
   </main>;
   const connectingScreen = loadingScreen(t.connecting);
-  const preparePercent = prepare.phase === "node" && prepare.total ? Math.max(3, (prepare.downloaded / prepare.total) * 40) : prepare.phase === "packages" ? 55 : prepare.phase === "verify" ? 90 : prepare.phase === "tools" ? 95 : 6;
-  // A loader-style prepare page: banner, one bar, no choices. It belongs to the
-  // runtime step of the same state machine.
+  // The prepare page renders the host's installation: its step, its real bytes,
+  // and a failure with its reason and Retry. No choices.
+  const step = installation?.state === "installing" ? installation.step ?? "" : "";
+  const prepareError = installation?.state === "failed" ? installation.error?.params.message ?? t.prepareFailed : installAsked;
+  const downloaded = installation?.downloaded ?? 0;
+  const total = installation?.total ?? null;
+  const preparePercent = step === "node" && total ? Math.max(3, (downloaded / total) * 40) : step === "packages" ? 55 : step === "verify" ? 90 : step === "tools" ? 95 : 6;
   const prepareScreen = <main className="flex h-screen w-full flex-col overflow-hidden bg-background">
     {onboardingBanner(t.prepareTitle, undefined, 0.45 + preparePercent / 200, true)}
     <div className="flex shrink-0 justify-center px-6 pb-16 pt-8">
       <div className="w-full max-w-xl space-y-3">
-        <div className="flex items-baseline justify-between"><span className="text-sm font-medium">{prepare.error ? t.prepareFailed : prepare.phase === "node" ? t.prepareNode : prepare.phase === "packages" ? t.preparePackages : prepare.phase === "verify" ? t.prepareVerify : prepare.phase === "tools" ? t.prepareTools : t.prepareTitle}</span><span className="text-xs text-muted-foreground">{prepare.phase === "node" && prepare.total ? `${Math.round(prepare.downloaded / 1048576)} / ${Math.round(prepare.total / 1048576)} MB` : ""}</span></div>
-        <Progress value={prepare.phase === "packages" && !prepare.error ? null : preparePercent} className="h-2.5" />
-        <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground"><span className="break-all">{prepare.error ? prepare.error : t.prepareHint}</span>{prepare.error && <Button variant="outline" onClick={() => void runPrepare()}>{t.retry}</Button>}</div>
+        <div className="flex items-baseline justify-between"><span className="text-sm font-medium">{prepareError ? t.prepareFailed : step === "node" ? t.prepareNode : step === "packages" ? t.preparePackages : step === "verify" ? t.prepareVerify : step === "tools" ? t.prepareTools : t.prepareTitle}</span><span className="text-xs text-muted-foreground">{step === "node" && total ? `${Math.round(downloaded / 1048576)} / ${Math.round(total / 1048576)} MB` : ""}</span></div>
+        <Progress value={step === "packages" && !prepareError ? null : preparePercent} className="h-2.5" />
+        <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground"><span className="break-all">{prepareError ? prepareError : t.prepareHint}</span>{prepareError && <Button variant="outline" onClick={() => void runtimeOperation(installation?.state === "failed" ? installation.action ?? "install" : "install")}>{t.retry}</Button>}</div>
       </div>
     </div>
   </main>;
@@ -615,8 +577,8 @@ export function App() {
       </div>
     </div>
   </main>;
-  if (runtimePresent === null) return connectingScreen;
-  if (runtimePresent === false) return prepareScreen;
+  if (!appView && !appViewFailure) return connectingScreen;
+  if (installation && installation.state !== "ready") return prepareScreen;
   // Only a first run asks: no saved language settings yet. A file Jouzu cannot read is not a first run.
   if (needsSetup && setup?.language?.status === "absent") return languageSetupScreen;
   if (needsSetup) return modelSetupScreen;
@@ -688,26 +650,24 @@ export function App() {
                 <TabsContent value="system" className="m-0 space-y-4">
                   
                   <UpdatePreview locale={locale} focusIndex={updateFocus} live={{
-                    phases:[jouzuUpdater.phase === 'preparing' || jouzuUpdater.phase === 'verifying' || jouzuUpdater.phase === 'activating' || jouzuUpdater.phase === 'staged' ? 'installing' : jouzuUpdater.phase as 'idle'|'checking'|'available'|'current'|'downloading'|'installing'|'complete'|'error', updater.phase],
+                    phases:[installation?.state === "installing" ? 'installing' : installation?.state === "failed" ? 'error' : installation?.state === "update-required" ? 'available' : 'idle', updater.phase],
                     downgrade:[false, updater.downgrade],
-                    versions:[components?.jouzu ?? t.unavailable, version ? (components?.commit && components.commit !== 'unknown' ? `${version} · ${components.commit} · ${components.build ?? ''}` : version) : t.unavailable],
-                    targets:[jouzuUpdater.version,updater.version],
-                    progress:jouzuUpdater.busy?jouzuUpdater.progress:updater.progress,
-                    configured:[!!components?.jouzuUpdaterConfigured,!!components?.desktopUpdaterConfigured],
-                    errors:[jouzuUpdater.error,updater.error],
-                    notes:[jouzuUpdater.notes ?? '',updater.notes ?? ''],
-                    sources:[jouzuUpdater.notesSource ?? '', ''],
+                    versions:[installation?.version ?? t.unavailable, version ? (components?.commit && components.commit !== 'unknown' ? `${version} · ${components.commit} · ${components.build ?? ''}` : version) : t.unavailable],
+                    targets:[installation?.state === "update-required" || (installation?.state === "failed" && installation.action === "update") ? installation.expectedVersion ?? null : null, updater.version],
+                    progress:installation?.state === "installing" ? (installation.step === "node" && installation.total ? (installation.downloaded ?? 0) / installation.total * 100 : undefined) : updater.progress,
+                    configured:[false,!!components?.desktopUpdaterConfigured],
+                    errors:[installation?.state === "failed" ? installation.error?.params.message ?? null : installAsked, updater.error],
+                    notes:['',updater.notes ?? ''],
+                    sources:['', ''],
                     channel: updater.channel && components?.desktopUpdaterConfigured ? { value: updater.channel, set: value => void updater.setChannel(value) } : undefined,
-                    repair: components?.jouzu || import.meta.env.DEV ? undefined : { label: recoveryText[locale].action, run: () => { void (async () => {
+                    repair: !installation || installation.state === "ready" || installation.state === "installing" || import.meta.env.DEV ? undefined : { label: recoveryText[locale].action, run: () => { void (async () => {
                       if (!await confirm(recoveryText[locale].description, {title: recoveryText[locale].title, kind: "warning"})) return;
-                      setOperation("saving"); setError(null);
-                      try { await invoke("repair_jouzu"); setComponents(await invoke<Components>("component_versions")); await refresh(); await refreshDiagnostics(); }
-                      catch (failure) { fail("settings", failure); } finally { setOperation(null); }
+                      await runtimeOperation("repair");
                     })(); } },
-                    check:()=>{void jouzuUpdater.check();void updater.refresh();},
-                    install:index=>{if(index===0)void jouzuUpdater.install();else void updater.install();}
+                    check:()=>{if(installation?.state === "failed")void runtimeOperation(installation.action ?? "install");void updater.refresh();},
+                    install:index=>{if(index===0)void runtimeOperation("update");else void updater.install();}
                   }}/>
-                  {state?.platform === "windows" && <div className="rounded-lg border border-border"><GitBashSection locale={locale} api={gitBash} /><TerminalSection locale={locale} /><CommandEntrySection locale={locale} /></div>}
+                  {state?.platform === "windows" && <div className="rounded-lg border border-border"><GitBashSection locale={locale} state={(installation?.tools?.git ?? null) as GitBashState | null} busy={installBusy} error={installation?.state === "ready" ? installation.error?.params.message ?? installAsked : installAsked} install={() => void runtimeOperation("install")} /><TerminalSection locale={locale} state={(installation?.tools?.terminal ?? null) as TerminalState | null} busy={installBusy} error={installation?.state === "ready" ? installation.error?.params.message ?? installAsked : installAsked} install={() => void runtimeOperation("install")} /><CommandEntrySection locale={locale} /></div>}
                   {diagnostics !== null && diagnostics.crashes.length > 0 && <Card className="border-border shadow-none">
                     <CardHeader><CardTitle>{t.crashTitle}</CardTitle><CardDescription>{t.crashHint}</CardDescription></CardHeader>
                     <CardContent className="space-y-3">{diagnostics.crashes.map(record => <div key={record.path} className="space-y-1 rounded-lg border border-border p-3">
@@ -783,8 +743,8 @@ export function App() {
 
         onSettings={() => setSettingsOpen(true)}
         onUpdate={openUpdatePanel}
-        updateAvailable={hasUpdateNotice(jouzuUpdater.version, updater.version, updater.downgrade)}
-        updateBusy={updater.busy || jouzuUpdater.busy}
+        updateAvailable={hasUpdateNotice(installation?.state === "update-required" ? installation.expectedVersion ?? "required" : null, updater.version, updater.downgrade)}
+        updateBusy={updater.busy || installBusy}
       />
     </div>}
     {!activePath && <PageFrame title={t.heading} description={t.intro}>

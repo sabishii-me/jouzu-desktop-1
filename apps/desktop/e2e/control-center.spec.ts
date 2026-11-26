@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { expect as expectBase, type Locator } from '@playwright/test';
-import { UI_BASE, stubHostControl } from './host-control';
+import { UI_BASE, stubHost, type HostStub } from './host-control';
 
 // An error reads as one sentence that says what failed; the raw text is behind Details.
 async function expectError(alert: Locator, sentence: string, raw: string) {
@@ -17,8 +17,23 @@ const control = (legacy: boolean) => (body: any) => {
   if (legacy) delete result.customProviders;
   return result;
 };
+// The runtime installation as the host reports it (AppView.installation). On
+// Windows it carries the Git Bash and Windows Terminal reports the System rows show.
+const environment = (git: string, root: string) => ({ path: root + '\\bin\\bash.exe', git, bash: 'GNU bash, version 5.2.37(1)-release' });
+const systemGit = () => ({ bundled: null, managed: null, system: environment('git version 2.51.0.windows.1', 'C:\\Program Files\\Git'), bundled_present: false, managed_present: false, system_present: true, archive: true, effective: environment('git version 2.51.0.windows.1', 'C:\\Program Files\\Git') });
+const systemTerminal = () => ({ bundled: null, system: { path: 'C:\\Program Files\\WindowsApps\\wt.exe', version: '1.25.2733.0' }, bundled_present: false, archive: false, version: '1.25.2733.0', effective: 'C:\\Program Files\\WindowsApps\\wt.exe' });
+const installed = (tools: { git: unknown; terminal: unknown } = { git: systemGit(), terminal: systemTerminal() }) => ({ state: 'ready', version: '0.2.5', nodeVersion: 'v24.22.2', expectedVersion: '0.2.5', tools });
+/** Per test: the installation the host starts with, and what `POST /v1/runtime/{action}` does. */
+const runtimeFixtures: Record<string, { installation: Record<string, unknown>; runtime?: (action: string, host: HostStub) => void }> = {};
+const asked: string[] = [];
 test.beforeEach(async ({page}, testInfo) => {
-  await stubHostControl(page, control(testInfo.title.includes('rejects old protocol')));
+  asked.length = 0;
+  const fixture = runtimeFixtures[testInfo.title] ?? { installation: installed() };
+  await stubHost(page, {
+    control: control(testInfo.title.includes('rejects old protocol')),
+    installation: fixture.installation,
+    runtime: (action, host) => { asked.push(action); fixture.runtime?.(action, host); },
+  });
 });
 for (const legacy of [false,true]) {
  test(`control center ${legacy ? 'rejects old protocol without crashing' : 'opens all tabs'}`, async ({page}) => {
@@ -70,18 +85,15 @@ for (const legacy of [false,true]) {
 }
 
 const updateStub = (config: {
-  jouzuVersion: string; jouzuTarget: string; jouzuNotes?: string;
   desktopVersion: string; desktopTarget?: string; desktopAvailable: boolean;
-  configured: [boolean, boolean]; failInstall?: boolean; desktopCheckFails?: boolean; desktopDowngrade?: boolean;
+  configured: boolean; desktopCheckFails?: boolean; desktopDowngrade?: boolean;
 }) => {
   const callbacks: Record<number, Function> = {};
   const listeners: Record<string, number[]> = {};
   let next = 1;
+  localStorage.setItem('jouzu.ui.language', 'en');
   (window as any).isTauri = true;
-  (window as any).__confirms = 0;
-  (window as any).__installs = 0;
   (window as any).__logs = [];
-  (window as any).__emit = (event: string, payload: any) => (listeners[event] ?? []).forEach(id => callbacks[id]({event, id, payload}));
   (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
   (window as any).__TAURI_INTERNALS__ = {
     metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
@@ -90,21 +102,9 @@ const updateStub = (config: {
     invoke: async (command: string, args: any) => {
       if (command === 'plugin:event|listen') { (listeners[args.event] ??= []).push(args.handler); return next++; }
       if (command === 'plugin:event|unlisten' || command === 'plugin:event|emit') return null;
-      if (command === 'shell_state') return { ready: true, bash: true, recent: [], platform: 'windows' };
-      if (command === 'component_versions') return {
-        jouzu: config.jouzuVersion, desktop: config.desktopVersion, development: true,
-        jouzuUpdaterConfigured: config.configured[0], desktopUpdaterConfigured: config.configured[1],
-      };
-      if (command === 'control_request') return { schemaVersion: 1, profile: 'core', account: { signedIn: false }, credentials: [], customProviders: [], providers: [] };
+      if (command === 'component_versions') return { development: true, desktopUpdaterConfigured: config.configured };
       if (command === 'environment_read') return [];
-      if (command === 'git_bash' || command === 'terminal') return 1;
       if (command === 'plugin:dialog|confirm' || command === 'plugin:dialog|message') return true;
-      if (command === 'jouzu_update') {
-        if (args.action === 'check') return { version: config.jouzuTarget, available: true, notes: config.jouzuNotes ?? '', notesSource: 'Jouzu ' + config.jouzuTarget };
-        (window as any).__installs++;
-        if (config.failInstall && (window as any).__installs === 1) throw new Error('Download failed. Your current version is unchanged.');
-        return new Promise(resolve => { (window as any).__finishInstall = () => resolve({ version: config.jouzuTarget, available: false }); });
-      }
       if (command === 'log_event') { (window as any).__logs.push(args.message); return null; }
       // The app's own update commands (src-tauri update_channel.rs), which pick the feed by channel.
       if (command === 'update_channel' || command === 'update_channel_set') return args?.channel ?? 'stable';
@@ -129,20 +129,31 @@ async function openSystem(page: any) {
   return dialog;
 }
 
-test('the System section shows both update rows with their state and notes', async ({ page }) => {
-  await page.addInitScript(updateStub, {
-    jouzuVersion: '0.1.17', jouzuTarget: '0.1.18',
-    jouzuNotes: '### Release notes\n- Git Bash is prepared during installation.\n- Startup no longer fails after an update.',
-    desktopVersion: '0.1.20', desktopAvailable: false, configured: [true, true],
-  });
+/** A Windows window with nothing else to stub than the installation the host reports. */
+const windowsWindow = () => {
+  (window as any).isTauri = true;
+  (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
+  localStorage.setItem('jouzu.ui.language', 'en');
+  (window as any).__TAURI_INTERNALS__ = {
+    metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
+    transformCallback: () => 1, unregisterCallback: () => {},
+    invoke: async (command: string) => {
+      (window as any).__invoked = ((window as any).__invoked ?? []).concat(command);
+      if (command === 'plugin:dialog|message') return 'Ok';
+      if (command === 'component_versions') return { development: true };
+      if (command === 'environment_read') return [];
+      if (command.includes('version')) return '0.1.0';
+      return 1;
+    },
+  };
+};
+
+test('the System section shows both update rows with their state', async ({ page }) => {
+  await page.addInitScript(updateStub, { desktopVersion: '0.1.20', desktopAvailable: false, configured: true });
   const dialog = await openSystem(page);
+  // The Jouzu row shows the version the host installed.
   const jouzu = dialog.locator('section[aria-label="Jouzu"]');
-  await expect(jouzu.getByText('0.1.17')).toBeVisible();
-  await expect(jouzu.getByText('0.1.18').first()).toBeVisible();
-  // Notes live in a bounded, scrollable area rather than a clipped box.
-  const notes = jouzu.locator('div.max-h-40');
-  await expect(notes).toHaveClass(/overflow-auto/);
-  expect(await notes.evaluate((node: HTMLElement) => node.scrollHeight >= node.clientHeight)).toBe(true);
+  await expect(jouzu.getByText('0.2.5')).toBeVisible();
   const desktop = dialog.locator('section[aria-label="Jouzu Desktop"]');
   await expect(desktop.getByText('0.1.20')).toBeVisible();
   await expect(desktop.getByRole('button')).toHaveCount(0);
@@ -152,8 +163,7 @@ test('the System section shows both update rows with their state and notes', asy
 
 test('an older Stable build is offered as a downgrade, not an update (#176)', async ({ page }) => {
   await page.addInitScript(updateStub, {
-    jouzuVersion: '0.1.17', jouzuTarget: '0.1.18', desktopVersion: '1.1.4-rc.1', desktopTarget: '1.0.23',
-    desktopAvailable: true, desktopDowngrade: true, configured: [true, true],
+    desktopVersion: '1.1.4-rc.1', desktopTarget: '1.0.23', desktopAvailable: true, desktopDowngrade: true, configured: true,
   });
   const dialog = await openSystem(page);
   const desktop = dialog.locator('section[aria-label="Jouzu Desktop"]');
@@ -169,10 +179,7 @@ test('an older Stable build is offered as a downgrade, not an update (#176)', as
 });
 
 test('a failed update check is reported and recorded', async ({ page }) => {
-  await page.addInitScript(updateStub, {
-    jouzuVersion: '0.1.17', jouzuTarget: '0.1.18', desktopVersion: '0.1.20',
-    desktopAvailable: false, configured: [true, true], desktopCheckFails: true,
-  });
+  await page.addInitScript(updateStub, { desktopVersion: '0.1.20', desktopAvailable: false, configured: true, desktopCheckFails: true });
   const dialog = await openSystem(page);
   const desktop = dialog.locator('section[aria-label="Jouzu Desktop"]');
   await expectError(desktop.getByRole('alert'), 'Could not check for updates', 'network');
@@ -180,119 +187,62 @@ test('a failed update check is reported and recorded', async ({ page }) => {
   expect(logs.some(line => line.startsWith('desktop update check failed error='))).toBe(true);
 });
 
-test('installing a Jouzu update reports progress and needs no further confirmation', async ({ page }) => {
-  await page.addInitScript(updateStub, {
-    jouzuVersion: '0.1.17', jouzuTarget: '0.1.18', desktopVersion: '0.1.20', desktopAvailable: false, configured: [true, true],
-  });
+test('the Jouzu Desktop update confirms once before it restarts', async ({ page }) => {
+  await page.addInitScript(updateStub, { desktopVersion: '0.1.20', desktopTarget: '0.1.21', desktopAvailable: true, configured: true });
   const dialog = await openSystem(page);
-  const jouzu = dialog.locator('section[aria-label="Jouzu"]');
-  await jouzu.getByRole('button', { name: 'Update Jouzu', exact: true }).click();
-  await page.evaluate(() => (window as any).__emit('jouzu-update-progress', { phase: 'downloading', downloaded: 5, total: 10 }));
-  await expect(jouzu.getByRole('progressbar')).toBeVisible();
-  await page.evaluate(() => (window as any).__emit('jouzu-update-progress', { phase: 'installing' }));
-  await expect(jouzu.getByRole('progressbar')).toBeVisible();
-  await page.waitForFunction(() => typeof (window as any).__finishInstall === 'function');
-  await page.evaluate(() => (window as any).__finishInstall());
-  await expect(jouzu.getByRole('button')).toHaveCount(0);
-  await expect(jouzu.getByRole('button', { name: 'Update Jouzu', exact: true })).toHaveCount(0);
-  expect(await page.evaluate(() => (window as any).__confirms)).toBe(0);
-  expect(await page.evaluate(() => (window as any).__installs)).toBe(1);
-});
-
-test('a failed install offers Retry and the Jouzu Desktop update confirms once', async ({ page }) => {
-  await page.addInitScript(updateStub, {
-    jouzuVersion: '0.1.17', jouzuTarget: '0.1.18', desktopVersion: '0.1.20', desktopTarget: '0.1.21',
-    desktopAvailable: true, configured: [true, true], failInstall: true,
-  });
-  const dialog = await openSystem(page);
-  const jouzu = dialog.locator('section[aria-label="Jouzu"]');
-  await jouzu.getByRole('button', { name: 'Update Jouzu', exact: true }).click();
-  await expectError(jouzu.getByRole('alert'), 'Could not install the update', 'Your current version is unchanged');
-  // Retrying the same row installs without asking again.
-  await jouzu.getByRole('button', { name: 'Retry', exact: true }).click();
-  await page.waitForFunction(() => typeof (window as any).__finishInstall === 'function');
-  await page.evaluate(() => (window as any).__finishInstall());
-  await expect(jouzu.getByRole('button')).toHaveCount(0);
-  expect(await page.evaluate(() => (window as any).__confirms)).toBe(0);
-  // The app asks once before it restarts.
   const desktop = dialog.locator('section[aria-label="Jouzu Desktop"]');
   await desktop.getByRole('button', { name: 'Update and restart', exact: true }).click();
-  await expect(page.getByRole('dialog')).toBeVisible();
-  expect(await page.evaluate(() => (window as any).__confirms)).toBe(0);
+  await expect(page.getByRole('dialog', { name: 'Update and restart' })).toBeVisible();
 });
 
+runtimeFixtures['the System section names the copy in use and offers installing the ones Jouzu ships'] = {
+  installation: installed(),
+  runtime: (action, host) => {
+    host.installation({ ...installed(), operation: { action, step: 'tools', tool: 'git' } });
+    // The host installs both tools in one operation, then reports them again.
+    setTimeout(() => {
+      const git = systemGit() as any;
+      git.bundled = environment('git version 2.55.0.windows.5', 'C:\\Users\\test\\AppData\\Local\\Shisa.ai\\JouzuDesktop\\runtime\\git\\installed');
+      git.effective = git.bundled;
+      const terminal = systemTerminal() as any;
+      terminal.bundled = { path: 'C:\\Users\\test\\AppData\\Local\\Shisa.ai\\JouzuDesktop\\runtime\\terminal\\installed\\WindowsTerminal.exe', version: '1.25.2733.0' };
+      terminal.effective = terminal.bundled.path;
+      host.installation(installed({ git, terminal }));
+    }, 1500);
+  },
+};
 test('the System section names the copy in use and offers installing the ones Jouzu ships', async ({page})=>{
- await page.addInitScript(()=>{
-  (window as any).isTauri=true;
-  (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener:()=>{}};
-  localStorage.setItem('jouzu.ui.language','en');
-  const environment=(git:string,root:string)=>({path:root+'\bin\bash.exe',git,bash:'GNU bash, version 5.2.37(1)-release'});
-  const state:any={bundled:null,managed:null,system:environment('git version 2.51.0.windows.1','C:\Program Files\Git'),preferred:null,archive:true,effective:null};
-  const settle=()=>({...state,effective:state.bundled??state.managed??state.system});
-  state.effective=settle().effective;
-  const terminal:any={bundled:null,system:{path:'C:\Program Files\WindowsApps\wt.exe',version:'1.25.2733.0'},preferred:null,archive:false,version:'1.25.2733.0',effective:null};
-  const settleTerminal=()=>({...terminal,effective:terminal.bundled?.path??terminal.system?.path});
-  terminal.effective=settleTerminal().effective;
-  (window as any).__TAURI_INTERNALS__={
-   metadata:{currentWindow:{label:'main'},currentWebview:{label:'main'}},
-   transformCallback:()=>1,unregisterCallback:()=>{},
-   invoke:async(command:string)=>{(window as any).__invoked=((window as any).__invoked??[]).concat(command);if(command==='plugin:dialog|message')return 'Ok';
-    if(command==='shell_state')return {ready:true,bash:false,recent:[],platform:'windows'};
-    if(command==='component_versions')return {jouzu:'0.1.18',development:true};
-    if(command==='environment_read')return [];
-    if(command==='terminal')return {...terminal};
-    if(command==='terminal_install'){terminal.bundled={path:'C:\Program Files\Jouzu\terminal\WindowsTerminal.exe',version:'1.25.2733.0'};return settleTerminal();}
-    if(command==='git_bash')return {...state};
-    if(command==='git_bash_install'){state.bundled=environment('git version 2.55.0.windows.5','C:\Users\test\AppData\Local\Shisa.ai\Jouzu\runtime\git\installed');return settle();}
-    if(command.includes('version'))return '0.1.0';
-    return 1;
-   }
-  };
- });
- await page.goto(UI_BASE);
- await page.getByRole('button',{name:'Settings',exact:true}).click();
- const dialog=page.getByRole('dialog');
- await dialog.getByRole('tab',{name:'System',exact:true}).click();
+ await page.addInitScript(windowsWindow);
+ const dialog=await openSystem(page);
  // Nothing here switches copies: the row names the one in use and offers installing the shipped one.
  await expect(dialog.getByRole('radio')).toHaveCount(0);
  const bash=dialog.locator('section[aria-label="Git Bash"]');
- await expect(bash.getByRole('button')).toBeEnabled();
+ await expect(bash.getByText(/Git Bash installed on this PC/)).toBeVisible();
  const installBash=bash.getByRole('button',{name:/Install and use Jouzu's Git Bash/});
- await expect(installBash).toBeVisible();
+ await expect(installBash).toBeEnabled();
  await installBash.click();
- await expect(bash.getByRole('button',{name:/Install and use Jouzu's Git Bash/})).toBeDisabled();
- // The console host follows the same rule.
+ // One operation of the host's: both rows wait for it.
+ await expect(installBash).toBeDisabled();
  const terminalRow=dialog.locator('section[aria-label="Windows Terminal"]');
- await expect(terminalRow.getByRole('button')).toBeEnabled();
- const installTerminal=terminalRow.getByRole('button',{name:/Install and use Jouzu's Windows Terminal/});
- await installTerminal.click();
  await expect(terminalRow.getByRole('button',{name:/Install and use Jouzu's Windows Terminal/})).toBeDisabled();
+ // Installed: the rows name Jouzu's copies, and there is nothing left to install.
+ await expect(bash.getByText(/Jouzu's Git Bash · 2\.55\.0/)).toBeVisible({ timeout: 10_000 });
+ await expect(terminalRow.getByText(/Jouzu's Windows Terminal · 1\.25/)).toBeVisible();
+ await expect(bash.locator('svg.animate-spin')).toHaveCount(0);
+ await expect(bash.getByRole('button')).toBeDisabled();
+ expect(asked).toEqual(['install']);
+ // The shell has no say in it.
+ const invoked: string[] = await page.evaluate(() => (window as any).__invoked ?? []);
+ for (const command of ['git_bash', 'git_bash_install', 'terminal', 'terminal_install']) expect(invoked).not.toContain(command);
 });
+
+runtimeFixtures['a component row keeps its height while an action runs'] = {
+  installation: installed({ git: systemGit(), terminal: { bundled: null, system: null, bundled_present: false, effective: null, archive: true, version: '1.25.2733.0' } }),
+  runtime: (action, host) => host.installation({ ...installed({ git: systemGit(), terminal: { bundled: null, system: null, bundled_present: false, effective: null, archive: true, version: '1.25.2733.0' } }), operation: { action, step: 'tools', tool: 'terminal' } }),
+};
 test('a component row keeps its height while an action runs', async ({page})=>{
- await page.addInitScript(()=>{
-  (window as any).isTauri=true;
-  (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener:()=>{}};
-  localStorage.setItem('jouzu.ui.language','en');
-  const terminal={bundled:null,system:null,preferred:null,effective:null,archive:true,version:'1.25.2733.0',choice:'bundled'};
-  (window as any).__TAURI_INTERNALS__={
-   metadata:{currentWindow:{label:'main'},currentWebview:{label:'main'}},
-   transformCallback:()=>1,unregisterCallback:()=>{},
-   invoke:async(command:string)=>{(window as any).__invoked=((window as any).__invoked??[]).concat(command);if(command==='plugin:dialog|message')return 'Ok';
-    if(command==='shell_state')return {ready:true,bash:false,recent:[],platform:'windows'};
-    if(command==='component_versions')return {jouzu:'0.1.18',development:true};
-    if(command==='environment_read')return [];
-    if(command==='terminal')return {...terminal};
-    if(command==='terminal_install')return new Promise(()=>{});
-    if(command==='git_bash')return 1;
-    if(command.includes('version'))return '0.1.0';
-    return 1;
-   }
-  };
- });
- await page.goto(UI_BASE);
- await page.getByRole('button',{name:'Settings',exact:true}).click();
- const dialog=page.getByRole('dialog');
- await dialog.getByRole('tab',{name:'System',exact:true}).click();
+ await page.addInitScript(windowsWindow);
+ const dialog=await openSystem(page);
  const row=dialog.locator('section[aria-label="Windows Terminal"]');
  const before=(await row.boundingBox())!.height;
  await row.getByRole('button',{name:/Install and use Jouzu's Windows Terminal/}).click();
@@ -302,35 +252,20 @@ test('a component row keeps its height while an action runs', async ({page})=>{
  expect(during).toBe(before);
 });
 
+// Both components have a directory on disk and nothing in it that answers a launch.
+runtimeFixtures['a component copy that is here but does not run is repaired, not installed'] = {
+  installation: installed({
+    git: { bundled: null, managed: null, system: null, bundled_present: true, managed_present: false, system_present: false, archive: true, effective: null },
+    terminal: { bundled: null, system: null, bundled_present: true, archive: false, version: '1.25.2733.0', effective: null },
+  }),
+};
 test('a component copy that is here but does not run is repaired, not installed', async ({page})=>{
- await page.addInitScript(()=>{
-  (window as any).isTauri=true;
-  (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener:()=>{}};
-  localStorage.setItem('jouzu.ui.language','en');
-  // Both components have a directory on disk and nothing in it that answers a launch.
-  const git:any={bundled:null,managed:null,system:null,bundled_present:true,managed_present:false,system_present:false,archive:true,effective:null};
-  const terminal:any={bundled:null,system:null,bundled_present:true,archive:false,version:'1.25.2733.0',effective:null};
-  (window as any).__TAURI_INTERNALS__={
-   metadata:{currentWindow:{label:'main'},currentWebview:{label:'main'}},
-   transformCallback:()=>1,unregisterCallback:()=>{},
-   invoke:async(command:string)=>{(window as any).__invoked=((window as any).__invoked??[]).concat(command);if(command==='plugin:dialog|message')return 'Ok';
-    if(command==='shell_state')return {ready:true,bash:false,recent:[],platform:'windows'};
-    if(command==='component_versions')return {jouzu:'0.1.18',development:true};
-    if(command==='environment_read')return [];
-    if(command==='git_bash')return {...git};
-    if(command==='terminal')return {...terminal};
-    if(command.includes('version'))return '0.1.0';
-    return 1;
-   }
-  };
- });
- await page.goto(UI_BASE);
- await page.getByRole('button',{name:'Settings',exact:true}).click();
- const dialog=page.getByRole('dialog');
- await dialog.getByRole('tab',{name:'System',exact:true}).click();
+ await page.addInitScript(windowsWindow);
+ const dialog=await openSystem(page);
  const bash=dialog.locator('section[aria-label="Git Bash"]');
  await expect(bash.getByRole('button')).toHaveCount(1);
  await expect(bash.getByRole('button')).toBeEnabled();
+ await expect(bash.getByRole('button')).toHaveText(/Repair/);
  const terminalRow=dialog.locator('section[aria-label="Windows Terminal"]');
  await expect(terminalRow.getByRole('button')).toHaveCount(1);
  await expect(terminalRow.getByRole('button')).toBeEnabled();

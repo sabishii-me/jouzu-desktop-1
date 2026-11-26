@@ -30,6 +30,7 @@ describes no screens; what a person sees is in the UI document.
 | Queue of messages sent during a run | host `Session.queue` | UI-local queue |
 | Configuration operations | host `ConfigQueue` | One operation at a time with `409`, partly queued in the UI, bypassed by environment save |
 | Errors | host error slots (section 6) | UI builds one notice list from about 14 inputs |
+| Runtime installation: present, current, being installed ([0029](../decisions/0029-runtime-installation-owned-by-host.md)) | host `Installation`, in `AppView.installation` | Shell: `runtime_report`, `runtime_install`, `jouzu_update`, `git_bash_install`, `terminal_install`, `repair_jouzu`, `image_tool_ensure`, its own `active.json` reader. Host: runtime files looked up again at each start (`runtime-missing`), a second `active.json` reader, `/v1/status` file checks. UI: `runtimePresent` |
 
 ## 3. Runs
 
@@ -306,6 +307,7 @@ stays with the session and records every outcome, `stopped` included.
 | `configGeneration` | Raised by every configuration change (section 4) |
 | `models` | `generation`, `state` (`updating` / `ready`), `list`, `startModel` |
 | `tools` | `settings` (`tools.json`), `report` (the image report), `state` (`checking` / `ready`) |
+| `installation` | `state` (`absent` / `installing` / `update-required` / `ready` / `failed`); `action`, `step` (`node` / `packages` / `verify` / `tools`) and `downloaded`/`total` bytes while installing; `version`, `nodeVersion`, `expectedVersion` when ready; on `ready`, `operation` while a tool is installed without replacing the runtime, and `error` when that failed; `error` (`code`, `params.message`) when failed; `tools` (Windows: the Git Bash and Windows Terminal reports) |
 
 ### 7.3 Events and commands
 
@@ -314,6 +316,16 @@ stays with the session and records every outcome, `stopped` included.
   number; a client catches up by sequence after reconnecting.
 - Commands are HTTP. Each returns acceptance or a typed refusal synchronously;
   the resulting state is read from snapshots.
+- `POST /v1/runtime/install` (also `update` and `repair`) starts the installation
+  operation; asking while one runs changes nothing. `install` and `update` bring
+  the installation to what this build pins; `repair` also installs the packages
+  again. The host starts it on its own at start-up when the installation is
+  `absent` or `update-required`. An operation that replaces runtime files stops
+  every runtime first (state `installing`); one on a `ready` installation that
+  only adds a missing tool keeps it `ready` and its sessions running
+  (`operation`). Files a terminal Jouzu holds are not replaced while it runs.
+  A session start while the installation is not `ready` is refused with
+  `runtime-not-ready` and the current `installation`.
 
 ## 8. Host code to remove
 

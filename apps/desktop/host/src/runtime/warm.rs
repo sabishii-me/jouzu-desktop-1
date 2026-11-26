@@ -778,6 +778,22 @@ impl WarmPool {
         }
     }
 
+    /// The installation was replaced while the pool was stopped: start again,
+    /// with the new files.
+    pub fn resume(self: &Arc<Self>) {
+        {
+            let mut inner = self.lock();
+            inner.stopped = false;
+            inner.failures = 0;
+            inner.error = None;
+            inner.converged = false;
+            inner.generation += 1;
+        }
+        self.notify();
+        self.fill();
+        self.hurry();
+    }
+
     /// The folder warm runtimes start in when no workspace is known yet.
     pub fn scratch(home: &std::path::Path) -> PathBuf {
         home.join("warm")
