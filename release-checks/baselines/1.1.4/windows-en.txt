@@ -1,0 +1,44 @@
+# 1.1.4 on native Windows, en, 2026-11-23, release package host and UI, runtime 0.2.5, harness 84b2874
+FAIL [en] Provider rejects the key while sending: nothing shown within 10 s (Stop visible: true)
+PASS [en] Provider rate-limits the request
+PASS [en] Provider fails with a server error
+PASS [en] Provider unreachable (network down)
+PASS [en] Model removed by the provider
+PASS [en] Reply cut off mid-stream
+PASS [en] Provider slow to answer (8 s to first word)
+PASS [en] Nothing moves while a reply runs
+PASS [en] Stop right after Send
+PASS [en] Stop while the provider has not answered
+PASS [en] Stop while the reply is writing
+PASS [en] Stop while a new session's runtime is still starting
+PASS [en] Stop with a message waiting in the queue
+PASS [en] Runtime killed while the session is idle
+PASS [en] Runtime killed while the reply is writing
+FAIL [en] Runtime keeps crashing: after the cause was fixed, the next message got no reply within 30 s; problems still shown outside the old reply after recovery: Flow is holding the last message.
+PASS [en] Runtime slow to start: a new session is sendable at once
+PASS [en] Computer asleep for 30 s during a reply
+PASS [en] Very long message (300 KB)
+PASS [en] Long unbroken token in a message
+FAIL [en] Image the model refuses: after the cause was fixed, the next message got no reply within 30 s; problems still shown outside the old reply after recovery: No replyWhat is 46 × 7? Reply with only the number. | The session was not reloaded.
+PASS [en] A file that is not an image, named .png
+PASS [en] Rapid settings changes
+FAIL [en] Settings file cannot be written: the case could not finish: locator.click: Timeout 30000ms exceeded.
+PASS [en] Missing tools.json
+FAIL [en] Old and damaged saved sessions: not shown where it happened (expected composer or reply or page): sidebar: The runtime for this folder could not start.; the composer moved or resized: 416,504,768,138 -> 416,682,768,134; still shows waiting after the cause was known: spinner; not shown where it happened (expected composer or reply or page): sidebar: The runtime for this folder could not start.; still shows waiting after the cause was known: spinner; not shown where it happened (expected composer or reply or page): sidebar: The runtime for this folder could not start.; still shows waiting after the cause was known: spinner; not shown where it happened (expected composer or reply or page): sidebar: The runtime for this folder could not start.; still shows waiting after the cause was known: spinner
+PASS [en] #233 Opening a saved session does not show it as Running
+FAIL [en] #212 A background session's live state shows in the list: a session writing in the background shows "null", not running; a finished background reply shows "null", not finished
+PASS [en] #214 A finished reply is not shown as Interrupted
+FAIL [en] #177 #179 Send while a new session's runtime starts: #177: the session sent while its runtime starts is not in the list within 2 s; #179: Steer is offered while the session's runtime starts; #179: the composer says Jouzu reads it at its next step while nothing runs
+FAIL [en] #162 Waiting messages come back paused after a restart: the session is not in the list after the restart; the waiting message is gone or not paused with Continue after the restart
+FAIL [en] #173 An environment change reaches the open session: the open session still uses the old environment: no reply with the new key
+FAIL [en] #171 A custom connection can be removed: no Remove connection for a custom connection
+FAIL [en] #174 A session whose folder was deleted: the reason does not name the folder: "The runtime could not open this session. Details Restart session"; it says the runtime failed; Restart session is offered for a missing folder
+FAIL [en] #178 A provider server error is not called no network: both say the same: "The provider did not answer"
+FAIL [en] #205 #168 Settings show no dirty build and no launcher: #168: the Model providers page speaks of a launcher; #168: the Tools page speaks of a launcher; #168: the Appearance page speaks of a launcher; #168: the Environment page speaks of a launcher; #168: the Language page speaks of a launcher; #168: the System page speaks of a launcher
+FAIL [en] #208 Commit marking can be switched on and kept: the case could not finish: locator.click: Timeout 30000ms exceeded.
+PASS [en] #130 The host token is in no file
+PASS [en] #33 A draft stays in its own session
+PASS [en] #26 Settings stay open when clicking beside them
+PASS [en] #119 An image in a sent message stays after switching sessions
+# Added from the 1.1.5-rc.2 regression report (2026-11-23): #87 run separately on 1.1.4, HOME Windows package, en and ja, failed (Retry gone, stuck on Connecting, no session)
+FAIL [en] #87 Retry after the runtime's files come back: Retry disappears, stuck on Connecting, no session (separate run)

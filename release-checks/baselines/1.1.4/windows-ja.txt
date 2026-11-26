@@ -1,0 +1,25 @@
+# 1.1.4 on native Windows, ja, 2026-11-23, release package host and UI, runtime 0.2.5, harness 84b2874
+PASS [ja] Provider rejects the key while sending
+PASS [ja] Provider rate-limits the request
+PASS [ja] Provider fails with a server error
+PASS [ja] Provider unreachable (network down)
+PASS [ja] Model removed by the provider
+PASS [ja] Reply cut off mid-stream
+PASS [ja] Provider slow to answer (8 s to first word)
+PASS [ja] Runtime killed while the session is idle
+PASS [ja] Runtime killed while the reply is writing
+PASS [ja] Runtime keeps crashing
+PASS [ja] Very long message (300 KB)
+FAIL [ja] Image the model refuses: after the cause was fixed, the next message got no reply within 30 s; problems still shown outside the old reply after recovery: 応答なしWhat is 33 × 7? Reply with only the number. | セッションは再読み込みされませんでした。
+PASS [ja] A file that is not an image, named .png
+PASS [ja] Settings file cannot be written
+PASS [ja] Old and damaged saved sessions
+PASS [ja] #233 Opening a saved session does not show it as Running
+FAIL [ja] #212 A background session's live state shows in the list: a session writing in the background shows "null", not running; a finished background reply shows "null", not finished
+PASS [ja] #214 A finished reply is not shown as Interrupted
+FAIL [ja] #177 #179 Send while a new session's runtime starts: #179: Steer is offered while the session's runtime starts
+FAIL [ja] #174 A session whose folder was deleted: Restart session is offered for a missing folder
+FAIL [ja] #178 A provider server error is not called no network: both say the same: "プロバイダーから応答がありません"
+FAIL [ja] #205 #168 Settings show no dirty build and no launcher: #168: the モデルプロバイダー page speaks of a launcher; #168: the ツール page speaks of a launcher; #168: the 外観 page speaks of a launcher; #168: the 環境変数 page speaks of a launcher; #168: the 言語 page speaks of a launcher; #168: the システム page speaks of a launcher
+# Added from the 1.1.5-rc.2 regression report (2026-11-23): #87 run separately on 1.1.4, HOME Windows package, en and ja, failed (Retry gone, stuck on Connecting, no session)
+FAIL [ja] #87 Retry after the runtime's files come back: Retry disappears, stuck on Connecting, no session (separate run)

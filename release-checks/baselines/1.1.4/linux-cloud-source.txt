@@ -1,3 +1,4 @@
+# 1.1.4 in the cloud (Linux, source build of v1.1.4), en and ja, 2026-11-23, runtime 0.2.5
 PASS [en] Provider rejects the key while sending
 PASS [en] Provider rate-limits the request
 PASS [en] Provider fails with a server error
@@ -61,3 +62,6 @@ FAIL [ja] #177 #179 Send while a new session's runtime starts: #179: Steer is of
 FAIL [ja] #174 A session whose folder was deleted: Restart session is offered for a missing folder
 FAIL [ja] #178 A provider server error is not called no network: both say the same: "プロバイダーから応答がありません"
 FAIL [ja] #205 #168 Settings show no dirty build and no launcher: #168: the モデルプロバイダー page speaks of a launcher; #168: the ツール page speaks of a launcher; #168: the 外観 page speaks of a launcher; #168: the 環境変数 page speaks of a launcher; #168: the 言語 page speaks of a launcher; #168: the システム page speaks of a launcher
+# Added from the 1.1.5-rc.2 regression report (2026-11-23): #87 run separately on 1.1.4 in the cloud, en and ja, failed
+FAIL [en] #87 Retry after the runtime's files come back: Retry disappears, stuck on Connecting, no session (separate run)
+FAIL [ja] #87 Retry after the runtime's files come back: Retry disappears, stuck on Connecting, no session (separate run)
