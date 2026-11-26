@@ -1,7 +1,9 @@
 /**
- * The host's app-wide snapshot (`AppView`): configuration operations and the
- * current settings. The host owns both; this module only follows the snapshot
- * and sends commands. Nothing here queues, retries or keeps a copy of its own.
+ * The host's app-wide snapshot (`AppView`): configuration operations, the
+ * current settings, the configuration generation, the runtimes' models for it
+ * and the tools. The host owns all of it and publishes it again whenever any
+ * of it changes; this module only follows the snapshot and sends commands.
+ * Nothing here polls, queues, retries or keeps a copy of its own.
  */
 import { useSyncExternalStore } from "react";
 import type { HostClient } from "./api/host-client";
@@ -26,6 +28,46 @@ export interface ConfigResult {
   provider?: string | null;
   finishedAt: string;
 }
+/** A model as the runtime lists it. */
+export interface RuntimeModel { provider: string; id: string; name: string; [key: string]: unknown }
+
+/**
+ * The runtimes' answer for the current configuration. `updating` from a
+ * configuration change until a runtime started with it answered: an older list
+ * is never shown in its place.
+ */
+export interface ModelsView {
+  generation: number | null;
+  state: "updating" | "ready";
+  list: RuntimeModel[];
+  startModel: RuntimeModel | null;
+}
+
+export interface ImageModel { id: string; sizes: string[] }
+/** An image provider the user added, as the image tool's report gives it. */
+export interface ImageProvider {
+  id: string;
+  label: string;
+  usable: boolean;
+  /** Why it cannot make images: a code this window words; `reason` and `detail` are the original text. */
+  code?: string;
+  reason?: string;
+  detail?: string;
+  models: ImageModel[];
+}
+export interface ImageReport {
+  usable: boolean;
+  defaults: { provider: string; model: string; size: string; maxImages: number };
+  providers: ImageProvider[];
+}
+export interface ImageSettings { enabled: boolean; provider: string; model: string; size: string; maxImages: number }
+/** `checking` from a configuration change until the image tool reported for it. */
+export interface ToolsView {
+  settings: { image: ImageSettings; reviewTools: string[] };
+  report: ImageReport | null;
+  state: "checking" | "ready";
+}
+
 export interface AppView {
   revision: number;
   config: { running: ConfigRunning | null; queued: ConfigQueued[]; lastResult: Partial<Record<ConfigKind, ConfigResult>> };
@@ -33,9 +75,71 @@ export interface AppView {
   settings: ControlState | null;
   /** Providers whose latest reply refused the stored key or sign-in, with the provider's words. */
   providerAuth?: Record<string, { refusedAt: string; text: string }>;
+  /** Raised by every configuration change. */
+  configGeneration?: number;
+  models?: ModelsView;
+  tools?: ToolsView;
 }
 
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
+const text = (value: unknown, fallback = ""): string => (typeof value === "string" ? value : fallback);
+
+function runtimeModel(value: unknown): RuntimeModel | null {
+  if (!record(value) || typeof value.provider !== "string" || typeof value.id !== "string") return null;
+  return { ...value, provider: value.provider, id: value.id, name: text(value.name, value.id) };
+}
+
+export function parseModels(value: unknown): ModelsView | undefined {
+  if (!record(value)) return undefined;
+  const list = Array.isArray(value.list) ? value.list.map(runtimeModel).filter((model): model is RuntimeModel => !!model) : [];
+  return {
+    generation: typeof value.generation === "number" ? value.generation : null,
+    state: value.state === "ready" ? "ready" : "updating",
+    list,
+    startModel: runtimeModel(value.startModel),
+  };
+}
+
+function imageModels(value: unknown): ImageModel[] {
+  return Array.isArray(value)
+    ? value.flatMap(item => record(item) && typeof item.id === "string"
+      ? [{ id: item.id, sizes: Array.isArray(item.sizes) ? item.sizes.filter((size): size is string => typeof size === "string") : [] }]
+      : [])
+    : [];
+}
+
+export function parseTools(value: unknown): ToolsView | undefined {
+  if (!record(value) || !record(value.settings)) return undefined;
+  const image = record(value.settings.image) ? value.settings.image : {};
+  const settings = {
+    image: {
+      enabled: image.enabled !== false,
+      provider: text(image.provider),
+      model: text(image.model),
+      size: text(image.size, "1K"),
+      maxImages: typeof image.maxImages === "number" ? image.maxImages : 3,
+    },
+    reviewTools: Array.isArray(value.settings.reviewTools) ? value.settings.reviewTools.filter((tool): tool is string => typeof tool === "string") : [],
+  };
+  let report: ImageReport | null = null;
+  if (record(value.report) && Array.isArray(value.report.providers)) {
+    const defaults = record(value.report.defaults) ? value.report.defaults : {};
+    report = {
+      usable: value.report.usable === true,
+      defaults: { provider: text(defaults.provider), model: text(defaults.model), size: text(defaults.size, "1K"), maxImages: typeof defaults.maxImages === "number" ? defaults.maxImages : 3 },
+      providers: value.report.providers.flatMap(item => record(item) && typeof item.id === "string" ? [{
+        id: item.id,
+        label: text(item.label, item.id),
+        usable: item.usable === true,
+        ...(typeof item.code === "string" ? { code: item.code } : {}),
+        ...(typeof item.reason === "string" ? { reason: item.reason } : {}),
+        ...(typeof item.detail === "string" ? { detail: item.detail } : {}),
+        models: imageModels(item.models),
+      }] : []),
+    };
+  }
+  return { settings, report, state: value.state === "ready" ? "ready" : "checking" };
+}
 
 /** Read a snapshot. Settings this window cannot read leave `settings` empty and
  *  are reported in `settingsError`; the operations stay readable either way. */
@@ -55,7 +159,18 @@ export function parseAppView(value: unknown): AppView & { settingsError: Error |
       if (record(entry) && typeof entry.text === "string") providerAuth[id] = { refusedAt: typeof entry.refusedAt === "string" ? entry.refusedAt : "", text: entry.text };
     }
   }
-  return { revision: value.revision, config: { running, queued, lastResult }, settings, settingsError, providerAuth };
+  const models = parseModels(value.models);
+  const tools = parseTools(value.tools);
+  return {
+    revision: value.revision,
+    config: { running, queued, lastResult },
+    settings,
+    settingsError,
+    providerAuth,
+    ...(typeof value.configGeneration === "number" ? { configGeneration: value.configGeneration } : {}),
+    ...(models ? { models } : {}),
+    ...(tools ? { tools } : {}),
+  };
 }
 
 type Listener = () => void;
@@ -109,12 +224,14 @@ export function useAppViewFailure(): Error | null {
   return useSyncExternalStore(
     listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     () => failure,
+    () => failure,
   );
 }
 
 export function useAppView(): AppView | null {
   return useSyncExternalStore(
     listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+    () => view,
     () => view,
   );
 }

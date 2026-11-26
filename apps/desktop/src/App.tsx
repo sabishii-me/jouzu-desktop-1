@@ -20,7 +20,6 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { ARTIFACT_FIELDS, ARTIFACT_LANGUAGES, RESPONSE_LANGUAGES, artifactPolicyFor, artifactPreset, catalogChangeSummary, type ArtifactLanguage } from "./control-state";
 import { cancelConfig, configFailure, configPending, currentAppView, enqueueConfig, heldCatalog as heldCatalogOf, runConfig, useAppView, useAppViewFailure, type ConfigKind, type ConfigResult } from "./app-view";
 import { DetailsPopover } from "./control-result";
-import { eventRouter } from "./event-router";
 import { useApi } from "./api/context";
 import type { WarmView } from "./warm-runtime";
 import { Switch } from "./components/ui/switch";
@@ -242,31 +241,13 @@ export function App() {
   const [provider, setProvider] = useState("");
   const [token, setToken] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
-  // The warm runtime's own model list (what it can run): the default-model
-  // choices, and whether any model is set up at all. A configuration change
-  // restarts that runtime, so the list is read again once the host reports the
-  // new one started: never an older runtime's answer. Until then the last
-  // answer stands; `null` means the runtime has not answered yet.
-  const [runtimeModels, setRuntimeModels] = useState<{ provider: string; id: string; name: string }[] | null>(null);
-  // A warm runtime that became ready has a list to read (after a recycle, a
-  // start, or a session taking the previous one).
-  const [warmReady, setWarmReady] = useState(0);
-  useEffect(() => eventRouter.subscribe(event => {
-    if (event.event === "runtime.warm" && event.data?.state === "ready") setWarmReady(value => value + 1);
-  }), []);
-  const changes = Object.entries(appView?.config.lastResult ?? {}).filter(([kind, result]) => kind !== "status" && result?.ok).map(([, result]) => result!.operationId).sort().join();
-  useEffect(() => {
-    let current = true;
-    void (async () => {
-      try {
-        let warm = await api.runtime.warmState(0);
-        while (current && warm.state === "starting") warm = await api.runtime.warmState(5000);
-        const models = current ? await api.models.list("") : [];
-        if (current) setRuntimeModels(models);
-      } catch (error) { quiet(error); }
-    })();
-    return () => { current = false; };
-  }, [api, changes, settingsOpen, warmReady]);
+  // The runtimes' model list for the current configuration (what they can run):
+  // the default-model choices, and whether any model is set up at all. The host
+  // publishes it with AppView after every configuration change once a runtime
+  // started with that change answered; until then it is `updating` and nothing
+  // is decided from an older list.
+  const modelsView = appView?.models;
+  const runtimeModels = modelsView?.state === "ready" ? modelsView.list : null;
   // There is no setup wizard: a missing runtime auto-prepares, and the model
   // page shows only while the runtime reports that it has no model at all.
   const needsSetup = runtimeModels !== null && runtimeModels.length === 0;
@@ -670,7 +651,7 @@ export function App() {
                   {providerContent}
                   
                 </TabsContent>
-                <TabsContent value="tools" className="m-0 space-y-4"><ToolsPanel /></TabsContent>
+                <TabsContent value="tools" className="m-0 space-y-4"><ToolsPanel onOpenProviders={() => setSettingsTab("providers")} /></TabsContent>
                 <TabsContent value="collaboration" className="m-0 space-y-4"><CollaborationPanel /></TabsContent>
                 <TabsContent value="environment" className="m-0 space-y-4"><Card className="border-border shadow-none"><CardHeader><CardTitle>{t.environment}</CardTitle><CardDescription>{t.envHint}</CardDescription></CardHeader><CardContent className="space-y-3">{cardNotice(["environment"])}
                   {envRows.map((row,index) => <div key={index} className="space-y-2 rounded-lg border border-border p-3"><div className="flex items-center gap-2">{editingEnv === index ? <Input aria-label={t.variableName} placeholder={t.variableName} value={row.name} disabled={environmentBusy} onChange={event => setEnvRows(rows => rows.map((r,i) => i === index ? {...r,name:event.target.value} : r))} /> : <span className="min-w-0 flex-1 truncate text-sm font-medium" title={row.name}>{row.name}</span>}<Button variant="ghost" disabled={environmentBusy} onClick={() => setEditingEnv(index)}>{t.editValue}</Button><Switch aria-label={t.enabled} checked={row.enabled} disabled={environmentBusy} onCheckedChange={enabled => setEnvRows(rows => rows.map((r,i) => i === index ? {...r,enabled} : r))} /><Button variant="ghost" disabled={environmentBusy} aria-label={t.deleteEntry} onClick={() => { setEnvRows(rows => rows.filter((_,i) => i !== index)); setEditingEnv(null); }}><X /></Button></div>{editingEnv === index && <Input type="password" autoComplete="off" aria-label={t.variableValue} placeholder={t.variableValue} value={row.value} disabled={environmentBusy} onChange={event => setEnvRows(rows => rows.map((r,i) => i === index ? {...r,value:event.target.value} : r))} />}</div>)}

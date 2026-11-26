@@ -62,6 +62,8 @@ function ModelMenu({ open, onOpenChange, models, model, state, onSelect, thinkin
     <Button type="button" variant="ghost" className="h-8 gap-1 px-2 text-xs" aria-label={t.model} aria-expanded={open} disabled={state === "resolving" && !models.length} onClick={() => { if (state === "none" && !models.length) { onSetup?.(); return; } const next = !open; onOpenChange(next); if (next) setQuery(""); }}>
       {state === "resolving" && !model ? <Loader2 className="size-4 shrink-0 animate-spin" aria-hidden="true" /> : <Cpu className="size-4 shrink-0" aria-hidden="true" />}
       <span className="max-w-40 truncate">{state === "none" ? (models.length ? t.selectModel : t.setUpModel) : model ?? ""}</span>
+      {/* No list yet for this configuration: the name stays, the list cannot open. */}
+      {state === "resolving" && !models.length && model && <span data-models-updating className="shrink-0 text-muted-foreground">{t.modelsUpdating}</span>}
       <ChevronDown className="size-3 shrink-0" aria-hidden="true" />
     </Button>
     <ResultMark result={result} />

@@ -280,11 +280,12 @@ export interface ModelApi {
 }
 
 export interface ToolsApi {
-  settings(): Promise<{ path: string; exists: boolean; settings: Record<string, unknown> }>;
-  save(image: Record<string, unknown>): Promise<Record<string, unknown>>;
-  /** Each provider says whether it can generate images now, and why not; `models` comes with a usable one. */
-  providers(): Promise<{ providers: Array<{ id: string; label: string; available?: boolean; reason?: string; models?: unknown }> }>;
-  models(provider: string): Promise<{ models: unknown }>;
+  /** The same tools block AppView carries: saved choices, the image report, and its state. */
+  settings(): Promise<Record<string, unknown>>;
+  /** Save only the fields given; the host checks their types. */
+  save(change: Record<string, unknown>): Promise<Record<string, unknown>>;
+  /** Check again: the image tool asks every added provider again. */
+  refresh(): Promise<Record<string, unknown>>;
 }
 
 export interface McpApi {
