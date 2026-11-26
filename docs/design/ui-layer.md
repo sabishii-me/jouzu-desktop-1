@@ -120,6 +120,14 @@ Providers nobody added are never listed. A saved switch that is on while
 nothing can make images shows off; the saved choice is kept and applies again
 when a provider can.
 
+The provider, model and size shown are the ones a call uses when it names none,
+decided by one rule that the card and the image tool share
+(`jouzu-image/choice.mjs`): the saved provider while it is added (usable or not,
+so its reason has a place), otherwise the report's default; the saved model when
+that provider offers it, otherwise its first; the saved size when the model makes
+it, otherwise its first. The saved choice is never rewritten by this: a provider
+that was removed and added back is chosen again.
+
 ### 6.2 Model picker during a configuration change
 
 From a configuration change until the runtimes of the new configuration
