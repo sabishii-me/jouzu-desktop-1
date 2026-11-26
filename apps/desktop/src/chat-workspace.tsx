@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { ArrowUpCircle, ArrowUpDown, Archive, ArchiveRestore, Check, ChevronDown, ChevronRight, Copy, FolderOpen, FolderPlus, Images, MessageSquare, MoreHorizontal, PanelLeft, Columns2, PanelRight, Pencil, Pin, Plus, RefreshCw, Search, Settings, Sparkles, X } from "lucide-react";
+import { ArrowUpCircle, Archive, ArchiveRestore, Check, ChevronDown, ChevronRight, Copy, FolderOpen, FolderPlus, Images, MessageSquare, MoreHorizontal, PanelLeft, Columns2, PanelRight, Pencil, Pin, Plus, RefreshCw, Search, Settings, SlidersHorizontal, Sparkles, X } from "lucide-react";
 import { Button } from "./components/ui/button";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuSeparator, DropdownMenuTrigger } from "./components/ui/dropdown-menu";
 import { Input } from "./components/ui/input";
 import { McpMenu } from "./mcp-menu";
 import { ChatConversation, type EarlierHistory } from "./chat-conversation";
@@ -8,6 +9,7 @@ import { AgentAction, turnLabel } from "./chat-live";
 import { Composer } from "./composer";
 import { changedFiles, snapshotComplete, type WorkspaceSnapshot } from "./workspace-diff";
 import { loadCollapsed, saveCollapsed, toggleCollapsed } from "./sidebar-state";
+import { buildSidebar, loadArrangement, loadManualOrder, manualFromModel, moveBefore, moveWithin, pathKey, saveArrangement, saveManualOrder, type Arrangement, type GroupBy, type ManualOrder, type OrderBy, type SessionFilter, type SidebarGroup } from "./sidebar-arrangement";
 import { ArtifactsPanel } from "./artifacts-panel";
 import { useApi } from "./api/context";
 import type { JouzuApi } from "./api/jouzu-api";
@@ -36,6 +38,7 @@ import { SessionRowStatus, rowStateText } from "./session-row-status";
 import { useWarmRuntime, warmBlocks, type WarmView } from "./warm-runtime";
 import { composerTurn } from "./composer-state";
 import { newId, copyText } from "./secure-context";
+import { resizedPaneWidth } from "./pane-resize";
 
 function defaultPaneWidth() {
   return Math.min(960, Math.max(480, Math.round(window.innerWidth / 2)));
@@ -80,7 +83,7 @@ const workspaceLabel = (path: string, t: ChatText) => lastSegment(path) === "def
 /** Saved reports first, then ones that arrived live and are not saved yet. */
 const mergeReports = (saved: FlowReportRecord[], live: FlowReportRecord[]) => [...saved, ...live.filter(report => !saved.some(known => known.text === report.text))].slice(-30);
 const isDefaultWorkspace = (path: string) => lastSegment(path) === "default-workspace";
-const normalizedPath = (path: string) => path.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
+const normalizedPath = pathKey;
 /** The height the workspace menu may take below its button and still fit inside the window (shisa-ai/jouzu-desktop#114). */
 function pickerSpaceOf(bounds: DOMRect): number {
   return Math.max(0, window.innerHeight - bounds.bottom - 16);
@@ -273,9 +276,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => loadCollapsed());
   const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState("");
-  const [showArchived, setShowArchived] = useState(false);
   const [sessionMenu, setSessionMenu] = useState<string | null>(null);
-  const [sort, setSort] = useState<"recent" | "name">("recent");
+  // Grouping, order and filter are the user's choice (0026); the list is theirs
+  // to arrange, and a preference that cannot be stored holds for this session.
+  const [arrangement, setArrangement] = useState<Arrangement>(() => loadArrangement());
+  const [manual, setManual] = useState<ManualOrder>(() => loadManualOrder());
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerSpace, setPickerSpace] = useState<number | null>(null);
   const picker = useRef<HTMLDivElement>(null);
@@ -1276,33 +1281,55 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     setPickerOpen(false);
     onSelect(next);
   }
-  const groups = useMemo(() => {
-    const map = new Map<string, { id: string; path: string; name: string; sessions: SessionSummary[] }>();
-    for (const workspace of workspaces) map.set(normalizedPath(workspace.path), { id: workspace.id, path: workspace.path, name: workspaceLabel(workspace.path, t), sessions: [] });
-    for (const session of sessions) {
-      if (session.archived && !showArchived) continue;
-      const key = normalizedPath(session.workspace);
-      if (!map.has(key)) map.set(key, { id: key, path: session.workspace, name: workspaceLabel(session.workspace, t), sessions: [] });
-      map.get(key)!.sessions.push(session);
-    }
-    // Most recent first, by the time each row shows: the list merges saved and
-    // live sessions and arrives in no order of its own.
-    for (const group of map.values()) group.sessions.sort((left, right) => right.updated - left.updated);
-    let result = [...map.values()];
-    if (search.trim()) {
-      const query = search.trim().toLowerCase();
-      result = result.flatMap(group => {
-        if (group.name.toLowerCase().includes(query) || group.path.toLowerCase().includes(query)) return [group];
-        const matches = group.sessions.filter(session => session.title.toLowerCase().includes(query));
-        return matches.length ? [{ ...group, sessions: matches }] : [];
-      });
-    }
-    if (sort === "name") result.sort((left, right) => left.name.localeCompare(right.name));
-    else result.sort((left, right) => (right.sessions[0]?.updated ?? 0) - (left.sessions[0]?.updated ?? 0));
-    return result;
-  }, [workspaces, sessions, search, sort, showArchived]);
-  const defaultGroup = groups.find(group => isDefaultWorkspace(group.path));
-  const regularGroups = defaultGroup ? groups.filter(group => group !== defaultGroup) : groups;
+  // The list's shape comes from the arrangement rules, not from this view (0026).
+  const model = useMemo(() => buildSidebar({
+    workspaces,
+    sessions,
+    arrangement,
+    manual,
+    query: search,
+    label: workspace => workspaceLabel(workspace, t),
+  }), [workspaces, sessions, arrangement, manual, search, t]);
+  const changeArrangement = (next: Partial<Arrangement>) => {
+    const value = { ...arrangement, ...next };
+    setArrangement(value);
+    saveArrangement(value);
+  };
+  const reorder = (next: ManualOrder) => { setManual(next); saveManualOrder(next); };
+  // Switching to Manual keeps the list exactly as it is on screen; the user moves
+  // it from there. Nothing jumps when they make the choice.
+  const chooseOrder = (next: OrderBy) => {
+    if (next === "manual" && arrangement.orderBy !== "manual") reorder(manualFromModel(model));
+    changeArrangement({ orderBy: next });
+  };
+  // One control, one menu: grouping, order and filter are three sections of the
+  // same choice (0026, 0027). The popover, focus and dismissal belong to the
+  // primitive, not to this view.
+  const arrangementMenu = (label: string) =>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild><Button variant="ghost" className="size-7 p-0" aria-label={label}><SlidersHorizontal className="size-3.5" /></Button></DropdownMenuTrigger>
+      <DropdownMenuContent align="end" aria-label={label} className="w-60">
+        <DropdownMenuLabel>{t.groupBy}</DropdownMenuLabel>
+        <DropdownMenuRadioGroup value={arrangement.groupBy} onValueChange={value => changeArrangement({ groupBy: value as GroupBy })}>
+          <DropdownMenuRadioItem value="workspace">{t.groupWorkspace}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="tree">{t.groupTree}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="one-list">{t.groupOneList}</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>{t.orderBy}</DropdownMenuLabel>
+        <DropdownMenuRadioGroup value={arrangement.orderBy} onValueChange={value => chooseOrder(value as OrderBy)}>
+          <DropdownMenuRadioItem value="manual">{t.orderManual}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="updated">{t.orderUpdated}</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>{t.filterSessions}</DropdownMenuLabel>
+        <DropdownMenuRadioGroup value={arrangement.filter} onValueChange={value => changeArrangement({ filter: value as SessionFilter })}>
+          <DropdownMenuRadioItem value="hide-archived">{t.filterHideArchived}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="all">{t.filterAll}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="archived-only">{t.filterArchivedOnly}</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>;
   // A host session the runtime has not written yet is its list row by its id (#177).
   const boundRow = snapshot.sessionFile ?? (snapshot.sessionId && !hero ? liveRowKey(snapshot.sessionId) : "");
   const activeSession = normalizedPath(boundRow);
@@ -1361,12 +1388,23 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     const move = (event: PointerEvent) => {
       const current = resizingPane.current;
       if (!current) return;
-      setPanes(list => list.map((pane, index) => index === current.index ? { ...pane, width: Math.min(960, Math.max(360, current.startWidth + (current.startX - event.clientX))) } : pane));
+      setPanes(list => list.map((pane, index) => index === current.index
+        ? { ...pane, width: resizedPaneWidth(current.startWidth, current.startX, event.clientX) }
+        : pane));
     };
+    // A drag ends on release, on cancellation (e.g. the OS takes over the gesture),
+    // or when the pointer is lost. Leaving any of these out strands the drag.
     const stop = () => { resizingPane.current = null; };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop);
-    return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stop); };
+    window.addEventListener("pointercancel", stop);
+    window.addEventListener("lostpointercapture", stop);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      window.removeEventListener("lostpointercapture", stop);
+    };
   }, []);
   useEffect(() => {
     let alive = true;
@@ -1476,7 +1514,6 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     [conversationProjection.messages, artifactsSessionId],
   );
   const conversationKey = selectedSession ?? snapshot.sessionId ?? path;
-  const hasArchived = sessions.some(session => session.archived);
   const selectedWorkspace = sessions.find(session => normalizedPath(session.path) === selectedKey)?.workspace;
   useEffect(() => { if (selectedSession) selectedRowRef.current?.scrollIntoView({ block: "nearest" }); }, [selectedSession]);
   const showingAttached = selectedKey === activeSession;
@@ -1605,6 +1642,81 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   }
   // Above the composer: only the queue of messages sent during a run.
   const banners = <SteerQueue items={queued} onEdit={id => void editQueued(id)} onRemove={id => changeQueue(client => client.unqueue(id))} onContinue={() => changeQueue(client => client.queue("continue"))} onDiscard={() => changeQueue(client => client.queue("discard"))} result={results.queue} />;
+  // One session row, in a group or in the one list. `scope` is the order on
+  // screen, which is what a manual move works against.
+  const sessionRow = (session: SessionSummary, options: { showWorkspace?: boolean; scope?: string[] } = {}) => {
+    const key = normalizedPath(session.path);
+    const scope = options.scope ?? [key];
+    const move = (delta: -1 | 1) => {
+      const next = moveWithin(manual.sessions, key, delta, scope);
+      if (next.length !== manual.sessions.length || next.some((entry, index) => entry !== manual.sessions[index])) reorder({ ...manual, sessions: next });
+    };
+    const renamingThis = !!renaming && normalizedPath(renaming.path) === key;
+    return <div key={session.path} data-session-key={key} ref={node => { if (selectedKey === key) selectedRowRef.current = node; }} data-session-selected={selectedKey === key || undefined} className={`group/session relative flex items-center rounded-md text-sm ${selectedKey === key ? "bg-accent text-foreground before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded-full before:bg-primary" : "hover:bg-muted/60"} ${session.archived ? "opacity-60" : ""}`}
+      draggable={arrangement.orderBy === "manual" && !renamingThis}
+      onDragStart={event => { event.dataTransfer.setData("text/plain", `session:${key}`); event.dataTransfer.effectAllowed = "move"; }}
+      onDragOver={event => { if (arrangement.orderBy === "manual") event.preventDefault(); }}
+      onDrop={event => {
+        const raw = event.dataTransfer.getData("text/plain");
+        if (!raw.startsWith("session:")) return;
+        event.preventDefault();
+        const dragged = raw.slice("session:".length);
+        if (dragged !== key) reorder({ ...manual, sessions: moveBefore(manual.sessions, dragged, key) });
+      }}>
+      {renamingThis
+        ? <Input autoFocus aria-label={t.sessionName} className="m-0.5 h-7 min-w-0 flex-1 text-sm" value={renaming!.title} onChange={event => setRenaming({ path: session.path, title: event.target.value })} onFocus={event => event.target.select()} onKeyDown={event => { if (event.key === "Enter") void finishRename(true); if (event.key === "Escape") void finishRename(false); }} onBlur={() => void finishRename(true)} />
+        : <button type="button" onClick={() => void openSession(session.path)} title={session.path} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left" onKeyDown={event => { if (!event.altKey || arrangement.orderBy !== "manual") return; if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return; event.preventDefault(); move(event.key === "ArrowUp" ? -1 : 1); }}>
+        {rowStates.get(session.path) ? <SessionRowStatus state={rowStates.get(session.path)!} now={listNow} t={t} /> : session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label={t.pinned} /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span data-session-title className="min-w-0 flex-1 truncate">{session.title}</span>{options.showWorkspace && <span className="shrink-0 truncate text-[10px] text-muted-foreground">{workspaceLabel(session.workspace, t)}</span>}{rowStates.get(session.path) && <span className="sr-only">{rowStateText(rowStates.get(session.path)!, listNow, t)}</span>}<span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={fill(t.artifactCount, { n: artifactCount(session.path) })}>{artifactCount(session.path)}</span>}
+      </button>}
+      {session.saved && <div className={`relative flex shrink-0 items-center gap-0.5 pr-1 transition-opacity focus-within:opacity-100 group-hover/session:opacity-100 ${sessionMenu === session.path ? "opacity-100" : "opacity-0"}`} data-session-menu>
+        <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={session.pinned ? t.unpinSession : t.pinSession} title={session.pinned ? t.unpinSession : t.pinSession} onClick={() => void updateSession(session.path, { pinned: !session.pinned })}><Pin className={`size-3.5 ${session.pinned ? "text-primary" : "text-muted-foreground"}`} /></button>
+        <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={t.sessionActions} title={t.sessionActions} aria-haspopup="menu" aria-expanded={sessionMenu === session.path} onClick={() => setSessionMenu(value => value === session.path ? null : session.path)}><MoreHorizontal className="size-4 text-muted-foreground" /></button>
+        {sessionMenu === session.path && <div role="menu" aria-label={fill(t.actionsFor, { name: session.title })} className="absolute right-0 top-full z-40 mt-1 w-52 rounded-xl border border-border bg-popover p-1 text-sm shadow-xl">
+          <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { pinned: !session.pinned }); setSessionMenu(null); }}><Pin className="size-4 text-muted-foreground" />{session.pinned ? t.unpinSession : t.pinSession}</button>
+          <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void renameSession(session)}><Pencil className="size-4 text-muted-foreground" />{t.rename}</button>
+          <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { archived: !session.archived }); setSessionMenu(null); }}>{session.archived ? <ArchiveRestore className="size-4 text-muted-foreground" /> : <Archive className="size-4 text-muted-foreground" />}{session.archived ? t.restoreSession : t.archiveSession}</button>
+          <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void copySessionId(session)}>{copied === session.path ? <><Check className="size-4 text-primary" />{t.copied}</> : <><Copy className="size-4 text-muted-foreground" />{t.copySessionId}</>}</button>
+        </div>}
+      </div>}
+    </div>;
+  };
+  // One workspace group. In `tree` its depth indents it; a manual move orders
+  // siblings, and a cross-parent move is ignored by the tree walk.
+  const groupSection = (group: SidebarGroup<SessionSummary>) => {
+    const open = !!search.trim() || !collapsedGroups.has(group.id);
+    const keys = group.sessions.map(session => normalizedPath(session.path));
+    const groupScope = model.groups.map(item => item.id);
+    const move = (delta: -1 | 1) => {
+      const next = moveWithin(manual.groups, group.id, delta, groupScope);
+      if (next.length !== manual.groups.length || next.some((entry, index) => entry !== manual.groups[index])) reorder({ ...manual, groups: next });
+    };
+    return <section key={group.id} data-sidebar-group={group.id} data-group-depth={group.depth} style={{ marginLeft: group.depth ? group.depth * 12 : undefined }} className="mb-1"
+      draggable={arrangement.orderBy === "manual"}
+      onDragStart={event => { event.dataTransfer.setData("text/plain", `group:${group.id}`); event.dataTransfer.effectAllowed = "move"; }}
+      onDragOver={event => { if (arrangement.orderBy === "manual") event.preventDefault(); }}
+      onDrop={event => {
+        const raw = event.dataTransfer.getData("text/plain");
+        if (!raw.startsWith("group:")) return;
+        event.preventDefault();
+        const dragged = raw.slice("group:".length);
+        if (dragged !== group.id) reorder({ ...manual, groups: moveBefore(manual.groups, dragged, group.id) });
+      }}>
+      <div className={`group flex items-center gap-1 rounded-lg ${(selectedWorkspace ? normalizedPath(selectedWorkspace) === normalizedPath(group.path) : !selectedKey && normalizedPath(group.path) === normalizedPath(path)) ? "bg-accent/70" : "hover:bg-muted/60"}`}>
+        <button type="button" aria-label={`${open ? t.collapse : t.expand} ${group.name}`} onClick={() => setCollapsedGroups(current => { const next = toggleCollapsed(current, group.id); saveCollapsed(next); return next; })} onKeyDown={event => { if (!event.altKey || arrangement.orderBy !== "manual") return; if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return; event.preventDefault(); move(event.key === "ArrowUp" ? -1 : 1); }} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
+          {open ? <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" /> : <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />}
+          <FolderOpen className="size-4 shrink-0 text-muted-foreground" /><span className="truncate text-sm">{group.name}</span>
+        </button>
+        <Button variant="ghost" className="mr-1 size-6 p-0 opacity-0 group-hover:opacity-100 focus:opacity-100" aria-label={fill(t.removeNamed, { name: group.path })} onClick={() => { const workspace = workspaces.find(item => normalizedPath(item.path) === normalizedPath(group.path)); if (workspace) onRemove(workspace.id); }}><X className="size-3" /></Button>
+      </div>
+      {open && <div className="ml-4 border-l border-border pl-1.5">
+        {warm.state === "failed" && normalizedPath(group.path) === normalizedPath(path) && <div className="py-1"><NoticeRow alert={{ id: "warm", level: "error", text: t.warmFailed, details: warm.error ?? undefined, actions: [{ label: t.retry, run: retryWarm }] }} /></div>}
+        {group.sessions.map(session => sessionRow(session, { scope: keys }))}
+        {!group.sessions.length && <p className="px-2 py-1.5 text-xs text-muted-foreground">{t.noSessions}</p>}
+      </div>}
+    </section>;
+  };
+  // The one list is one order to move within, across workspaces.
+  const oneListScope = model.mode === "list" ? model.sessions.map(session => normalizedPath(session.path)) : [];
   // `overflow-clip`, not `overflow-hidden`: the layout is never a scroll container,
   // so a sideways wheel or scrollIntoView cannot shift it (#113).
   return <div ref={chatRoot} className="relative flex min-h-0 min-w-0 flex-1 overflow-clip">
@@ -1616,8 +1728,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t.workspaces}</h2>
         <div className="flex items-center gap-1">
           <Button variant="ghost" className="size-7 p-0" aria-label={t.searchWorkspaces} aria-pressed={searchOpen} onClick={() => { setSearchOpen(value => !value); if (searchOpen) setSearch(""); }}><Search className="size-3.5" /></Button>
-          {(hasArchived || showArchived) && <Button variant="ghost" className="size-7 p-0" aria-label={showArchived ? t.hideArchived : t.showArchived} aria-pressed={showArchived} onClick={() => setShowArchived(value => !value)}><Archive className="size-3.5" /></Button>}
-          <Button variant="ghost" className="size-7 p-0" aria-label={sort === "recent" ? t.sortByName : t.sortByRecent} onClick={() => setSort(value => value === "recent" ? "name" : "recent")}><ArrowUpDown className="size-3.5" /></Button>
+          {arrangementMenu(t.arrangeSessions)}
           <Button variant="ghost" className="size-7 p-0" aria-label={t.addFolder} onClick={onAddFolder}><FolderPlus className="size-3.5" /></Button>
         </div>
       </div>
@@ -1625,41 +1736,11 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       {/* Over the bottom of the list, so the list never moves. */}
       {sidebarNote && <div className="absolute inset-x-2 bottom-14 z-10 rounded-lg bg-background shadow-lg"><NoticeRow alert={{ id: "sidebar", level: "error", text: sidebarNote.text, details: sidebarNote.details, actions: [], dismiss: () => setSidebarNote(null) }} /></div>}
       {searchOpen && <div className="px-2 pb-2"><Input autoFocus aria-label={t.searchSessions} placeholder={t.searchSessions} value={search} onChange={event => setSearch(event.target.value)} /></div>}
-      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 pb-2">
-        {[...regularGroups, ...(defaultGroup ? [defaultGroup] : [])].map(group => {
-          const open = !!search.trim() || !collapsedGroups.has(group.id);
-          return <section key={group.id} className="mb-1">
-            <div className={`group flex items-center gap-1 rounded-lg ${(selectedWorkspace ? normalizedPath(selectedWorkspace) === normalizedPath(group.path) : !selectedKey && normalizedPath(group.path) === normalizedPath(path)) ? "bg-accent/70" : "hover:bg-muted/60"}`}>
-              <button type="button" aria-label={`${open ? t.collapse : t.expand} ${group.name}`} onClick={() => setCollapsedGroups(current => { const next = toggleCollapsed(current, group.id); saveCollapsed(next); return next; })} className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1.5 text-left">
-                {open ? <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" /> : <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />}
-                <FolderOpen className="size-4 shrink-0 text-muted-foreground" /><span className="truncate text-sm">{group.name}</span>
-              </button>
-              <Button variant="ghost" className="mr-1 size-6 p-0 opacity-0 group-hover:opacity-100 focus:opacity-100" aria-label={fill(t.removeNamed, { name: group.path })} onClick={() => { const workspace = workspaces.find(item => normalizedPath(item.path) === normalizedPath(group.path)); if (workspace) onRemove(workspace.id); }}><X className="size-3" /></Button>
-            </div>
-            {open && <div className="ml-4 border-l border-border pl-1.5">
-              {warm.state === "failed" && normalizedPath(group.path) === normalizedPath(path) && <div className="py-1"><NoticeRow alert={{ id: "warm", level: "error", text: t.warmFailed, details: warm.error ?? undefined, actions: [{ label: t.retry, run: retryWarm }] }} /></div>}
-              {group.sessions.map(session => <div key={session.path} ref={node => { if (selectedKey === normalizedPath(session.path)) selectedRowRef.current = node; }} data-session-selected={selectedKey === normalizedPath(session.path) || undefined} className={`group/session relative flex items-center rounded-md text-sm ${selectedKey === normalizedPath(session.path) ? "bg-accent text-foreground before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded-full before:bg-primary" : "hover:bg-muted/60"} ${session.archived ? "opacity-60" : ""}`}>
-                {renaming && normalizedPath(renaming.path) === normalizedPath(session.path)
-                  ? <Input autoFocus aria-label={t.sessionName} className="m-0.5 h-7 min-w-0 flex-1 text-sm" value={renaming.title} onChange={event => setRenaming({ path: session.path, title: event.target.value })} onFocus={event => event.target.select()} onKeyDown={event => { if (event.key === "Enter") void finishRename(true); if (event.key === "Escape") void finishRename(false); }} onBlur={() => void finishRename(true)} />
-                  : <button type="button" onClick={() => void openSession(session.path)} title={session.path} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left">
-                  {rowStates.get(session.path) ? <SessionRowStatus state={rowStates.get(session.path)!} now={listNow} t={t} /> : session.pinned ? <Pin className="size-3.5 shrink-0 text-primary" aria-label={t.pinned} /> : <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />}<span className="min-w-0 flex-1 truncate">{session.title}</span>{rowStates.get(session.path) && <span className="sr-only">{rowStateText(rowStates.get(session.path)!, listNow, t)}</span>}<span className="shrink-0 text-[11px] text-muted-foreground">{relativeTime(session.updated)}</span>{artifactCount(session.path) > 0 && <span className="shrink-0 rounded border border-border px-1 text-[10px] tabular-nums text-muted-foreground" title={fill(t.artifactCount, { n: artifactCount(session.path) })}>{artifactCount(session.path)}</span>}
-                </button>}
-                {session.saved && <div className={`relative flex shrink-0 items-center gap-0.5 pr-1 transition-opacity focus-within:opacity-100 group-hover/session:opacity-100 ${sessionMenu === session.path ? "opacity-100" : "opacity-0"}`} data-session-menu>
-                  <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={session.pinned ? t.unpinSession : t.pinSession} title={session.pinned ? t.unpinSession : t.pinSession} onClick={() => void updateSession(session.path, { pinned: !session.pinned })}><Pin className={`size-3.5 ${session.pinned ? "text-primary" : "text-muted-foreground"}`} /></button>
-                  <button type="button" className="flex size-6 items-center justify-center rounded hover:bg-background/60" aria-label={t.sessionActions} title={t.sessionActions} aria-haspopup="menu" aria-expanded={sessionMenu === session.path} onClick={() => setSessionMenu(value => value === session.path ? null : session.path)}><MoreHorizontal className="size-4 text-muted-foreground" /></button>
-                  {sessionMenu === session.path && <div role="menu" aria-label={fill(t.actionsFor, { name: session.title })} className="absolute right-0 top-full z-40 mt-1 w-52 rounded-xl border border-border bg-popover p-1 text-sm shadow-xl">
-                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { pinned: !session.pinned }); setSessionMenu(null); }}><Pin className="size-4 text-muted-foreground" />{session.pinned ? t.unpinSession : t.pinSession}</button>
-                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void renameSession(session)}><Pencil className="size-4 text-muted-foreground" />{t.rename}</button>
-                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => { void updateSession(session.path, { archived: !session.archived }); setSessionMenu(null); }}>{session.archived ? <ArchiveRestore className="size-4 text-muted-foreground" /> : <Archive className="size-4 text-muted-foreground" />}{session.archived ? t.restoreSession : t.archiveSession}</button>
-                    <button type="button" role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" onClick={() => void copySessionId(session)}>{copied === session.path ? <><Check className="size-4 text-primary" />{t.copied}</> : <><Copy className="size-4 text-muted-foreground" />{t.copySessionId}</>}</button>
-                  </div>}
-                </div>}
-              </div>)}
-              {!group.sessions.length && <p className="px-2 py-1.5 text-xs text-muted-foreground">{t.noSessions}</p>}
-            </div>}
-          </section>;
-        })}
-        {!groups.length && <p className="p-3 text-sm text-muted-foreground">{search ? t.noMatchingSessions : t.noWorkspaces}</p>}
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1.5 pb-2" data-sidebar-mode={model.mode}>
+        {model.mode === "list"
+          ? model.sessions.map(session => sessionRow(session, { showWorkspace: true, scope: oneListScope }))
+          : model.groups.map(group => groupSection(group))}
+        {!model.groups.length && !model.sessions.length && <p className="p-3 text-sm text-muted-foreground">{search ? t.noMatchingSessions : t.noWorkspaces}</p>}
       </div>
       <div className="mt-auto border-t border-border p-2">
         <div className="flex items-center gap-1">
@@ -1733,7 +1814,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
               {pane.active === "start" ? <PanelStart onOpen={id => openPaneView(index, id)} /> : pane.active === "artifacts" ? <ArtifactsPanel embedded sessionId={artifactsSessionId} workspace={selectedSessionWorkspacePath} references={outputReferences} /> : pane.active === "files" ? <FilesPanel key={selectedSessionWorkspacePath} path={selectedSessionWorkspacePath} /> : null}
             </TabsContent>
           </Tabs>
-          <div role="separator" aria-orientation="vertical" aria-label={t.resizePane} className="absolute left-0 top-0 h-full w-1 cursor-col-resize hover:bg-primary/30" onPointerDown={event => { resizingPane.current = { index, startX: event.clientX, startWidth: pane.width }; event.preventDefault(); }} />
+          <div role="separator" aria-orientation="vertical" aria-label={t.resizePane} className="absolute -left-1 top-0 z-10 h-full w-2 cursor-col-resize touch-none select-none hover:bg-primary/20" onPointerDown={event => {
+            resizingPane.current = { index, startX: event.clientX, startWidth: pane.width };
+            // Capture keeps pointer events flowing to this element (and up to the
+            // window listener) after the pointer leaves the narrow handle.
+            event.currentTarget.setPointerCapture(event.pointerId);
+            event.preventDefault();
+          }} />
         </aside>)}
       </div>}
     </section>
