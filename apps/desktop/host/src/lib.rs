@@ -332,10 +332,9 @@ pub fn router(state: AppState) -> Router {
         .route("/config/operations/{id}/cancel", axum::routing::post(config_cancel))
         .route("/events", get(global_events))
         .route("/models", get(models))
-        .route("/tools", get(tools_snapshot).put(update_tools))
+        .route("/tools", get(tools_snapshot).patch(update_tools))
+        .route("/tools/refresh", axum::routing::post(refresh_tools))
         .route("/attribution", get(attribution_snapshot).put(update_attribution))
-        .route("/tools/providers", get(tool_providers))
-        .route("/tools/models", get(tool_models))
         .route("/mcp", get(mcp_snapshot))
         .route(
             "/workspaces",
@@ -1502,17 +1501,59 @@ async fn models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
     }
 }
 
-async fn tools_snapshot(State(state): State<AppState>) -> Json<Value> {
-    let path = state.sessions.runtime_home().join("agent").join("tools.json");
-    let value = std::fs::read_to_string(&path)
+fn tools_path(sessions: &SessionManager) -> PathBuf {
+    sessions.runtime_home().join("agent").join("tools.json")
+}
+
+fn read_json_file(path: &Path) -> Value {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .unwrap_or_else(|| json!({}));
-    Json(json!({
-        "path": path.to_string_lossy(),
-        "exists": path.is_file(),
-        "settings": read_tools_settings(&value),
-    }))
+        .unwrap_or_else(|| json!({}))
+}
+
+/// The tools block of AppView: the user's choices (`tools.json`, the host's),
+/// the image tool's report for this configuration, and `checking` until that
+/// report arrived.
+pub fn tools_view(sessions: &SessionManager) -> Value {
+    let settings = read_tools_settings(&read_json_file(&tools_path(sessions)));
+    let (report, state) = sessions
+        .known_models()
+        .map(|known| known.image_view())
+        .unwrap_or((Value::Null, "checking"));
+    json!({ "settings": settings, "report": report, "state": state })
+}
+
+/// AppView carries the configuration generation, the runtimes' models and the
+/// tools, and is published again whenever a runtime answers for the current
+/// configuration: no client polls or guesses when to read again.
+pub fn connect_app_view(control: &Arc<control::ControlManager>, sessions: &Arc<SessionManager>) {
+    let parts = sessions.clone();
+    control.show_parts(move || app_parts(&parts));
+    if let Some(known) = sessions.known_models() {
+        let control = Arc::downgrade(control);
+        known.on_change(move || {
+            if let Some(control) = control.upgrade() {
+                control.notify();
+            }
+        });
+    }
+}
+
+/// What AppView shows besides the configuration queue: the configuration
+/// generation, the runtimes' models for it, and the tools.
+pub fn app_parts(sessions: &SessionManager) -> serde_json::Map<String, Value> {
+    let mut parts = serde_json::Map::new();
+    if let Some(known) = sessions.known_models() {
+        parts.insert("configGeneration".into(), json!(known.generation()));
+        parts.insert("models".into(), known.models_view());
+    }
+    parts.insert("tools".into(), tools_view(sessions));
+    parts
+}
+
+async fn tools_snapshot(State(state): State<AppState>) -> Json<Value> {
+    Json(tools_view(&state.sessions))
 }
 
 /// The tools settings in the shape every reader can rely on, whatever the file
@@ -1637,47 +1678,101 @@ fn image_tool_fields(value: &Value, provider: &str, model: &str) -> Value {
     })
 }
 
-fn normalize_image_tool(value: &Value) -> Result<Value, ApiError> {
-    let provider = value
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|provider| !provider.is_empty())
-        .ok_or_else(|| ApiError::bad_request("provider is required"))?;
-    let model = value
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if !valid_image_model(model) {
-        return Err(ApiError::bad_request("model is invalid"));
-    }
-    Ok(image_tool_fields(value, provider, model))
+/// One saved choice, checked for its type and range only. Whether the choice
+/// can be used is the image tool's answer (its report), not the host's.
+fn image_tool_field(key: &str, value: &Value) -> Result<Value, ApiError> {
+    let checked = match key {
+        "enabled" => value.as_bool().map(Value::Bool),
+        // Empty means "not chosen".
+        "provider" => value
+            .as_str()
+            .map(str::trim)
+            .filter(|provider| provider.len() <= 64 && !provider.chars().any(char::is_control))
+            .map(|provider| json!(provider)),
+        "model" => value
+            .as_str()
+            .filter(|model| valid_image_model(model))
+            .map(|model| json!(model)),
+        "size" => value
+            .as_str()
+            .filter(|size| matches!(*size, "1K" | "2K" | "4K"))
+            .map(|size| json!(size)),
+        "maxImages" => value
+            .as_u64()
+            .filter(|max| (1..=10).contains(max))
+            .map(|max| json!(max)),
+        _ => return Err(ApiError::bad_request(format!("{key} is not an image setting"))),
+    };
+    checked.ok_or_else(|| ApiError::bad_request(format!("{key} is invalid")))
 }
 
+/// Save only the fields sent: turning the switch off sends `{ "enabled": false }`
+/// and leaves every other choice as it was.
 async fn update_tools(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let image = body.get("image").unwrap_or(&body);
-    let image = normalize_image_tool(image)?;
-    let path = state.sessions.runtime_home().join("agent").join("tools.json");
-    let current = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .unwrap_or_else(|| json!({}));
-    let review = current
-        .get("reviewTools")
-        .cloned()
-        .unwrap_or_else(|| json!(["generate_image"]));
-    let value = json!({ "image": image, "reviewTools": review });
+    let changes = body
+        .get("image")
+        .unwrap_or(&body)
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("image settings must be an object"))?;
+    let mut checked = serde_json::Map::new();
+    for (key, value) in changes {
+        checked.insert(key.clone(), image_tool_field(key, value)?);
+    }
+    let path = tools_path(&state.sessions);
+    let mut current = read_json_file(&path);
+    if !current.is_object() {
+        current = json!({});
+    }
+    if !current.get("image").is_some_and(Value::is_object) {
+        current["image"] = json!({});
+    }
+    if let Some(image) = current["image"].as_object_mut() {
+        image.extend(checked);
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| ApiError::internal(format!("Could not create the tools folder: {error}")))?;
     }
-    std::fs::write(&path, format!("{}\n", value))
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, format!("{current}\n"))
+        .and_then(|_| std::fs::rename(&temp, &path))
         .map_err(|error| ApiError::internal(format!("Could not save tools: {error}")))?;
-    recycle_warm_runtime(&state.sessions);
-    Ok(Json(value))
+    // The image tool reads the file at every turn and call: nothing restarts.
+    state.control.notify();
+    Ok(Json(tools_view(&state.sessions)))
+}
+
+/// Check again: the image tool asks every added provider again, including one
+/// whose refusal it remembered.
+async fn refresh_tools(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let unavailable = || {
+        ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "runtime-unavailable",
+            "The runtime is not ready yet",
+            true,
+        )
+    };
+    let known = state.sessions.known_models().ok_or_else(unavailable)?;
+    let runtime = state
+        .sessions
+        .warm_runtime()
+        .and_then(|pool| pool.ready_runtime())
+        .ok_or_else(unavailable)?;
+    let generation = known.generation();
+    let token = known.image_token(generation);
+    if !runtime::warm::refresh_image_report(&runtime, &known, generation, &token, true).await {
+        return Err(ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "tools-refresh-failed",
+            "The image tool did not answer",
+            true,
+        ));
+    }
+    Ok(Json(tools_view(&state.sessions)))
 }
 
 async fn mcp_snapshot(State(state): State<AppState>) -> Json<Value> {
@@ -1711,97 +1806,6 @@ async fn mcp_snapshot(State(state): State<AppState>) -> Json<Value> {
         "exists": path.is_file(),
         "servers": servers,
     }))
-}
-
-async fn run_image_cli(state: &AppState, args: &[&str]) -> Result<Value, ApiError> {
-    let node = state.sessions.node_executable().ok_or_else(|| {
-        ApiError::new(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "runtime-unavailable",
-            "The runtime is not installed yet",
-            true,
-        )
-    })?;
-    let home = state.sessions.runtime_home().to_path_buf();
-    let script = home
-        .join("agent")
-        .join("extensions")
-        .join("jouzu-image")
-        .join("index.js");
-    if !script.is_file() {
-        return Err(ApiError::new(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "tools-unavailable",
-            "The image tool is not installed yet",
-            true,
-        ));
-    }
-    let mut command = tokio::process::Command::new(node);
-    command
-        .arg(&script)
-        .args(args)
-        .env("JOUZU_HOME", &home)
-        .env("PI_CODING_AGENT_DIR", home.join("agent"))
-        .env_remove("JOUZU_RUNTIME_APP")
-        .env_remove("NODE_OPTIONS")
-        .env_remove("NODE_PATH")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    // The tool loads the runtime's packages from the app this host starts; the
-    // data home (which may be a custom JOUZU_HOME) does not locate it.
-    if let Some(app) = state.sessions.runtime_app() {
-        command.env("JOUZU_RUNTIME_APP", app);
-    }
-    #[cfg(windows)]
-    {
-        command.creation_flags(0x0800_0000);
-    }
-    let output = tokio::time::timeout(std::time::Duration::from_secs(20), command.output())
-        .await
-        .map_err(|_| {
-            ApiError::new(
-                axum::http::StatusCode::GATEWAY_TIMEOUT,
-                "tools-timeout",
-                "The image tool did not answer in time",
-                true,
-            )
-        })?
-        .map_err(|_| ApiError::internal("The image tool could not be started"))?;
-    let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
-        ApiError::new(
-            axum::http::StatusCode::BAD_GATEWAY,
-            "tools-error",
-            "The image tool returned an unexpected answer",
-            true,
-        )
-    })?;
-    if let Some(error) = value.get("error").and_then(Value::as_str) {
-        return Err(ApiError::new(
-            axum::http::StatusCode::BAD_GATEWAY,
-            "tools-error",
-            error,
-            true,
-        ));
-    }
-    Ok(value)
-}
-
-async fn tool_providers(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    run_image_cli(&state, &["--providers"]).await.map(Json)
-}
-
-#[derive(Deserialize)]
-struct ToolProviderQuery {
-    provider: String,
-}
-
-async fn tool_models(
-    State(state): State<AppState>,
-    Query(query): Query<ToolProviderQuery>,
-) -> Result<Json<Value>, ApiError> {
-    run_image_cli(&state, &["--models", &query.provider])
-        .await
-        .map(Json)
 }
 
 async fn capabilities(
@@ -4742,7 +4746,9 @@ mod session_tests {
         .await;
         assert_eq!(missing.0, StatusCode::OK, "{}", missing.2);
         let body: Value = serde_json::from_str(&missing.2).unwrap();
-        assert_eq!(body["exists"], false);
+        // No image report for this configuration yet.
+        assert_eq!(body["state"], "checking");
+        assert_eq!(body["report"], Value::Null);
         assert_eq!(
             body["settings"],
             json!({ "image": { "enabled": true, "provider": "", "model": "", "size": "1K", "maxImages": 3 }, "reviewTools": ["generate_image"] })
@@ -4807,6 +4813,80 @@ mod session_tests {
         assert_eq!(call(app, get()).await.2, both(true, false));
     }
 
+    /// A configuration change raises the generation, shows the models as
+    /// updating and the tools as checking, and publishes again once the new
+    /// runtimes answered: the list, and the image report for that generation.
+    #[tokio::test]
+    async fn a_configuration_change_is_published_with_its_answers() {
+        let prompts = tempfile::NamedTempFile::new().unwrap();
+        let log = prompts.path().to_string_lossy().into_owned();
+        let (manager, _home, _workspace) =
+            manager_with_env(50, &[("FAKE_IMAGE_USABLE", "1"), ("FAKE_RUNTIME_PROMPT_LOG", log.as_str())]);
+        let hub = events::EventHub::new();
+        let home = std::env::temp_dir();
+        let control = Arc::new(control::ControlManager::new(&home, &home, None, &home.join("data"), Some(hub.clone())).expect("control manager"));
+        connect_app_view(&control, &manager);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let ready = || {
+            let view = control.view();
+            view["models"]["state"] == "ready" && view["tools"]["state"] == "ready"
+        };
+        wait_until(ready).await;
+        let first = control.view();
+        assert_eq!(first["configGeneration"], 0, "{first}");
+        assert_eq!(first["models"]["generation"], 0, "{first}");
+        assert!(!first["models"]["list"].as_array().unwrap().is_empty(), "{first}");
+        assert_eq!(first["tools"]["report"]["usable"], true, "{first}");
+
+        // A sign-in, a sign-out or a saved key: the host's on_change.
+        let mut events = hub.subscribe();
+        recycle_warm_runtime(&manager);
+        control.notify();
+        let changed = control.view();
+        assert_eq!(changed["configGeneration"], 1, "{changed}");
+        assert_eq!(changed["models"]["state"], "updating", "{changed}");
+        assert_eq!(changed["tools"]["state"], "checking", "{changed}");
+        wait_until(ready).await;
+        let after = control.view();
+        assert_eq!(after["models"]["generation"], 1, "{after}");
+        assert_ne!(after["tools"]["report"]["generation"], first["tools"]["report"]["generation"], "{after}");
+        // Every state reached a client as an app.updated, ending in the ready one.
+        let mut published = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if event.event == "app.updated" {
+                published.push((event.data["models"]["state"].clone(), event.data["tools"]["state"].clone()));
+            }
+        }
+        assert_eq!(published.first(), Some(&(json!("updating"), json!("checking"))), "{published:?}");
+        assert_eq!(published.last(), Some(&(json!("ready"), json!("ready"))), "{published:?}");
+        // One runtime per generation was asked for the report.
+        let asked = std::fs::read_to_string(prompts.path()).unwrap();
+        assert_eq!(asked.lines().filter(|line| line.starts_with("/jouzu-image-refresh")).count(), 2, "{asked}");
+        pool.stop();
+        manager.stop_all();
+    }
+
+    /// #249: turning image generation off needs no provider.
+    #[tokio::test]
+    async fn the_image_switch_turns_off_with_no_provider() {
+        let (manager, home, _workspace) = manager(50);
+        let app = app(manager);
+        let off = call(
+            app,
+            request(Method::PATCH, "/v1/tools")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "image": { "enabled": false } }).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(off.0, StatusCode::OK, "{}", off.2);
+        let file: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join("data").join("agent").join("tools.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(file, json!({ "image": { "enabled": false } }));
+    }
+
     #[tokio::test]
     async fn tools_and_mcp_endpoints_read_host_state() {
         let (manager, home, _workspace) = manager(50);
@@ -4834,19 +4914,38 @@ mod session_tests {
         assert_eq!(tools.0, StatusCode::OK, "{}", tools.2);
         assert!(tools.2.contains("generate_image"));
 
+        let patch = |body: Value| {
+            request(Method::PATCH, "/v1/tools")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
         let saved = call(
             app.clone(),
-            request(Method::PUT, "/v1/tools")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({ "image": { "provider": "shisa", "model": "gemini-3-pro-image", "size": "2K", "maxImages": 2 } })
-                        .to_string(),
-                ))
-                .unwrap(),
+            patch(json!({ "image": { "provider": "shisa", "model": "gemini-3-pro-image", "size": "2K", "maxImages": 2 } })),
         )
         .await;
         assert_eq!(saved.0, StatusCode::OK, "{}", saved.2);
-        assert!(saved.2.contains("\"size\":\"2K\""), "{}", saved.2);
+        let image = |body: &str| serde_json::from_str::<Value>(body).unwrap()["settings"]["image"].clone();
+        assert_eq!(image(&saved.2)["size"], "2K");
+
+        // Changing only the size leaves the provider and model as they were.
+        let sized = call(app.clone(), patch(json!({ "image": { "size": "4K" } }))).await;
+        assert_eq!(sized.0, StatusCode::OK, "{}", sized.2);
+        assert_eq!(image(&sized.2), json!({ "enabled": true, "provider": "shisa", "model": "gemini-3-pro-image", "size": "4K", "maxImages": 2 }));
+        let file: Value = serde_json::from_str(&std::fs::read_to_string(agent.join("tools.json")).unwrap()).unwrap();
+        assert_eq!(file["reviewTools"], json!(["generate_image"]));
+
+        // An empty provider means "not chosen" and is saved.
+        let empty = call(app.clone(), patch(json!({ "image": { "provider": "", "model": "" } }))).await;
+        assert_eq!(empty.0, StatusCode::OK, "{}", empty.2);
+        assert_eq!(image(&empty.2)["provider"], "");
+
+        // Types and ranges are checked; nothing else is.
+        for refused in [json!({ "enabled": "no" }), json!({ "maxImages": 11 }), json!({ "size": "9K" }), json!({ "model": "bad model!" }), json!({ "colour": "red" })] {
+            let answer = call(app.clone(), patch(json!({ "image": refused }))).await;
+            assert_eq!(answer.0, StatusCode::BAD_REQUEST, "{refused}: {}", answer.2);
+        }
 
         let mcp = call(
             app,

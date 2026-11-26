@@ -427,6 +427,15 @@ impl WarmPool {
                         // A blank runtime's model is what a new conversation
                         // starts on; its list is what every runtime offers.
                         known.remember_start_model(configured, state.get("model"));
+                        // The first ready runtime of a configuration asks the
+                        // image tool for its report under that configuration.
+                        if let Some(token) = known.claim_image_refresh(configured) {
+                            let runtime = runtime.clone();
+                            let known = known.clone();
+                            tokio::spawn(async move {
+                                refresh_image_report(&runtime, &known, configured, &token, false).await;
+                            });
+                        }
                         let runtime = runtime.clone();
                         tokio::spawn(async move {
                             let listed = runtime
@@ -815,6 +824,35 @@ pub fn same_place(left: &Path, right: &Path) -> bool {
         }
     };
     normalize(left) == normalize(right)
+}
+
+/// Send the image tool's refresh command to a ready runtime and take the report
+/// it writes. An extension command runs at once and starts no turn. A failed
+/// refresh lets the next ready runtime ask again.
+pub async fn refresh_image_report(
+    runtime: &RuntimeSupervisor,
+    known: &KnownModels,
+    generation: u64,
+    token: &str,
+    recheck: bool,
+) -> bool {
+    let message = format!("/jouzu-image-refresh {token}{}", if recheck { " --recheck" } else { "" });
+    let answer = runtime
+        .request(
+            json!({ "id": format!("image-refresh-{generation}"), "type": "prompt", "message": message }),
+            Duration::from_secs(60),
+        )
+        .await;
+    match answer {
+        Ok(_) => {
+            known.read_image_report();
+            true
+        }
+        Err(_) => {
+            known.release_image_refresh(generation);
+            false
+        }
+    }
 }
 
 #[cfg(test)]
