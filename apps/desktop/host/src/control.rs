@@ -691,7 +691,7 @@ impl ControlManager {
             TimedOut,
         }
         let stop = tokio::select! {
-            status = child.wait() => Stop::Exited(status),
+            status = job.wait(&mut child) => Stop::Exited(status),
             _ = cancel.notified() => Stop::Cancelled,
             _ = tokio::time::sleep(TIMEOUT) => Stop::TimedOut,
         };
@@ -703,7 +703,7 @@ impl ControlManager {
                 // whole job goes. That is the documented loss in ADR 0012.
                 job.terminate();
                 let _ = child.start_kill();
-                let _ = child.wait().await;
+                let _ = job.wait(&mut child).await;
                 if let Some(task) = stderr_task {
                     task.abort();
                     let _ = task.await;
