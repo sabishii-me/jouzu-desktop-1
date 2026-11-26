@@ -1201,11 +1201,55 @@ impl Session {
         self.reload_if_due();
     }
 
+    /// Whether this session's runtime predates the configuration: the saved
+    /// environment changed since it started (#173), or the configuration
+    /// generation moved on since it last read its files. The session owns this
+    /// answer; the manager's reload pass only says when to look.
+    fn runtime_outdated(&self) -> bool {
+        if self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+        {
+            return false;
+        }
+        let current = self.config.environment_fingerprint();
+        let started = self
+            .started_environment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        (current.is_some() && current != started)
+            || self.known_generation.load(Ordering::SeqCst) != self.config.known.generation()
+    }
+
+    /// A turn is about to start on this session's runtime. When the runtime
+    /// predates the configuration, the session takes a current one first and
+    /// the turn waits for it, as a turn sent while a runtime starts does: no
+    /// turn runs on a runtime that does not have the saved configuration,
+    /// whenever the manager's reload pass reaches this session. Answers
+    /// whether a reload started.
+    fn catch_up_before_turn(self: &Arc<Self>) -> bool {
+        if !self.runtime_outdated() {
+            return false;
+        }
+        self.reload_due.store(true, Ordering::SeqCst);
+        self.reload_now(true);
+        self.status() == Status::Starting
+    }
+
     fn reload_if_due(self: &Arc<Self>) {
+        self.reload_now(false);
+    }
+
+    /// `queued`: a message waiting in the queue does not hold the reload back;
+    /// it starts when the new runtime's handshake ends (`finish_handshake`).
+    fn reload_now(self: &Arc<Self>, queued: bool) {
         if !self.reload_due.load(Ordering::SeqCst)
             || self.status() != Status::Idle
             || self.run_id().is_some()
-            || !self.queue_guard().is_empty()
+            || (!queued && !self.queue_guard().is_empty())
             || !matches!(
                 *self.handshake.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                 Handshake::Ready
@@ -4400,6 +4444,12 @@ impl Session {
             row["attachments"] = json!(stored_attachments);
         }
         self.remember_turn(text);
+        // An idle session whose runtime predates the configuration takes a
+        // current one first; the message is then parked like any other sent
+        // while a runtime starts.
+        if !resume && self.run_id().is_none() {
+            self.catch_up_before_turn();
+        }
         // Whether the runtime is still being started: the prompt is parked
         // until its handshake ends (`flush_parked_prompt`).
         let starting = resume
@@ -5935,6 +5985,13 @@ impl Session {
                 Status::Idle | Status::Running | Status::WaitingApproval | Status::WaitingQuestion
             )
         {
+            return false;
+        }
+        // The next message runs on a current runtime: an idle session whose
+        // runtime predates the configuration takes a new one first, and the
+        // new runtime's handshake (`finish_handshake`) starts the message.
+        let waiting = self.queue_guard().iter().any(|item| !item.held && !item.prompted);
+        if waiting && self.status() == Status::Idle && self.run_id().is_none() && self.catch_up_before_turn() {
             return false;
         }
         let started = {

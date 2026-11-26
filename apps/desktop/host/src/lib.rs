@@ -4322,6 +4322,72 @@ mod session_tests {
         manager.stop_all();
     }
 
+    /// #173 on 1.1.5-rc.3: a message sent before the manager's reload pass
+    /// reaches the session must not run on the runtime that predates the saved
+    /// environment. The session sees it is out of date and takes a new runtime
+    /// first; the message waits for it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_message_sent_before_the_reload_pass_runs_with_the_new_environment() {
+        let starts = tempfile::NamedTempFile::new().unwrap();
+        let starts_path = starts.path().to_string_lossy().into_owned();
+        let (manager, _home, workspace) = manager_with_env(
+            50,
+            &[("FAKE_RUNTIME_START_LOG", &starts_path), ("FAKE_RUNTIME_LOG_VAR", "JOUZU_TEST_SAVED")],
+        );
+        let save = |value: &str| {
+            crate::environment::save(
+                manager.runtime_home(),
+                &[crate::environment::Entry { name: "JOUZU_TEST_SAVED".into(), value: value.into(), enabled: true }],
+            )
+            .unwrap();
+        };
+        save("before");
+        let session = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &session.id);
+        wait_status(&session, Status::Idle).await;
+        let first = session.runtime_pid().unwrap();
+
+        // Saved, and no reload pass has reached this session yet.
+        save("after");
+        session.send("right-after-save", "hello").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.summary()["activeTurn"].is_null()).await;
+        assert_ne!(session.runtime_pid(), Some(first), "the message ran on the runtime from before the change");
+        let lines: Vec<String> = std::fs::read_to_string(starts.path()).unwrap().lines().map(str::to_string).collect();
+        assert!(lines.last().is_some_and(|line| line.ends_with(" after")), "{lines:?}");
+        assert!(session.summary()["failure"].is_null(), "{}", session.summary());
+
+        // The reload pass arriving afterwards finds the session current.
+        let second = session.runtime_pid().unwrap();
+        manager.reload_configuration();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        wait_status(&session, Status::Idle).await;
+        assert_eq!(session.runtime_pid(), Some(second), "an up-to-date session keeps its runtime");
+        manager.stop_all();
+    }
+
+    /// The same for any configuration change (a key, a provider): a message
+    /// sent before the reload pass reaches the session makes the runtime read
+    /// the configuration again first.
+    #[tokio::test]
+    async fn a_message_sent_before_the_reload_pass_reads_the_new_configuration_first() {
+        let (manager, home, workspace) = manager_with_env(50, &[]);
+        let session = manager.create(workspace.path().to_str().unwrap(), None, None).unwrap();
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &session.id);
+        wait_status(&session, Status::Idle).await;
+
+        manager.forget_known_models();
+        session.send("right-after-change", "hello").unwrap();
+        wait_until(|| session.status() == Status::Idle && session.summary()["activeTurn"].is_null()).await;
+        let log = std::fs::read_to_string(home.path().join("logs").join("host.log")).unwrap_or_default();
+        let reload = log.lines().position(|line| line.contains("session.reload_configuration") && line.contains(&session.id));
+        assert!(reload.is_some(), "the session did not read the configuration before the turn");
+        assert!(session.summary()["failure"].is_null(), "{}", session.summary());
+        manager.stop_all();
+    }
+
     /// #173: a process keeps the environment it was started with. After the
     /// saved environment changes, an open idle session runs in a new runtime
     /// with the new values, on the same session file; a change that is not to
