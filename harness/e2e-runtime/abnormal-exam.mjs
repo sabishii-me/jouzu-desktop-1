@@ -302,6 +302,14 @@ function descendants(rootPid) {
  * its process to "jouzu" (Linux), so the name is enough there; on Windows it is node.exe
  * and its command line says rpc. Helpers such as the configuration service are not runtimes.
  */
+/** The host's open handles (files, sockets, pipes): /proc on Linux, lsof on macOS, the process's HandleCount on Windows. */
+function handleCount(pid) {
+  try {
+    if (windows) return Number(execFileSync('powershell.exe', ['-NoProfile', '-Command', `(Get-Process -Id ${pid}).HandleCount`], { encoding: 'utf8' }).trim());
+    if (process.platform === 'darwin') return execFileSync('lsof', ['-p', String(pid)], { encoding: 'utf8' }).trim().split('\n').length - 1;
+    return readdirSync(`/proc/${pid}/fd`).length;
+  } catch { return null; }
+}
 function runtimes(hostPid) {
   return processTable().filter(row => row.ppid === hostPid && (/^jouzu$/.test(row.name) || (/node/i.test(row.name) && /\brpc\b/.test(row.args))));
 }
@@ -337,6 +345,7 @@ function suspend(pids, on) {
  *                                     runtime "missing" starts it without the runtime's files, "normal" as before
  *   POST /runtime/restore             the runtime's files are put in place while the app runs
  *   POST /runtime/kill {which}        kill the newest runtime, or "all" of them
+ *   POST /host/quit {ms}              the person quits: the host is asked to stop; answers what is left, then starts again
  *   POST /runtime/kill-loop {ms}      kill every runtime that appears, for ms
  *   POST /runtime/delay {ms}          later runtime starts wait ms
  *   POST /freeze {ms}                 freeze the host and its runtimes for ms (a computer asleep)
@@ -355,7 +364,7 @@ function worldServer(stack) {
       const reply = value => response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(value));
       try {
         const hostPid = stack.host.pid;
-        if (url.pathname === '/state') return reply({ world: newUser ? 'new-user' : shisaStandIn ? 'shisa-stand-in' : 'user', proxy: Boolean(process.env.HTTPS_PROXY || process.env.https_proxy), host: hostPid, runtimes: runtimes(hostPid).map(row => row.pid), home: stack.paths.home, workspace: stack.paths.workspace, shell: Boolean(stack.shell) });
+        if (url.pathname === '/state') return reply({ world: newUser ? 'new-user' : shisaStandIn ? 'shisa-stand-in' : 'user', proxy: Boolean(process.env.HTTPS_PROXY || process.env.https_proxy), host: hostPid, runtimes: runtimes(hostPid).map(row => row.pid), handles: handleCount(hostPid), home: stack.paths.home, workspace: stack.paths.workspace, shell: Boolean(stack.shell) });
         if (url.pathname === '/host/restart') {
           // The app ends and starts again on the same home (#162). Only when the exam started
           // the host itself; the installed app's own window is not restarted here.
@@ -374,6 +383,24 @@ function worldServer(stack) {
           startHost(stack);
           const info = await hostInfo(stack, 30_000);
           return reply({ url: `http://127.0.0.1:${info.port}/?token=${info.token}` });
+        }
+        if (url.pathname === '/host/quit') {
+          // The person quits: the window asks the host to stop (on macOS and Linux it closes the
+          // host's input, which ends it as SIGTERM does; on Windows the window's job ends the host
+          // and everything it started). Answers what is still running afterwards, then starts
+          // the app again on the same home so the case can go on.
+          if (stack.shell) return reply({ unsupported: 'installed app window' });
+          const before = [hostPid, ...descendants(hostPid).map(row => row.pid)];
+          if (windows) killAll(before); else process.kill(hostPid, 'SIGTERM');
+          const alive = () => { const table = new Map(processTable().map(row => [row.pid, row])); return before.filter(pid => table.has(pid)).map(pid => ({ pid, name: table.get(pid).name })); };
+          const until = Date.now() + (input.ms ?? 15_000);
+          let left = alive();
+          while (left.length && Date.now() < until) { await sleep(250); left = alive(); }
+          const stoppedMs = (input.ms ?? 15_000) - Math.max(0, until - Date.now());
+          killAll(left.map(row => row.pid));
+          startHost(stack);
+          const info = await hostInfo(stack, 30_000);
+          return reply({ before: before.length, left, stoppedMs, url: `http://127.0.0.1:${info.port}/?token=${info.token}` });
         }
         if (url.pathname === '/runtime/kill') {
           const list = runtimes(hostPid).sort((a, b) => b.pid - a.pid);

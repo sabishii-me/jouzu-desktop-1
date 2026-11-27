@@ -2,7 +2,7 @@
 
 Generated from release-checks/cases/*.yaml by `node harness/run/catalog.mjs --table`. Edit the YAML, not this file.
 
-80 cases: 54 automated, 22 planned, 1 gap, 3 deferred.
+80 cases: 66 automated, 10 planned, 1 gap, 3 deferred.
 
 ## smoke (5)
 
@@ -18,13 +18,13 @@ Generated from release-checks/cases/*.yaml by `node harness/run/catalog.mjs --ta
 
 | ID | Old | Title | Scenario | Priority | Platforms | Languages | Automation |
 |---|---|---|---|---|---|---|---|
-| CHAT-002 | P8 | A new session while another one is running | U4 | high | all | all | planned |
-| CHAT-004 | P12 | Switching the model | U5 | high | all | all | planned |
-| CHAT-005 | P13 | A question or approval from the agent | U4 | high | all | all | planned |
-| CHAT-006 | P23 | A reply with many steps keeps every step on screen | U4 | high | all | all | planned |
-| CHAT-007 | P24 | The status line says what the reply is doing | U4 | medium | all | all | planned |
-| CHAT-008 | P25 | Automatic retry and context compaction are shown | U6 | medium | all | all | planned |
-| CHAT-009 | P26 | A tool stopped or cut off shows as interrupted | U7 | high | all | all | planned |
+| CHAT-002 | P8 | A new session while another one is running | U4 | high | all | en, ja | automated (release-playbook.mjs) |
+| CHAT-004 | P12 | Switching the model | U5 | high | all | en, ja | automated (release-playbook.mjs) |
+| CHAT-005 | P13 | A question or approval from the agent | U4 | high | all | en, ja | automated (release-playbook.mjs) |
+| CHAT-006 | P23 | A reply with many steps keeps every step on screen | U4 | high | all | en, ja | automated (release-playbook.mjs) |
+| CHAT-007 | P24 | The status line says what the reply is doing | U4 | medium | all | en, ja | automated (release-playbook.mjs) |
+| CHAT-008 | P25 | Automatic retry and context compaction are shown | U6 | medium | all | en, ja | automated (release-playbook.mjs) |
+| CHAT-009 | P26 | A tool stopped or cut off shows as interrupted | U7 | high | all | en, ja | automated (release-playbook.mjs) |
 | CHAT-010 | P27 | Two messages sent while a reply runs are each used once | U4 | high | all | en, ja | automated (release-playbook.mjs) |
 | CHAT-011 | P28 | Queued messages can be deleted, edited and kept on Stop | U4 | high | all | en, ja | automated (release-playbook.mjs) |
 | CHAT-012 | P21 | TextGuard per session (on, strict, off) | U8 | low | all | all | deferred |
@@ -40,11 +40,11 @@ Generated from release-checks/cases/*.yaml by `node harness/run/catalog.mjs --ta
 | START-002 | P2 | Without a remembered session the folder's latest one opens | U9 | high | all | en, ja | automated (release-playbook.mjs) |
 | SESS-001 | P3 P5 | Sending in an old session keeps it whole | U9 | high | all | en, ja | automated (release-playbook.mjs) |
 | SESS-002 | P4 | An old session of another folder stays in its folder | U11 | high | all | en, ja | automated (release-playbook.mjs) |
-| SESS-003 | P6 | A very large old session (20 MB or more) opens and answers | U9 | medium | all | all | planned |
-| SESS-004 | P9 | Switching away and back shows the reply as it was live | U4 | high | all | all | planned |
-| SESS-005 | P10 | A background session keeps its state in the list | U4 | medium | all | all | planned |
-| SESS-006 | P15 | Thirty open sessions still work | U4 | medium | all | all | planned |
-| SESS-007 | P16 | Reloading the window ten times and quitting leaves nothing behind | U4 | medium | all | all | planned |
+| SESS-003 | P6 | A very large old session (20 MB or more) opens and answers | U9 | medium | all | en, ja | automated (release-playbook.mjs) |
+| SESS-004 | P9 | Switching away and back shows the reply as it was live | U4 | high | all | en, ja | automated (release-playbook.mjs) |
+| SESS-005 | P10 | A background session keeps its state in the list | U4 | medium | all | en, ja | automated (release-playbook.mjs) |
+| SESS-006 | P15 | Thirty open sessions still work | U4 | medium | all | en, ja | automated (release-playbook.mjs) |
+| SESS-007 | P16 | Reloading the window ten times and quitting leaves nothing behind | U4 | medium | all | en, ja | automated (release-playbook.mjs) |
 | SIGN-001 | N4 | Sign in to Shisa.AI and sign out | U5 | high | all | en, ja | automated (release-playbook.mjs) |
 | SIGN-002 | N4 C-mac-models | The model list follows sign-in and sign-out without a restart | U5 | high | all | all | gap: The runtime (jouzu 0.2.5) always fetches the Shisa.AI model list from the fixed api.shisa.ai address and does not use the model-list address the sign-in returns, so a stand-in cannot serve it, and a real account needs a person to approve the sign-in in a browser. |
 | IMG-001 | P19 C-win-image | The image tool with a paid account and with ChatGPT | U10 | high | all | all | planned |
@@ -151,10 +151,13 @@ The model list shows only chat models, also before the first message; the next t
 
 When the agent asks a question or needs an approval, the app shows it and the reply continues after the answer.
 
+Before: The saved tool settings (tools.json) ask for review of the read tool, as they do for the image tool by default.
+
 | # | Do | Expect |
 |---|---|---|
-| 1 | Send a message whose reply asks a question. | The question shows with its choices. |
-| 2 | Answer it. | The reply continues and ends. |
+| 1 | With review switched on for the read tool, send a message whose reply reads a file. | The approval shows with its choices; the session's row says it waits. |
+| 2 | Approve it. | The reply continues and ends. |
+| 3 | Do the same again and Deny it. | The reply ends without running the tool; nothing shows as running; the next message is answered. |
 
 ### CHAT-006 A reply with many steps keeps every step on screen
 
@@ -178,6 +181,8 @@ While a reply runs, the status line says what is happening (waiting for the mode
 ### CHAT-008 Automatic retry and context compaction are shown
 
 A failed model request that is retried shows "request failed, retry a/b (reason)"; compaction shows as such; neither looks stuck.
+
+Data: Fixture: one refused request ({status: 500, times: 1}); a BULK reply (older turns), then a FULL reply that reports 30,000 of the model's 32,000 tokens used.
 
 | # | Do | Expect |
 |---|---|---|
@@ -593,7 +598,7 @@ Opening an old session of the same folder and sending keeps the history and titl
 | 3 | Send a message. | The reply arrives; the earlier history stays; exactly that session's file grows; no new file with its messages; no new row; the title is unchanged. |
 | 4 | Reload the window, then restart the app. | The old session is still listed both times. |
 
-Limit: click to history: 1 s (set by proposed)
+Limit: click to history: 1 s (set by proposed, not decided)
 
 ### SESS-002 An old session of another folder stays in its folder
 
@@ -618,7 +623,9 @@ Before: A saved session of 20 MB or more (a generated one, never a person's real
 | 1 | Click the large session. | Its history is readable at once. |
 | 2 | Send a message. | The window stays responsive; the status shows starting, then the reply arrives. |
 
-Limit: click to history: 1 s regardless of file size (set by proposed)
+Limit: click to history: 1 s regardless of file size (set by proposed, not decided)
+
+Limit: window not answering while the session starts: none decided; recorded only (set by nobody decided)
 
 ### SESS-004 Switching away and back shows the reply as it was live
 
@@ -655,6 +662,10 @@ After ten window reloads and quitting, no runtime is left and handle counts are 
 |---|---|---|
 | 1 | Reload the window ten times. | The app works after each. |
 | 2 | Quit. | No runtime process is left; handles back at the baseline. |
+
+Limit: processes left 15 s after quitting: none (set by release playbook P16)
+
+Limit: host handles after ten reloads: none decided; recorded only (set by nobody decided)
 
 ### SESS-008 A draft stays in its own session
 

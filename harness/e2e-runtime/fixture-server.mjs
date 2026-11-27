@@ -27,6 +27,8 @@ function imageSizes(messages) {
  *   { status: 401|404|429|500, message } each request is refused with that status and an
  *                                        OpenAI-style error body: key rejected, model
  *                                        gone, rate limited, provider failure
+ *   { status, times: n }                 only the next n requests are refused, then the
+ *                                        fault clears itself (a failure a retry gets past)
  *   { reset: true }                      the connection drops before any answer
  *                                        (provider or network unreachable)
  *   { hang: true }                       requests are accepted and never answered; clearing
@@ -111,8 +113,11 @@ export function startFixtureServer(port = 0) {
       if (fault.status) {
         refused += 1;
         request.resume();
-        response.writeHead(fault.status, { 'content-type': 'application/json', ...(fault.status === 429 ? { 'retry-after': '20' } : {}) });
-        response.end(JSON.stringify({ error: { ...faultBodies[fault.status], ...(fault.message ? { message: fault.message } : {}) } }));
+        const status = fault.status;
+        if (fault.times !== undefined && --fault.times <= 0) fault = {};
+        const message = fault.message;
+        response.writeHead(status, { 'content-type': 'application/json', ...(status === 429 ? { 'retry-after': '20' } : {}) });
+        response.end(JSON.stringify({ error: { ...faultBodies[status], ...(message ? { message } : {}) } }));
         return;
       }
       if (fault.hang) {
@@ -142,7 +147,7 @@ export function startFixtureServer(port = 0) {
       return;
     }
     let body = '';
-    request.on('data', chunk => { body += chunk; if (body.length > 2_000_000) request.destroy(); });
+    request.on('data', chunk => { body += chunk; if (body.length > 64_000_000) request.destroy(); });
     request.on('end', () => {
       let data;
       try { data = JSON.parse(body); } catch { response.writeHead(400).end(); return; }
@@ -195,6 +200,41 @@ export function startFixtureServer(port = 0) {
       if (text.includes('TOOLWAIT') && !messages.some(message => message.role === 'tool')) {
         chunk({ tool_calls: [{ index: 0, id: 'fixture-wait-1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'sleep 30' }) } }] });
         chunk({}, 'tool_calls');
+        response.end('data: [DONE]\n\n');
+        return;
+      }
+      // PHASES: a reply that goes through each phase a status line names, slowly enough to see:
+      // the model is waited for (3 s), it reasons (2 s), runs a command (3 s), then writes (3 s).
+      if (text.includes('PHASES')) {
+        const later = (ms, run) => setTimeout(() => { if (!response.destroyed) run(); }, ms);
+        if (messages.at(-1)?.role !== 'tool') {
+          later(3_000, () => {
+            for (let k = 0; k < 4; k += 1) later(k * 500, () => chunk({ reasoning_content: `thinking about the phases ${k + 1}\n` }));
+            later(2_000, () => {
+              chunk({ tool_calls: [{ index: 0, id: 'fixture-phases-1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'sleep 3' }) } }] });
+              chunk({}, 'tool_calls');
+              response.end('data: [DONE]\n\n');
+            });
+          });
+          return;
+        }
+        for (let k = 0; k < 10; k += 1) later(k * 300, () => chunk({ content: `writing part ${k + 1}\n` }));
+        later(3_100, () => { chunk({ content: 'phases done' }); chunk({}, 'stop'); response.end('data: [DONE]\n\n'); });
+        return;
+      }
+      // BULK: a long answer (about 30,000 tokens of text), so a session has older turns to compact.
+      if (text.includes('BULK')) {
+        chunk({ content: 'bulk answer. '.repeat(10_000) });
+        chunk({}, 'stop');
+        response.end('data: [DONE]\n\n');
+        return;
+      }
+      // FULL: the provider reports the context as nearly full (30,000 of the model's 32,000
+      // tokens), so the runtime compacts before the next turn.
+      if (text.includes('FULL')) {
+        chunk({ content: 'the context is nearly full' });
+        chunk({}, 'stop');
+        response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'deterministic', choices: [], usage: { prompt_tokens: 30_000, completion_tokens: 10, total_tokens: 30_010 } })}\n\n`);
         response.end('data: [DONE]\n\n');
         return;
       }

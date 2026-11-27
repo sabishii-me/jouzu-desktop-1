@@ -1,8 +1,8 @@
 import { join } from "node:path";
 import {
-  add, ask, chatSession, control, conversation, conversationText, fault, freshSession, idle, judgeRecovers, lang,
+  SEL, add, ask, chatSession, control, conversation, conversationText, fault, freshSession, idle, judgeRecovers, lang,
   judgeNoEndlessWait, layout, openSettings, more, named, namedMore, newSession, now, page, problems, redSquarePng, replyArrives, runCases, sendButton,
-  shots, sidebar, sleep, slug, stopButton, technical, textbox, typeAndSend, waiting, world, fixture,
+  shots, sidebar, sleep, slug, stopButton, technical, textbox, typeAndSend, waitRowState, rowState, post, waiting, world, fixture,
 } from "./playbook-kit.mjs";
 
 /**
@@ -488,6 +488,454 @@ release("P28 Queued messages can be deleted, edited and kept on Stop", "U4", "A 
   if (keptTimes !== 1) c.fail(`the kept message was asked ${keptTimes} times after Continue (expected once)`);
   const shownTimes = await conversation().getByText(kept, { exact: true }).count();
   if (shownTimes !== 1) c.fail(`the kept message shows ${shownTimes} times in the conversation (expected once)`);
+});
+
+// ---- U4 / U5 / U7: more than one session, switching, models, many steps, cut-off tools ----
+
+/** The tools shown in the conversation, as their chips name them: "bash · running", "read · done", "bash · failed". */
+const toolChips = () => conversation().locator('button[aria-label*=" · "]').evaluateAll(list => list.map(button => button.getAttribute("aria-label") ?? "").filter(label => !/^Thinking · /.test(label)));
+/** Tools in the conversation still marked as running (a chip, or an opened card whose state dot pulses). */
+const runningTools = async () => (await toolChips()).filter(label => / · running$/.test(label)).length + await conversation().locator("section span.rounded-full.animate-pulse").count();
+/** The conversation's text with live timers taken out, to compare what is shown at two moments. */
+const steady = async () => (await conversationText()).replace(/\d+:\d{2}/g, "").replace(/\s+/g, " ").trim();
+
+release("P8 A new session while another one is running", "U4", "A new session can be opened while another reply runs; the running one is not affected and both rows show their state.", async c => {
+  await freshSession();
+  const long = "LONG reply while a new session starts";
+  await typeAndSend(long);
+  if (!await page.waitForFunction(selector => /line 2\b/.test(document.querySelector(selector)?.textContent ?? ""), SEL.conversation, { timeout: 30_000 }).then(() => true, () => false)) { c.fail("the long reply never started"); return; }
+  await freshSession();
+  const next = ask();
+  await typeAndSend(next.prompt);
+  if (!await replyArrives(next.answer)) c.fail("the new session got no reply within 30 s while the other one ran");
+  const busy = await waitRowState(long, ["running"], 3_000);
+  if (busy !== "running") c.fail(`while its reply runs, the first session's row shows "${busy}", not running`);
+  const finished = await waitRowState(long, ["done", null], 25_000);
+  if (finished === "running") c.fail("the first session's row still shows running 25 s later (its reply lasts about 12 s)");
+  else c.note(`the first session's row after its reply ended: ${finished ?? "no state icon"}`);
+  await sidebar().getByText(long, { exact: false }).first().click().catch(() => c.fail("the first session is not in the list"));
+  const whole = await conversation().getByText("line 40", { exact: false }).first().waitFor({ timeout: 15_000 }).then(() => true, () => false);
+  if (!whole) c.fail("the first session's reply did not reach its end (line 40) while the other session was used");
+  const own = await conversationText();
+  if (own.includes(next.prompt)) c.fail("the second session's message shows in the first session");
+});
+
+release("P9 Switching away and back shows the reply as it was live", "U4", "Switching to another session and back, while a reply runs and after it ended, shows the same tool calls and results as live, never \"Unsupported content\".", async c => {
+  await chatSession();
+  const other = (await conversationText()).match(/What is \d+ × 7\?/)?.[0];
+  await freshSession();
+  const prompt = "STEPS:3 read the readme three times";
+  await typeAndSend(prompt);
+  if (!await page.waitForFunction(selector => /step 2 thinking/.test(document.querySelector(selector)?.textContent ?? ""), SEL.conversation, { timeout: 30_000 }).then(() => true, () => false)) { c.fail("the reply's steps never showed"); return; }
+  const away = async () => {
+    await sidebar().getByText(other ?? "×", { exact: false }).first().click();
+    await sleep(500);
+    const start = now();
+    await sidebar().getByText(prompt, { exact: false }).first().click();
+    const back = await conversation().getByText(prompt, { exact: true }).first().waitFor({ timeout: 10_000 }).then(() => now() - start, () => null);
+    if (back !== null) c.metric("switchMs", back);
+    return back !== null;
+  };
+  if (!await away()) { c.fail("switching back while the reply ran did not show the session within 10 s"); return; }
+  if (!await conversation().getByText("all 3 steps done", { exact: false }).first().waitFor({ timeout: 30_000 }).then(() => true, () => false)) { c.fail("after switching back the reply never reached its end"); await shot(c, "no-end"); return; }
+  await idle(10_000);
+  await sleep(500);
+  const live = await steady();
+  for (const k of [1, 2, 3]) if (!live.includes(`step ${k} thinking`)) c.fail(`step ${k} is missing after switching back during the reply`);
+  if (!await away()) { c.fail("switching back after the reply ended did not show the session within 10 s"); return; }
+  await sleep(1_000);
+  const after = await steady();
+  if (after !== live) c.fail(`after switching away and back the reply looks different: live "${live.slice(-300)}" / now "${after.slice(-300)}"`);
+  if (/Unsupported content/i.test(after)) c.fail('the reply shows "Unsupported content" after switching back');
+  if (await runningTools()) c.fail("a tool of the finished reply shows as running after switching back");
+});
+
+release("P12 Switching the model", "U5", "The model list shows only chat models, also before the first message; the next turn uses the chosen model and the model shown is the one used.", async c => {
+  await freshSession();
+  const button = page.getByRole("button", { name: { en: "Model", ja: "モデル", "zh-Hans": "模型", "zh-Hant": "模型" }[lang], exact: true }).first();
+  if (!await button.isVisible().catch(() => false)) { c.fail("the new session shows no model button before the first message"); await shot(c, "no-model"); return; }
+  await button.click();
+  const items = page.getByRole("menuitemradio");
+  await items.first().waitFor({ timeout: 10_000 }).catch(() => {});
+  const listed = (await items.allInnerTexts()).map(text => text.replace(/\s+/g, " ").trim());
+  if (!listed.length) { c.fail("the model list is empty"); await shot(c, "empty"); return; }
+  c.note(`models listed: ${listed.join(" | ")}`);
+  const notChat = listed.filter(text => /translate|embedding|image/i.test(text));
+  if (notChat.length) c.fail(`the model list offers models that are not chat models: ${notChat.join(" | ")}`);
+  const second = items.filter({ hasText: "Fixture second model" }).first();
+  if (!await second.count()) { c.fail("the second model of the provider is not in the list"); return; }
+  const start = now();
+  await second.click();
+  const shown = await page.waitForFunction(selector => /Fixture second model/.test(document.querySelector(selector)?.textContent ?? ""), SEL.composer, { timeout: 10_000 }).then(() => now() - start, () => null);
+  if (shown === null) c.fail("the composer does not show the chosen model within 10 s");
+  else c.metric("switchMs", shown);
+  const before = (await requests()).length;
+  const next = ask();
+  await typeAndSend(next.prompt);
+  if (!await replyArrives(next.answer)) { c.fail("no reply after choosing the model"); return; }
+  const used = (await requests()).slice(before).filter(request => request.text.includes(next.prompt)).map(request => request.model);
+  if (!used.length) c.fail("the provider was not asked");
+  else if (used.some(model => model !== "second")) c.fail(`the provider was asked with model ${used.join(", ")}, not the chosen one (second)`);
+  await idle();
+  if (!/Fixture second model/.test(await page.locator(SEL.composer).first().innerText().catch(() => ""))) c.fail("after the reply the composer no longer shows the model that was used");
+});
+
+release("P23 A reply with many steps keeps every step on screen", "U4", "In a reply of five or more steps (thinking, tool, thinking) each step's reasoning and tool stay on screen; after a reload and a restart it looks the same.", async c => {
+  await freshSession();
+  const prompt = "STEPS:6 read the readme six times";
+  const start = now();
+  await typeAndSend(prompt);
+  const ended = await conversation().getByText("all 6 steps done", { exact: false }).first().waitFor({ timeout: 90_000 }).then(() => true, () => false);
+  c.metric("stepWaitMs", now() - start);
+  if (!ended) { c.fail("the 6-step reply did not end within 90 s"); await shot(c, "not-ended"); return; }
+  await idle(10_000);
+  const check = async when => {
+    const text = await conversationText();
+    const missing = [1, 2, 3, 4, 5, 6].filter(k => !text.includes(`step ${k} thinking`));
+    if (missing.length) c.fail(`${when}: the thinking of step ${missing.join(", ")} is not on screen`);
+    const tools = (await toolChips()).length;
+    if (tools < 6) c.fail(`${when}: ${tools} tools on screen, 6 expected`);
+    if (await runningTools()) c.fail(`${when}: a tool shows as running after the reply ended`);
+    return text.replace(/\s+/g, " ").trim();
+  };
+  const live = await check("at the end of the reply");
+  await page.reload();
+  await newSession().waitFor({ timeout: 60_000 });
+  if (!await conversation().getByText(prompt, { exact: true }).first().isVisible().catch(() => false)) await sidebar().getByText(prompt, { exact: false }).first().click().catch(() => {});
+  await conversation().getByText("all 6 steps done", { exact: false }).first().waitFor({ timeout: 15_000 }).catch(() => c.fail("after a reload the reply is not shown"));
+  const reloaded = await check("after a reload");
+  if (reloaded !== live) c.fail("after a reload the reply looks different from the live one");
+  await reopen();
+  await newSession().waitFor({ timeout: 60_000 });
+  if (!await conversation().getByText(prompt, { exact: true }).first().isVisible().catch(() => false)) await sidebar().getByText(prompt, { exact: false }).first().click().catch(() => {});
+  await conversation().getByText("all 6 steps done", { exact: false }).first().waitFor({ timeout: 15_000 }).catch(() => c.fail("after a restart the reply is not shown"));
+  const restarted = await check("after a restart");
+  if (restarted !== live) c.fail("after a restart the reply looks different from the live one");
+});
+
+release("P26 A tool cut off when the runtime ends shows as interrupted", "U7", "A tool cut off when the runtime ends shows as interrupted or failed, never still running, and the next turn works; in an old session a tool call without a result also shows as interrupted. (Stop while a tool runs is P11.)", async c => {
+  await freshSession();
+  const prompt = "TOOLWAIT run the long command before the runtime ends";
+  await typeAndSend(prompt);
+  const running = await page.waitForFunction(() => /\bbash\b/.test(document.body.innerText), null, { timeout: 30_000 }).then(() => true, () => false);
+  if (!running) { c.fail("the tool never showed as running"); await shot(c, "no-tool"); return; }
+  await sleep(1_500);
+  const killed = await control("/runtime/kill", { which: "all" });
+  c.note(`runtimes ended: ${JSON.stringify(killed.killed ?? killed)}`);
+  const settled = await idle(20_000);
+  if (!settled) c.fail("20 s after the runtime ended the reply still shows as running");
+  await sleep(1_000);
+  if (await runningTools()) c.fail("the cut-off tool still shows as running");
+  const spinning = await waiting();
+  if (spinning.length) c.fail(`something still shows as running: ${spinning.join(" | ")}`);
+  c.note(`the cut-off tool shows: ${(await toolChips()).join(" | ") || "(no tool)"}`);
+  await shot(c, "cut-off");
+  await judgeRecovers(c);
+  // An old session whose tool call has no result, as a crash of an earlier version leaves it.
+  const state = await worldGet("/state");
+  const at = "2026-01-09T00:00:00.000Z";
+  const lines = [
+    { type: "session", version: 3, id: "tool-without-result", timestamp: at, cwd: state.workspace },
+    { type: "message", id: "a1", parentId: null, timestamp: at, message: { role: "user", content: [{ type: "text", text: "Old session with a tool cut off" }] } },
+    { type: "message", id: "a2", parentId: "a1", timestamp: at, message: { role: "assistant", content: [{ type: "toolCall", id: "old-call-1", name: "bash", arguments: { command: "sleep 30" } }], provider: "fixture", model: "deterministic", stopReason: "toolUse" } },
+  ];
+  await control("/file", { path: "data/state/sessions/2026-01-09T00-00-00-000Z_tool-without-result.jsonl", text: `${lines.map(line => JSON.stringify(line)).join("\n")}\n` });
+  await reopen();
+  await newSession().waitFor({ timeout: 60_000 });
+  const row = sidebar().getByText("Old session with a tool cut off", { exact: false }).first();
+  if (!await row.waitFor({ timeout: 10_000 }).then(() => true, () => false)) { c.fail("the old session is not in the list"); return; }
+  await row.click();
+  if (!await conversation().getByText("Old session with a tool cut off", { exact: true }).first().waitFor({ timeout: 10_000 }).then(() => true, () => false)) { c.fail("the old session did not open"); return; }
+  await sleep(1_000);
+  await shot(c, "old-session");
+  if (await runningTools()) c.fail("in the old session the tool without a result shows as running");
+  if (await stopButton().isVisible().catch(() => false)) c.fail("opening the old session shows Stop, as if its reply still ran");
+  const shownOld = await toolChips();
+  c.note(`the old session's tool shows: ${shownOld.join(" | ") || "(no tool)"}; status line: ${(await page.locator('[role="status"]').allInnerTexts().catch(() => [])).join(" | ") || "(none)"}`);
+  if (!shownOld.length) c.fail("the old session's tool call is not shown at all");
+});
+
+release("P13 A question or approval from the agent", "U4", "When the agent needs an approval for a tool call, the app shows it with its choices and the session's row says it waits; the reply continues after Approve, and after Deny the reply ends without running the tool. (The review is switched on for the read tool in the saved tool settings, as the image tool has it by default.)", async c => {
+  await control("/file", { path: "data/agent/tools.json", text: JSON.stringify({ reviewTools: ["read"] }) });
+  const ask1 = async (prompt, choice) => {
+    await freshSession();
+    await typeAndSend(prompt);
+    const dialog = page.getByRole("dialog").filter({ hasText: /read|README/ }).first();
+    if (!await dialog.waitFor({ timeout: 30_000 }).then(() => true, () => false)) { c.fail(`no approval was shown for the tool call (${choice})`); await shot(c, `no-approval-${choice}`); return false; }
+    const buttons = (await dialog.getByRole("button").allInnerTexts()).map(text => text.trim()).filter(Boolean);
+    c.note(`approval choices: ${buttons.join(" | ")}`);
+    const row = await waitRowState(prompt, ["waiting"], 5_000);
+    if (row !== "waiting") c.fail(`while the approval waits, the session's row shows "${row}", not waiting`);
+    const button = dialog.getByRole("button", { name: choice === "approve" ? /^(Approve|承認|批准|核准)$/ : /^(Deny|拒否|拒绝|拒絕)$/ }).first();
+    if (!await button.count()) { c.fail(`the approval has no ${choice} choice`); return false; }
+    await button.click();
+    if (await dialog.isVisible().catch(() => false) && !await dialog.waitFor({ state: "hidden", timeout: 10_000 }).then(() => true, () => false)) c.fail(`the approval stayed on screen after ${choice}`);
+    return true;
+  };
+  if (await ask1("TOOL read the readme with approval", "approve")) {
+    if (!await conversation().getByText("tool finished", { exact: false }).first().waitFor({ timeout: 30_000 }).then(() => true, () => false)) c.fail("after Approve the reply did not continue to its end");
+    await idle(10_000);
+  }
+  const before = (await requests()).length;
+  if (await ask1("TOOL read the readme but deny it", "deny")) {
+    const ended = await idle(30_000);
+    if (!ended) c.fail("after Deny the reply did not end within 30 s");
+    const after = (await requests()).slice(before);
+    if (!after.some(request => request.text.includes("deny it")) ) c.fail("the provider was never asked");
+    if (await runningTools()) c.fail("after Deny the tool shows as running");
+  }
+  await control("/file", { path: "data/agent/tools.json", remove: true });
+  await judgeRecovers(c);
+});
+
+/** A saved session of about `megabytes` MB: many turns of plain text, as a long project leaves it. */
+function largeSession(workspace, megabytes) {
+  const at = "2026-01-08T00:00:00.000Z";
+  const lines = [JSON.stringify({ type: "session", version: 3, id: "large-session", timestamp: at, cwd: workspace })];
+  const filler = "This line is part of a very large old session. ".repeat(40);
+  let parent = null;
+  let size = lines[0].length;
+  for (let turn = 1; size < megabytes * 1_000_000; turn += 1) {
+    const user = { type: "message", id: `u${turn}`, parentId: parent, timestamp: at, message: { role: "user", content: [{ type: "text", text: turn === 1 ? "Large old session" : `Question ${turn}` }] } };
+    const answer = { type: "message", id: `a${turn}`, parentId: `u${turn}`, timestamp: at, message: { role: "assistant", content: [{ type: "text", text: `Answer ${turn}. ${filler.repeat(5)}` }], provider: "fixture", model: "deterministic", stopReason: "stop" } };
+    parent = `a${turn}`;
+    for (const line of [user, answer]) { const text = JSON.stringify(line); lines.push(text); size += text.length + 1; }
+  }
+  // A long session has been compacted: the model is given a summary and the latest turn, not 20 MB.
+  lines.push(JSON.stringify({ type: "compaction", id: "c1", parentId: parent, timestamp: at, summary: "The person asked many questions about the project; each was answered.", firstKeptEntryId: `u${Number(parent.slice(1))}`, tokensBefore: 30_000 }));
+  return { text: `${lines.join("\n")}\n`, last: parent };
+}
+
+release("P6 A very large old session opens and answers", "U9", "The history of a saved session of 20 MB or more is readable at once, sending does not freeze the window, the status first says it is starting, and the reply arrives. (The session is generated, never a person's real one.)", async c => {
+  const state = await worldGet("/state");
+  const large = largeSession(state.workspace, 20);
+  await control("/file", { path: "data/state/sessions/2026-01-08T00-00-00-000Z_large-session.jsonl", text: large.text });
+  c.note(`session file: ${(large.text.length / 1e6).toFixed(1)} MB`);
+  await reopen();
+  await newSession().waitFor({ timeout: 60_000 });
+  const row = sidebar().getByText("Large old session", { exact: false }).first();
+  if (!await row.waitFor({ timeout: 15_000 }).then(() => true, () => false)) { c.fail("the large session is not in the list"); await shot(c, "not-listed"); return; }
+  const start = now();
+  await row.click();
+  const lastAnswer = `Answer ${large.last.slice(1)}.`;
+  const shown = await conversation().getByText(lastAnswer, { exact: false }).first().waitFor({ timeout: 30_000 }).then(() => now() - start, () => null);
+  if (shown === null) { c.fail("the large session's latest history did not show within 30 s"); await shot(c, "no-history"); return; }
+  c.metric("sessionHistoryMs", shown);
+  if (shown > 1_000) c.note(`history took ${shown} ms (proposed line 1 s, not decided)`);
+  // The window must answer while the session is attached: the longest gap between two answers of the page.
+  let longest = 0;
+  let polling = true;
+  const poll = (async () => { let last = now(); while (polling) { await page.evaluate(() => 1).catch(() => {}); const at = now(); longest = Math.max(longest, at - last); last = at; await sleep(100); } })();
+  const sent = now();
+  const next = ask();
+  await typeAndSend(next.prompt);
+  let starting = false;
+  const startWords = /Starting session|セッションを開始しています|正在启动会话|正在啟動工作階段/;
+  const arrived = await (async () => {
+    for (const until = now() + 120_000; now() < until; await sleep(150)) {
+      if (startWords.test(await page.locator('[role="status"]').allInnerTexts().then(list => list.join(" ")).catch(() => ""))) starting = true;
+      if (await replyArrives(next.answer, 1)) return now() - sent;
+    }
+    return null;
+  })();
+  polling = false;
+  await poll;
+  c.metric("longestFreezeMs", longest);
+  if (arrived === null) { c.fail("the large session got no reply within 2 min"); return; }
+  c.metric("firstOutputMs", arrived);
+  if (!starting) c.note("the status line was not seen saying the session is starting");
+  if (longest > 1_000) c.note(`the window did not respond for ${longest} ms while the large session started (no line decided)`);
+});
+
+release("P10 A background session keeps its state in the list", "U4", "A session nobody is looking at keeps its state up to date in the list (running, then finished) and is complete when opened again.", async c => {
+  await chatSession();
+  const other = (await conversationText()).match(/What is \d+ × 7\?/)?.[0] ?? "×";
+  await freshSession();
+  const long = "LONG reply in the background";
+  const sent = now();
+  await typeAndSend(long);
+  await page.waitForFunction(selector => /line 2\b/.test(document.querySelector(selector)?.textContent ?? ""), SEL.conversation, { timeout: 30_000 }).catch(() => {});
+  await sidebar().getByText(other, { exact: false }).first().click().catch(() => c.fail("the other session is not in the list"));
+  await sleep(500);
+  const running = await waitRowState(long, ["running"], 3_000);
+  if (running !== "running") c.fail(`in the background the session's row shows "${running}", not running`);
+  const done = await waitRowState(long, ["done", null], 40_000);
+  if (done === "running") { c.fail("40 s later the background session's row still shows running (its reply lasts about 12 s)"); return; }
+  c.metric("stateDelayMs", now() - sent);
+  c.note(`row after the reply ended: ${done ?? "no state icon"} (the reply itself lasts about 12 s)`);
+  await sidebar().getByText(long, { exact: false }).first().click();
+  if (!await conversation().getByText("line 40", { exact: false }).first().waitFor({ timeout: 10_000 }).then(() => true, () => false)) c.fail("opened again, the background reply is not complete (no line 40)");
+});
+
+release("P15 Thirty open sessions still work", "U4", "With 30 sessions, the list shows them all, switching between them shows each one's history, and messages sent in several of them are answered.", async c => {
+  const made = [];
+  for (let k = 0; k < 30; k += 1) {
+    await freshSession();
+    const item = ask();
+    await typeAndSend(item.prompt);
+    if (!await replyArrives(item.answer)) { c.fail(`session ${k + 1} of 30 got no reply`); return; }
+    await idle(10_000);
+    made.push(item);
+  }
+  await sleep(1_000);
+  const listed = (await Promise.all(made.map(item => sidebar().getByText(item.prompt, { exact: false }).count()))).filter(Boolean).length;
+  if (listed < 30) c.fail(`only ${listed} of the 30 sessions are in the list`);
+  const switches = [];
+  for (const index of [0, 7, 15, 22, 29]) {
+    const item = made[index];
+    const start = now();
+    await sidebar().getByText(item.prompt, { exact: false }).first().click().catch(() => {});
+    const shown = await conversation().getByText(item.prompt, { exact: true }).first().waitFor({ timeout: 10_000 }).then(() => now() - start, () => null);
+    if (shown === null) { c.fail(`session ${index + 1} did not show its history within 10 s`); continue; }
+    switches.push(shown);
+    if (index % 2 === 0) {
+      const next = ask();
+      const sent = now();
+      await typeAndSend(next.prompt);
+      if (!await replyArrives(next.answer)) c.fail(`session ${index + 1} got no reply within 30 s`);
+      else c.metric(`firstOutputMs.${index + 1}`, now() - sent);
+      await idle(10_000);
+    }
+  }
+  if (switches.length) c.metric("switchMs", Math.max(...switches));
+  const stuck = [];
+  for (const item of made) if (await rowState(item.prompt) === "running") stuck.push(item.prompt);
+  if (stuck.length) c.fail(`${stuck.length} finished sessions still show as running`);
+});
+
+release("P16 Reloading the window ten times and quitting leaves nothing behind", "U4", "After ten window reloads the app works and no runtime piles up; when the person quits, the host and every runtime it started end.", async c => {
+  await chatSession();
+  await sleep(2_000);
+  const start = await worldGet("/state");
+  c.metric("processCount.start", start.runtimes.length);
+  if (start.handles !== null) c.metric("handleCount.start", start.handles);
+  const counts = [];
+  for (let k = 1; k <= 10; k += 1) {
+    await page.reload();
+    if (!await newSession().waitFor({ timeout: 60_000 }).then(() => true, () => false)) { c.fail(`after reload ${k} the app did not load within 60 s`); return; }
+    await sleep(1_000);
+    counts.push((await worldGet("/state")).runtimes.length);
+  }
+  c.note(`runtimes after each reload: ${counts.join(", ")} (${start.runtimes.length} before)`);
+  const next = ask();
+  await typeAndSend(next.prompt);
+  if (!await replyArrives(next.answer)) c.fail("after ten reloads a message got no reply within 30 s");
+  await idle(10_000);
+  await sleep(3_000);
+  const after = await worldGet("/state");
+  c.metric("processCount.after", after.runtimes.length);
+  if (after.handles !== null) c.metric("handleCount.after", after.handles);
+  // Piling up: the count still rising over the last reloads (a pool that fills and stays is recorded).
+  if (counts[9] > counts[6]) c.fail(`runtimes pile up with reloads: ${counts.join(", ")}`);
+  else if (counts[9] > start.runtimes.length) c.note(`after the reloads ${counts[9]} runtimes run, ${start.runtimes.length} before; the count stopped rising after reload ${counts.indexOf(counts[9]) + 1}`);
+  if (start.handles !== null && after.handles !== null && after.handles > start.handles) c.note(`the host holds ${after.handles - start.handles} more handles than before the reloads (no line decided)`);
+  const quit = await control("/host/quit", {});
+  if (quit.unsupported) { c.skip(`quitting is not available here: ${quit.unsupported}`); return; }
+  c.metric("quitMs", quit.stoppedMs);
+  if (quit.left?.length) c.fail(`after quitting, ${quit.left.length} of ${quit.before} processes were still running 15 s later: ${quit.left.map(row => row.name).join(", ")}`);
+  // The app opens again for the end check.
+  await page.goto(quit.url);
+  await page.evaluate(value => localStorage.setItem("jouzu.ui.language", value), lang);
+  await page.reload();
+  await newSession().waitFor({ timeout: 60_000 }).catch(() => c.fail("the app did not open again after quitting"));
+});
+
+/** The status line's words while a reply runs (the line above the composer). */
+const statusWords = () => page.locator('[role="status"]').allInnerTexts().then(list => list.map(text => text.replace(/\s+/g, " ").trim()).filter(Boolean)).catch(() => []);
+const PHASE = {
+  en: { waiting: "Waiting for model", thinking: /Thinking|Reasoning/, tool: "Running bash", writing: "Writing", working: "Working…" },
+  ja: { waiting: "モデルを待っています", thinking: /思考|推論/, tool: "bash を実行中", writing: "書き込み中", working: "作業中…" },
+}[lang];
+
+release("P24 The status line says what the reply is doing", "U4", "While a reply runs, the status line says what is happening: waiting for the model (and for how long), thinking, which tool runs (and for how long), writing; never a bare Working.", async c => {
+  await freshSession();
+  await typeAndSend("PHASES show every phase");
+  const seen = new Set();
+  const bare = [];
+  for (const until = now() + 40_000; now() < until; await sleep(150)) {
+    for (const text of await statusWords()) {
+      seen.add(text);
+      if (text === PHASE.working) bare.push(text);
+    }
+    const reasoning = await page.getByRole("button", { name: PHASE.thinking }).count().catch(() => 0);
+    if (reasoning) seen.add("(reasoning row)");
+    if (await conversation().getByText("phases done", { exact: false }).count() && await idle(500)) break;
+  }
+  const words = [...seen];
+  c.note(`status line showed: ${words.join(" | ")}`);
+  const has = test => words.some(text => typeof test === "string" ? text.includes(test) : test.test(text));
+  if (!has(PHASE.waiting)) c.fail("the status line never said it was waiting for the model");
+  else if (!words.some(text => text.includes(PHASE.waiting) && /\d+:\d{2}/.test(text))) c.fail("waiting for the model was shown without how long");
+  if (!has(PHASE.thinking) && !seen.has("(reasoning row)")) c.fail("the status line never said the model was thinking");
+  if (!has(PHASE.tool)) c.fail("the status line never named the running tool (bash)");
+  else if (!words.some(text => text.includes(PHASE.tool) && /\d+:\d{2}/.test(text))) c.fail("the running tool was shown without how long");
+  if (!has(PHASE.writing)) c.fail("the status line never said the reply was being written");
+  if (bare.length) c.fail(`the status line showed a bare "${PHASE.working}" ${bare.length} times`);
+  if (!await conversation().getByText("phases done", { exact: false }).count()) c.fail("the reply did not reach its end within 40 s");
+});
+
+const RETRY = { en: "Model request failed, retrying", ja: "モデルへのリクエストが失敗しました。再試行中" }[lang];
+const COMPACT = { en: "Compacting context", ja: "コンテキストを圧縮中" }[lang];
+
+release("P25 Automatic retry and context compaction are shown", "U6", "A failed model request that is retried shows that it failed and is retried, with the count and the reason, and the reply arrives; compaction of a full context shows as such; neither looks stuck.", async c => {
+  await freshSession();
+  await post(fixture, "/__fault", { status: 500, times: 1 });
+  const first = ask();
+  await typeAndSend(first.prompt);
+  const seen = new Set();
+  let answered = false;
+  for (const until = now() + 60_000; now() < until && !answered; await sleep(150)) {
+    for (const text of await statusWords()) seen.add(text);
+    answered = await replyArrives(first.answer, 1);
+  }
+  await post(fixture, "/__fault", {});
+  const retryLines = [...seen].filter(text => text.includes(RETRY));
+  c.note(`status line during the failed request: ${[...seen].join(" | ") || "(nothing)"}`);
+  if (!answered) c.fail("after one failed request the reply did not arrive within 60 s");
+  if (!retryLines.length) c.fail("the retry was not shown on the status line");
+  else {
+    if (!retryLines.some(text => /\d+\/\d+/.test(text))) c.fail(`the retry was shown without its count: "${retryLines[0]}"`);
+    if (!retryLines.some(text => /\(.+\)/.test(text))) c.fail(`the retry was shown without its reason: "${retryLines[0]}"`);
+  }
+  await idle(10_000);
+  for (const item of await problems()) c.fail(`after the retried request a problem is shown: "${item.text}"`);
+  // Compaction: the provider reports the context nearly full; the runtime compacts after that
+  // turn or before the next one. The status line is watched from the FULL message on.
+  const during = new Set();
+  const watch = async (until, done) => {
+    for (; now() < until; await sleep(100)) {
+      for (const text of await statusWords()) during.add(text);
+      if (await page.getByText(COMPACT, { exact: false }).count().catch(() => 0)) during.add(COMPACT);
+      if (await done()) return true;
+    }
+    return false;
+  };
+  // A session of its own: the retry above left a context edit, after which the runtime estimates
+  // the context from the text instead of the provider's count.
+  await freshSession();
+  // Older turns with enough text to compact (the latest turns are always kept).
+  await typeAndSend("BULK write a long answer");
+  await conversation().getByText("bulk answer.", { exact: false }).first().waitFor({ timeout: 30_000 }).catch(() => c.fail("the BULK reply never arrived"));
+  await idle(30_000);
+  await typeAndSend("FULL fill the context");
+  if (!await watch(now() + 30_000, () => conversation().getByText("the context is nearly full", { exact: false }).count())) c.fail("the FULL reply never arrived");
+  await watch(now() + 5_000, () => Promise.resolve(false));
+  const next = ask();
+  await typeAndSend(next.prompt);
+  const done = await watch(now() + 90_000, () => replyArrives(next.answer, 1));
+  c.note(`status line around compaction: ${[...during].join(" | ") || "(nothing)"}`);
+  // Whether the runtime compacted at all, from the session's own file.
+  let compacted = false;
+  for (const name of Object.keys(await sessionFiles())) {
+    const file = await worldGet("/file", { path: `data/state/sessions/${name}` });
+    if (file.text?.includes("FULL fill the context") && /"type":"compaction"/.test(file.text)) compacted = true;
+  }
+  c.note(`the session file has a compaction entry: ${compacted}`);
+  if (!done) c.fail("after the context was full the next message got no reply within 90 s");
+  if (![...during].some(text => text.includes(COMPACT))) c.fail(compacted ? `the runtime compacted the context but the app never said so ("${COMPACT}"); the status line showed: ${[...during].join(" | ")}` : "the context was reported nearly full (30,000 of 32,000 tokens) but no compaction happened or was shown");
+  const raw = [...during].filter(text => /pi-vcc|\btok\b|summarized \d/.test(text));
+  if (raw.length) c.fail(`the runtime's own compaction note is shown to the person as is: "${raw[0]}"`);
+  await judgeNoEndlessWait(c);
 });
 
 await runCases();

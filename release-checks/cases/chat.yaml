@@ -34,8 +34,11 @@
   steps:
     - do: Start a long reply; open a new session and send there.
       expect: Both replies arrive; both rows show their state.
+  languages: [en, ja]
   automation:
-    status: planned
+    status: automated
+    impl: { file: release-playbook.mjs, case: P8 A new session while another one is running }
+  added: 1.1.5
 
 - id: CHAT-003
   legacy: [P11]
@@ -81,9 +84,11 @@
     - do: Choose another model and send.
       expect: The provider is asked with that model; the composer shows it.
   measures: [switchMs]
+  languages: [en, ja]
   automation:
-    status: planned
-    note: Partly covered before 1.1.5 by product tests; no harness case yet.
+    status: automated
+    impl: { file: release-playbook.mjs, case: P12 Switching the model }
+  added: 1.1.5
 
 - id: CHAT-005
   legacy: [P13]
@@ -95,13 +100,19 @@
   purpose: When the agent asks a question or needs an approval, the app shows it and the reply continues after the answer.
   preconditions:
     world: user
+    state: The saved tool settings (tools.json) ask for review of the read tool, as they do for the image tool by default.
   steps:
-    - do: Send a message whose reply asks a question.
-      expect: The question shows with its choices.
-    - do: Answer it.
+    - do: With review switched on for the read tool, send a message whose reply reads a file.
+      expect: The approval shows with its choices; the session's row says it waits.
+    - do: Approve it.
       expect: The reply continues and ends.
+    - do: Do the same again and Deny it.
+      expect: The reply ends without running the tool; nothing shows as running; the next message is answered.
+  languages: [en, ja]
   automation:
-    status: planned
+    status: automated
+    impl: { file: release-playbook.mjs, case: P13 A question or approval from the agent }
+  added: 1.1.5
 
 - id: CHAT-006
   legacy: [P23]
@@ -120,8 +131,11 @@
     - do: Reload, then restart the app.
       expect: The reply looks the same.
   measures: [stepWaitMs]
+  languages: [en, ja]
   automation:
-    status: planned
+    status: automated
+    impl: { file: release-playbook.mjs, case: P23 A reply with many steps keeps every step on screen }
+  added: 1.1.5
 
 - id: CHAT-007
   legacy: [P24]
@@ -136,8 +150,11 @@
   steps:
     - do: Send a message whose reply thinks, runs a tool and writes.
       expect: Each phase is named on the status line.
+  languages: [en, ja]
   automation:
-    status: planned
+    status: automated
+    impl: { file: release-playbook.mjs, case: P24 The status line says what the reply is doing }
+  added: 1.1.5
 
 - id: CHAT-008
   legacy: [P25]
@@ -149,13 +166,17 @@
   purpose: A failed model request that is retried shows "request failed, retry a/b (reason)"; compaction shows as such; neither looks stuck.
   preconditions:
     world: user
+  data: "Fixture: one refused request ({status: 500, times: 1}); a BULK reply (older turns), then a FULL reply that reports 30,000 of the model's 32,000 tokens used."
   steps:
     - do: Make the provider fail once, then answer.
       expect: The status shows the retry with its count and reason; the reply arrives.
     - do: Fill the context until it is compacted.
       expect: The status shows compaction.
+  languages: [en, ja]
   automation:
-    status: planned
+    status: automated
+    impl: { file: release-playbook.mjs, case: P25 Automatic retry and context compaction are shown }
+  added: 1.1.5
 
 - id: CHAT-009
   legacy: [P26]
@@ -172,9 +193,12 @@
       expect: Both tools show as interrupted; none as running.
     - do: Open an old session with a tool call that has no result.
       expect: That tool shows as interrupted.
+  languages: [en, ja]
   automation:
-    status: planned
+    status: automated
+    impl: { file: release-playbook.mjs, case: P26 A tool cut off when the runtime ends shows as interrupted }
     note: The Stop part is CHAT-003.
+  added: 1.1.5
 
 - id: CHAT-010
   legacy: [P27]

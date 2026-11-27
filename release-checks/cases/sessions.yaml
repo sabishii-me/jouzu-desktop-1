@@ -66,7 +66,7 @@
     - do: Reload the window, then restart the app.
       expect: The old session is still listed both times.
   limits:
-    - { what: click to history, line: 1 s, by: proposed, not decided }
+    - { what: click to history, line: 1 s, by: "proposed, not decided" }
   measures: [clickToHistoryMs]
   languages: [en, ja]
   automation:
@@ -116,10 +116,14 @@
     - do: Send a message.
       expect: The window stays responsive; the status shows starting, then the reply arrives.
   limits:
-    - { what: click to history, line: 1 s regardless of file size, by: proposed, not decided }
-  measures: [sessionHistoryMs, attachMs, firstOutputMs]
+    - { what: click to history, line: 1 s regardless of file size, by: "proposed, not decided" }
+    - { what: window not answering while the session starts, line: none decided; recorded only, by: nobody decided }
+  measures: [sessionHistoryMs, firstOutputMs, longestFreezeMs]
+  languages: [en, ja]
   automation:
-    status: planned
+    status: automated
+    impl: { file: release-playbook.mjs, case: P6 A very large old session opens and answers }
+  added: 1.1.5
 
 - id: SESS-004
   legacy: [P9]
@@ -137,8 +141,11 @@
     - do: Switch away and back after it ended.
       expect: The same; no "Unsupported content".
   measures: [switchMs]
+  languages: [en, ja]
   automation:
-    status: planned
+    status: automated
+    impl: { file: release-playbook.mjs, case: P9 Switching away and back shows the reply as it was live }
+  added: 1.1.5
 
 - id: SESS-005
   legacy: [P10]
@@ -156,9 +163,12 @@
     - do: Open the first session again.
       expect: The whole reply is there.
   measures: [stateDelayMs]
+  languages: [en, ja]
   automation:
-    status: planned
+    status: automated
+    impl: { file: release-playbook.mjs, case: P10 A background session keeps its state in the list }
     note: The list state part is REG-212.
+  added: 1.1.5
 
 - id: SESS-006
   legacy: [P15]
@@ -176,8 +186,11 @@
     - do: Switch between them and send in several.
       expect: Switching and replies work.
   measures: [switchMs, firstOutputMs]
+  languages: [en, ja]
   automation:
-    status: planned
+    status: automated
+    impl: { file: release-playbook.mjs, case: P15 Thirty open sessions still work }
+  added: 1.1.5
 
 - id: SESS-007
   legacy: [P16]
@@ -194,9 +207,15 @@
       expect: The app works after each.
     - do: Quit.
       expect: No runtime process is left; handles back at the baseline.
-  measures: [processCount, handleCount]
+  limits:
+    - { what: processes left 15 s after quitting, line: none, by: release playbook P16 }
+    - { what: host handles after ten reloads, line: none decided; recorded only, by: nobody decided }
+  measures: [processCount, handleCount, quitMs]
+  languages: [en, ja]
   automation:
-    status: planned
+    status: automated
+    impl: { file: release-playbook.mjs, case: P16 Reloading the window ten times and quitting leaves nothing behind }
+  added: 1.1.5
 
 - id: SESS-008
   legacy: [P17, "#33"]

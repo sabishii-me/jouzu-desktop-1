@@ -58,7 +58,7 @@ export function loadCatalog(dir = casesDir) {
     for (const key of ['legacy', 'measures', 'links']) need(entry[key] === undefined || Array.isArray(entry[key]), `${key} must be a list`);
     need(entry.languages === undefined || (Array.isArray(entry.languages) && entry.languages.every(item => ENUMS.language.includes(item))), `languages must be from ${ENUMS.language.join(', ')}`);
     need(entry.platforms === undefined || (Array.isArray(entry.platforms) && entry.platforms.every(item => ENUMS.platform.includes(item))), `platforms must be from ${ENUMS.platform.join(', ')}`);
-    need(entry.limits === undefined || (Array.isArray(entry.limits) && entry.limits.every(item => item?.what && item?.line && item?.by)), 'limits must be a list of {what, line, by}: every line says who set it');
+    need(entry.limits === undefined || (Array.isArray(entry.limits) && entry.limits.every(item => item?.what && item?.line && item?.by && Object.keys(item).every(key => ['what', 'line', 'by', 'status'].includes(key)))), 'limits must be a list of {what, line, by}: every line says who set it (quote a value that has a comma)');
     const automation = entry.automation ?? {};
     need(ENUMS.status.includes(automation.status), `automation.status must be one of ${ENUMS.status.join(', ')}`);
     if (automation.status === 'automated') need(automation.impl?.file && (automation.impl.case || automation.impl.check), 'an automated case names its code: automation.impl {file, case}');
