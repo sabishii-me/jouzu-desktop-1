@@ -1,0 +1,254 @@
+# Provider and network trouble (U6) and runtime trouble (U7).
+# Every provider case: the problem shows on the reply in plain words, once; the session keeps working afterwards.
+- id: PROV-001
+  title: Provider rejects the key while sending
+  suite: abnormal
+  scenario: U6
+  priority: high
+  type: functional
+  purpose: An expired or revoked key (401) says so on the reply, without stopping the session or showing raw provider text.
+  preconditions: { world: user }
+  data: Fixture answers 401.
+  steps:
+    - do: Send a message.
+      expect: The reply says the key was refused, in plain words, once.
+    - do: Fix the cause and send again.
+      expect: The reply arrives.
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Provider rejects the key while sending }
+
+- id: PROV-002
+  title: Provider rate-limits the request
+  suite: abnormal
+  scenario: U6
+  priority: high
+  type: functional
+  purpose: 429 ends in a readable failure or a reply within the limit, not an endless retry the person cannot see.
+  preconditions: { world: user }
+  data: Fixture answers 429.
+  steps:
+    - do: Send a message.
+      expect: A readable failure or a reply within the limit; no silent endless retry.
+    - do: Fix the cause and send again.
+      expect: The reply arrives.
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Provider rate-limits the request }
+
+- id: PROV-003
+  title: Provider fails with a server error
+  suite: abnormal
+  scenario: U6
+  priority: high
+  type: functional
+  purpose: A provider outage (500) shows on the reply; the person can try again.
+  preconditions: { world: user }
+  data: Fixture answers 500.
+  steps:
+    - do: Send a message.
+      expect: The reply says the provider failed; a way to try again is offered.
+    - do: Fix the cause and try again.
+      expect: The reply arrives.
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Provider fails with a server error }
+
+- id: PROV-004
+  title: Provider unreachable (network down)
+  suite: abnormal
+  scenario: U6
+  priority: high
+  type: functional
+  purpose: With no network or a gateway down, the reply says it could not reach the provider.
+  preconditions: { world: user }
+  data: Fixture resets the connection.
+  steps:
+    - do: Send a message.
+      expect: The reply says the provider could not be reached.
+    - do: Fix the cause and send again.
+      expect: The reply arrives.
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Provider unreachable (network down) }
+
+- id: PROV-005
+  title: Model removed by the provider
+  suite: abnormal
+  scenario: U6
+  priority: medium
+  type: functional
+  purpose: A model the provider no longer offers (404) is named as such, once.
+  preconditions: { world: user }
+  data: Fixture answers 404 for the model.
+  steps:
+    - do: Send a message.
+      expect: The reply says the model is no longer offered, once.
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Model removed by the provider }
+
+- id: PROV-006
+  title: Reply cut off mid-stream
+  suite: abnormal
+  scenario: U6
+  priority: high
+  type: functional
+  purpose: The provider drops the connection while writing. The written part stays, the reply is marked, the next message works.
+  preconditions: { world: user }
+  data: Fixture cuts the stream after 5 chunks.
+  steps:
+    - do: Send a message with a long reply.
+      expect: The written part stays; the reply is marked as cut off.
+    - do: Send the next message.
+      expect: The reply arrives.
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Reply cut off mid-stream }
+
+- id: PROV-007
+  title: Provider slow to answer (8 s to first word)
+  suite: abnormal
+  scenario: U6
+  priority: medium
+  type: functional
+  purpose: A slow provider is not an error. The person's own message shows at once, the turn visibly works, the reply arrives, nothing is shown as failed.
+  preconditions: { world: user }
+  data: Fixture waits 8 s before the first word.
+  steps:
+    - do: Send a message.
+      expect: The message shows at once; the turn shows it is working; the reply arrives; nothing shows as failed.
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Provider slow to answer (8 s to first word) }
+
+- id: REG-178
+  legacy: ["#178"]
+  title: A provider server error is not called no network
+  suite: regression
+  scenario: U6
+  priority: medium
+  type: functional
+  purpose: A 500 from the provider and an unreachable provider are told apart in the words the person reads.
+  preconditions: { world: user }
+  steps:
+    - do: Send once with the provider answering 500, once with it unreachable.
+      expect: The two messages say different things; the 500 is not called no network.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#178 A provider server error is not called no network" }
+  links: ["#178"]
+
+- id: RT-001
+  legacy: [P14]
+  title: Runtime killed while the session is idle
+  suite: abnormal
+  scenario: U7
+  priority: high
+  type: functional
+  purpose: A runtime that died between messages must not cost the next message.
+  preconditions: { world: user }
+  steps:
+    - do: After an answered message, end every runtime.
+      expect: Nothing is shown as broken.
+    - do: Send the next message.
+      expect: The reply arrives.
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Runtime killed while the session is idle }
+
+- id: RT-002
+  legacy: [P14]
+  title: Runtime killed while the reply is writing
+  suite: abnormal
+  scenario: U7
+  priority: high
+  type: functional
+  purpose: The interrupted reply is marked once; the session is usable again within 10 s; other sessions are not affected.
+  preconditions: { world: user }
+  steps:
+    - do: End every runtime while a reply is writing.
+      expect: The reply is marked interrupted once; within 10 s the session is usable.
+    - do: Send the next message.
+      expect: The reply arrives.
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Runtime killed while the reply is writing }
+
+- id: RT-003
+  title: Runtime keeps crashing
+  suite: abnormal
+  scenario: U7
+  priority: high
+  type: functional
+  purpose: A runtime that dies again and again ends in one readable session error with one way out, not an endless spinner; the way out works once the cause is gone.
+  preconditions: { world: user }
+  steps:
+    - do: Keep ending the runtime for 20 s and send a message.
+      expect: One readable session error with one way out; no endless spinner.
+    - do: Stop ending it and use the way out.
+      expect: The session answers.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Runtime keeps crashing }
+
+- id: RT-004
+  title: Runtime slow to start, a new session is sendable at once
+  suite: abnormal
+  scenario: U7
+  priority: high
+  type: performance
+  purpose: On a slow or busy computer the runtime may take seconds; the person can still type and send at once, and the message is answered when it is ready.
+  preconditions: { world: user }
+  data: Runtime start delayed 8 s.
+  steps:
+    - do: Open a new session and send at once.
+      expect: Typing and Send work at once; the reply arrives when the runtime is ready.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "Runtime slow to start: a new session is sendable at once" }
+
+- id: RT-005
+  title: Computer asleep for 30 s during a reply
+  suite: abnormal
+  scenario: U7
+  priority: medium
+  type: functional
+  purpose: After sleep the reply finishes or is marked once, nothing is duplicated, and the session works.
+  preconditions: { world: user }
+  steps:
+    - do: Freeze the app's processes for 30 s while a reply runs.
+      expect: The reply finishes or is marked once; nothing is duplicated.
+    - do: Send the next message.
+      expect: The reply arrives.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Computer asleep for 30 s during a reply }
+
+- id: RT-006
+  legacy: ["#87"]
+  title: Retry after the runtime's files come back
+  suite: regression
+  scenario: U7
+  priority: high
+  type: functional
+  purpose: The runtime's files are missing at start. The start page says so (not an endless Connecting), Retry says so again while they are missing, and once they are back Retry opens a session that answers.
+  preconditions:
+    world: user
+    state: The runtime's files moved away before the app starts.
+  steps:
+    - do: Start the app.
+      expect: The start page says the runtime files are missing.
+    - do: Press Retry.
+      expect: It says so again.
+    - do: Put the files back and press Retry.
+      expect: A session opens and answers.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#87 Retry after the runtime's files come back" }
+  links: ["#87"]

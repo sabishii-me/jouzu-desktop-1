@@ -9,7 +9,8 @@ import { baselineOf, comparison, readBaseline, readResults } from './common.mjs'
 // The report holds facts only: each case's result, its re-runs, the baseline result and
 // what the two say together, the evidence folder, and (if <out>/triage.json exists) the
 // issue and severity given after the run. Acceptance items of the plan that have no record
-// are listed as NOT RUN.
+// are listed as NOT RUN. Cases the plan chose that no code runs yet (planned, gap, deferred in the
+// case catalog) are listed as not covered: a scenario without coverage counts in the release decision.
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, item, index, all) => item.startsWith('--') ? [...pairs, [item.slice(2), all[index + 1]]] : pairs, []));
 const out = resolve(args.out);
@@ -65,9 +66,9 @@ lines.push(`- Baseline: ${hasBaseline ? `${plan.baselineVersion ?? ''} ${baselin
 for (const note of baselineNotes) lines.push(`- ${note}`);
 lines.push(`- Started ${run.startedAt ?? '?'}, finished ${run.finishedAt ?? 'not finished'}`, '');
 lines.push('## Counts', '');
-lines.push(`| Planned | Ran | PASS | FAIL | ERROR | SKIP | Regressions | Acceptance planned | Acceptance recorded |`);
-lines.push('|---|---|---|---|---|---|---|---|---|');
-lines.push(`| ${run.cases ?? '?'} | ${rows.length} | ${count('PASS')} | ${count('FAIL')} | ${count('ERROR')} | ${count('SKIP')} | ${rows.filter(row => row.label === 'REGRESSION').length} | ${planned.length} | ${acceptanceRows.filter(row => row.status !== 'NOT RUN').length} |`, '');
+lines.push(`| Planned | Ran | PASS | FAIL | ERROR | SKIP | Regressions | Not covered | Acceptance planned | Acceptance recorded |`);
+lines.push('|---|---|---|---|---|---|---|---|---|---|');
+lines.push(`| ${run.cases ?? '?'} | ${rows.length} | ${count('PASS')} | ${count('FAIL')} | ${count('ERROR')} | ${count('SKIP')} | ${rows.filter(row => row.label === 'REGRESSION').length} | ${(run.notCovered ?? []).length} | ${planned.length} | ${acceptanceRows.filter(row => row.status !== 'NOT RUN').length} |`, '');
 
 lines.push('## Every result that is not PASS', '');
 lines.push('| # | Case | Lang | Suite | Result | Re-runs | Baseline | Together | Problems | Evidence | Issue | Severity |');
@@ -76,7 +77,7 @@ let number = 0;
 for (const row of rows.filter(r => r.status !== 'PASS')) {
   number += 1;
   const reruns = row.reruns.length ? `${row.reruns.filter(r => r.status === 'PASS').length}/${row.reruns.length} PASS` : '-';
-  lines.push(`| ${number} | ${cell(row.case)} | ${row.language} | ${row.suite} | ${row.status} | ${reruns} | ${row.base ?? '-'} | ${row.label} | ${cell([...row.problems, ...(row.leftProcesses?.length ? [`left running: ${row.leftProcesses.join(', ')}`] : [])].join('; '))} | ${row.evidence} | ${row.triage.issue ?? ''} | ${row.triage.severity ?? ''} |`);
+  lines.push(`| ${number} | ${cell(`${row.id ?? ''} ${row.case}`.trim())} | ${row.language} | ${row.suite} | ${row.status} | ${reruns} | ${row.base ?? '-'} | ${row.label} | ${cell([...row.problems, ...(row.leftProcesses?.length ? [`left running: ${row.leftProcesses.join(', ')}`] : [])].join('; '))} | ${row.evidence} | ${row.triage.issue ?? ''} | ${row.triage.severity ?? ''} |`);
 }
 for (const row of acceptanceRows.filter(r => r.status !== 'PASS')) {
   number += 1;
@@ -88,7 +89,14 @@ lines.push('');
 lines.push('## All suite cases', '');
 lines.push('| Case | Lang | Suite | Result | Baseline | Together | Time (s) | Left running after the case |');
 lines.push('|---|---|---|---|---|---|---|---|');
-for (const row of rows) lines.push(`| ${cell(row.case)} | ${row.language} | ${row.suite} | ${row.status} | ${row.base ?? '-'} | ${row.label} | ${Math.round((row.ms ?? 0) / 1000)} | ${(row.leftProcesses ?? []).join(', ')} |`);
+for (const row of rows) lines.push(`| ${cell(`${row.id ?? ''} ${row.case}`.trim())} | ${row.language} | ${row.suite} | ${row.status} | ${row.base ?? '-'} | ${row.label} | ${Math.round((row.ms ?? 0) / 1000)} | ${(row.leftProcesses ?? []).join(', ')} |`);
+lines.push('');
+
+lines.push('## Chosen but not covered', '');
+lines.push('| ID | Suite | Title | Status | Why |');
+lines.push('|---|---|---|---|---|');
+for (const item of run.notCovered ?? []) lines.push(`| ${item.id} | ${item.suite} | ${cell(item.title)} | ${item.status} | ${cell(item.why)} |`);
+if (!(run.notCovered ?? []).length) lines.push('| - | | none | | |');
 lines.push('');
 
 lines.push('## Acceptance items', '');

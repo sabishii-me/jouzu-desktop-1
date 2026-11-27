@@ -2,10 +2,11 @@ import { execFileSync, spawn } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { platformName, readResults, slug } from './common.mjs';
+import { listPlaybook, loadCatalog, matchCode, selected } from './catalog.mjs';
 
-// The neutral suite runner. It runs every case of the plan's playbooks (plan.playbooks; default the
-// abnormal-path playbook) on its own,
-// in its own throwaway home, host, browser and fixture provider (abnormal-exam.mjs with
+// The neutral suite runner. It runs the cases the plan selects from the case catalog
+// (release-checks/cases/*.yaml; plan.select {suites, scenarios, priorities, ids}, none = all),
+// each on its own, in its own throwaway home, host, browser and fixture provider (abnormal-exam.mjs with
 // ABN_ONLY set to that one case), and records what happened. It judges nothing beyond
 // the case's own checks, never stops early, and never decides what a failure means.
 //
@@ -36,10 +37,10 @@ const plan = JSON.parse(readFileSync(resolve(args.plan), 'utf8'));
 const out = resolve(args.out);
 mkdirSync(out, { recursive: true });
 const here = import.meta.dirname;
-// RUN_EXAM / RUN_PLAYBOOK replace the exam and playbook only to test this runner (test/selftest.mjs).
+// RUN_EXAM / RUN_CATALOG replace the exam and the case catalog only to test this runner (test/selftest.sh).
 const exam = resolve(process.env.RUN_EXAM ?? join(here, '..', 'e2e-runtime', 'abnormal-exam.mjs'));
-// The playbooks whose cases this plan runs (plan.playbooks, file names in harness/e2e; default the abnormal-path one).
-const playbooks = process.env.RUN_PLAYBOOK ? [resolve(process.env.RUN_PLAYBOOK)] : (plan.playbooks ?? ['abnormal-playbook.mjs']).map(name => resolve(here, '..', 'e2e', name));
+const catalog = loadCatalog(process.env.RUN_CATALOG ? resolve(process.env.RUN_CATALOG) : undefined);
+const chosen = selected(catalog, plan.select);
 const platform = platformName();
 const languages = (args.langs ?? process.env.ABN_LANGS ?? 'en').split(',').map(item => item.trim()).filter(Boolean);
 const timeoutMs = (plan.caseTimeoutMinutes ?? 10) * 60_000;
@@ -56,20 +57,31 @@ function elevated() {
 }
 if (elevated() && !process.env.RUN_SELFTEST) { console.error('Entry criterion not met: this account is root or an administrator. Run the suite as a normal user.'); process.exit(2); }
 
-// ---- The cases, from the playbook itself. ----
-const listed = playbooks.flatMap(playbook => JSON.parse(execFileSync(process.execPath, [playbook], { env: { ...process.env, PLAYBOOK_LIST: '1', PLAYBOOK_SHOTS: join(out, '.list') }, encoding: 'utf8' })).map(item => ({ ...item, playbook })));
+// ---- The cases: chosen from the catalog, run by the playbook code the catalog names. ----
+const playbookFiles = [...new Set(catalog.filter(entry => entry.automation.impl?.case).map(entry => entry.automation.impl.file))];
+const listed = playbookFiles.flatMap(file => listPlaybook(file, { ...process.env, TMPDIR: out }));
+const mismatch = matchCode(catalog, listed);
+if (mismatch.length) { console.error(`Entry criterion not met: the case catalog and the code do not match:\n${mismatch.join('\n')}`); process.exit(2); }
 // ABN_ONLY matches by contained text: one name inside another would run two cases at once.
 const clashes = listed.flatMap(a => listed.filter(b => a !== b && b.name.toLowerCase().includes(a.name.toLowerCase())).map(b => `"${a.name}" is inside "${b.name}"`));
 if (clashes.length) { console.error(`Case names overlap; the runner cannot run them one by one:\n${clashes.join('\n')}`); process.exit(2); }
+const codeOf = entry => listed.find(item => item.file === entry.automation.impl.file && item.name === entry.automation.impl.case);
 const confirmation = new Set(plan.confirmation ?? []);
 const excluded = new Set(plan.exclude ?? []);
-const queue = languages.flatMap(language => listed.filter(item => item.langs.includes(language) && !excluded.has(item.name)).map(item => ({ name: item.name, language, suite: confirmation.has(item.name) ? 'B' : 'A', playbook: item.playbook, scenario: item.scenario ?? null, world: item.world ?? null })));
-const declaredSkip = (name) => (plan.declaredSkips ?? []).find(item => item.case === name && (!item.platforms || item.platforms.includes(platform)));
+const runnable = chosen.filter(entry => entry.automation.status === 'automated' && entry.automation.impl.case && entry.platforms.includes(platform) && !excluded.has(entry.id));
+const queue = languages.flatMap(language => runnable.filter(entry => entry.languages.includes(language)).map(entry => ({
+  id: entry.id, name: entry.automation.impl.case, language, suite: confirmation.has(entry.id) || confirmation.has(entry.automation.impl.case) ? 'B' : 'A',
+  layer: entry.suite, playbook: codeOf(entry).playbook, scenario: entry.scenario, world: entry.world === 'user' ? null : entry.world,
+})));
+// Chosen cases this platform should run but no code runs: listed in the report as not covered.
+const notCovered = chosen.filter(entry => entry.platforms.includes(platform) && entry.automation.status !== 'automated')
+  .map(entry => ({ id: entry.id, title: entry.title, suite: entry.suite, status: entry.automation.status, why: entry.automation.reason ?? entry.automation.note ?? '' }));
+const declaredSkip = (item) => (plan.declaredSkips ?? []).find(skip => (skip.case === item.id || skip.case === item.name) && (!skip.platforms || skip.platforms.includes(platform)));
 
 writeFileSync(join(out, 'run.json'), `${JSON.stringify({
   plan: resolve(args.plan), version: plan.version, machine: args.machine, platform, languages,
   app: Object.fromEntries(['ABN_HOST', 'ABN_DIST', 'ABN_RUNTIME_APP', 'ABN_UNIX_LAYOUT', 'ABN_INSTALL', 'ABN_MANAGED', 'ABN_SHELL', 'ABN_EXTENSIONS'].filter(name => process.env[name]).map(name => [name, process.env[name]])),
-  harness: harnessCommit(), cases: queue.length, startedAt: new Date().toISOString(),
+  harness: harnessCommit(), select: plan.select ?? 'all', cases: queue.length, notCovered, startedAt: new Date().toISOString(),
 }, null, 2)}\n`);
 
 function harnessCommit() {
@@ -130,7 +142,7 @@ async function runOnce(item, phase, attempt) {
   killList(left);
 
   const record = {
-    case: item.name, language: item.language, suite: item.suite, scenario: item.scenario, playbook: relative(join(here, '..', 'e2e'), item.playbook).split('\\').join('/'), phase, attempt, machine: args.machine, platform,
+    id: item.id, case: item.name, language: item.language, suite: item.suite, layer: item.layer, scenario: item.scenario, playbook: relative(join(here, '..', 'e2e'), item.playbook).split('\\').join('/'), phase, attempt, machine: args.machine, platform,
     status: 'ERROR', problems: [], notes: [], ms: Date.now() - started, exitCode: code,
     evidence: relative(out, folder).split('\\').join('/'),
     leftProcesses: left.map(row => row.name), at: new Date().toISOString(),
@@ -145,7 +157,7 @@ async function runOnce(item, phase, attempt) {
   } else if (!found) {
     record.problems.push(run?.error ? `the case did not run: ${String(run.error).split('\n')[0]}` : `the case did not run (exam exit code ${code}); see exam.log`);
   } else if (found.skipped) {
-    const declared = declaredSkip(item.name);
+    const declared = declaredSkip(item);
     record.notes.push(...found.notes);
     if (declared) { record.status = 'SKIP'; record.notes.push(`planned: ${declared.reason}`); }
     else record.problems.push(`the case skipped itself, and the plan declares no skip for it on ${platform}: ${found.notes.join('; ')}`);

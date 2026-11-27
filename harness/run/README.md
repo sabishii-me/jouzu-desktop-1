@@ -5,7 +5,8 @@ beyond each case's own checks, never stops early, and writes no conclusions.
 
 | Script | What it does |
 |---|---|
-| `run-suite.mjs` | Suites A and B: every case of `e2e/abnormal-playbook.mjs`, each in its own throwaway world, then 3 re-runs of every FAIL and ERROR. |
+| `run-suite.mjs` | Suites A and B: the cases the plan selects from the case catalog (`release-checks/cases`, see its README), each in its own throwaway world, then 3 re-runs of every FAIL and ERROR. It refuses to start when the catalog and the code do not match. |
+| `catalog.mjs` | Reads and checks the case catalog (`--check`), and writes the table people read (`--table`). |
 | `record.mjs` | Suites C and D: records one acceptance item of the plan (PASS/FAIL, what was seen, evidence files). `--show <id>` prints its steps and expected results. |
 | `report.mjs` | Writes `report.md` and `results.txt` from `results.jsonl`. Can be run again at any time; runs nothing. |
 | `test/selftest.sh` | Tests the runner with a stand-in exam (pass, fail, hang, crash, skips, flaky, a process left behind). No app, no browser. |

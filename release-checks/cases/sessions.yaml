@@ -1,0 +1,344 @@
+# Starting the app and saved sessions (scenarios U4, U9).
+- id: START-001
+  legacy: [P1]
+  title: Cold start opens the last session
+  suite: smoke
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: After the app is closed and opened again, loading ends on the session the person was in. Its history and title are there and a message can be sent at once.
+  preconditions:
+    world: user
+  data: Fixture model (arithmetic questions with known answers).
+  steps:
+    - do: Open a new session and send a message.
+      expect: The reply arrives.
+    - do: Close the app and open it again.
+      expect: When loading ends the same session is shown with its history and title, within 30 s.
+    - do: Send the next message at once.
+      expect: The reply arrives within 30 s.
+  measures: [openToHistoryMs, hostStartToLoadingReadyMs]
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: release-playbook.mjs, case: P1 Cold start opens the last session }
+  added: 1.1.5
+
+- id: START-002
+  legacy: [P2]
+  title: Without a remembered session the folder's latest one opens
+  suite: main
+  scenario: U9
+  priority: high
+  type: functional
+  purpose: When the window remembers only the folder, its most recent session opens with its whole history, tool results included.
+  preconditions:
+    world: user
+  data: A reply that runs a tool (fixture TOOL).
+  steps:
+    - do: Send a message whose reply uses a tool.
+      expect: The tool result and the reply show.
+    - do: Make the window forget the session (keep the folder) and start the app again.
+      expect: The folder's latest session opens with its whole history, the tool result included.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: release-playbook.mjs, case: P2 Without a remembered session the folder's latest one opens }
+  added: 1.1.5
+
+- id: SESS-001
+  legacy: [P3, P5]
+  title: Sending in an old session keeps it whole
+  suite: main
+  scenario: U9
+  priority: high
+  type: functional
+  purpose: Opening an old session of the same folder and sending keeps the history and title, writes the same file, adds no row; after a reload and a full restart it is still there.
+  preconditions:
+    world: user
+  steps:
+    - do: Make a session with one answered message; restart the app; open another session.
+      expect: Both are listed.
+    - do: Click the old session.
+      expect: Its history shows (proposed line 1 s, not decided; the case notes it).
+    - do: Send a message.
+      expect: The reply arrives; the earlier history stays; exactly that session's file grows; no new file with its messages; no new row; the title is unchanged.
+    - do: Reload the window, then restart the app.
+      expect: The old session is still listed both times.
+  limits:
+    - { what: click to history, line: 1 s, by: proposed, not decided }
+  measures: [clickToHistoryMs]
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: release-playbook.mjs, case: P3 P5 Sending in an old session keeps it whole }
+  added: 1.1.5
+
+- id: SESS-002
+  legacy: [P4]
+  title: An old session of another folder stays in its folder
+  suite: main
+  scenario: U11
+  priority: high
+  type: functional
+  purpose: Opening an old session that belongs to another folder and sending behaves as SESS-001, and the session stays in its own folder (the file header says which).
+  preconditions:
+    world: user
+    state: A second folder added to the app.
+  steps:
+    - do: Add a second folder; start a new session there with the folder picker; send a message.
+      expect: The reply arrives; the session file's header names the second folder.
+    - do: Restart the app; open a session of the first folder; then click the old session of the second folder.
+      expect: Its history shows within 10 s.
+    - do: Send a message.
+      expect: The reply arrives; it is written to the same file; the header still names the second folder; no new file holds its messages; it is listed under the second folder, also after a reload.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: release-playbook.mjs, case: P4 An old session of another folder stays in its folder }
+    note: A new session file without messages (a prepared session) appearing meanwhile is recorded as a note.
+  added: 1.1.5
+
+- id: SESS-003
+  legacy: [P6]
+  title: A very large old session (20 MB or more) opens and answers
+  suite: main
+  scenario: U9
+  priority: medium
+  type: performance
+  purpose: The history of a very large session is readable at once, sending does not freeze the window, and the status first says it is starting.
+  preconditions:
+    world: user
+    state: A saved session of 20 MB or more (a generated one, never a person's real session).
+  steps:
+    - do: Click the large session.
+      expect: Its history is readable at once.
+    - do: Send a message.
+      expect: The window stays responsive; the status shows starting, then the reply arrives.
+  limits:
+    - { what: click to history, line: 1 s regardless of file size, by: proposed, not decided }
+  measures: [sessionHistoryMs, attachMs, firstOutputMs]
+  automation:
+    status: planned
+
+- id: SESS-004
+  legacy: [P9]
+  title: Switching away and back shows the reply as it was live
+  suite: main
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: Switching to another session and back, while a reply runs and after it ended, shows the same tool calls and results as live, never "Unsupported content".
+  preconditions:
+    world: user
+  steps:
+    - do: Start a reply with tool calls; switch to another session and back while it runs.
+      expect: The tool calls and results match what was shown live.
+    - do: Switch away and back after it ended.
+      expect: The same; no "Unsupported content".
+  measures: [switchMs]
+  automation:
+    status: planned
+
+- id: SESS-005
+  legacy: [P10]
+  title: A background session keeps its state in the list
+  suite: main
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: A session nobody is looking at keeps its state up to date in the list and is complete when opened again.
+  preconditions:
+    world: user
+  steps:
+    - do: Start a reply and open another session.
+      expect: The first session's row shows it is running, then finished.
+    - do: Open the first session again.
+      expect: The whole reply is there.
+  measures: [stateDelayMs]
+  automation:
+    status: planned
+    note: The list state part is REG-212.
+
+- id: SESS-006
+  legacy: [P15]
+  title: Thirty open sessions still work
+  suite: main
+  scenario: U4
+  priority: medium
+  type: performance
+  purpose: With 30 sessions open, switching, sending and states still work (the lower bound for regressions).
+  preconditions:
+    world: user
+  steps:
+    - do: Open 30 sessions, each with one message.
+      expect: All listed with their states.
+    - do: Switch between them and send in several.
+      expect: Switching and replies work.
+  measures: [switchMs, firstOutputMs]
+  automation:
+    status: planned
+
+- id: SESS-007
+  legacy: [P16]
+  title: Reloading the window ten times and quitting leaves nothing behind
+  suite: main
+  scenario: U4
+  priority: medium
+  type: performance
+  purpose: After ten window reloads and quitting, no runtime is left and handle counts are back at the start.
+  preconditions:
+    world: user
+  steps:
+    - do: Reload the window ten times.
+      expect: The app works after each.
+    - do: Quit.
+      expect: No runtime process is left; handles back at the baseline.
+  measures: [processCount, handleCount]
+  automation:
+    status: planned
+
+- id: SESS-008
+  legacy: [P17, "#33"]
+  title: A draft stays in its own session
+  suite: regression
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: Text typed but not sent in one session never shows in another session's composer.
+  preconditions:
+    world: user
+  steps:
+    - do: Type a draft in one session without sending; open another session.
+      expect: The other composer is empty.
+    - do: Go back.
+      expect: The draft is there.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#33 A draft stays in its own session" }
+    note: P17 also asks for drafts across folders and after a reload; those parts are planned.
+  links: ["#33"]
+
+- id: SESS-009
+  title: Old and damaged saved sessions
+  suite: abnormal
+  scenario: U9
+  priority: medium
+  type: functional
+  purpose: Sessions written by earlier versions, half-written or empty, are listed without breaking the list; opening one shows its history or one plain reason, never a spinner; a new session still works.
+  preconditions:
+    world: user
+    state: The world's saved sessions in an older format, cut off mid-line, with an unknown entry, empty, and one whose folder was deleted.
+  steps:
+    - do: Open each damaged session.
+      expect: Its history or one plain reason shows; no spinner stays.
+    - do: Open a new session and send.
+      expect: The reply arrives.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Old and damaged saved sessions }
+
+- id: REG-233
+  legacy: ["#233"]
+  title: Opening a saved session does not show it as Running
+  suite: regression
+  scenario: U9
+  priority: medium
+  type: functional
+  purpose: Opening a saved session only starts its runtime; the list must not say it is running a reply.
+  preconditions:
+    world: user
+  steps:
+    - do: Click a saved session.
+      expect: Its row never shows Running.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#233 Opening a saved session does not show it as Running" }
+  links: ["#233", "#213"]
+
+- id: REG-212
+  legacy: ["#212"]
+  title: A background session's live state shows in the list
+  suite: regression
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: A session writing a reply while another is open shows as running; once done it shows as finished until opened; a stopped reply shows as a session at rest.
+  preconditions:
+    world: user
+  steps:
+    - do: Start a long reply and open a new session.
+      expect: The first row shows running, then finished.
+    - do: Start another reply, stop it, open a new session.
+      expect: That row shows a session at rest.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#212 A background session's live state shows in the list" }
+  links: ["#212"]
+
+- id: REG-162
+  legacy: ["#162"]
+  title: Waiting messages come back paused after a restart
+  suite: regression
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: A message waiting in the queue is kept across a restart of the app, paused, with Continue and Discard; Continue sends it once.
+  preconditions:
+    world: user
+  data: A provider that does not answer (fixture hang).
+  steps:
+    - do: Send a message to a provider that hangs; queue a second message.
+      expect: The second waits in the queue.
+    - do: Restart the app.
+      expect: The waiting message is back, paused, with Continue and Discard.
+    - do: Press Continue.
+      expect: It is sent once.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#162 Waiting messages come back paused after a restart" }
+  links: ["#162"]
+
+- id: REG-174
+  legacy: ["#174"]
+  title: A session whose folder was deleted
+  suite: regression
+  scenario: U11
+  priority: medium
+  type: functional
+  purpose: It stays in the list and in its folder group, says its folder is gone, offers no Restart session and starts no runtime.
+  preconditions:
+    world: user
+    state: A saved session whose folder no longer exists.
+  steps:
+    - do: Click it.
+      expect: It says its folder is gone; no Restart session; no runtime starts.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#174 A session whose folder was deleted" }
+  links: ["#174"]
+
+- id: REG-119
+  legacy: ["#119"]
+  title: An image in a sent message stays after switching sessions
+  suite: regression
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: The image a person sent is still shown in the message after opening another session and coming back.
+  preconditions:
+    world: user
+  steps:
+    - do: Send a message with an image; open another session; come back.
+      expect: The image still shows in the message.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#119 An image in a sent message stays after switching sessions" }
+  links: ["#119"]

@@ -4,7 +4,7 @@
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 out=$(mktemp -d)
-RUN_SELFTEST=1 RUN_EXAM="$here/fake-exam.mjs" RUN_PLAYBOOK="$here/fake-playbook.mjs" ABN_LANGS=en,ja node "$here/../run-suite.mjs" --plan "$here/plan.json" --out "$out" --machine selftest
+RUN_SELFTEST=1 RUN_EXAM="$here/fake-exam.mjs" RUN_CATALOG="$here/cases" ABN_LANGS=en,ja node "$here/../run-suite.mjs" --plan "$here/plan.json" --out "$out" --machine selftest
 mkdir -p "$out/accept" && echo shot > "$out/accept/c1.txt"
 node "$here/../record.mjs" --out "$out" --plan "$here/plan.json" --machine selftest --id C1 --result PASS --actual "It opened" --evidence accept/c1.txt
 node "$here/../report.mjs" --out "$out" --plan "$here/plan.json"

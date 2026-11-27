@@ -2,11 +2,8 @@
   "planId": "1.1.5-rc.4 v1 (draft until the product owner approves)",
   "version": "1.1.5-rc.4",
   "purpose": "First full run under the release test procedure: suite A (every case) on every machine, suite B (confirmation of each fix in rc.4), suites C and D (acceptance of new features, install and update).",
-  "playbooks": [
-    "abnormal-playbook.mjs",
-    "release-playbook.mjs"
-  ],
-  "playbooksNote": "release-playbook.mjs holds the release playbook steps (P1-P29) and the main user scenarios (N1-N4). A case may ask for its own world: new-user (nothing prepared; the app installs its runtime, needs the network) or shisa-stand-in (Shisa.AI sign-in goes to the fixture stand-in through the runtime address setting).",
+  "select": {},
+  "selectNote": "Cases come from the case catalog (release-checks/cases). An empty select runs every automated case for this platform; chosen cases that are not automated are listed in the report as not covered. Smoke cases (suite smoke) are the most used paths.",
   "machines": {
     "windows-en": [
       "en"
@@ -31,9 +28,9 @@
   "caseTimeoutNote": "15 min: N1 (a new user) downloads and installs the runtime inside the case.",
   "reruns": 3,
   "confirmation": [
-    "#173 An environment change reaches the open session",
-    "#162 Waiting messages come back paused after a restart",
-    "Settings file cannot be written"
+    "REG-173",
+    "REG-162",
+    "SET-002"
   ],
   "confirmationNote": "Suite cases that confirm a fix in rc.4. Keep only those whose fix is in rc.4; add the case of every other fix before the plan is frozen.",
   "declaredSkips": [],

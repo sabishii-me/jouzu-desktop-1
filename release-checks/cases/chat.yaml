@@ -1,0 +1,438 @@
+# Everyday chat: new sessions, replies, Stop, the queue (scenario U4).
+- id: CHAT-001
+  legacy: [P7]
+  title: A new session answers at once
+  suite: smoke
+  scenario: U4
+  priority: high
+  type: performance
+  purpose: A new session in this folder can be used at once.
+  preconditions:
+    world: user
+  steps:
+    - do: Open a new session and send a message.
+      expect: From the host taking the message to the reply's first output is under 2 s.
+  limits:
+    - { what: message.accepted to message.first_output, line: "fail above 2 s, target 0.5 s", by: product owner 2026-11-13 }
+  measures: [acceptedToFirstOutputMs]
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: release-playbook.mjs, case: P7 A new session answers at once }
+  added: 1.1.5
+
+- id: CHAT-002
+  legacy: [P8]
+  title: A new session while another one is running
+  suite: main
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: A new session can be opened while another reply runs; the running one is not affected and both rows show their state.
+  preconditions:
+    world: user
+  steps:
+    - do: Start a long reply; open a new session and send there.
+      expect: Both replies arrive; both rows show their state.
+  automation:
+    status: planned
+
+- id: CHAT-003
+  legacy: [P11]
+  title: Stop while a tool runs
+  suite: smoke
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: Stop while a tool is running ends the turn safely, the tool shows as stopped (not running), nothing is shown as an error, and the next message is answered.
+  preconditions:
+    world: user
+  data: A reply that runs a 30 s command (fixture TOOLWAIT).
+  steps:
+    - do: Send a message whose reply runs a long command; wait until it shows as running.
+      expect: The status names the running tool.
+    - do: Press Stop.
+      expect: Send comes back within 2 s; no problem is shown; the tool no longer shows as running.
+    - do: Send the next message.
+      expect: The reply arrives.
+  limits:
+    - { what: Stop to Send back, line: 2 s, by: release playbook }
+  measures: [stopToSendMs, recoveredReplyMs]
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: release-playbook.mjs, case: P11 Stop while a tool runs }
+    note: Stop while starting and while writing are CHAT-017 and CHAT-019.
+  added: 1.1.5
+
+- id: CHAT-004
+  legacy: [P12]
+  title: Switching the model
+  suite: main
+  scenario: U5
+  priority: high
+  type: functional
+  purpose: The model list shows only chat models, also before the first message; the next turn uses the chosen model and the model shown is the one used.
+  preconditions:
+    world: user
+  steps:
+    - do: Open the model list in a new session.
+      expect: Only chat models are listed.
+    - do: Choose another model and send.
+      expect: The provider is asked with that model; the composer shows it.
+  measures: [switchMs]
+  automation:
+    status: planned
+    note: Partly covered before 1.1.5 by product tests; no harness case yet.
+
+- id: CHAT-005
+  legacy: [P13]
+  title: A question or approval from the agent
+  suite: main
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: When the agent asks a question or needs an approval, the app shows it and the reply continues after the answer.
+  preconditions:
+    world: user
+  steps:
+    - do: Send a message whose reply asks a question.
+      expect: The question shows with its choices.
+    - do: Answer it.
+      expect: The reply continues and ends.
+  automation:
+    status: planned
+
+- id: CHAT-006
+  legacy: [P23]
+  title: A reply with many steps keeps every step on screen
+  suite: main
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: In a reply of five or more steps (thinking, tool, thinking) each step's reasoning and tool stay on screen; after a reload and a restart it looks the same.
+  preconditions:
+    world: user
+  data: Fixture STEPS:n reply.
+  steps:
+    - do: Send a message whose reply takes 6 steps.
+      expect: Every step's thinking and tool stay on screen; none disappears after the second.
+    - do: Reload, then restart the app.
+      expect: The reply looks the same.
+  measures: [stepWaitMs]
+  automation:
+    status: planned
+
+- id: CHAT-007
+  legacy: [P24]
+  title: The status line says what the reply is doing
+  suite: main
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: While a reply runs, the status line says what is happening (waiting for the model and how long, thinking, writing, which tool and how long, which step); never a bare Working.
+  preconditions:
+    world: user
+  steps:
+    - do: Send a message whose reply thinks, runs a tool and writes.
+      expect: Each phase is named on the status line.
+  automation:
+    status: planned
+
+- id: CHAT-008
+  legacy: [P25]
+  title: Automatic retry and context compaction are shown
+  suite: main
+  scenario: U6
+  priority: medium
+  type: functional
+  purpose: A failed model request that is retried shows "request failed, retry a/b (reason)"; compaction shows as such; neither looks stuck.
+  preconditions:
+    world: user
+  steps:
+    - do: Make the provider fail once, then answer.
+      expect: The status shows the retry with its count and reason; the reply arrives.
+    - do: Fill the context until it is compacted.
+      expect: The status shows compaction.
+  automation:
+    status: planned
+
+- id: CHAT-009
+  legacy: [P26]
+  title: A tool stopped or cut off shows as interrupted
+  suite: main
+  scenario: U7
+  priority: high
+  type: functional
+  purpose: A tool stopped half-way, or cut off when the runtime ends, shows as interrupted or failed, never still running; the next turn works; in old sessions a tool without a result also shows as interrupted.
+  preconditions:
+    world: user
+  steps:
+    - do: Stop while a tool runs; then end the runtime while another tool runs.
+      expect: Both tools show as interrupted; none as running.
+    - do: Open an old session with a tool call that has no result.
+      expect: That tool shows as interrupted.
+  automation:
+    status: planned
+    note: The Stop part is CHAT-003.
+
+- id: CHAT-010
+  legacy: [P27]
+  title: Two messages sent while a reply runs are each used once
+  suite: main
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: While a reply runs, two messages go to the queue above the composer and the button says Steer; the runtime takes them in order, each shows once in the conversation, the model is asked about each once, and the queue empties.
+  preconditions:
+    world: user
+  steps:
+    - do: Start a long reply; send two messages.
+      expect: Both wait in the queue in order, not yet in the conversation; the button says Steer.
+    - do: Wait for the reply to end.
+      expect: Each shows once in the conversation, in order; the provider was asked about each once; the queue is empty.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: release-playbook.mjs, case: P27 Two messages sent while a reply runs are each used once }
+  added: 1.1.5
+
+- id: CHAT-011
+  legacy: [P28]
+  title: Queued messages can be deleted, edited and kept on Stop
+  suite: main
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: A deleted queued message is never sent; Edit puts its text and image back in the composer; after Stop the rest wait with Continue and Discard, Continue sends once, and Stop is not shown as an error.
+  preconditions:
+    world: user
+  steps:
+    - do: Queue three messages during a long reply; delete one; edit one.
+      expect: The deleted one is gone; the edited one is back in the composer.
+    - do: Press Stop.
+      expect: The rest wait with Continue and Discard; no error shows.
+    - do: Press Continue.
+      expect: Each waiting message is sent once; the deleted one never.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: release-playbook.mjs, case: "P28 Queued messages can be deleted, edited and kept on Stop" }
+  added: 1.1.5
+
+- id: CHAT-012
+  legacy: [P21]
+  title: TextGuard per session (on, strict, off)
+  suite: main
+  scenario: U8
+  priority: low
+  type: functional
+  purpose: The TextGuard mode is kept per session and never switched off by itself.
+  preconditions:
+    world: user
+  steps:
+    - do: Set different modes in two sessions; switch and restart.
+      expect: Each session keeps its own mode.
+  automation:
+    status: deferred
+    note: The product owner put TextGuard, Flow and web access last (release playbook 2026-11-14).
+
+- id: CHAT-013
+  legacy: [P22]
+  title: A request held by Flow
+  suite: main
+  scenario: U4
+  priority: low
+  type: functional
+  purpose: The banner's actions on a held request work and nothing stays stuck.
+  preconditions:
+    world: user
+  steps:
+    - do: Get a request held by Flow; use each banner action.
+      expect: Each action works; the session is not stuck.
+  automation:
+    status: deferred
+    note: Put last by the product owner (2026-11-14).
+
+- id: CHAT-014
+  legacy: [P20]
+  title: Web access from this computer and another device
+  suite: main
+  scenario: U4
+  priority: low
+  type: functional
+  purpose: Through web access, opening old sessions and new sessions behave as SESS-001 and CHAT-001.
+  preconditions:
+    world: user
+  steps:
+    - do: Open the app through web access, here and from another device.
+      expect: Same as SESS-001 and CHAT-001.
+  automation:
+    status: deferred
+    note: Web access is not in the product yet; written when it ships.
+
+- id: CHAT-015
+  title: Nothing moves while a reply runs
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: The baseline for every layout check. Starting and ending a normal turn does not move the composer or resize the conversation.
+  preconditions:
+    world: user
+  steps:
+    - do: Send a message with a long reply and watch the layout.
+      expect: The composer and conversation keep their place and size.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Nothing moves while a reply runs }
+
+- id: CHAT-016
+  title: Stop right after Send
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: Stop before anything is written ends the turn; nothing is left running or shown as failed.
+  preconditions:
+    world: user
+  data: Provider slow to the first word.
+  steps:
+    - do: Send and press Stop at once.
+      expect: Send comes back; nothing shows as running or failed; the next message is answered.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Stop right after Send }
+
+- id: CHAT-017
+  title: Stop while the provider has not answered
+  suite: abnormal
+  scenario: U6
+  priority: high
+  type: functional
+  purpose: A provider that hangs must never trap the session. Stop gives Send back.
+  preconditions:
+    world: user
+  data: Provider that never answers (fixture hang).
+  steps:
+    - do: Send, then press Stop.
+      expect: Send comes back; the next message is answered once the provider answers again.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Stop while the provider has not answered }
+
+- id: CHAT-018
+  title: Stop while the reply is writing
+  suite: abnormal
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: Stop during output keeps what was written and gives Send back.
+  preconditions:
+    world: user
+  steps:
+    - do: Press Stop while the reply is writing.
+      expect: The written part stays; Send comes back; the next message is answered.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Stop while the reply is writing }
+
+- id: CHAT-019
+  title: Stop while a new session's runtime is still starting
+  suite: abnormal
+  scenario: U7
+  priority: medium
+  type: functional
+  purpose: Stop during a slow start leaves a usable session.
+  preconditions:
+    world: user
+  data: Runtime start delayed 8 s.
+  steps:
+    - do: Send in a new session while its runtime starts; press Stop.
+      expect: The session is usable; the next message is answered.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "Stop while a new session's runtime is still starting" }
+
+- id: CHAT-020
+  title: Stop with a message waiting in the queue
+  suite: abnormal
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: The waiting message is kept (Continue or Discard), never lost or sent twice.
+  preconditions:
+    world: user
+  steps:
+    - do: Queue a message during a long reply; press Stop.
+      expect: The message waits with Continue and Discard.
+    - do: Press Continue.
+      expect: It is sent once.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Stop with a message waiting in the queue }
+
+- id: REG-214
+  legacy: ["#214"]
+  title: A finished reply is not shown as Interrupted
+  suite: regression
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: After a normal turn the status line says how it ended, never "Interrupted".
+  preconditions:
+    world: user
+  steps:
+    - do: Send a message and let the reply end.
+      expect: The status line never says Interrupted.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#214 A finished reply is not shown as Interrupted" }
+  links: ["#214"]
+
+- id: REG-177
+  legacy: ["#177", "#179"]
+  title: Send while a new session's runtime starts
+  suite: regression
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: On a slow start the message is sent at once, the session is listed at once, Stop is offered and Steer is not.
+  preconditions:
+    world: user
+  data: Runtime start delayed 8 s.
+  steps:
+    - do: Send in a new session while its runtime starts.
+      expect: The message shows at once; the session is listed; Stop is offered, Steer is not; the reply arrives.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#177 #179 Send while a new session's runtime starts" }
+  links: ["#177", "#179"]
+
+- id: UI-001
+  legacy: [P29]
+  title: Problems and notices are shown in their place
+  suite: main
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: No floating notice or pop-up at the top; a session's notices appear in one place above the composer in one style (a sentence, an action, details); app-level errors stay in Settings, the folder list or their panel; no raw technical text on screen except under Details.
+  preconditions:
+    world: user
+  steps:
+    - do: At the end of every case, look at the whole window.
+      expect: No floating notice; no raw technical text as a main sentence.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: release-playbook.mjs, check: endCheck }
+    note: Not a case of its own. Every release-playbook case runs this end check; abnormal cases run the same judgements (judgeShown).
+  added: 1.1.5

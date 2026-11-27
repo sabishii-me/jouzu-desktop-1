@@ -1,0 +1,107 @@
+# Sign-in and models (U5), the image tool (U10), security (U12).
+- id: SIGN-001
+  legacy: [N4]
+  title: Sign in to Shisa.AI and sign out
+  suite: main
+  scenario: U5
+  priority: high
+  type: functional
+  purpose: In Settings the person signs in to Shisa.AI. The app shows the sign-in address and the device code, says it is connected once the device is approved, with no restart. Signing out asks Shisa.AI to revoke the device and the app shows the signed-out state again. Nothing is shown as an error.
+  preconditions:
+    world: shisa-stand-in
+    state: Shisa.AI sign-in goes to a local stand-in through the runtime's address setting (JOUZU_SHISA_PLATFORM_URL); the stand-in approves on its second poll.
+  steps:
+    - do: Settings > Model providers > Sign in to Shisa.AI.
+      expect: The sign-in address (platform.shisa.ai/connect) and the device code Shisa.AI gave are shown.
+    - do: Wait for the approval.
+      expect: Within 30 s the app says it is connected; the link is confirmed to Shisa.AI; no problem is shown.
+    - do: Sign out.
+      expect: Within 30 s the signed-out state is back; Shisa.AI was asked to revoke the device; no problem is shown.
+    - do: Send a message with the fixture model.
+      expect: The reply arrives.
+  measures: [signInToConnectedMs]
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: release-playbook.mjs, case: N4 Sign in to Shisa.AI and sign out }
+  added: 1.1.5
+
+- id: SIGN-002
+  legacy: [N4, C-mac-models]
+  title: The model list follows sign-in and sign-out without a restart
+  suite: main
+  scenario: U5
+  priority: high
+  type: functional
+  purpose: After sign-in the New session model list has the account's models without a restart; after sign-out they are gone.
+  preconditions: { world: shisa-stand-in }
+  steps:
+    - do: Note the model list; sign in.
+      expect: The account's models are listed, without a restart.
+    - do: Sign out.
+      expect: Those models are gone.
+  automation:
+    status: gap
+    reason: The runtime (jouzu 0.2.5) always fetches the Shisa.AI model list from the fixed api.shisa.ai address and does not use the model-list address the sign-in returns, so a stand-in cannot serve it, and a real account needs a person to approve the sign-in in a browser.
+    note: Recorded by hand as acceptance item C-mac-models.
+  added: 1.1.5
+
+- id: IMG-001
+  legacy: [P19, C-win-image]
+  title: The image tool with a paid account and with ChatGPT
+  suite: main
+  scenario: U10
+  priority: high
+  type: functional
+  purpose: With a valid key the image tool makes an image in each language and with each provider; otherwise it gives a clear message.
+  preconditions:
+    world: user
+    state: A dedicated QA test account for the Shisa.AI image service (decided by the product owner 2026-11-27); its key in a secret store, never in the repository.
+  steps:
+    - do: Ask for an image in en and in ja.
+      expect: An image is made each time.
+    - do: Choose the other provider and ask again.
+      expect: An image is made.
+    - do: Use a key that is not valid.
+      expect: A clear message says what is wrong.
+  automation:
+    status: planned
+    note: Recorded by hand as acceptance item C-win-image until the QA account's key is available to the harness.
+
+- id: IMG-002
+  legacy: [C-mac-image-free]
+  title: The image tool with a free Shisa.AI account
+  suite: main
+  scenario: U10
+  priority: medium
+  type: functional
+  purpose: With a free account, Settings > Tools shows Shisa.AI as the provider and says the plan has no image generation; asking for an image gives that message, not an error.
+  preconditions:
+    world: user
+    state: A dedicated free QA test account.
+  steps:
+    - do: Open Settings > Tools.
+      expect: Shisa.AI is the provider and the plan's limit is said.
+    - do: Ask for an image.
+      expect: A clear message about the plan.
+  automation:
+    status: planned
+    note: Recorded by hand as acceptance item C-mac-image-free.
+
+- id: SEC-001
+  legacy: ["#130"]
+  title: The host token is in no file
+  suite: regression
+  scenario: U12
+  priority: high
+  type: security
+  purpose: The host gives its API token only to the app that started it; the agent's tools cannot read it from a file.
+  preconditions: { world: user }
+  steps:
+    - do: Search the app's home for the host token.
+      expect: No file holds it.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#130 The host token is in no file" }
+  links: ["#130"]

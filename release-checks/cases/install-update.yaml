@@ -1,0 +1,210 @@
+# New install and update (scenarios U1, U2, U3).
+- id: INST-001
+  legacy: [N1]
+  title: A new user's first run
+  suite: smoke
+  scenario: U1
+  priority: high
+  type: install
+  purpose: A person who never used Jouzu opens it. The app prepares its runtime by itself, asks for the languages, offers Shisa.AI sign-in and another provider, and after a provider is saved a new session answers, with no restart and nothing for the person to fix.
+  preconditions:
+    world: new-user
+    state: No runtime, model, settings or sessions. The machine is online.
+  data: Custom provider = the fixture (OpenAI-compatible), model "deterministic".
+  steps:
+    - do: Open the app.
+      expect: The app prepares its runtime on its own. A failure says in plain words what failed.
+    - do: Wait, and press Continue on the language page.
+      expect: The language page comes first, then the model connection page, which offers Shisa.AI sign-in.
+    - do: On the same page add a custom provider (address, model ID, key) and save.
+      expect: The chat opens within 2 min, without a restart.
+    - do: Open a new session and send a message.
+      expect: The reply arrives within 30 s. The host started once.
+  measures: [toConnectPageMs, saveToChatMs, firstRunToFirstReplyMs]
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: release-playbook.mjs, case: "N1 A new user's first run" }
+  links: [O8]
+  added: 1.1.5
+
+- id: INST-002
+  legacy: [D-mac-1, D-linux-1]
+  title: First run of the installed package on macOS and Linux
+  suite: main
+  scenario: U1
+  priority: high
+  type: install
+  purpose: The DMG app, the AppImage and the .deb, started with a throwaway home, install their runtime on their own and answer a message.
+  preconditions:
+    world: installed-package
+    state: The package of this rc, a throwaway home.
+  steps:
+    - do: Start the installed app with a throwaway home.
+      expect: The start page becomes ready on its own.
+    - do: Open a new session and send a message.
+      expect: A reply arrives.
+  platforms: [macos, linux]
+  automation:
+    status: planned
+    note: Recorded by hand as acceptance items D-mac-1 and D-linux-1 until the harness drives the installed package.
+  added: 1.1.5
+
+- id: INST-003
+  legacy: [D-mac-2, D-linux-1]
+  title: Quitting or killing the app leaves no host or runtime
+  suite: main
+  scenario: U1
+  priority: medium
+  type: install
+  purpose: After Quit, and after the app process is killed, no host or runtime of that app is left running.
+  preconditions:
+    world: installed-package
+  steps:
+    - do: Quit the app (Cmd+Q, closing the window).
+      expect: No host or runtime process is left.
+    - do: Start it again and kill the app process.
+      expect: Within 5 s no host or runtime process is left.
+  platforms: [macos, linux]
+  automation:
+    status: planned
+    note: Recorded by hand as acceptance items D-mac-2 and D-linux-1.
+  added: 1.1.5
+
+- id: INST-004
+  legacy: [D-mac-3, D-linux-1]
+  title: Runtime files deleted while the app runs are reinstalled
+  suite: abnormal
+  scenario: U7
+  priority: medium
+  type: install
+  purpose: The app notices its runtime files are gone, says it is reinstalling them, and a session answers afterwards.
+  preconditions:
+    world: installed-package
+  steps:
+    - do: With the app running, delete the runtime's files under its home.
+      expect: Within 60 s the app shows that it is reinstalling the runtime.
+    - do: Open a session and send a message.
+      expect: A reply arrives.
+  platforms: [macos, linux]
+  automation:
+    status: planned
+    note: Recorded by hand as acceptance items D-mac-3 and D-linux-1. The source-build form of this path is RT-007.
+  added: 1.1.5
+
+- id: UPD-001
+  legacy: [N2, D-upg-1]
+  title: Update from the last release keeps sessions, settings and sign-ins
+  suite: smoke
+  scenario: U2
+  priority: high
+  type: update
+  purpose: A person on the last release updates in the app through the QA feed. After the update every session, setting and sign-in is still there and a message is answered.
+  preconditions:
+    world: installed-app
+    state: The last release installed and used (sessions, a changed setting, a sign-in). The real data and install folders of the test machine moved aside first and restored after.
+  data: The real QA update feed (the feed is compiled into the app; there is no address switch).
+  steps:
+    - do: Settings > check for updates.
+      expect: The rc under test is offered.
+    - do: Install it.
+      expect: The app restarts on the new version by itself.
+    - do: Open the sessions, Settings and the model list.
+      expect: Sessions, the changed setting and the sign-in are all there.
+    - do: Send a message in an old session.
+      expect: A reply arrives.
+  platforms: [windows]
+  automation:
+    status: planned
+    note: Needs the installed app on the Windows upgrade machine. Recorded by hand as D-upg-1 until written.
+  added: 1.1.5
+
+- id: UPD-002
+  legacy: [D-upg-2]
+  title: Update between release candidates keeps data, sign-ins and the runtime
+  suite: main
+  scenario: U3
+  priority: high
+  type: update
+  purpose: An update from the previous rc keeps data and sign-ins, keeps a runtime that is already the pinned version, and never stops on Preparing.
+  preconditions:
+    world: installed-app
+    state: The previous rc installed and used.
+  steps:
+    - do: Update through the app.
+      expect: The app restarts on the new version; it does not stop on Preparing.
+    - do: Open sessions and Settings, send a message.
+      expect: Data and sign-ins are kept; a reply arrives.
+  platforms: [windows]
+  automation:
+    status: planned
+    note: Recorded by hand as D-upg-2.
+  added: 1.1.5
+
+- id: UPD-003
+  legacy: [D-upg-3]
+  title: The install folder after an update is clean
+  suite: main
+  scenario: U2
+  priority: medium
+  type: update
+  purpose: After an update Settings > System shows the release commit (not dirty), and uninstalling keeps the data folder.
+  preconditions:
+    world: installed-app
+  steps:
+    - do: After UPD-001 or UPD-002, open Settings > System.
+      expect: The commit has no "-dirty".
+    - do: Uninstall silently.
+      expect: The data folder is kept.
+  platforms: [windows]
+  automation:
+    status: planned
+    note: Recorded by hand as D-upg-3.
+  added: 1.1.5
+
+- id: UPD-004
+  legacy: [N3]
+  title: The app ends for an update while a reply runs
+  suite: main
+  scenario: U2
+  priority: high
+  type: update
+  purpose: An update ends the app while a reply is running. When the app opens again the session is there, the interrupted message has an end the person can see, and the next message is answered.
+  preconditions:
+    world: user
+  data: A reply that runs a 30 s command (fixture TOOLWAIT).
+  steps:
+    - do: Send a message whose reply runs a long command; wait until the command shows as running.
+      expect: The command shows as running.
+    - do: End the app the way the Windows installer does (host and runtimes at once) and start it again on the same data.
+      expect: Loading ends; the session is in the list with the interrupted message.
+    - do: Look at the interrupted message.
+      expect: It is not shown as running or waiting; it has a visible end (for example Interrupted).
+    - do: Send the next message.
+      expect: A reply arrives.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: release-playbook.mjs, case: "N3 The app ends for an update while a reply runs" }
+    note: The in-app update itself is UPD-001; this case covers what the update does to a running reply.
+  links: [O9]
+  added: 1.1.5
+
+- id: UPD-005
+  legacy: [P18]
+  title: Switching the update channel release → QA → release keeps data
+  suite: main
+  scenario: U3
+  priority: medium
+  type: update
+  purpose: Moving from the release channel to the QA channel and back keeps every session and setting in both directions.
+  preconditions:
+    world: installed-app
+  steps:
+    - do: Switch to the QA channel and update.
+      expect: Data is complete.
+    - do: Switch back to the release channel and update.
+      expect: Data is complete.
+  platforms: [windows]
+  automation:
+    status: planned

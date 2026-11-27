@@ -1,0 +1,240 @@
+# Settings (U8), folders (U11), what the person sends (U4).
+- id: SET-001
+  title: Rapid settings changes
+  suite: abnormal
+  scenario: U8
+  priority: medium
+  type: functional
+  purpose: Changing a setting many times quickly never fails with "another operation is running", ends on the last choice and survives a reload.
+  preconditions: { world: user }
+  steps:
+    - do: Change the interface language many times in a row.
+      expect: No "another operation is running"; the last choice is shown.
+    - do: Reload.
+      expect: The last choice is kept.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Rapid settings changes }
+
+- id: SET-002
+  title: Settings file cannot be written
+  suite: abnormal
+  scenario: U8
+  priority: high
+  type: functional
+  purpose: When a setting cannot be saved, that card says so in plain words, nothing moves, and nothing else stops working.
+  preconditions:
+    world: user
+    state: settings.json made read-only for this user (the case runs as a normal user).
+  steps:
+    - do: Change a setting that is saved in settings.json.
+      expect: The card says it was not saved, in plain words; nothing moves.
+    - do: Make the file writable again; send a message.
+      expect: The reply arrives.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Settings file cannot be written }
+
+- id: SET-003
+  title: Missing tools.json
+  suite: abnormal
+  scenario: U8
+  priority: low
+  type: functional
+  purpose: A data folder without tools settings opens the Tools page normally.
+  preconditions:
+    world: user
+    state: data/agent/tools.json removed.
+  steps:
+    - do: Open Settings > Tools.
+      expect: The page shows normally.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Missing tools.json }
+
+- id: REG-173
+  legacy: ["#173"]
+  title: An environment change reaches the open session
+  suite: regression
+  scenario: U8
+  priority: high
+  type: functional
+  purpose: A variable changed in Settings > Environment is used by the session already open, without restarting the app.
+  preconditions: { world: user }
+  data: The fixture requires a new key; the provider's key comes from an environment variable.
+  steps:
+    - do: Send with the old key.
+      expect: The key is refused.
+    - do: Set the new key in Settings > Environment and save.
+      expect: Saved, no error.
+    - do: Send again in the same session.
+      expect: The reply arrives without restarting the app.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#173 An environment change reaches the open session" }
+  links: ["#173"]
+
+- id: REG-171
+  legacy: ["#171"]
+  title: A custom connection can be removed
+  suite: regression
+  scenario: U8
+  priority: medium
+  type: functional
+  purpose: Remove connection deletes the provider and its key; it leaves the list at once.
+  preconditions: { world: user }
+  steps:
+    - do: Settings > Model providers > the extra connection > Remove connection.
+      expect: It leaves the list at once and stays gone after reopening Settings.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#171 A custom connection can be removed" }
+  links: ["#171"]
+
+- id: REG-205
+  legacy: ["#205", "#168"]
+  title: Settings show no dirty build and no launcher
+  suite: regression
+  scenario: U8
+  priority: low
+  type: functional
+  purpose: Settings > System shows a clean build, and no page of Settings speaks of a launcher.
+  preconditions: { world: user }
+  steps:
+    - do: Open every Settings page.
+      expect: System shows no "-dirty"; no page says launcher.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#205 #168 Settings show no dirty build and no launcher" }
+  links: ["#205", "#168"]
+
+- id: REG-208
+  legacy: ["#208"]
+  title: Commit marking can be switched on and kept
+  suite: regression
+  scenario: U8
+  priority: low
+  type: functional
+  purpose: In Settings > Collaboration the switch turns commit marking on, the author choice shows and is kept after reopening, and it turns off again.
+  preconditions: { world: user }
+  steps:
+    - do: Turn commit marking on and choose an author.
+      expect: The choice shows.
+    - do: Reopen Settings.
+      expect: It is kept.
+    - do: Turn it off.
+      expect: It is off after reopening.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#208 Commit marking can be switched on and kept" }
+  links: ["#208"]
+
+- id: REG-026
+  legacy: ["#26"]
+  title: Settings stay open when clicking beside them
+  suite: regression
+  scenario: U8
+  priority: low
+  type: functional
+  purpose: A click outside the Settings window does not close it and lose what was being edited.
+  preconditions: { world: user }
+  steps:
+    - do: Open Settings and click beside the window.
+      expect: Settings stay open.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "#26 Settings stay open when clicking beside them" }
+  links: ["#26"]
+
+- id: FOLD-001
+  legacy: [C-mac-239, "#239"]
+  title: A folder opened through a symlink is listed once
+  suite: regression
+  scenario: U11
+  priority: medium
+  type: functional
+  purpose: Opening a folder by its real path and through a symlink lists it once.
+  preconditions: { world: user }
+  steps:
+    - do: Open a folder by its real path, then through a symlink to it.
+      expect: The sidebar lists it once.
+  platforms: [macos, linux]
+  automation:
+    status: planned
+    note: Recorded by hand as acceptance item C-mac-239.
+  links: ["#239"]
+
+- id: INPUT-001
+  title: Very long message (300 KB)
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: A huge paste is either sent whole or refused before sending with the text kept; the window does not widen or freeze.
+  preconditions: { world: user }
+  steps:
+    - do: Paste 300 KB of text and send.
+      expect: Sent whole, or refused before sending with the text kept; the window keeps its width and responds.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Very long message (300 KB) }
+
+- id: INPUT-002
+  title: Long unbroken token in a message
+  suite: abnormal
+  scenario: U4
+  priority: low
+  type: functional
+  purpose: A pasted path or id thousands of characters long never widens the window or moves the composer.
+  preconditions: { world: user }
+  steps:
+    - do: Send a message with a 3,000-character unbroken token.
+      expect: The window keeps its width; the composer does not move.
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Long unbroken token in a message }
+
+- id: INPUT-003
+  title: Image the model refuses
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: A refused image shows once on the reply with a way out; the session does not stay stuck.
+  preconditions: { world: user }
+  data: Fixture refuses images.
+  steps:
+    - do: Send a message with an image.
+      expect: The refusal shows once on the reply, with a way out.
+    - do: Send the next message.
+      expect: The reply arrives.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: Image the model refuses }
+
+- id: INPUT-004
+  title: A file that is not an image, named .png
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: A broken attachment is refused at the composer with the text kept, never sent half-way.
+  preconditions: { world: user }
+  steps:
+    - do: Attach a non-image file named .png and send.
+      expect: It is refused at the composer; the text is kept; nothing is sent.
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: abnormal-playbook.mjs, case: "A file that is not an image, named .png" }

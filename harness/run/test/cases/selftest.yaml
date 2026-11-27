@@ -1,0 +1,134 @@
+# Stand-in catalog for the runner self-test: it names the stand-in playbook's cases.
+- id: SELF-001
+  title: Passes
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: Self-test case "Passes".
+  preconditions: { world: user }
+  steps:
+    - { do: Run it, expect: The runner records it }
+  languages: [en, ja]
+  automation:
+    status: automated
+    impl: { file: ../run/test/fake-playbook.mjs, case: Passes }
+
+- id: SELF-002
+  title: Fails
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: Self-test case "Fails".
+  preconditions: { world: user }
+  steps:
+    - { do: Run it, expect: The runner records it }
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: ../run/test/fake-playbook.mjs, case: Fails }
+
+- id: SELF-003
+  title: Hangs
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: Self-test case "Hangs".
+  preconditions: { world: user }
+  steps:
+    - { do: Run it, expect: The runner records it }
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: ../run/test/fake-playbook.mjs, case: Hangs }
+
+- id: SELF-004
+  title: Crashes the exam
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: Self-test case "Crashes the exam".
+  preconditions: { world: user }
+  steps:
+    - { do: Run it, expect: The runner records it }
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: ../run/test/fake-playbook.mjs, case: Crashes the exam }
+
+- id: SELF-005
+  title: Skips with a planned reason
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: Self-test case "Skips with a planned reason".
+  preconditions: { world: user }
+  steps:
+    - { do: Run it, expect: The runner records it }
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: ../run/test/fake-playbook.mjs, case: Skips with a planned reason }
+
+- id: SELF-006
+  title: Skips without a planned reason
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: Self-test case "Skips without a planned reason".
+  preconditions: { world: user }
+  steps:
+    - { do: Run it, expect: The runner records it }
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: ../run/test/fake-playbook.mjs, case: Skips without a planned reason }
+
+- id: SELF-007
+  title: Flaky
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: Self-test case "Flaky".
+  preconditions: { world: user }
+  steps:
+    - { do: Run it, expect: The runner records it }
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: ../run/test/fake-playbook.mjs, case: Flaky }
+
+- id: SELF-008
+  title: Leaves a process behind
+  suite: abnormal
+  scenario: U4
+  priority: medium
+  type: functional
+  purpose: Self-test case "Leaves a process behind".
+  preconditions: { world: user }
+  steps:
+    - { do: Run it, expect: The runner records it }
+  languages: [en]
+  automation:
+    status: automated
+    impl: { file: ../run/test/fake-playbook.mjs, case: Leaves a process behind }
+
+- id: SELF-009
+  title: Not automated yet
+  suite: main
+  scenario: U4
+  priority: high
+  type: functional
+  purpose: Listed as not covered.
+  preconditions: { world: user }
+  steps:
+    - { do: Nothing, expect: The report lists it as not covered }
+  automation:
+    status: planned
+    note: written later
