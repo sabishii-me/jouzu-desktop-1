@@ -363,9 +363,11 @@
       ],
       "title": "In-place update 1.1.4 -> rc.4 keeps data and sign-ins",
       "steps": [
-        "As a second Windows user with 1.1.4 installed and used (sessions, a sign-in, a setting changed)",
+        "As the machine's normal test user (the Windows upgrade machine is a test machine; no second user): move the app's real data and install folders aside so the item starts clean",
+        "Install 1.1.4 and use it (sessions, a sign-in, a setting changed)",
         "Update through the QA channel to rc.4",
-        "Open the app"
+        "Open the app",
+        "Restore the folders moved aside at the start"
       ],
       "expected": [
         "All sessions are listed and open",
@@ -386,9 +388,11 @@
       ],
       "title": "In-place update rc.2 -> rc.4 keeps data, sign-ins and the runtime",
       "steps": [
+        "As the machine's normal test user (the Windows upgrade machine is a test machine; no second user): move the app's real data and install folders aside so the item starts clean",
         "With rc.2 installed and used, update through the QA channel to rc.4",
         "Open the app",
-        "Look at the runtime version and install log"
+        "Look at the runtime version and install log",
+        "Restore the folders moved aside at the start"
       ],
       "expected": [
         "All sessions, sign-ins and settings are kept",
@@ -408,8 +412,10 @@
       ],
       "title": "Install folder after the update",
       "steps": [
+        "As the machine's normal test user (the Windows upgrade machine is a test machine; no second user): move the app's real data and install folders aside so the item starts clean",
         "After D-upg-1 or D-upg-2, list the install folder",
-        "Open Settings > System"
+        "Open Settings > System",
+        "Restore the folders moved aside at the start"
       ],
       "expected": [
         "No files left from the old version (for example an old icon)",
