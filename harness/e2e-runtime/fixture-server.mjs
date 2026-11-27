@@ -63,8 +63,42 @@ export function startFixtureServer(port = 0) {
       response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ fault, requests: requests.length, refused }));
     });
   };
+  // A stand-in for the Shisa.AI platform's device sign-in (JOUZU_SHISA_PLATFORM_URL=<fixture>/shisa):
+  // it hands out a device code, approves it on the second poll, and records every call.
+  const shisa = { calls: [], issued: 0 };
+  const standIn = (request, response) => {
+    const path = request.url.slice('/shisa'.length).split('?')[0];
+    const own = `http://${request.headers.host}`;
+    let body = '';
+    request.on('data', chunk => { body += chunk; });
+    request.on('end', () => {
+      let input = {}; try { input = body ? JSON.parse(body) : {}; } catch { /* not JSON */ }
+      shisa.calls.push({ path, method: request.method, bearer: request.headers.authorization === 'Bearer stand-in-link', clientId: input.client_id ?? null });
+      const json = (status, value) => response.writeHead(status, { 'content-type': 'application/json' }).end(value === undefined ? '' : JSON.stringify(value));
+      if (path === '/device/code') {
+        shisa.issued += 1; shisa.polls = 0;
+        return json(201, { device_code: `stand-in-device-${shisa.issued}`, user_code: `QA-${1000 + shisa.issued}`, verification_uri: 'https://platform.shisa.ai/connect', verification_uri_complete: `https://platform.shisa.ai/connect?code=QA-${1000 + shisa.issued}`, authorization_id: `auth-${shisa.issued}`, expires_in: 120, interval: 1 });
+      }
+      if (path === '/device/token') {
+        shisa.polls += 1;
+        if (shisa.polls < 2) return json(400, { error: 'authorization_pending' });
+        return json(200, {
+          api_key: { uuid: 'stand-in-key', secret: 'stand-in-secret', label: 'QA stand-in' },
+          org: { id: 'org-qa', name: 'QA organisation', slug: 'qa' }, user: { email: ['qa', 'example.invalid'].join(String.fromCharCode(64)) },
+          endpoints: { openai_base_url: `${own}/v1`, model_catalog_url: `${own}/shisa/catalog`, asr_realtime_url: `${own.replace('http', 'ws')}/shisa/asr` },
+          link_token: 'stand-in-link', authorization_id: `auth-${shisa.issued}`, urls: {},
+        });
+      }
+      if (path === '/device/link/ack' || path === '/device/link/revoke') { response.writeHead(204).end(); return; }
+      json(404, { error: 'not_found' });
+    });
+  };
   const server = createServer((request, response) => {
     if (request.url === '/__fault') { control(request, response); return; }
+    if (request.url === '/__shisa') { response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(shisa)); return; }
+    if (request.url?.startsWith('/shisa/')) { standIn(request, response); return; }
+    // The requests answered so far: the last user text of each, in order (release playbook: asked once).
+    if (request.url === '/__requests') { response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(requests.map(item => ({ model: item.model, text: item.text, users: item.users })))); return; }
     if (request.method === 'POST' && request.url?.endsWith('/chat/completions') && Object.keys(fault).length) {
       if (fault.reset) { refused += 1; request.socket.destroy(); return; }
       if (fault.requireKey && request.headers.authorization !== `Bearer ${fault.requireKey}`) {
@@ -117,7 +151,8 @@ export function startFixtureServer(port = 0) {
       const text = typeof lastUser?.content === 'string' ? lastUser.content : JSON.stringify(lastUser?.content ?? '');
       // The system prompt is kept so a check can see what the runtime instructed (e.g. its language section).
       const system = messages.filter(message => message.role === 'system' || message.role === 'developer').map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content ?? '')).join('\n');
-      requests.push({ model: data.model, text, system, images: imageSizes(messages) });
+      const users = messages.filter(message => message.role === 'user').map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content ?? ''));
+      requests.push({ model: data.model, text, system, images: imageSizes(messages), users });
       // A real provider refuses an image with a side of 10 px or less, with this text (#17).
       const tiny = imageSizes(messages).find(([width, height]) => Math.min(width, height) <= 10)
         ?? (fault.refuseImages ? imageSizes(messages)[0] : undefined);
@@ -156,6 +191,29 @@ export function startFixtureServer(port = 0) {
         request.on('close', () => clearInterval(timer));
         return;
       }
+      // TOOLWAIT: one tool call that runs for 30 s (a command that sleeps), to stop it half-way.
+      if (text.includes('TOOLWAIT') && !messages.some(message => message.role === 'tool')) {
+        chunk({ tool_calls: [{ index: 0, id: 'fixture-wait-1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'sleep 30' }) } }] });
+        chunk({}, 'tool_calls');
+        response.end('data: [DONE]\n\n');
+        return;
+      }
+      // STEPS:n: a reply of n steps, each a short thought and one tool call, then a final answer.
+      const steps = /STEPS:(\d+)/u.exec(text);
+      if (steps) {
+        const done = messages.filter(message => message.role === 'tool').length;
+        if (done < Number(steps[1])) {
+          chunk({ content: `step ${done + 1} thinking\n` });
+          chunk({ tool_calls: [{ index: 0, id: `fixture-step-${done + 1}`, type: 'function', function: { name: 'read', arguments: JSON.stringify({ path: 'README.md' }) } }] });
+          chunk({}, 'tool_calls');
+          response.end('data: [DONE]\n\n');
+          return;
+        }
+        chunk({ content: `all ${steps[1]} steps done` });
+        chunk({}, 'stop');
+        response.end('data: [DONE]\n\n');
+        return;
+      }
       if (text.includes('TOOL') && !messages.some(message => message.role === 'tool')) {
         chunk({ tool_calls: [{ index: 0, id: 'fixture-call-1', type: 'function', function: { name: 'read', arguments: JSON.stringify({ path: /TOOL:(\S+)/u.exec(text)?.[1] ?? process.env.JOUZU_FIXTURE_FILE ?? 'README.md' }) } }] });
         chunk({}, 'tool_calls');
@@ -167,7 +225,8 @@ export function startFixtureServer(port = 0) {
       // Japanese when the runtime instructs Japanese replies.
       const product = /What is (\d+) × (\d+)\?/.exec(text);
       const japanese = system.includes('Response language: Japanese (ja)');
-      const answer = messages.some(message => message.role === 'tool') ? 'tool finished'
+      // "tool finished" answers the request that carries a tool's result, not every later turn of that session.
+      const answer = messages.at(-1)?.role === 'tool' ? 'tool finished'
         : product ? String(Number(product[1]) * Number(product[2]))
         : japanese ? 'あかです。'
         : `fixture reply: ${text}`;

@@ -3,7 +3,8 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { dirname, join, relative, resolve } from 'node:path';
 import { platformName, readResults, slug } from './common.mjs';
 
-// The neutral suite runner. It runs every case of the abnormal-path playbook on its own,
+// The neutral suite runner. It runs every case of the plan's playbooks (plan.playbooks; default the
+// abnormal-path playbook) on its own,
 // in its own throwaway home, host, browser and fixture provider (abnormal-exam.mjs with
 // ABN_ONLY set to that one case), and records what happened. It judges nothing beyond
 // the case's own checks, never stops early, and never decides what a failure means.
@@ -37,7 +38,8 @@ mkdirSync(out, { recursive: true });
 const here = import.meta.dirname;
 // RUN_EXAM / RUN_PLAYBOOK replace the exam and playbook only to test this runner (test/selftest.mjs).
 const exam = resolve(process.env.RUN_EXAM ?? join(here, '..', 'e2e-runtime', 'abnormal-exam.mjs'));
-const playbook = resolve(process.env.RUN_PLAYBOOK ?? join(here, '..', 'e2e', 'abnormal-playbook.mjs'));
+// The playbooks whose cases this plan runs (plan.playbooks, file names in harness/e2e; default the abnormal-path one).
+const playbooks = process.env.RUN_PLAYBOOK ? [resolve(process.env.RUN_PLAYBOOK)] : (plan.playbooks ?? ['abnormal-playbook.mjs']).map(name => resolve(here, '..', 'e2e', name));
 const platform = platformName();
 const languages = (args.langs ?? process.env.ABN_LANGS ?? 'en').split(',').map(item => item.trim()).filter(Boolean);
 const timeoutMs = (plan.caseTimeoutMinutes ?? 10) * 60_000;
@@ -55,13 +57,13 @@ function elevated() {
 if (elevated() && !process.env.RUN_SELFTEST) { console.error('Entry criterion not met: this account is root or an administrator. Run the suite as a normal user.'); process.exit(2); }
 
 // ---- The cases, from the playbook itself. ----
-const listed = JSON.parse(execFileSync(process.execPath, [playbook], { env: { ...process.env, PLAYBOOK_LIST: '1', PLAYBOOK_SHOTS: join(out, '.list') }, encoding: 'utf8' }));
+const listed = playbooks.flatMap(playbook => JSON.parse(execFileSync(process.execPath, [playbook], { env: { ...process.env, PLAYBOOK_LIST: '1', PLAYBOOK_SHOTS: join(out, '.list') }, encoding: 'utf8' })).map(item => ({ ...item, playbook })));
 // ABN_ONLY matches by contained text: one name inside another would run two cases at once.
 const clashes = listed.flatMap(a => listed.filter(b => a !== b && b.name.toLowerCase().includes(a.name.toLowerCase())).map(b => `"${a.name}" is inside "${b.name}"`));
 if (clashes.length) { console.error(`Case names overlap; the runner cannot run them one by one:\n${clashes.join('\n')}`); process.exit(2); }
 const confirmation = new Set(plan.confirmation ?? []);
 const excluded = new Set(plan.exclude ?? []);
-const queue = languages.flatMap(language => listed.filter(item => item.langs.includes(language) && !excluded.has(item.name)).map(item => ({ name: item.name, language, suite: confirmation.has(item.name) ? 'B' : 'A' })));
+const queue = languages.flatMap(language => listed.filter(item => item.langs.includes(language) && !excluded.has(item.name)).map(item => ({ name: item.name, language, suite: confirmation.has(item.name) ? 'B' : 'A', playbook: item.playbook, scenario: item.scenario ?? null, world: item.world ?? null })));
 const declaredSkip = (name) => (plan.declaredSkips ?? []).find(item => item.case === name && (!item.platforms || item.platforms.includes(platform)));
 
 writeFileSync(join(out, 'run.json'), `${JSON.stringify({
@@ -110,7 +112,7 @@ async function runOnce(item, phase, attempt) {
   const started = Date.now();
   const log = join(folder, 'exam.log');
   port += 2;
-  const env = { ...process.env, ABN_ONLY: item.name, ABN_LANGS: item.language, ABN_OUT: folder, ABN_PORT: String(port), TEMP: temp, TMP: temp, TMPDIR: temp };
+  const env = { ...process.env, ABN_PLAYBOOK: relative(join(here, '..', 'e2e'), item.playbook), ABN_ONLY: item.name, ABN_WORLD: item.world ?? '', ABN_LANGS: item.language, ABN_OUT: folder, ABN_PORT: String(port), TEMP: temp, TMP: temp, TMPDIR: temp };
   const child = spawn(process.execPath, [exam], { env, cwd: resolve(here, '..', '..'), stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32', windowsHide: true });
   let text = '';
   child.stdout.on('data', chunk => { text += chunk; });
@@ -128,7 +130,7 @@ async function runOnce(item, phase, attempt) {
   killList(left);
 
   const record = {
-    case: item.name, language: item.language, suite: item.suite, phase, attempt, machine: args.machine, platform,
+    case: item.name, language: item.language, suite: item.suite, scenario: item.scenario, playbook: relative(join(here, '..', 'e2e'), item.playbook).split('\\').join('/'), phase, attempt, machine: args.machine, platform,
     status: 'ERROR', problems: [], notes: [], ms: Date.now() - started, exitCode: code,
     evidence: relative(out, folder).split('\\').join('/'),
     leftProcesses: left.map(row => row.name), at: new Date().toISOString(),

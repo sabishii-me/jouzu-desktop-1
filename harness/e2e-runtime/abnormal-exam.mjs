@@ -12,6 +12,12 @@ import { startFixtureServer } from './fixture-server.mjs';
 // frozen app, bad files). It never touches a user's data folder and only ever stops
 // processes it started itself.
 //
+// The world a case needs (ABN_WORLD, set per case by the runner from the case's own list entry):
+//   (empty)          a person who uses Jouzu: the fixture model saved, old sessions, the runtime linked
+//   new-user         nothing prepared: no runtime, model, settings or sessions; the host is laid out as
+//                    an installation and installs its runtime itself (needs the network, as a person's
+//                    first run does; the machine's proxy and CA settings are passed on)
+//   shisa-stand-in   as empty, and JOUZU_SHISA_PLATFORM_URL points Shisa.AI sign-in at the fixture's stand-in
 // Three ways to run it:
 //   Installed app, as a person starts it (release acceptance, Windows):
 //     ABN_SHELL    the installed "Jouzu Desktop.exe"; it runs with its own LOCALAPPDATA, so
@@ -41,6 +47,11 @@ const launcher = resolve(here, '..');
 const out = resolve(process.env.ABN_OUT ?? `abnormal-exam-${new Date().toISOString().replace(/[:.]/g, '-')}`);
 mkdirSync(out, { recursive: true });
 const windows = process.platform === 'win32';
+// The kind of world a case needs: '' (a person who uses Jouzu: the fixture model, old sessions),
+// 'new-user' (nothing prepared), or 'shisa-stand-in' (as '' and Shisa.AI sign-in goes to the fixture's stand-in).
+const newUser = process.env.ABN_WORLD === 'new-user';
+const shisaStandIn = process.env.ABN_WORLD === 'shisa-stand-in';
+let fixturePortNow = null;
 const children = new Set();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -62,6 +73,16 @@ function installed() {
 /** A throwaway root: the host's home, its data folder, a workspace, the runtime linked in. */
 function makeRoot(fixturePort, pkg) {
   const root = mkdtempSync(join(tmpdir(), 'jouzu-abnormal-'));
+  if (newUser) {
+    // ABN_WORLD=new-user: a person who never used Jouzu. Nothing is prepared: no runtime, no
+    // model, no settings, no sessions. The app installs its runtime itself (release playbook N1).
+    const home = pkg?.shell ? join(root, 'localappdata', 'Shisa.ai', 'JouzuDesktop') : join(root, 'home');
+    const data = join(home, 'data');
+    const workspace = join(root, 'workspace');
+    for (const dir of [home, workspace]) mkdirSync(dir, { recursive: true });
+    writeFileSync(join(root, 'runtime-delay.json'), '{"ms":0}');
+    return { root, home, data, workspace };
+  }
   // The app keeps its files in %LOCALAPPDATA%\Shisa.ai\JouzuDesktop; the exam gives it its own.
   const home = pkg?.shell ? join(root, 'localappdata', 'Shisa.ai', 'JouzuDesktop') : join(root, 'home');
   const data = join(home, 'data');
@@ -139,7 +160,9 @@ function writeOldSessions(data, workspace) {
 
 /** Only what a person's machine would give the app: no keys or tokens of this machine. */
 function cleanEnv(root, extra) {
-  const keep = ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'windir', 'ComSpec', 'PATHEXT', 'TEMP', 'TMP', 'TMPDIR', 'LANG', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS', 'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'];
+  const keep = ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'windir', 'ComSpec', 'PATHEXT', 'TEMP', 'TMP', 'TMPDIR', 'LANG', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS', 'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS',
+    // The machine's network settings, as a person's machine gives them to every app.
+    'HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'no_proxy', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS'];
   const env = {};
   for (const name of keep) if (process.env[name] !== undefined) env[name] = process.env[name];
   return {
@@ -150,6 +173,8 @@ function cleanEnv(root, extra) {
     // would: a change in Settings > Environment must reach open sessions (#173).
     FIXTURE_SECRET: 'fixture-key',
     JOUZU_E2E_RUNTIME_DELAY: join(root, 'runtime-delay.json'),
+    // The address switch the runtime has for Shisa.AI sign-in, pointed at the fixture's stand-in (N4).
+    ...(shisaStandIn && fixturePortNow ? { JOUZU_SHISA_PLATFORM_URL: `http://127.0.0.1:${fixturePortNow}/shisa` } : {}),
     ...extra,
   };
 }
@@ -189,8 +214,9 @@ function startHost(stack) {
   const { pkg, paths } = stack;
   // stack.managed: the source build runs its runtime as an installation does, from <home>\app
   // and a Node it is given, so the runtime's files can go missing and come back (#87).
-  const args = pkg
-    ? ['--dist', pkg.dist, '--home', paths.home, '--runtime-home', paths.data, '--install', paths.home]
+  // A new user's host is laid out as an installation is and given no runtime: it installs one (N1).
+  const args = pkg || newUser
+    ? ['--dist', pkg ? pkg.dist : resolve(process.env.ABN_DIST), '--home', paths.home, '--runtime-home', paths.data, '--install', paths.home]
     : stack.managed
       ? ['--dist', resolve(process.env.ABN_DIST), '--home', paths.home, '--runtime-home', paths.data, '--install', sourceInstall(paths.root)]
       : process.env.ABN_UNIX_LAYOUT
@@ -200,7 +226,7 @@ function startHost(stack) {
         '--runtime', process.execPath, '--runtime-arg', join(resolve(process.env.ABN_RUNTIME_APP), 'bootstrap.mjs'), '--runtime-arg', '--mode', '--runtime-arg', 'rpc'];
   for (const dir of ['localappdata', 'appdata']) mkdirSync(join(paths.root, dir), { recursive: true });
   try { rmSync(join(paths.home, 'host.json')); } catch { /* first start */ }
-  const env = cleanEnv(paths.root, !pkg && stack.managed ? { JOUZU_HOST_NODE: process.execPath } : {});
+  const env = cleanEnv(paths.root, !pkg && !newUser && stack.managed ? { JOUZU_HOST_NODE: process.execPath } : {});
   const child = spawn(pkg ? pkg.host : resolve(process.env.ABN_HOST), args, { env, cwd: paths.workspace, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
   children.add(child);
   child.on('exit', () => children.delete(child));
@@ -316,6 +342,8 @@ function suspend(pids, on) {
  *   POST /freeze {ms}                 freeze the host and its runtimes for ms (a computer asleep)
  *   POST /file {path, text|remove|readOnly}  change a file under the home (path relative to it)
  *   GET  /file?path=                  read it back
+ *   POST /workspace {name}            make another workspace folder beside the first; answers its path
+ *   GET  /list?path=                  the files in a folder under the home (name, size, mtimeMs)
  */
 function worldServer(stack) {
   const server = createServer((request, response) => {
@@ -327,7 +355,7 @@ function worldServer(stack) {
       const reply = value => response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(value));
       try {
         const hostPid = stack.host.pid;
-        if (url.pathname === '/state') return reply({ host: hostPid, runtimes: runtimes(hostPid).map(row => row.pid), home: stack.paths.home, workspace: stack.paths.workspace, shell: Boolean(stack.shell) });
+        if (url.pathname === '/state') return reply({ world: newUser ? 'new-user' : shisaStandIn ? 'shisa-stand-in' : 'user', proxy: Boolean(process.env.HTTPS_PROXY || process.env.https_proxy), host: hostPid, runtimes: runtimes(hostPid).map(row => row.pid), home: stack.paths.home, workspace: stack.paths.workspace, shell: Boolean(stack.shell) });
         if (url.pathname === '/host/restart') {
           // The app ends and starts again on the same home (#162). Only when the exam started
           // the host itself; the installed app's own window is not restarted here.
@@ -376,6 +404,20 @@ function worldServer(stack) {
           await sleep(input.ms ?? 30_000);
           suspend(pids, false);
           return reply({ frozen: pids.length });
+        }
+        if (url.pathname === '/workspace') {
+          // Another folder the person works in, beside the first one (release playbook P4).
+          const path = join(stack.paths.root, String(input.name ?? 'second-workspace').replace(/[^A-Za-z0-9_-]/g, '-'));
+          mkdirSync(path, { recursive: true });
+          writeFileSync(join(path, 'README.md'), `# ${input.name ?? 'second workspace'}\n`);
+          return reply({ path });
+        }
+        if (url.pathname === '/list') {
+          // The files in a folder under the home, with size and time (release playbook: which session file was written).
+          const path = resolve(stack.paths.home, input.path ?? url.searchParams.get('path') ?? '');
+          if (!path.startsWith(resolve(stack.paths.home))) throw new Error('outside the home');
+          if (!existsSync(path)) return reply({ files: [] });
+          return reply({ files: readdirSync(path).map(name => { const info = statSync(join(path, name)); return { name, size: info.size, mtimeMs: info.mtimeMs, dir: info.isDirectory() }; }) });
         }
         if (url.pathname === '/file') {
           const path = resolve(stack.paths.home, input.path ?? url.searchParams.get('path') ?? '');
@@ -432,6 +474,7 @@ let port = Number(process.env.ABN_PORT ?? 9240);
 try {
   for (const language of languages) {
     const fixture = await startFixtureServer(0);
+    fixturePortNow = fixture.port;
     const stack = { pkg, paths: makeRoot(fixture.port, pkg) };
     let browser = null;
     if (pkg?.shell) {
