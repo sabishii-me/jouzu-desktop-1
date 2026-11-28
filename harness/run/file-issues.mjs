@@ -9,9 +9,11 @@
 // One issue per finding, not per language or attempt:
 //   - cases are grouped by case ID; cases that name the same finding in legacy/links (N1, O8,
 //     P25: a letter and a number) are one finding;
-//   - the issue it belongs to is, in this order: an issue that already carries the line
-//     "QA case: <ID>" (in its text or a comment, open or closed); else an issue the catalog
-//     links (#123); else a new one;
+//   - the issue it belongs to is, in this order: an issue that names the case ID (in its title,
+//     text or a comment; open ones first) and says the same failure (at least half of the
+//     failure's words); else an issue the failure names (#179: ...) or the catalog links (#123);
+//     else a new one. An issue that names the case but describes another failure is mentioned
+//     in the comment or new issue, not commented on;
 //   - an open issue gets a comment with this run's results; a closed one gets the comment and is
 //     reopened, because the case fails again; a new one is opened with the label bug.
 //   - each comment carries "QA run: <version> <machine> <started>", so filing the same run again
@@ -124,28 +126,46 @@ const commentBody = (group, reopen) => `${reopen === 'unknown' ? 'The case fails
 // ---- Decide and act ----
 const actions = [];
 const errors = [];
+// How much of a failure's wording an issue already says: the share of the failure's words (4
+// letters or more, quoted UI text included) found in the issue's title, text and comments.
+const words = text => [...new Set(String(text).toLowerCase().match(/[\p{L}\p{N}]{4,}/gu) ?? [])];
+const overlap = (problem, text) => { const want = words(problem); if (!want.length) return 0; const have = new Set(words(text)); return want.filter(word => have.has(word)).length / want.length; };
+const SAME = 0.5;
+const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 for (const group of groups) {
   let target = null;
+  const related = [];
+  const problems = group.rows.flatMap(row => row.problems ?? []).filter(item => !/could not finish|Timeout \d+ms/i.test(item));
+  const score = text => Math.max(0, ...problems.map(problem => overlap(problem, text)));
   try {
+    // 1. An issue that names the case ID (open first, newest first) and says the same failure.
+    //    One that names the case but describes another failure is a different finding: it is
+    //    mentioned, not commented on.
+    const candidates = [];
     for (const id of group.ids) {
-      if (target) break;
-      const found = await search(`repo:${repo} is:issue "QA case: ${id}"`);
-      for (const item of found) {
-        const text = `${item.body ?? ''}\n${(await comments(item.number)).map(c => c.body).join('\n')}`;
-        if (text.split('\n').some(line => line.trim() === `QA case: ${id}`)) { target = item; break; }
+      for (const item of await search(`repo:${repo} is:issue "${id}"`)) {
+        const text = `${item.title}\n${item.body ?? ''}\n${(await comments(item.number)).map(c => c.body).join('\n')}`;
+        if (!new RegExp(`(^|[^A-Z0-9-])${escape(id)}([^0-9]|$)`).test(text)) continue;
+        if (!candidates.some(c => c.item.number === item.number)) candidates.push({ item, score: score(text) });
       }
     }
-    // An issue the failure itself names ("#179: ...") comes before the case's other links.
+    candidates.sort((a, b) => (a.item.state === 'open' ? 0 : 1) - (b.item.state === 'open' ? 0 : 1) || b.item.number - a.item.number);
+    target = candidates.find(c => c.score >= SAME)?.item ?? null;
+    for (const c of candidates) if (c.item !== target) related.push(c.item.number);
+    // 2. An issue the failure itself names ("#179: ..."), then the issues the catalog links.
     const named = group.rows.flatMap(row => row.problems ?? []).map(item => item.match(/^#(\d+):/)?.[1]).filter(Boolean).map(Number);
     if (!target) for (const number of [...new Set([...named, ...group.ids.flatMap(id => linkedIssues(catalog.get(id)))])]) { target = await issue(number); if (target) break; }
   } catch (error) { errors.push(`searching for ${group.ids.join(', ')}: ${error.message}`); }
+  const also = related.filter(number => number !== target?.number);
+  const alsoLine = also.length ? `\n\nThe same case also has ${also.map(n => `#${n}`).join(', ')}, which describes a different failure.` : '';
   if (target) {
     const already = (await comments(target.number).catch(() => [])).some(c => (c.body ?? '').includes(runMark)) || (target.body ?? '').includes(runMark);
     const reopen = target.state === 'closed';
     const kind = already ? 'nothing (this run is already on it)' : reopen ? 'comment and reopen' : target.state === 'unknown' ? 'comment, and reopen if closed' : 'comment';
-    actions.push({ ids: group.ids, kind, issue: target.number, title: target.title, body: already ? null : commentBody(group, target.state === 'unknown' ? 'unknown' : reopen) });
+    actions.push({ ids: group.ids, kind, issue: target.number, title: target.title, related: also, body: already ? null : commentBody(group, target.state === 'unknown' ? 'unknown' : reopen).replace('\n\n---\n', `${alsoLine}\n\n---\n`) });
   } else {
-    actions.push({ ids: group.ids, kind: 'open', issue: null, title: titleOf(group), body: newBody(group), labels: ['bug'] });
+    actions.push({ ids: group.ids, kind: 'open', issue: null, title: titleOf(group), related: also, body: newBody(group).replace('\n\n---\n', `${alsoLine}\n\n---\n`), labels: ['bug'] });
   }
 }
 

@@ -86,9 +86,10 @@ code 3, prints why, and the report marks the cases not started as NOT RUN.
 
 Issues: at the end of every run the runner files each product FAIL as an issue in
 the product repository (`harness/run/file-issues.mjs`, `plan.issueRepo`), with no
-review step first. One issue per finding: an issue that already names the case
-("QA case: <ID>") or that the catalog links gets a comment (and is reopened if
-it was closed); otherwise a new issue is opened. Filing the same run twice adds
+review step first. One issue per finding: an issue that names the case ID and
+describes the same failure (open ones first), or else the issue the catalog
+links, gets a comment (and is reopened if it was closed); otherwise a new issue
+is opened, naming any issue of the same case that describes another failure. Filing the same run twice adds
 nothing. ERROR results are harness gaps and are listed, not filed. It needs a
 GitHub sign-in that may write issues (`GH_TOKEN`, or `gh` signed in); without
 one the run ends with exit code 4 and `issue-actions.json` holds what to file.
