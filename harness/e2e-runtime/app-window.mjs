@@ -119,7 +119,7 @@ export function webDriver(url) {
     end: () => call('DELETE', '').catch(() => {}),
   };
   return Object.assign(api, {
-    /** The visible element of a kind (button, field, option, combobox, text) whose name is exactly name. */
+    /** The visible element of a kind (button, field, option, combobox, text) whose name is exactly name (or one of a list of names). */
     find: (kind, name) => api.exec(FIND, [kind, name]),
     /**
      * Find and click, again and again for up to timeout: the page re-renders (a stale element)
@@ -152,6 +152,8 @@ export function webDriver(url) {
 // element's text, aria-label, its <label>, or its placeholder.
 const FIND = `
 const [kind, name] = arguments;
+// A name may be a list: the window's words in the language picked and in English, whichever it shows.
+const wanted = [].concat(name);
 const shown = el => { const box = el.getBoundingClientRect(); return box.width > 0 && box.height > 0 && getComputedStyle(el).visibility !== 'hidden'; };
 const text = el => (el.innerText || el.textContent || '').trim();
 const labelled = el => {
@@ -162,6 +164,6 @@ const labelled = el => {
   return names.filter(Boolean).map(item => item.trim());
 };
 const selector = { button: 'button,[role=button],[role=tab],[role=menuitem],a', option: '[role=option],[role=menuitemradio],option', combobox: '[role=combobox],select,button[aria-haspopup]', field: 'input,textarea,[contenteditable=true]' }[kind];
-if (kind === 'text') return [...document.querySelectorAll('body *')].find(el => shown(el) && el.children.length === 0 && text(el).includes(name)) || null;
-return [...document.querySelectorAll(selector)].find(el => shown(el) && (text(el) === name || labelled(el).includes(name))) || null;
+if (kind === 'text') return [...document.querySelectorAll('body *')].find(el => shown(el) && el.children.length === 0 && wanted.some(item => text(el).includes(item))) || null;
+return [...document.querySelectorAll(selector)].find(el => shown(el) && (wanted.includes(text(el)) || labelled(el).some(item => wanted.includes(item)))) || null;
 `;

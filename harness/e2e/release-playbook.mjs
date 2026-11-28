@@ -304,6 +304,11 @@ const WINDOW = {
   en: { language: "Interface language", message: "Message Jouzu", send: "Send", prepare: ["Preparing Jouzu…", "Downloading Node…", "Installing packages…", "Runtime files are missing. Install them to continue."] },
   ja: { language: "表示言語", message: "Jouzu へのメッセージ", send: "送信", prepare: ["Jouzu を準備しています…", "Node をダウンロードしています…", "パッケージをインストールしています…", "ランタイムがありません。続行するにはインストールしてください。"] },
 }[lang];
+const WINDOW_EN = { message: "Message Jouzu", send: "Send" };
+const FIRST_EN = { proceed: "Continue", signIn: "Sign in to Shisa.AI", service: "Service", custom: "Custom provider", providerId: "Provider ID", endpoint: "API base URL", modelId: "Model ID", apiKey: "API key", save: "Save" };
+// The window shows English until the person picks a language on the first page (and when that page is
+// skipped), so each word is looked for in the run's language and in English.
+const W2 = Object.fromEntries([...Object.keys(FIRST_EN).map(key => [key, [FIRST[key], FIRST_EN[key]]]), ...Object.keys(WINDOW_EN).map(key => [key, [WINDOW[key], WINDOW_EN[key]]])]);
 const appGet = (path, query) => worldGet(path, query);
 /** The installed app's window over WebDriver (Linux), or null where it has none (macOS). */
 async function appWindow(c, name, seed) {
@@ -327,8 +332,8 @@ async function appReady(name, timeout) {
 /** Send one message in the app's window and wait for its answer. */
 async function windowAsk(wd, timeout = 60_000) {
   const question = ask();
-  await wd.fill(WINDOW.message, question.prompt);
-  if (!await wd.tap("button", WINDOW.send, 10_000)) return { ok: false, why: "no Send button" };
+  await wd.fill(W2.message, question.prompt);
+  if (!await wd.tap("button", W2.send, 10_000)) return { ok: false, why: "no Send button" };
   const until = now() + timeout;
   while (now() < until) {
     const text = await wd.exec("return [...document.querySelectorAll('main *')].filter(el => !el.closest('form') && el.children.length === 0).map(el => el.textContent.trim())", []).catch(() => []);
@@ -342,7 +347,7 @@ const pageText = async wd => (await wd.text().catch(() => "")).replace(/\s+/g, "
 /** The first run in the app's window, as N1 does it in the browser: languages, the connection page, a custom provider, a reply. */
 async function windowFirstRun(c, wd) {
   const start = now();
-  const proceed = [FIRST.proceed, "Continue"];
+  const proceed = W2.proceed;
   let languagePage = false;
   let switched = lang === "en";
   let failure = null;
@@ -350,7 +355,7 @@ async function windowFirstRun(c, wd) {
   while (now() < until) {
     const text = await pageText(wd);
     if (text.includes(FIRST.failed) || text.includes("Installation failed")) { failure = text.slice(0, 400); break; }
-    if (await wd.find("button", FIRST.signIn).catch(() => null)) break;
+    if (await wd.find("button", W2.signIn).catch(() => null)) break;
     if (await wd.find("combobox", WINDOW.language).catch(() => null) || await wd.find("combobox", "Interface language").catch(() => null)) {
       languagePage = true;
       if (!switched) {
@@ -359,27 +364,27 @@ async function windowFirstRun(c, wd) {
         switched = await wd.tap("option", "日本語", 5_000);
         await sleep(500);
       }
-      for (const word of proceed) if (await wd.tap("button", word, 1_000)) break;
+      await wd.tap("button", proceed, 1_000);
     }
     await sleep(500);
   }
   if (failure) { c.fail(`the first run failed to prepare: ${failure}`); return false; }
-  if (!await wd.find("button", FIRST.signIn).catch(() => null)) {
+  if (!await wd.find("button", W2.signIn).catch(() => null)) {
     c.fail(`the first-run pages did not reach the model connection page within 9 min (language page shown: ${languagePage}; the window shows: "${(await pageText(wd)).slice(0, 200)}")`);
     return false;
   }
   c.metric("toConnectPageMs", now() - start);
   if (!languagePage) c.fail("the first run did not ask for the languages before the model connection");
-  if (!await wd.tap("combobox", FIRST.service)) { c.fail("no service choice on the connection page"); return false; }
-  if (!await wd.tap("option", FIRST.custom)) { c.fail(`no "${FIRST.custom}" in the service list`); return false; }
-  await wd.fill(FIRST.providerId, "first-run");
-  await wd.fill(FIRST.endpoint, `${fixture}/v1`);
-  await wd.fill(FIRST.modelId, "deterministic");
-  await wd.fill(FIRST.apiKey, "fixture-key");
+  if (!await wd.tap("combobox", W2.service)) { c.fail("no service choice on the connection page"); return false; }
+  if (!await wd.tap("option", W2.custom)) { c.fail(`no "${FIRST.custom}" in the service list`); return false; }
+  await wd.fill(W2.providerId, "first-run");
+  await wd.fill(W2.endpoint, `${fixture}/v1`);
+  await wd.fill(W2.modelId, "deterministic");
+  await wd.fill(W2.apiKey, "fixture-key");
   const saved = now();
-  await wd.tap("button", FIRST.save);
+  await wd.tap("button", W2.save);
   let composer = null;
-  while (!composer && now() < saved + 120_000) { composer = await wd.find("field", WINDOW.message).catch(() => null); if (!composer) await sleep(500); }
+  while (!composer && now() < saved + 120_000) { composer = await wd.find("field", W2.message).catch(() => null); if (!composer) await sleep(500); }
   if (!composer) { c.fail(`after saving the provider the window did not open the chat within 2 min (it shows: "${(await pageText(wd)).slice(0, 200)}")`); return false; }
   c.metric("saveToChatMs", now() - saved);
   const answered = await windowAsk(wd);
@@ -438,7 +443,7 @@ release("INST-004 Runtime files deleted while the app runs are reinstalled", "U7
   while (now() < until && !seen) {
     const text = await pageText(app.wd);
     seen = WINDOW.prepare.find(word => text.includes(word)) ?? null;
-    if (!seen && !sent && now() > deleted + 5_000) { const question = ask(); await app.wd.fill(WINDOW.message, question.prompt).catch(() => {}); sent = await app.wd.tap("button", WINDOW.send, 2_000); }
+    if (!seen && !sent && now() > deleted + 5_000) { const question = ask(); await app.wd.fill(W2.message, question.prompt).catch(() => {}); sent = await app.wd.tap("button", W2.send, 2_000); }
     if (!seen) await sleep(500);
   }
   if (!seen) c.fail(`within 60 s of deleting the runtime's files the window never said it was preparing the runtime (it shows: "${(await pageText(app.wd)).slice(0, 200)}")`);
@@ -446,7 +451,7 @@ release("INST-004 Runtime files deleted while the app runs are reinstalled", "U7
   const restored = await appGet("/app/file", { name: "repair", path: "app/bootstrap.mjs" });
   let composerBack = null;
   const back = now() + 5 * 60_000;
-  while (!composerBack && now() < back) { composerBack = await app.wd.find("field", WINDOW.message).catch(() => null); if (!composerBack) await sleep(1_000); }
+  while (!composerBack && now() < back) { composerBack = await app.wd.find("field", W2.message).catch(() => null); if (!composerBack) await sleep(1_000); }
   if (!composerBack) { c.fail("the chat did not come back within 5 min of deleting the runtime's files"); return; }
   const answered = await windowAsk(app.wd, 180_000);
   if (!answered.ok) c.fail(`after the runtime's files were deleted, a message got no reply: ${answered.why}`);
