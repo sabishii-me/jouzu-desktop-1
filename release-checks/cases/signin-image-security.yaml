@@ -69,7 +69,9 @@
   automation:
     status: automated
     impl: { file: release-playbook.mjs, case: IMG-001 The image tool with a paid account and with ChatGPT }
-    note: The not-valid key step always runs. Without the two secrets the case runs that step and then records no verdict for the rest (ERROR unless the plan declares the skip), so a missing account is never a PASS.
+    note: The not-valid key step always runs. Without the two credentials the case runs that step and then records no verdict for the rest (ERROR unless the plan declares the skip), so a missing account is never a PASS.
+  limits:
+    - { what: "QA account credentials", line: "harness gap: no QA credential store yet; the valid-key and ChatGPT steps need a dedicated QA environment in CI with its own QA accounts (proposed QA CI design, awaiting the product owner)", by: harness }
 
 - id: IMG-002
   legacy: [C-mac-image-free]
@@ -92,7 +94,9 @@
   automation:
     status: automated
     impl: { file: release-playbook.mjs, case: IMG-002 The image tool with a free Shisa.AI account }
-    note: Without the secret the case records no verdict (ERROR unless the plan declares the skip).
+    note: Without the credential the case records no verdict (ERROR unless the plan declares the skip).
+  limits:
+    - { what: "QA account credentials", line: "harness gap: no free-tier QA account credential in a QA credential store yet (proposed QA CI design, awaiting the product owner)", by: harness }
 
 - id: SEC-001
   legacy: ["#130"]

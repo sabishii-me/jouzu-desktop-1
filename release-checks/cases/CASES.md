@@ -2,7 +2,7 @@
 
 Generated from release-checks/cases/*.yaml by `node harness/run/catalog.mjs --table`. Edit the YAML, not this file.
 
-80 cases: 66 automated, 10 planned, 1 gap, 3 deferred.
+80 cases: 76 automated, 0 planned, 1 gap, 3 deferred.
 
 ## smoke (5)
 
@@ -11,7 +11,7 @@ Generated from release-checks/cases/*.yaml by `node harness/run/catalog.mjs --ta
 | CHAT-001 | P7 | A new session answers at once | U4 | high | all | en, ja | automated (release-playbook.mjs) |
 | CHAT-003 | P11 | Stop while a tool runs | U4 | high | all | en, ja | automated (release-playbook.mjs) |
 | INST-001 | N1 | A new user's first run | U1 | high | all | en, ja | automated (release-playbook.mjs) |
-| UPD-001 | N2 D-upg-1 | Update from the last release keeps sessions, settings and sign-ins | U2 | high | windows | all | planned |
+| UPD-001 | N2 D-upg-1 | Update from the last release keeps sessions, settings and sign-ins | U2 | high | windows | en, ja | automated (update-playbook.mjs) |
 | START-001 | P1 | Cold start opens the last session | U4 | high | all | en, ja | automated (release-playbook.mjs) |
 
 ## main (31)
@@ -31,12 +31,12 @@ Generated from release-checks/cases/*.yaml by `node harness/run/catalog.mjs --ta
 | CHAT-013 | P22 | A request held by Flow | U4 | low | all | all | deferred |
 | CHAT-014 | P20 | Web access from this computer and another device | U4 | low | all | all | deferred |
 | UI-001 | P29 | Problems and notices are shown in their place | U4 | high | all | en, ja | automated (release-playbook.mjs) |
-| INST-002 | D-mac-1 D-linux-1 | First run of the installed package on macOS and Linux | U1 | high | macos, linux | all | planned |
-| INST-003 | D-mac-2 D-linux-1 | Quitting or killing the app leaves no host or runtime | U1 | medium | macos, linux | all | planned |
-| UPD-002 | D-upg-2 | Update between release candidates keeps data, sign-ins and the runtime | U3 | high | windows | all | planned |
-| UPD-003 | D-upg-3 | The install folder after an update is clean | U2 | medium | windows | all | planned |
+| INST-002 | D-mac-1 D-linux-1 | First run of the installed package on macOS and Linux | U1 | high | macos, linux | en, ja | automated (release-playbook.mjs) |
+| INST-003 | D-mac-2 D-linux-1 | Quitting or killing the app leaves no host or runtime | U1 | medium | macos, linux | en, ja | automated (release-playbook.mjs) |
+| UPD-002 | D-upg-2 | Update between release candidates keeps data, sign-ins and the runtime | U3 | high | windows | en | automated (update-playbook.mjs) |
+| UPD-003 | D-upg-3 | The install folder after an update is clean | U2 | medium | windows | en | automated (update-playbook.mjs) |
 | UPD-004 | N3 | The app ends for an update while a reply runs | U2 | high | all | en, ja | automated (release-playbook.mjs) |
-| UPD-005 | P18 | Switching the update channel release → QA → release keeps data | U3 | medium | windows | all | planned |
+| UPD-005 | P18 | Switching the update channel release → QA → release keeps data | U3 | medium | windows | en | automated (update-playbook.mjs) |
 | START-002 | P2 | Without a remembered session the folder's latest one opens | U9 | high | all | en, ja | automated (release-playbook.mjs) |
 | SESS-001 | P3 P5 | Sending in an old session keeps it whole | U9 | high | all | en, ja | automated (release-playbook.mjs) |
 | SESS-002 | P4 | An old session of another folder stays in its folder | U11 | high | all | en, ja | automated (release-playbook.mjs) |
@@ -47,8 +47,8 @@ Generated from release-checks/cases/*.yaml by `node harness/run/catalog.mjs --ta
 | SESS-007 | P16 | Reloading the window ten times and quitting leaves nothing behind | U4 | medium | all | en, ja | automated (release-playbook.mjs) |
 | SIGN-001 | N4 | Sign in to Shisa.AI and sign out | U5 | high | all | en, ja | automated (release-playbook.mjs) |
 | SIGN-002 | N4 C-mac-models | The model list follows sign-in and sign-out without a restart | U5 | high | all | all | gap: The runtime (jouzu 0.2.5) always fetches the Shisa.AI model list from the fixed api.shisa.ai address and does not use the model-list address the sign-in returns, so a stand-in cannot serve it, and a real account needs a person to approve the sign-in in a browser. |
-| IMG-001 | P19 C-win-image | The image tool with a paid account and with ChatGPT | U10 | high | all | all | planned |
-| IMG-002 | C-mac-image-free | The image tool with a free Shisa.AI account | U10 | medium | all | all | planned |
+| IMG-001 | P19 C-win-image | The image tool with a paid account and with ChatGPT | U10 | high | all | en, ja | automated (release-playbook.mjs) |
+| IMG-002 | C-mac-image-free | The image tool with a free Shisa.AI account | U10 | medium | all | en, ja | automated (release-playbook.mjs) |
 
 ## regression (17)
 
@@ -69,7 +69,7 @@ Generated from release-checks/cases/*.yaml by `node harness/run/catalog.mjs --ta
 | REG-205 | #205 #168 | Settings show no dirty build and no launcher | U8 | low | all | en, ja | automated (abnormal-playbook.mjs) |
 | REG-208 | #208 | Commit marking can be switched on and kept | U8 | low | all | en | automated (abnormal-playbook.mjs) |
 | REG-026 | #26 | Settings stay open when clicking beside them | U8 | low | all | en | automated (abnormal-playbook.mjs) |
-| FOLD-001 | C-mac-239 #239 | A folder opened through a symlink is listed once | U11 | medium | macos, linux | all | planned |
+| FOLD-001 | C-mac-239 #239 | A folder opened through a symlink is listed once | U11 | medium | macos, linux | en, ja | automated (release-playbook.mjs) |
 | SEC-001 | #130 | The host token is in no file | U12 | high | all | en | automated (abnormal-playbook.mjs) |
 
 ## abnormal (27)
@@ -82,7 +82,7 @@ Generated from release-checks/cases/*.yaml by `node harness/run/catalog.mjs --ta
 | CHAT-018 |  | Stop while the reply is writing | U4 | high | all | en | automated (abnormal-playbook.mjs) |
 | CHAT-019 |  | Stop while a new session's runtime is still starting | U7 | medium | all | en | automated (abnormal-playbook.mjs) |
 | CHAT-020 |  | Stop with a message waiting in the queue | U4 | high | all | en | automated (abnormal-playbook.mjs) |
-| INST-004 | D-mac-3 D-linux-1 | Runtime files deleted while the app runs are reinstalled | U7 | medium | macos, linux | all | planned |
+| INST-004 | D-mac-3 D-linux-1 | Runtime files deleted while the app runs are reinstalled | U7 | medium | linux | en, ja | automated (release-playbook.mjs) |
 | PROV-001 |  | Provider rejects the key while sending | U6 | high | all | all | automated (abnormal-playbook.mjs) |
 | PROV-002 |  | Provider rate-limits the request | U6 | high | all | all | automated (abnormal-playbook.mjs) |
 | PROV-003 |  | Provider fails with a server error | U6 | high | all | all | automated (abnormal-playbook.mjs) |
@@ -339,32 +339,45 @@ Data: Custom provider = the fixture (OpenAI-compatible), model "deterministic".
 
 ### INST-002 First run of the installed package on macOS and Linux
 
-The DMG app, the AppImage and the .deb, started with a throwaway home, install their runtime on their own and answer a message.
+The DMG app, the AppImage and the .deb, started with a throwaway home, install their runtime on their own, walk the person through the first-run pages and answer a message.
 
-Before: The package of this rc, a throwaway home.
+Before: The package of this rc installed (ABN_APP names its executable), a throwaway home that never had Jouzu.
+
+Data: The fixture model, entered on the first-run connection page as a custom provider.
 
 | # | Do | Expect |
 |---|---|---|
-| 1 | Start the installed app with a throwaway home. | The start page becomes ready on its own. |
-| 2 | Open a new session and send a message. | A reply arrives. |
+| 1 | Start the installed app with a throwaway home. | It prepares its runtime by itself, then shows the language page and the model connection page. |
+| 2 | Pick the language, choose Custom provider and save the fixture model. | The chat opens without a restart. |
+| 3 | Send a message. | A reply arrives in the window; the host started once. |
+
+Limit: macOS window: WKWebView has no WebDriver: on macOS the case checks only that the app installs and starts its runtime by itself (set by harness)
 
 ### INST-003 Quitting or killing the app leaves no host or runtime
 
 After Quit, and after the app process is killed, no host or runtime of that app is left running.
 
+Before: The installed app (ABN_APP) on a throwaway home; its runtime from an earlier run of the same app (ABN_APP_SEED).
+
 | # | Do | Expect |
 |---|---|---|
-| 1 | Quit the app (Cmd+Q, closing the window). | No host or runtime process is left. |
+| 1 | Quit the app (Linux the tray's Quit Jouzu; closing the window only hides it to the tray). | Within 5 s no host or runtime process is left. |
 | 2 | Start it again and kill the app process. | Within 5 s no host or runtime process is left. |
+
+Limit: macOS Quit: the menu is not scriptable without accessibility permission, so on macOS Quit is SIGTERM to the app (set by harness)
 
 ### INST-004 Runtime files deleted while the app runs are reinstalled
 
 The app notices its runtime files are gone, says it is reinstalling them, and a session answers afterwards.
 
+Before: The installed app (ABN_APP) after its first run on a throwaway home.
+
 | # | Do | Expect |
 |---|---|---|
-| 1 | With the app running, delete the runtime's files under its home. | Within 60 s the app shows that it is reinstalling the runtime. |
-| 2 | Open a session and send a message. | A reply arrives. |
+| 1 | With the app running, delete the runtime's files under its home, open a new session and send a message. | Within 60 s the window says it is preparing the runtime. |
+| 2 | Send a message. | A reply arrives within 3 min; the runtime's files are back. |
+
+Limit: macOS window: WKWebView has no WebDriver: the case cannot run on macOS and is recorded by hand there (set by harness)
 
 ### UPD-001 Update from the last release keeps sessions, settings and sign-ins
 
@@ -380,6 +393,8 @@ Data: The real QA update feed (the feed is compiled into the app; there is no ad
 | 2 | Install it. | The app restarts on the new version by itself. |
 | 3 | Open the sessions, Settings and the model list. | Sessions, the changed setting and the sign-in are all there. |
 | 4 | Send a message in an old session. | A reply arrives. |
+
+Limit: installer to new window: none decided; recorded only (set by nobody decided)
 
 ### UPD-002 Update between release candidates keeps data, sign-ins and the runtime
 
@@ -881,11 +896,15 @@ With a valid key the image tool makes an image in each language and with each pr
 
 Before: A dedicated QA test account for the Shisa.AI image service (decided by the product owner 2026-11-27); its key in a secret store, never in the repository.
 
+Data: Runner secrets JOUZU_QA_SHISA_KEY (paid Shisa.AI QA account) and JOUZU_QA_CHATGPT_AUTH (the runtime's openai-codex sign-in entry of a ChatGPT QA account, JSON). The fixture model calls generate_image (prompt IMAGE:provider); the image itself is made by the real service.
+
 | # | Do | Expect |
 |---|---|---|
 | 1 | Ask for an image in en and in ja. | An image is made each time. |
 | 2 | Choose the other provider and ask again. | An image is made. |
-| 3 | Use a key that is not valid. | A clear message says what is wrong. |
+| 3 | Use a key that is not valid. | A clear message says what is wrong, and the tool's row shows it failed. |
+
+Limit: QA account credentials: harness gap: no QA credential store yet; the valid-key and ChatGPT steps need a dedicated QA environment in CI with its own QA accounts (proposed QA CI design, awaiting the product owner) (set by harness)
 
 ### IMG-002 The image tool with a free Shisa.AI account
 
@@ -893,10 +912,14 @@ With a free account, Settings > Tools shows Shisa.AI as the provider and says th
 
 Before: A dedicated free QA test account.
 
+Data: Runner secret JOUZU_QA_SHISA_FREE_KEY (the free Shisa.AI QA account).
+
 | # | Do | Expect |
 |---|---|---|
 | 1 | Open Settings > Tools. | Shisa.AI is the provider and the plan's limit is said. |
 | 2 | Ask for an image. | A clear message about the plan. |
+
+Limit: QA account credentials: harness gap: no free-tier QA account credential in a QA credential store yet (proposed QA CI design, awaiting the product owner) (set by harness)
 
 ### SEC-001 The host token is in no file
 
