@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statfsSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { platformName, readResults, slug } from './common.mjs';
 import { listPlaybook, loadCatalog, matchCode, selected } from './catalog.mjs';
@@ -30,6 +30,12 @@ import { listPlaybook, loadCatalog, matchCode, selected } from './catalog.mjs';
 //     plan.reruns times (default 3). A re-run never changes the first result; it is recorded
 //     next to it.
 //   - At the end it writes report.md and results.txt (report.mjs). It writes no conclusions.
+//   - Disk: when a case ends (PASS, FAIL, ERROR or timeout alike) its throwaway world is
+//     deleted; only small evidence is kept (the case's screenshots and reports, and log, session
+//     and settings files of at most 1 MB each, 20 MB per case, copied to <case>/kept/). Before
+//     each case the runner checks the disk: if the run's folder is over plan.diskCapMB (default
+//     2000) or the drive has less than plan.minFreeMB free (default 5000), it stops the run
+//     with an error that says so, and the report lists the cases not run.
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, item, index, all) => item.startsWith('--') ? [...pairs, [item.slice(2), all[index + 1]]] : pairs, []));
 for (const name of ['plan', 'out', 'machine']) if (!args[name]) { console.error(`--${name} is required`); process.exit(2); }
@@ -45,6 +51,8 @@ const platform = platformName();
 const languages = (args.langs ?? process.env.ABN_LANGS ?? 'en').split(',').map(item => item.trim()).filter(Boolean);
 const timeoutMs = (plan.caseTimeoutMinutes ?? 10) * 60_000;
 const reruns = plan.reruns ?? 3;
+const diskCapMB = plan.diskCapMB ?? 2000;
+const minFreeMB = plan.minFreeMB ?? 5000;
 const resultsFile = join(out, 'results.jsonl');
 let port = Number(process.env.ABN_PORT ?? 9400);
 
@@ -140,6 +148,7 @@ async function runOnce(item, phase, attempt) {
   await sleep(timedOut ? 1_000 : 5_000);
   const left = processesUnder(temp);
   killList(left);
+  const notDeleted = await keepAndDelete(temp, folder);
 
   const record = {
     id: item.id, case: item.name, language: item.language, suite: item.suite, layer: item.layer, scenario: item.scenario, playbook: relative(join(here, '..', 'e2e'), item.playbook).split('\\').join('/'), phase, attempt, machine: args.machine, platform,
@@ -147,6 +156,7 @@ async function runOnce(item, phase, attempt) {
     evidence: relative(out, folder).split('\\').join('/'),
     leftProcesses: left.map(row => row.name), at: new Date().toISOString(),
   };
+  if (notDeleted) record.notes.push(`harness: ${notDeleted}`);
   let report = null;
   try { report = JSON.parse(readFileSync(join(folder, 'abnormal-exam.json'), 'utf8')); } catch { /* none written */ }
   const run = report?.runs?.find(entry => entry.language === item.language) ?? report?.runs?.[0];
@@ -173,11 +183,76 @@ async function runOnce(item, phase, attempt) {
   return record;
 }
 
+// ---- Disk: each world is deleted when its case ends; a cap stops the run loudly. ----
+/** Bytes under a folder (links not followed). */
+function sizeOf(path) {
+  let total = 0;
+  const stack = [path];
+  while (stack.length) {
+    const next = stack.pop();
+    let info; try { info = lstatSync(next); } catch { continue; }
+    if (info.isDirectory()) { try { for (const name of readdirSync(next)) stack.push(join(next, name)); } catch { /* unreadable */ } } else total += info.size;
+  }
+  return total;
+}
+const KEEP = /\.(log|jsonl|json|txt|md)$/i;
+const SKIP_DIRS = /^(node_modules|runtime|app|bin|cache|install|webview|EBWebView|warm|updates|\.cache|\.local)$/i;
+/** Copy the world's small evidence files to <case>/kept/, then delete the world. Answers what could not be deleted. */
+async function keepAndDelete(temp, folder) {
+  const kept = join(folder, 'kept');
+  let budget = 20 * 1024 * 1024;
+  const stack = [temp];
+  while (stack.length && budget > 0) {
+    const next = stack.pop();
+    let info; try { info = lstatSync(next); } catch { continue; }
+    if (info.isSymbolicLink()) continue;
+    if (info.isDirectory()) {
+      if (next !== temp && SKIP_DIRS.test(next.split(/[\\/]/).pop())) continue;
+      try { for (const name of readdirSync(next)) stack.push(join(next, name)); } catch { /* unreadable */ }
+    } else if (KEEP.test(next) && info.size <= 1024 * 1024 && info.size <= budget) {
+      const target = join(kept, relative(temp, next));
+      try { mkdirSync(dirname(target), { recursive: true }); copyFileSync(next, target); budget -= info.size; } catch { /* in use */ }
+    }
+  }
+  // Windows lets go of files a moment after their process ends: try a few times.
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try { rmSync(temp, { recursive: true, force: true, maxRetries: 3 }); } catch { /* retried below */ }
+    if (!existsSync(temp)) return null;
+    killList(processesUnder(temp));
+    await sleep(2_000);
+  }
+  return `its throwaway world could not be deleted (${Math.round(sizeOf(temp) / 1048576)} MB left in ${temp})`;
+}
+/** Stop the run when it would fill the disk. */
+function diskProblem() {
+  const used = sizeOf(out) / 1048576;
+  if (used > diskCapMB) return `the run's folder holds ${Math.round(used)} MB, over the plan's cap of ${diskCapMB} MB`;
+  try {
+    const fs = statfsSync(out);
+    const free = (fs.bavail * fs.bsize) / 1048576;
+    if (free < minFreeMB) return `the drive has ${Math.round(free)} MB free, under the plan's minimum of ${minFreeMB} MB`;
+  } catch { /* statfs unavailable */ }
+  return null;
+}
+let stoppedFor = null;
+function checkDisk() {
+  if (stoppedFor) return false;
+  const problem = diskProblem();
+  if (!problem) return true;
+  stoppedFor = problem;
+  const meta = JSON.parse(readFileSync(join(out, 'run.json'), 'utf8'));
+  meta.stoppedForDisk = problem;
+  writeFileSync(join(out, 'run.json'), `${JSON.stringify(meta, null, 2)}\n`);
+  console.error(`\n*** RUN STOPPED: ${problem}. No more cases are started; the report lists the cases not run. ***\n`);
+  return false;
+}
+
 // ---- First pass: every case once, whatever happens. ----
 const done = readResults(out);
 const have = (item, phase, attempt) => done.some(r => r.case === item.name && r.language === item.language && r.phase === phase && (phase === 'first' || r.attempt === attempt));
 for (const [index, item] of queue.entries()) {
   if (have(item, 'first', 1)) continue;
+  if (!checkDisk()) break;
   console.log(`--- ${index + 1}/${queue.length}`);
   done.push(await runOnce(item, 'first', 1));
 }
@@ -188,6 +263,7 @@ for (const item of queue) {
   if (!first || !['FAIL', 'ERROR'].includes(first.status)) continue;
   for (let attempt = 1; attempt <= reruns; attempt += 1) {
     if (have(item, 'rerun', attempt)) continue;
+    if (!checkDisk()) break;
     done.push(await runOnce(item, 'rerun', attempt));
   }
 }
@@ -200,5 +276,9 @@ writeFileSync(join(out, 'run.json'), `${JSON.stringify(meta, null, 2)}\n`);
 const reportArgs = [join(here, 'report.mjs'), '--out', out, '--plan', resolve(args.plan)];
 if (args.baseline) reportArgs.push('--baseline', resolve(args.baseline));
 try { execFileSync(process.execPath, reportArgs, { stdio: 'inherit' }); } catch { console.log('report.mjs failed; results.jsonl holds every result'); }
+if (stoppedFor) {
+  console.error(`*** RUN STOPPED EARLY: ${stoppedFor}. Cases not started are NOT RUN in ${join(out, 'report.md')}. ***`);
+  process.exit(3);
+}
 console.log(`All ${queue.length} cases ran. Results: ${join(out, 'report.md')}`);
 process.exit(0);

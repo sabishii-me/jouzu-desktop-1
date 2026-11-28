@@ -75,6 +75,14 @@ What each world needs besides the app under test:
 | UPD-* (world installed-app) | Windows | `ABN_UPDATE_FROM_RELEASE` and `ABN_UPDATE_FROM_RC` = the earlier installers, `ABN_UPDATE_TO` = the version under test. |
 | IMG-001/002 | all | The QA accounts' credentials `JOUZU_QA_SHISA_KEY`, `JOUZU_QA_SHISA_FREE_KEY`, `JOUZU_QA_CHATGPT_AUTH`. Until a QA credential store exists these steps are a harness gap and record ERROR. |
 
+Disk: each case's world lives under `<out>/cases/<lang>/<case>/tmp` and is
+deleted when the case ends, also after a FAIL, ERROR or crash. Only small
+evidence files (logs, JSON, text, at most 1 MB each and 20 MB per case) are kept
+in `<case>/kept/`. Before every case the runner checks the disk: if the run's
+folder holds more than `diskCapMB` (plan, default 2000) or the disk has less
+than `minFreeMB` free (plan, default 5000), the run stops at once with exit
+code 3, prints why, and the report marks the cases not started as NOT RUN.
+
 `harness/run/README.md` has the runner's rules, acceptance records and the report.
 To add or change a case: edit its YAML entry and its code together, then
 `npm run catalog:check` and `npm run catalog:table`.
