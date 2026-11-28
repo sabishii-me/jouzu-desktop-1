@@ -5,9 +5,9 @@ import { join } from "node:path";
 /**
  * Update playbook: a person on an earlier version updates Jouzu Desktop in the app (Windows).
  * Runs in the exam's update world (ABN_WORLD=installed-app, update-world.mjs): each case installs
- * the earlier version with its own installer at the app's real place, uses it, updates through the
- * app's own feed, and checks what the person has afterwards. The machine's own Jouzu Desktop is
- * put aside before and put back after by the exam.
+ * the earlier version with its own installer into a throwaway folder, with throwaway data and
+ * profile folders, uses it, updates through the app's own feed, and checks what the person has
+ * afterwards. The machine's own Jouzu Desktop is never moved, closed or changed.
  *
  * Unlike the other playbooks it does not attach to a window when it starts: the window it drives
  * is closed by the update and a new one opens, so each case attaches (again) itself.
@@ -262,9 +262,9 @@ for (const item of cases) {
   }
   await shot(c, "end");
   await browser?.close().catch(() => {});
-  // Put the machine's own Jouzu Desktop back before anything else runs.
+  // Remove the test installation and put the installer's registry entries back before anything else runs.
   const restored = await control("/update/restore").catch(error => ({ error: String(error) }));
-  if (restored.error) c.fail(`the machine's own Jouzu Desktop could not be put back: ${restored.error}`);
+  if (restored.error) c.fail(`the test installation could not be removed: ${restored.error}`);
   record.ms = now() - started;
   result.cases.push(record);
   console.error(`${record.skipped ? "SKIP" : record.ok ? "PASS" : "FAIL"} ${item.name}${record.problems.length ? `: ${record.problems.join("; ")}` : ""}`);

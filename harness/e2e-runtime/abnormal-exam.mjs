@@ -7,7 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { startFixtureServer } from './fixture-server.mjs';
 import { endGroup, quitApp, startApp } from './app-window.mjs';
-import { appExe, appProcesses, installedVersion, managedFolder, putAside, restoreAside, runSilently, startInstalled } from './update-world.mjs';
+import { appProcesses, endAppProcesses, installedVersion, installInto, restoreKeys, saveKeys, startInstalled, uninstallFrom, updatePaths } from './update-world.mjs';
 
 // The abnormal-path exam: e2e/abnormal-playbook.mjs on a throwaway home, with a world the
 // playbook can break and repair (provider faults, runtime kills, a slow runtime start, a
@@ -58,7 +58,7 @@ const windows = process.platform === 'win32';
 // 'new-user' (nothing prepared), or 'shisa-stand-in' (as '' and Shisa.AI sign-in goes to the fixture's stand-in).
 const newUser = process.env.ABN_WORLD === 'new-user';
 const shisaStandIn = process.env.ABN_WORLD === 'shisa-stand-in';
-// 'installed-app' with an update installer (Windows): the app is installed and updated at its real place (update-world.mjs).
+// 'installed-app' (Windows): the earlier version installed into a throwaway folder and updated in the app (update-world.mjs).
 const updateWorld = process.env.ABN_WORLD === 'installed-app' && windows;
 let fixturePortNow = null;
 const children = new Set();
@@ -95,7 +95,7 @@ function makeRoot(fixturePort, pkg, at = null) {
     return { root, home, data, workspace };
   }
   // The app keeps its files in %LOCALAPPDATA%\Shisa.ai\JouzuDesktop; the exam gives it its own
-  // (the update world: the real one, the machine's own put aside).
+  // (the update world: its throwaway profile's LOCALAPPDATA).
   const home = at?.home ?? (pkg?.shell ? join(root, 'localappdata', 'Shisa.ai', 'JouzuDesktop') : join(root, 'home'));
   const data = join(home, 'data');
   const workspace = join(root, 'workspace');
@@ -487,41 +487,37 @@ function worldServer(stack) {
         }
         if (url.pathname.startsWith('/update/')) {
           if (!updateWorld) throw new Error('the update world runs on Windows with ABN_WORLD=installed-app');
-          const saveDir = join(stack.paths.root, 'aside');
-          // A person's environment: the real profile folders, so the app and its installer agree on where it lives.
-          const personEnv = () => ({ ...cleanEnv(stack.paths.root, {}), HOME: process.env.USERPROFILE, USERPROFILE: process.env.USERPROFILE, LOCALAPPDATA: process.env.LOCALAPPDATA, APPDATA: process.env.APPDATA });
+          const paths = updatePaths(stack.paths.root);
+          // The app's environment: every user folder throwaway, as in the other worlds.
+          const appEnv = () => ({ ...cleanEnv(stack.paths.root, {}), HOME: paths.profile, USERPROFILE: paths.profile, LOCALAPPDATA: paths.localappdata, APPDATA: paths.appdata });
           if (url.pathname === '/update/prepare') {
-            // The earlier version installed by its own installer and used: the fixture model saved, old sessions.
+            // The earlier version installed by its own installer into a throwaway folder and used: the fixture model saved, old sessions.
             const installer = { release: process.env.ABN_UPDATE_FROM_RELEASE, rc: process.env.ABN_UPDATE_FROM_RC }[input.from ?? 'release'];
             if (!installer || !existsSync(installer)) throw new Error(`no installer for "${input.from}" (ABN_UPDATE_FROM_${String(input.from ?? 'release').toUpperCase()})`);
-            putAside(saveDir);
-            stack.aside = saveDir;
-            const code = await runSilently(installer, ['/S']);
-            if (!existsSync(appExe())) throw new Error(`the installer ended (${code}) without installing ${appExe()}`);
-            makeRoot(fixturePortNow, { shell: appExe() }, { root: stack.paths.root, home: managedFolder() });
-            stack.paths.home = managedFolder();
-            stack.paths.data = join(managedFolder(), 'data');
-            startInstalled(personEnv(), input.port, stack.paths.workspace);
-            return reply({ version: installedVersion(), exe: appExe(), to: process.env.ABN_UPDATE_TO ?? null });
+            for (const dir of [paths.localappdata, paths.appdata, paths.profile, join(paths.profile, 'AppData', 'Local'), join(paths.profile, 'AppData', 'Roaming')]) mkdirSync(dir, { recursive: true });
+            stack.keys ??= saveKeys(join(stack.paths.root, 'saved-keys'));
+            stack.update = paths;
+            const exe = await installInto(installer, paths, appEnv());
+            makeRoot(fixturePortNow, { shell: exe }, { root: stack.paths.root, home: paths.managed });
+            stack.paths.home = paths.managed;
+            stack.paths.data = join(paths.managed, 'data');
+            startInstalled(paths, appEnv(), input.port, stack.paths.workspace);
+            return reply({ version: installedVersion(), exe, to: process.env.ABN_UPDATE_TO ?? null });
           }
-          if (url.pathname === '/update/state') return reply({ version: installedVersion(), exe: existsSync(appExe()), processes: appProcesses(), to: process.env.ABN_UPDATE_TO ?? null, managed: managedFolder() });
-          if (url.pathname === '/update/start') { startInstalled(personEnv(), input.port, stack.paths.workspace); return reply({ ok: true }); }
-          if (url.pathname === '/update/quit') {
-            // The app ends (an update or uninstall needs it closed); answers when nothing of it runs.
-            const pids = appProcesses().map(row => row.pid);
-            if (pids.length) try { execFileSync('taskkill.exe', [...pids.flatMap(pid => ['/PID', String(pid)]), '/T', '/F'], { stdio: 'ignore' }); } catch { /* gone */ }
-            return reply({ ended: pids.length, left: appProcesses() });
-          }
+          if (url.pathname === '/update/state') return reply({ version: installedVersion(), processes: appProcesses(paths.install), to: process.env.ABN_UPDATE_TO ?? null });
+          if (url.pathname === '/update/start') { startInstalled(paths, appEnv(), input.port, stack.paths.workspace); return reply({ ok: true }); }
+          if (url.pathname === '/update/quit') { const ended = endAppProcesses(paths.install); return reply({ ended, left: appProcesses(paths.install) }); }
           if (url.pathname === '/update/uninstall') {
-            // Uninstall silently, as a person's silent uninstall does; answers whether the data folder is kept.
-            const uninstaller = join(managedFolder(), 'uninstall.exe');
-            if (!existsSync(uninstaller)) throw new Error('no uninstall.exe in the install folder');
-            await runSilently(uninstaller, ['/S']);
-            const until = Date.now() + 120_000;
-            while ((installedVersion() || existsSync(appExe())) && Date.now() < until) await sleep(1_000);
-            return reply({ uninstalled: !installedVersion() && !existsSync(appExe()), dataKept: existsSync(join(managedFolder(), 'data', 'state', 'sessions')), left: existsSync(managedFolder()) ? readdirSync(managedFolder()) : [] });
+            const removed = await uninstallFrom(paths, appEnv());
+            return reply({ uninstalled: removed.removed, dataKept: existsSync(join(paths.managed, 'data', 'state', 'sessions')), left: existsSync(paths.managed) ? readdirSync(paths.managed) : [] });
           }
-          if (url.pathname === '/update/restore') return reply(restoreAside(saveDir));
+          if (url.pathname === '/update/restore') {
+            // The throwaway installation removed and the registry entries put back as they were.
+            if (stack.update) await uninstallFrom(stack.update, appEnv());
+            restoreKeys(stack.keys);
+            stack.update = null; stack.keys = null;
+            return reply({ restored: true });
+          }
         }
         if (url.pathname.startsWith('/app/')) {
           if (!process.env.ABN_APP) throw new Error('ABN_APP is not set: no installed app to start');
@@ -599,7 +595,7 @@ function runPlaybook(env) {
 
 const report = { startedAt: new Date().toISOString(), mode: null, runs: [] };
 const pkg = installed();
-report.mode = updateWorld ? `update world ${process.env.LOCALAPPDATA}` : pkg?.shell ? `installed app ${pkg.shell}` : pkg ? `installed package's host and UI in a test browser ${pkg.install}` : `source build ${process.env.ABN_HOST}`;
+report.mode = updateWorld ? 'update world (throwaway install folder)' : pkg?.shell ? `installed app ${pkg.shell}` : pkg ? `installed package's host and UI in a test browser ${pkg.install}` : `source build ${process.env.ABN_HOST}`;
 if (!pkg && !updateWorld) for (const name of ['ABN_HOST', 'ABN_DIST', 'ABN_RUNTIME_APP']) if (!process.env[name]) { console.error(`${name} is not set`); process.exit(2); }
 const languages = (process.env.ABN_LANGS ?? 'en,ja').split(',').map(item => item.trim()).filter(Boolean);
 let port = Number(process.env.ABN_PORT ?? 9240);
@@ -632,7 +628,7 @@ try {
     fixture.server.close();
     if (stack.host) kill(stack.host.pid);
     if (stack.shell) kill(stack.shell.pid);
-    if (stack.aside) { try { restoreAside(stack.aside); } catch (error) { report.runs.push({ error: `could not put the machine's own Jouzu Desktop back: ${error.message}` }); } }
+    if (stack.update || stack.keys) { try { if (stack.update) await uninstallFrom(stack.update, process.env); restoreKeys(stack.keys); } catch (error) { report.runs.push({ error: `could not remove the test installation or put the registry entries back: ${error.message}` }); } }
     for (const app of stack.apps?.values() ?? []) endGroup(app.group);
     try { cpSync(join(stack.paths.home, 'logs'), join(out, `logs-${language}`), { recursive: true }); } catch { /* no logs */ }
     port += 1;

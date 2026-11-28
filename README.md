@@ -42,7 +42,7 @@ scenarios that use them live here.
 | `harness/e2e-runtime/abnormal-exam.mjs` | Starts one world: a throwaway home, the app's host, a test browser, the fixture provider, and a control server the cases use to break and repair it (provider faults, runtime kills, slow starts, bad files, restarts, quitting). Never touches a real data folder; only stops processes it started. |
 | `harness/e2e-runtime/fixture-server.mjs` | Deterministic local model provider with switchable faults, scripted replies (LONG, TOOL, TOOLWAIT, STEPS:n, PHASES, BULK, FULL) and a Shisa.AI sign-in stand-in. |
 | `harness/e2e-runtime/app-window.mjs` | The installed app on macOS/Linux started as a person starts it, on a throwaway home: its window driven over WebKitWebDriver (Linux), its tray Quit clicked over its session bus (INST cases). |
-| `harness/e2e-runtime/update-world.mjs` | The Windows update world: the earlier version installed at the app's real place and updated in the app; the machine's own Jouzu Desktop put aside and put back (UPD cases). |
+| `harness/e2e-runtime/update-world.mjs` | The Windows update world: the earlier version installed by its installer into a throwaway folder (`/S /NS /D=`), with throwaway data and profile folders, then updated in the app (UPD cases). The machine's own Jouzu Desktop is never moved or closed. |
 | `harness/e2e-runtime/runtime-delay.mjs` | Loaded into runtimes the world starts, to make a runtime slow to start on request. |
 | `harness/e2e/playbook-kit.mjs` | What every playbook shares: the words of the interface per language, locators, waiting, and the judgements (silent, scope, recovery). |
 | `harness/e2e/release-playbook.mjs` | The release playbook's cases (main user paths, smoke). |
@@ -72,7 +72,7 @@ What each world needs besides the app under test:
 | Cases | Platforms | Needs |
 |---|---|---|
 | INST-002/003/004 (world installed-package) | Linux, macOS | `ABN_APP` = the installed app's executable; `ABN_APP_SEED` = a managed folder an earlier run of that app installed its runtime into. Linux also needs `xvfb`, `dbus` and `webkit2gtk-driver` (WebKitWebDriver). |
-| UPD-* (world installed-app) | Windows | `ABN_UPDATE_FROM_RELEASE` and `ABN_UPDATE_FROM_RC` = the earlier installers, `ABN_UPDATE_TO` = the version under test. No Jouzu Desktop may be running. |
+| UPD-* (world installed-app) | Windows | `ABN_UPDATE_FROM_RELEASE` and `ABN_UPDATE_FROM_RC` = the earlier installers, `ABN_UPDATE_TO` = the version under test. |
 | IMG-001/002 | all | The QA accounts' credentials `JOUZU_QA_SHISA_KEY`, `JOUZU_QA_SHISA_FREE_KEY`, `JOUZU_QA_CHATGPT_AUTH`. Until a QA credential store exists these steps are a harness gap and record ERROR. |
 
 `harness/run/README.md` has the runner's rules, acceptance records and the report.

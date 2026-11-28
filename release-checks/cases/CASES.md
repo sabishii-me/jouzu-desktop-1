@@ -383,7 +383,7 @@ Limit: macOS window: WKWebView has no WebDriver: the case cannot run on macOS an
 
 A person on the last release updates in the app through the QA feed. After the update every session, setting and sign-in is still there and a message is answered.
 
-Before: The last release installed and used (sessions, a changed setting, a sign-in). The real data and install folders of the test machine moved aside first and restored after.
+Before: The last release installed by its installer into a throwaway folder, with throwaway data and profile folders, and used (sessions, a changed setting, saved providers).
 
 Data: The real QA update feed (the feed is compiled into the app; there is no address switch).
 

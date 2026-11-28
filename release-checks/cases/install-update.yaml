@@ -122,7 +122,7 @@
   purpose: A person on the last release updates in the app through the QA feed. After the update every session, setting and sign-in is still there and a message is answered.
   preconditions:
     world: installed-app
-    state: The last release installed and used (sessions, a changed setting, a sign-in). The real data and install folders of the test machine moved aside first and restored after.
+    state: The last release installed by its installer into a throwaway folder, with throwaway data and profile folders, and used (sessions, a changed setting, saved providers).
   data: The real QA update feed (the feed is compiled into the app; there is no address switch).
   steps:
     - do: Settings > check for updates.
