@@ -21,6 +21,22 @@ people. Read this before changing anything.
 - Work on a branch and open a pull request. Only QA and the maintainers merge;
   an author of product code never marks their own change as intended.
 
+## Cases
+
+- Every case is one entry in `release-checks/cases/*.yaml` and one `add(...)`
+  in a playbook under `harness/e2e/`, named the same. Change both together;
+  `npm run catalog:check` must pass and `npm run catalog:table` rewrites `CASES.md`.
+- An ID is permanent. A case no longer run keeps its ID with
+  `automation.status: deferred` and a note saying whose decision it was.
+- A case records facts (PASS/FAIL, what was seen, evidence). It never says
+  "known", "minor" or "not a regression", and never skips itself without a
+  reason the plan declares.
+- A number a case fails on must say who set it (`limits[].by`); a line nobody
+  decided is recorded, not judged.
+- A test round runs one frozen commit of this repository. Fixes wait until the
+  round is over.
+- One-off scripts and run output do not go in this repository.
+
 ## The atlas
 
 - A state id is stable: `<flow>--<state>`, lower case, words joined by `-`.

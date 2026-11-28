@@ -2,8 +2,12 @@
   "name": "jouzu-desktop-qa",
   "private": true,
   "type": "module",
-  "description": "Independent QA for Jouzu Desktop: the UI atlas and the harness that records it.",
+  "description": "Independent QA for Jouzu Desktop: the case catalog, the release test runner, the playbooks and the UI atlas.",
   "scripts": {
+    "catalog:check": "node harness/run/catalog.mjs --check",
+    "catalog:table": "node harness/run/catalog.mjs --table release-checks/cases/CASES.md",
+    "selftest": "sh harness/run/test/selftest.sh",
+    "scan": "node tools/scan-public.mjs",
     "atlas:build": "node tools/atlas-build.mjs",
     "atlas:diff": "node tools/atlas-diff.mjs"
   },
