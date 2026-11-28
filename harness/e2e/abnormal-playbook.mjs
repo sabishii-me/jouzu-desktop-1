@@ -1116,7 +1116,16 @@ add("#119 An image in a sent message stays after switching sessions", "The image
   if (after < before) c.fail(`the image is gone after switching sessions (${before} -> ${after})`);
 }, { langs: ["en"] });
 
-add("#87 Retry after the runtime's files come back", "The runtime's files are missing at start: the start page says so (not an endless Connecting), Retry says so again while they are missing, and once they are back Retry opens a session that answers.", async c => {
+// Expected behaviour from decision 0029 and host-layer.md §7: the host checks the installation
+// when it starts and installs it on its own; the prepare screen shows it; the person is not asked
+// to repair anything, and a session then answers.
+const PREPARING = {
+  en: ["Preparing Jouzu…", "Downloading Node…", "Installing packages…"],
+  ja: ["Jouzu を準備しています…", "Node をダウンロードしています…", "パッケージをインストールしています…"],
+};
+const INSTALL_FAILED = { en: "Installation failed", ja: "インストールに失敗しました" };
+const ASKED_TO_INSTALL = { en: "Runtime files are missing. Install them to continue.", ja: "ランタイムがありません。続行するにはインストールしてください。" };
+add("#87 Runtime files missing at start are installed again", "The runtime's files are missing when the app starts: within 60 s the window says it is preparing the runtime (not an endless Connecting, not a request to install), the host installs them on its own, and a session then answers.", async c => {
   if (!await browserMode()) { c.record.skipped = true; c.note("the installed app's window cannot be restarted by this exam; run it with ABN_INSTALL"); return; }
   const reopen = async body => {
     const restarted = await control("/host/restart", body);
@@ -1125,37 +1134,35 @@ add("#87 Retry after the runtime's files come back", "The runtime's files are mi
     await page.evaluate(value => localStorage.setItem("jouzu.ui.language", value), lang);
     await page.reload();
   };
-  const connecting = () => page.getByText(/Connecting|接続しています|接続中|正在连接|正在連線/i).filter({ visible: true }).count();
-  // A Connecting that flashes while the session opens is fine; it fails only if it is still there after 3 s.
-  const staysConnecting = async () => {
-    for (const end = now() + 3_000; now() < end; await sleep(250)) if (!await connecting()) return false;
-    return await connecting() > 0;
-  };
+  const words = PREPARING[lang] ?? PREPARING.en;
+  const bodyText = () => page.locator("body").innerText().catch(() => "");
   try {
-    await reopen({ runtime: "missing" });
-    const alert = page.locator("[data-session-blocked]").first();
-    const shown = await alert.waitFor({ timeout: 20_000 }).then(() => true, () => false);
-    await page.screenshot({ path: join(shots, `${slug(c.record.name)}-missing.png`) }).catch(() => {});
-    if (!shown) { c.fail(`missing runtime files are not said at the start page (Connecting shown: ${await connecting() > 0})`); return; }
-    c.note(`shown: ${(await alert.innerText()).replace(/\s+/g, " ").slice(0, 160)}`);
-    const retry = () => alert.getByRole("button", { name: named("retry") }).first();
-    if (!await retry().count()) { c.fail("no Retry at the start page"); return; }
-    await retry().click();
-    await sleep(3_000);
-    if (!await alert.isVisible().catch(() => false)) c.fail("Retry while the files are still missing no longer says what is wrong");
-    if (await staysConnecting()) c.fail("Retry while the files are missing leaves the window on Connecting");
-    const restored = await control("/runtime/restore", {});
-    if (!restored.restored) { c.fail("the exam could not put the runtime back"); return; }
     const start = now();
-    await retry().click().catch(() => c.fail("Retry is gone before the files came back"));
-    const gone = await alert.waitFor({ state: "hidden", timeout: 20_000 }).then(() => true, () => false);
-    c.metric("retryToSessionMs", now() - start);
-    if (!gone) { c.fail("after the runtime came back, Retry did not open a session within 20 s"); await page.screenshot({ path: join(shots, `${slug(c.record.name)}-after-retry.png`) }).catch(() => {}); return; }
-    if (await staysConnecting()) c.fail("after Retry the window stays on Connecting");
-    await textbox().waitFor({ timeout: 15_000 }).catch(() => {});
+    await reopen({ runtime: "missing" });
+    let seen = null;
+    for (const end = now() + 60_000; !seen && now() < end; await sleep(500)) { const text = await bodyText(); seen = words.find(word => text.includes(word)) ?? null; }
+    await page.screenshot({ path: join(shots, `${slug(c.record.name)}-start.png`) }).catch(() => {});
+    if (!seen) {
+      const text = (await bodyText()).replace(/\s+/g, " ");
+      if (text.includes(ASKED_TO_INSTALL[lang] ?? ASKED_TO_INSTALL.en)) c.fail("the window asks the person to install the runtime's files instead of installing them on its own");
+      else c.fail(`within 60 s of starting without the runtime's files the window never said it was preparing the runtime (it shows: "${text.slice(0, 200)}")`);
+      return;
+    }
+    c.metric("startToPrepareMs", now() - start);
+    // Ready when the composer shows; a shown installation failure ends the wait at once with its words.
+    let ready = false, failed = null;
+    for (const end = now() + 9 * 60_000; !ready && !failed && now() < end; await sleep(1_000)) {
+      ready = await textbox().isVisible().catch(() => false);
+      const text = await bodyText();
+      const word = INSTALL_FAILED[lang] ?? INSTALL_FAILED.en;
+      if (!ready && text.includes(word)) failed = text.slice(text.indexOf(word)).replace(/\s+/g, " ").slice(0, 300);
+    }
+    c.metric("startToReadyMs", now() - start);
+    if (failed) { c.fail(`the installation the host started on its own failed: "${failed}"`); await page.screenshot({ path: join(shots, `${slug(c.record.name)}-failed.png`) }).catch(() => {}); return; }
+    if (!ready) { c.fail("the runtime was not installed again within 9 min"); await page.screenshot({ path: join(shots, `${slug(c.record.name)}-not-ready.png`) }).catch(() => {}); return; }
     const next = ask();
     await typeAndSend(next.prompt);
-    if (!await replyArrives(next.answer, 40_000)) c.fail("the session opened by Retry did not answer");
+    if (!await replyArrives(next.answer, 40_000)) c.fail("after the runtime was installed again, the session did not answer");
   } finally {
     await reopen({ runtime: "normal" }).catch(error => c.note(`could not restore the normal host: ${error.message}`));
     await newSession().waitFor({ timeout: 60_000 }).catch(() => {});

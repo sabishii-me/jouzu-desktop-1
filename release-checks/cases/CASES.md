@@ -57,7 +57,7 @@ Generated from release-checks/cases/*.yaml by `node harness/run/catalog.mjs --ta
 | REG-214 | #214 | A finished reply is not shown as Interrupted | U4 | medium | all | en, ja | automated (abnormal-playbook.mjs) |
 | REG-177 | #177 #179 | Send while a new session's runtime starts | U4 | high | all | en, ja | automated (abnormal-playbook.mjs) |
 | REG-178 | #178 | A provider server error is not called no network | U6 | medium | all | en, ja | automated (abnormal-playbook.mjs) |
-| RT-006 | #87 | Retry after the runtime's files come back | U7 | high | all | en, ja | automated (abnormal-playbook.mjs) |
+| RT-006 | #87 | Runtime files missing at start are installed again | U7 | high | all | en, ja | automated (abnormal-playbook.mjs) |
 | SESS-008 | P17 #33 | A draft stays in its own session | U4 | medium | all | en | automated (abnormal-playbook.mjs) |
 | REG-233 | #233 | Opening a saved session does not show it as Running | U9 | medium | all | en, ja | automated (abnormal-playbook.mjs) |
 | REG-212 | #212 | A background session's live state shows in the list | U4 | medium | all | en, ja | automated (abnormal-playbook.mjs) |
@@ -567,17 +567,21 @@ After sleep the reply finishes or is marked once, nothing is duplicated, and the
 | 1 | Freeze the app's processes for 30 s while a reply runs. | The reply finishes or is marked once; nothing is duplicated. |
 | 2 | Send the next message. | The reply arrives. |
 
-### RT-006 Retry after the runtime's files come back
+### RT-006 Runtime files missing at start are installed again
 
-The runtime's files are missing at start. The start page says so (not an endless Connecting), Retry says so again while they are missing, and once they are back Retry opens a session that answers.
+The runtime's files are missing when the app starts. The host installs them again on its own and the window shows that it is preparing the runtime (not an endless Connecting, not a request to the person to install or repair), then a session answers. Expected behaviour from decision 0029 (the host owns the runtime installation) and docs/design/host-layer.md section 7; it replaced the earlier expectation (the start page says the files are missing and Retry opens a session once they are back), which predates 0029.
 
 Before: The runtime's files moved away before the app starts.
 
 | # | Do | Expect |
 |---|---|---|
-| 1 | Start the app. | The start page says the runtime files are missing. |
-| 2 | Press Retry. | It says so again. |
-| 3 | Put the files back and press Retry. | A session opens and answers. |
+| 1 | Start the app. | Within 60 s the window says it is preparing the runtime. |
+| 2 | Wait. | The host installs the runtime by itself and the chat is ready within 9 min, with nothing for the person to do. |
+| 3 | Send a message. | The reply arrives. |
+
+Limit: prepare screen shown: 60 s (set by harness (same line as INST-004; not decided))
+
+Limit: installation finished: 9 min (set by harness (same line as INST-001; not decided))
 
 ### START-001 Cold start opens the last session
 

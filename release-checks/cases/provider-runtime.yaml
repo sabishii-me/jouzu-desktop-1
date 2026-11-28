@@ -231,24 +231,27 @@
 
 - id: RT-006
   legacy: ["#87"]
-  title: Retry after the runtime's files come back
+  title: Runtime files missing at start are installed again
   suite: regression
   scenario: U7
   priority: high
   type: functional
-  purpose: The runtime's files are missing at start. The start page says so (not an endless Connecting), Retry says so again while they are missing, and once they are back Retry opens a session that answers.
+  purpose: The runtime's files are missing when the app starts. The host installs them again on its own and the window shows that it is preparing the runtime (not an endless Connecting, not a request to the person to install or repair), then a session answers. Expected behaviour from decision 0029 (the host owns the runtime installation) and docs/design/host-layer.md section 7; it replaced the earlier expectation (the start page says the files are missing and Retry opens a session once they are back), which predates 0029.
   preconditions:
     world: user
     state: The runtime's files moved away before the app starts.
   steps:
     - do: Start the app.
-      expect: The start page says the runtime files are missing.
-    - do: Press Retry.
-      expect: It says so again.
-    - do: Put the files back and press Retry.
-      expect: A session opens and answers.
+      expect: Within 60 s the window says it is preparing the runtime.
+    - do: Wait.
+      expect: The host installs the runtime by itself and the chat is ready within 9 min, with nothing for the person to do.
+    - do: Send a message.
+      expect: The reply arrives.
+  limits:
+    - { what: "prepare screen shown", line: "60 s", by: "harness (same line as INST-004; not decided)" }
+    - { what: "installation finished", line: "9 min", by: "harness (same line as INST-001; not decided)" }
   languages: [en, ja]
   automation:
     status: automated
-    impl: { file: abnormal-playbook.mjs, case: "#87 Retry after the runtime's files come back" }
+    impl: { file: abnormal-playbook.mjs, case: "#87 Runtime files missing at start are installed again" }
   links: ["#87"]
