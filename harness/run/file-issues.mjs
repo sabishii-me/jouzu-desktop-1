@@ -15,7 +15,8 @@
 //     else a new one. An issue that names the case but describes another failure is mentioned
 //     in the comment or new issue, not commented on;
 //   - an open issue gets a comment with this run's results; a closed one gets the comment and is
-//     reopened, because the case fails again; a new one is opened with the label bug.
+//     listed as needing a decision, never reopened here (its fix may not be in the build under
+//     test, or the case's expectation may be out of date); a new one is opened with the label bug.
 //   - each comment carries "QA run: <version> <machine> <started>", so filing the same run again
 //     changes nothing.
 // Severity and priority are not set here: they are the product owner's.
@@ -58,9 +59,10 @@ async function api(method, path, body) {
   return text.trim() ? JSON.parse(text) : null;
 }
 const search = async q => (await api('GET', `/search/issues?q=${encodeURIComponent(q)}&per_page=20`)).items ?? [];
-// --plan-only reads nothing but search (an issue's state is then 'unknown', and
-// the action says to reopen it if it is closed).
-const searchOnly = planOnly;
+// --search-only (for a machine whose GitHub sign-in may only search) reads nothing but search:
+// comments and run marks are then not checked, and an issue's state is 'unknown'.
+// --plan-only still reads everything; it only does not write.
+const searchOnly = Boolean(args['search-only']);
 const comments = async number => searchOnly ? [] : api('GET', `/repos/${repo}/issues/${number}/comments?per_page=100`);
 const issue = async number => searchOnly ? { number, state: 'unknown', title: '' } : api('GET', `/repos/${repo}/issues/${number}`);
 
@@ -121,7 +123,7 @@ function stepsOf(group) {
 const caseLines = group => group.ids.map(id => `QA case: ${id}`).join('\n');
 const evidence = group => `Evidence: the run's results.jsonl and case folders (${[...new Set(group.rows.map(row => row.evidence))].join(', ')}), kept with the QA run.`;
 const newBody = group => `## What happens\n\n${resultsOf(group)}\n\n## Steps and expected result\n\n${stepsOf(group)}\n\n${evidence(group)}\nThe cases are described in the [case catalog](${CATALOG_URL}).\n\n---\n${caseLines(group)}\n${runMark}\n`;
-const commentBody = (group, reopen) => `${reopen === 'unknown' ? 'The case fails again on this run.\n\n' : reopen ? 'The case fails again, so this issue is reopened.\n\n' : 'Seen again.\n\n'}${resultsOf(group)}\n\n${evidence(group)}\n\n---\n${caseLines(group)}\n${runMark}\n`;
+const commentBody = (group, closed) => `${closed ? `The case fails on ${meta.version ?? 'this build'}${closed === 'unknown' ? '' : ' while this issue is closed'}. The issue is left as it is: reopening is decided by people (the fix may not be in this build yet, or the case may need updating).\n\n` : 'Seen again.\n\n'}${resultsOf(group)}\n\n${evidence(group)}\n\n---\n${caseLines(group)}\n${runMark}\n`;
 
 // ---- Decide and act ----
 const actions = [];
@@ -132,6 +134,11 @@ const words = text => [...new Set(String(text).toLowerCase().match(/[\p{L}\p{N}]
 const overlap = (problem, text) => { const want = words(problem); if (!want.length) return 0; const have = new Set(words(text)); return want.filter(word => have.has(word)).length / want.length; };
 const SAME = 0.5;
 const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Issues this run is already on (its run mark, in the text or a comment), found by search so
+// that it holds with --search-only too.
+let marked = new Set();
+try { marked = new Set((await search(`repo:${repo} is:issue "${runMark}"`)).map(item => item.number)); } catch (error) { errors.push(`searching for this run's mark: ${error.message}`); }
 
 for (const group of groups) {
   let target = null;
@@ -160,10 +167,12 @@ for (const group of groups) {
   const also = related.filter(number => number !== target?.number);
   const alsoLine = also.length ? `\n\nThe same case also has ${also.map(n => `#${n}`).join(', ')}, which describes a different failure.` : '';
   if (target) {
-    const already = (await comments(target.number).catch(() => [])).some(c => (c.body ?? '').includes(runMark)) || (target.body ?? '').includes(runMark);
-    const reopen = target.state === 'closed';
-    const kind = already ? 'nothing (this run is already on it)' : reopen ? 'comment and reopen' : target.state === 'unknown' ? 'comment, and reopen if closed' : 'comment';
-    actions.push({ ids: group.ids, kind, issue: target.number, title: target.title, related: also, body: already ? null : commentBody(group, target.state === 'unknown' ? 'unknown' : reopen).replace('\n\n---\n', `${alsoLine}\n\n---\n`) });
+    const already = marked.has(target.number) || (await comments(target.number).catch(() => [])).some(c => (c.body ?? '').includes(runMark)) || (target.body ?? '').includes(runMark);
+    // A closed issue is never reopened here: whether its fix is in the build under test, or the
+    // case's expectation is still right, is for people to decide. It is commented on and listed.
+    const closed = target.state === 'closed' ? true : target.state === 'unknown' ? 'unknown' : false;
+    const kind = already ? 'nothing (this run is already on it)' : closed === true ? 'comment (issue closed: needs a decision)' : closed ? 'comment (state unknown)' : 'comment';
+    actions.push({ ids: group.ids, kind, issue: target.number, title: target.title, related: also, body: already ? null : commentBody(group, closed).replace('\n\n---\n', `${alsoLine}\n\n---\n`) });
   } else {
     actions.push({ ids: group.ids, kind: 'open', issue: null, title: titleOf(group), related: also, body: newBody(group).replace('\n\n---\n', `${alsoLine}\n\n---\n`), labels: ['bug'] });
   }
@@ -175,7 +184,6 @@ if (!planOnly) {
       if (action.kind === 'open') action.issue = (await api('POST', `/repos/${repo}/issues`, { title: action.title, body: action.body, labels: action.labels })).number;
       else if (action.body) {
         await api('POST', `/repos/${repo}/issues/${action.issue}/comments`, { body: action.body });
-        if (action.kind === 'comment and reopen') await api('PATCH', `/repos/${repo}/issues/${action.issue}`, { state: 'open' });
       }
       action.done = true;
     } catch (error) { action.done = false; errors.push(`${action.kind} for ${action.ids.join(', ')}: ${error.message}`); }
@@ -183,7 +191,7 @@ if (!planOnly) {
 }
 
 writeFileSync(join(out, 'issue-actions.json'), `${JSON.stringify({ repo, runMark, planOnly, actions, errors }, null, 2)}\n`);
-writeFileSync(join(out, 'issues.json'), `${JSON.stringify({ repo, findings: actions.map(a => ({ ids: a.ids, issue: a.issue, kind: a.kind, done: a.done ?? false })), harnessGaps }, null, 2)}\n`);
+writeFileSync(join(out, 'issues.json'), `${JSON.stringify({ repo, findings: actions.map(a => ({ ids: a.ids, issue: a.issue, kind: a.kind, related: a.related, done: a.done ?? false })), closedIssuesFailing: actions.filter(a => /closed/.test(a.kind)).map(a => ({ ids: a.ids, issue: a.issue })), harnessGaps }, null, 2)}\n`);
 const triageFile = join(out, 'triage.json');
 const triage = existsSync(triageFile) ? JSON.parse(readFileSync(triageFile, 'utf8')) : {};
 for (const action of actions) if (action.issue) for (const row of fails.filter(item => action.ids.includes(item.id))) {

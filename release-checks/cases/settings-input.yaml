@@ -225,7 +225,7 @@
   automation:
     status: automated
     impl: { file: abnormal-playbook.mjs, case: Image the model refuses }
-  links: ["#17"]
+  links: ["#137"]
 
 - id: INPUT-004
   title: A file that is not an image, named .png

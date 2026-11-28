@@ -36,7 +36,7 @@ scenarios that use them live here.
 | `harness/run/run-suite.mjs` | The runner: takes the plan's cases from the catalog, runs each in its own world, re-runs FAIL and ERROR at the end, writes `results.jsonl`. |
 | `harness/run/catalog.mjs` | Checks the catalog against the code (`npm run catalog:check`) and writes `CASES.md`. |
 | `harness/run/record.mjs` | Records an acceptance item that is checked by hand. |
-| `harness/run/file-issues.mjs` | Files every product FAIL of a run as a GitHub issue, deduplicated (one issue per finding; comments on and reopens an issue that already has it). |
+| `harness/run/file-issues.mjs` | Files every product FAIL of a run as a GitHub issue, deduplicated (one issue per finding; comments on an issue that already has it; never reopens a closed one). |
 | `harness/run/report.mjs` | Writes `report.md` and `results.txt` from `results.jsonl`, with the baseline comparison. |
 | `harness/run/common.mjs` | Shared helpers of the runner scripts. |
 | `harness/run/test/` | The runner's self-test (`selftest.sh`): a stand-in exam, no app. |
@@ -88,7 +88,7 @@ Issues: at the end of every run the runner files each product FAIL as an issue i
 the product repository (`harness/run/file-issues.mjs`, `plan.issueRepo`), with no
 review step first. One issue per finding: an issue that names the case ID and
 describes the same failure (open ones first), or else the issue the catalog
-links, gets a comment (and is reopened if it was closed); otherwise a new issue
+links, gets a comment (a closed one is never reopened by the filer: it is listed in `issues.json` for people to decide); otherwise a new issue
 is opened, naming any issue of the same case that describes another failure. Filing the same run twice adds
 nothing. ERROR results are harness gaps and are listed, not filed. It needs a
 GitHub sign-in that may write issues (`GH_TOKEN`, or `gh` signed in); without
