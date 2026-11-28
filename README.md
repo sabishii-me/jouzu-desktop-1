@@ -36,6 +36,7 @@ scenarios that use them live here.
 | `harness/run/run-suite.mjs` | The runner: takes the plan's cases from the catalog, runs each in its own world, re-runs FAIL and ERROR at the end, writes `results.jsonl`. |
 | `harness/run/catalog.mjs` | Checks the catalog against the code (`npm run catalog:check`) and writes `CASES.md`. |
 | `harness/run/record.mjs` | Records an acceptance item that is checked by hand. |
+| `harness/run/file-issues.mjs` | Files every product FAIL of a run as a GitHub issue, deduplicated (one issue per finding; comments on and reopens an issue that already has it). |
 | `harness/run/report.mjs` | Writes `report.md` and `results.txt` from `results.jsonl`, with the baseline comparison. |
 | `harness/run/common.mjs` | Shared helpers of the runner scripts. |
 | `harness/run/test/` | The runner's self-test (`selftest.sh`): a stand-in exam, no app. |
@@ -82,6 +83,17 @@ in `<case>/kept/`. Before every case the runner checks the disk: if the run's
 folder holds more than `diskCapMB` (plan, default 2000) or the disk has less
 than `minFreeMB` free (plan, default 5000), the run stops at once with exit
 code 3, prints why, and the report marks the cases not started as NOT RUN.
+
+Issues: at the end of every run the runner files each product FAIL as an issue in
+the product repository (`harness/run/file-issues.mjs`, `plan.issueRepo`), with no
+review step first. One issue per finding: an issue that already names the case
+("QA case: <ID>") or that the catalog links gets a comment (and is reopened if
+it was closed); otherwise a new issue is opened. Filing the same run twice adds
+nothing. ERROR results are harness gaps and are listed, not filed. It needs a
+GitHub sign-in that may write issues (`GH_TOKEN`, or `gh` signed in); without
+one the run ends with exit code 4 and `issue-actions.json` holds what to file.
+`--no-issues` turns it off. To file a run recorded elsewhere:
+`node harness/run/file-issues.mjs --out <folder with results.jsonl and run.json>`.
 
 `harness/run/README.md` has the runner's rules, acceptance records and the report.
 To add or change a case: edit its YAML entry and its code together, then

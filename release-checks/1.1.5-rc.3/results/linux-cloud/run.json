@@ -1,0 +1,43 @@
+{
+  "version": "1.1.5-rc.3",
+  "machine": "linux-cloud",
+  "platform": "linux",
+  "languages": [
+    "en",
+    "ja"
+  ],
+  "harness": "729810e38ef2582481f8a99d39df4e999703a5d6",
+  "select": {},
+  "cases": 123,
+  "notCovered": [
+    {
+      "id": "CHAT-012",
+      "title": "TextGuard per session (on, strict, off)",
+      "suite": "main",
+      "status": "deferred",
+      "why": "The product owner put TextGuard, Flow and web access last (release playbook 2026-11-14)."
+    },
+    {
+      "id": "CHAT-013",
+      "title": "A request held by Flow",
+      "suite": "main",
+      "status": "deferred",
+      "why": "Put last by the product owner (2026-11-14)."
+    },
+    {
+      "id": "CHAT-014",
+      "title": "Web access from this computer and another device",
+      "suite": "main",
+      "status": "deferred",
+      "why": "Web access is not in the product yet; written when it ships."
+    },
+    {
+      "id": "SIGN-002",
+      "title": "The model list follows sign-in and sign-out without a restart",
+      "suite": "main",
+      "status": "gap",
+      "why": "The runtime (jouzu 0.2.5) always fetches the Shisa.AI model list from the fixed api.shisa.ai address and does not use the model-list address the sign-in returns, so a stand-in cannot serve it, and a real account needs a person to approve the sign-in in a browser."
+    }
+  ],
+  "startedAt": "2026-11-28T09:54:58.933Z"
+}

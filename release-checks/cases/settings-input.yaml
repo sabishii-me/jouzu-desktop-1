@@ -36,6 +36,7 @@
   automation:
     status: automated
     impl: { file: abnormal-playbook.mjs, case: Settings file cannot be written }
+  links: ["#155"]
 
 - id: SET-003
   title: Missing tools.json
@@ -224,6 +225,7 @@
   automation:
     status: automated
     impl: { file: abnormal-playbook.mjs, case: Image the model refuses }
+  links: ["#17"]
 
 - id: INPUT-004
   title: A file that is not an image, named .png

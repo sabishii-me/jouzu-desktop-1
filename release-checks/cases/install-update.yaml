@@ -56,6 +56,7 @@
     status: automated
     impl: { file: release-playbook.mjs, case: INST-002 First run of the installed app }
     note: The real app's window is driven through WebKitWebDriver (Linux, package webkit2gtk-driver) on a virtual display. N1 checks the same pages in a test browser on every platform.
+  links: [N1]
   added: 1.1.5
 
 - id: INST-003

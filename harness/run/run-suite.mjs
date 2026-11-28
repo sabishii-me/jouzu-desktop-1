@@ -36,6 +36,8 @@ import { listPlaybook, loadCatalog, matchCode, selected } from './catalog.mjs';
 //     each case the runner checks the disk: if the run's folder is over plan.diskCapMB (default
 //     2000) or the drive has less than plan.minFreeMB free (default 5000), it stops the run
 //     with an error that says so, and the report lists the cases not run.
+//   - At the end every product FAIL is filed as a GitHub issue, deduplicated against the issues
+//     already there (file-issues.mjs; plan.issueRepo; --no-issues turns it off).
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, item, index, all) => item.startsWith('--') ? [...pairs, [item.slice(2), all[index + 1]]] : pairs, []));
 for (const name of ['plan', 'out', 'machine']) if (!args[name]) { console.error(`--${name} is required`); process.exit(2); }
@@ -276,9 +278,17 @@ writeFileSync(join(out, 'run.json'), `${JSON.stringify(meta, null, 2)}\n`);
 const reportArgs = [join(here, 'report.mjs'), '--out', out, '--plan', resolve(args.plan)];
 if (args.baseline) reportArgs.push('--baseline', resolve(args.baseline));
 try { execFileSync(process.execPath, reportArgs, { stdio: 'inherit' }); } catch { console.log('report.mjs failed; results.jsonl holds every result'); }
+// Every product FAIL is filed as a GitHub issue now, deduplicated (file-issues.mjs), and the
+// report is written again with the issue numbers. --no-issues (or the selftest) turns it off.
+let issuesFiled = true;
+if (!('no-issues' in args) && !process.env.RUN_SELFTEST) {
+  try { execFileSync(process.execPath, [join(here, 'file-issues.mjs'), '--out', out, '--repo', plan.issueRepo ?? 'shisa-ai/jouzu-desktop'], { stdio: 'inherit' }); }
+  catch { issuesFiled = false; console.error(`*** Some FAILs were not filed as issues: see ${join(out, 'issue-actions.json')} ***`); }
+  try { execFileSync(process.execPath, reportArgs, { stdio: 'inherit' }); } catch { /* written above */ }
+}
 if (stoppedFor) {
   console.error(`*** RUN STOPPED EARLY: ${stoppedFor}. Cases not started are NOT RUN in ${join(out, 'report.md')}. ***`);
   process.exit(3);
 }
 console.log(`All ${queue.length} cases ran. Results: ${join(out, 'report.md')}`);
-process.exit(0);
+process.exit(issuesFiled ? 0 : 4);
