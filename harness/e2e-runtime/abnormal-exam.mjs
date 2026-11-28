@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { startFixtureServer } from './fixture-server.mjs';
+import { endGroup, quitApp, startApp } from './app-window.mjs';
+import { appExe, appProcesses, installedVersion, managedFolder, putAside, restoreAside, runSilently, startInstalled } from './update-world.mjs';
 
 // The abnormal-path exam: e2e/abnormal-playbook.mjs on a throwaway home, with a world the
 // playbook can break and repair (provider faults, runtime kills, a slow runtime start, a
@@ -36,6 +38,11 @@ import { startFixtureServer } from './fixture-server.mjs';
 //     ABN_UNIX_LAYOUT  macOS/Linux: run the runtime as an installation there does, from
 //                  <home>/runtime/node/bin/node and <home>/app, without --runtime (#181)
 // Common:
+//   ABN_APP      macOS/Linux: the installed app's executable (/usr/bin/jouzu-desktop, the AppImage,
+//                or ".../Jouzu Desktop.app/Contents/MacOS/Jouzu Desktop"). Cases of the installed-package
+//                world start it on throwaway homes of their own through /app/* (app-window.mjs).
+//   ABN_APP_SEED a managed folder whose runtime/ and app/ that same app installed earlier; cases that
+//                are not about the first run link them in so the app starts without downloading
 //   ABN_EXTENSIONS the desktop extensions folder to install into the throwaway home (source build or unpacked package)
 //   ABN_LANGS    interface languages to run, comma separated (default en,ja)
 //   ABN_ONLY     run only the cases whose names contain this text (several: separate with |)
@@ -51,8 +58,12 @@ const windows = process.platform === 'win32';
 // 'new-user' (nothing prepared), or 'shisa-stand-in' (as '' and Shisa.AI sign-in goes to the fixture's stand-in).
 const newUser = process.env.ABN_WORLD === 'new-user';
 const shisaStandIn = process.env.ABN_WORLD === 'shisa-stand-in';
+// 'installed-app' with an update installer (Windows): the app is installed and updated at its real place (update-world.mjs).
+const updateWorld = process.env.ABN_WORLD === 'installed-app' && windows;
 let fixturePortNow = null;
 const children = new Set();
+// Process groups of installed apps started through /app/start; all are ended when the exam ends.
+const appGroups = new Set();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function installed() {
@@ -71,8 +82,8 @@ function installed() {
 }
 
 /** A throwaway root: the host's home, its data folder, a workspace, the runtime linked in. */
-function makeRoot(fixturePort, pkg) {
-  const root = mkdtempSync(join(tmpdir(), 'jouzu-abnormal-'));
+function makeRoot(fixturePort, pkg, at = null) {
+  const root = at?.root ?? mkdtempSync(join(tmpdir(), 'jouzu-abnormal-'));
   if (newUser) {
     // ABN_WORLD=new-user: a person who never used Jouzu. Nothing is prepared: no runtime, no
     // model, no settings, no sessions. The app installs its runtime itself (release playbook N1).
@@ -83,13 +94,14 @@ function makeRoot(fixturePort, pkg) {
     writeFileSync(join(root, 'runtime-delay.json'), '{"ms":0}');
     return { root, home, data, workspace };
   }
-  // The app keeps its files in %LOCALAPPDATA%\Shisa.ai\JouzuDesktop; the exam gives it its own.
-  const home = pkg?.shell ? join(root, 'localappdata', 'Shisa.ai', 'JouzuDesktop') : join(root, 'home');
+  // The app keeps its files in %LOCALAPPDATA%\Shisa.ai\JouzuDesktop; the exam gives it its own
+  // (the update world: the real one, the machine's own put aside).
+  const home = at?.home ?? (pkg?.shell ? join(root, 'localappdata', 'Shisa.ai', 'JouzuDesktop') : join(root, 'home'));
   const data = join(home, 'data');
   const workspace = join(root, 'workspace');
   for (const dir of [home, join(data, 'agent'), workspace]) mkdirSync(dir, { recursive: true });
   writeFileSync(join(workspace, 'README.md'), '# Abnormal path workspace\n');
-  if (pkg) {
+  if (pkg && !at) {
     for (const part of ['runtime', 'app', 'bin']) {
       if (existsSync(join(pkg.managed, part))) symlinkSync(join(pkg.managed, part), join(home, part), 'junction');
     }
@@ -353,6 +365,15 @@ function suspend(pids, on) {
  *   GET  /file?path=                  read it back
  *   POST /workspace {name}            make another workspace folder beside the first; answers its path
  *   GET  /list?path=                  the files in a folder under the home (name, size, mtimeMs)
+ *   POST /workspace {name, linkTo}    with linkTo: a symlink of that name to the folder linkTo
+ * The installed app (ABN_APP, macOS/Linux), on a throwaway home of its own:
+ *   POST /app/start {name, seed}      start it as a person does (name: the same name starts it again on the
+ *                                     same home; seed: link ABN_APP_SEED's runtime in); answers {managed, window}
+ *                                     window: a WebDriver session URL for its window (Linux), or null (macOS)
+ *   GET  /app/processes?name=         the app, its host and the host's runtimes
+ *   POST /app/end {name, how, ms}     how "quit" (as a person quits) or "kill"; answers what was left after ms
+ *   POST /app/file {name, path, remove}  remove a file or folder under its managed folder
+ *   GET  /app/file?name=&path=        read one back
  */
 function worldServer(stack) {
   const server = createServer((request, response) => {
@@ -363,8 +384,8 @@ function worldServer(stack) {
       const input = body ? JSON.parse(body) : {};
       const reply = value => response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(value));
       try {
-        const hostPid = stack.host.pid;
-        if (url.pathname === '/state') return reply({ world: newUser ? 'new-user' : shisaStandIn ? 'shisa-stand-in' : 'user', proxy: Boolean(process.env.HTTPS_PROXY || process.env.https_proxy), host: hostPid, runtimes: runtimes(hostPid).map(row => row.pid), handles: handleCount(hostPid), home: stack.paths.home, workspace: stack.paths.workspace, shell: Boolean(stack.shell) });
+        const hostPid = stack.host?.pid ?? null;
+        if (url.pathname === '/state') return reply({ world: newUser ? 'new-user' : shisaStandIn ? 'shisa-stand-in' : 'user', proxy: Boolean(process.env.HTTPS_PROXY || process.env.https_proxy), host: hostPid, runtimes: runtimes(hostPid).map(row => row.pid), handles: handleCount(hostPid), home: stack.paths.home, workspace: stack.paths.workspace, shell: Boolean(stack.shell), app: process.env.ABN_APP ? process.platform : null });
         if (url.pathname === '/host/restart') {
           // The app ends and starts again on the same home (#162). Only when the exam started
           // the host itself; the installed app's own window is not restarted here.
@@ -435,6 +456,8 @@ function worldServer(stack) {
         if (url.pathname === '/workspace') {
           // Another folder the person works in, beside the first one (release playbook P4).
           const path = join(stack.paths.root, String(input.name ?? 'second-workspace').replace(/[^A-Za-z0-9_-]/g, '-'));
+          // A symlink to another folder, as a person makes one (#239).
+          if (input.linkTo) { symlinkSync(resolve(input.linkTo), path, windows ? 'junction' : 'dir'); return reply({ path, linkTo: resolve(input.linkTo) }); }
           mkdirSync(path, { recursive: true });
           writeFileSync(join(path, 'README.md'), `# ${input.name ?? 'second workspace'}\n`);
           return reply({ path });
@@ -461,6 +484,88 @@ function worldServer(stack) {
             return reply({ ok: true, effective: input.readOnly ? !writable : writable });
           }
           return reply({ ok: true });
+        }
+        if (url.pathname.startsWith('/update/')) {
+          if (!updateWorld) throw new Error('the update world runs on Windows with ABN_WORLD=installed-app');
+          const saveDir = join(stack.paths.root, 'aside');
+          // A person's environment: the real profile folders, so the app and its installer agree on where it lives.
+          const personEnv = () => ({ ...cleanEnv(stack.paths.root, {}), HOME: process.env.USERPROFILE, USERPROFILE: process.env.USERPROFILE, LOCALAPPDATA: process.env.LOCALAPPDATA, APPDATA: process.env.APPDATA });
+          if (url.pathname === '/update/prepare') {
+            // The earlier version installed by its own installer and used: the fixture model saved, old sessions.
+            const installer = { release: process.env.ABN_UPDATE_FROM_RELEASE, rc: process.env.ABN_UPDATE_FROM_RC }[input.from ?? 'release'];
+            if (!installer || !existsSync(installer)) throw new Error(`no installer for "${input.from}" (ABN_UPDATE_FROM_${String(input.from ?? 'release').toUpperCase()})`);
+            putAside(saveDir);
+            stack.aside = saveDir;
+            const code = await runSilently(installer, ['/S']);
+            if (!existsSync(appExe())) throw new Error(`the installer ended (${code}) without installing ${appExe()}`);
+            makeRoot(fixturePortNow, { shell: appExe() }, { root: stack.paths.root, home: managedFolder() });
+            stack.paths.home = managedFolder();
+            stack.paths.data = join(managedFolder(), 'data');
+            startInstalled(personEnv(), input.port, stack.paths.workspace);
+            return reply({ version: installedVersion(), exe: appExe(), to: process.env.ABN_UPDATE_TO ?? null });
+          }
+          if (url.pathname === '/update/state') return reply({ version: installedVersion(), exe: existsSync(appExe()), processes: appProcesses(), to: process.env.ABN_UPDATE_TO ?? null, managed: managedFolder() });
+          if (url.pathname === '/update/start') { startInstalled(personEnv(), input.port, stack.paths.workspace); return reply({ ok: true }); }
+          if (url.pathname === '/update/quit') {
+            // The app ends (an update or uninstall needs it closed); answers when nothing of it runs.
+            const pids = appProcesses().map(row => row.pid);
+            if (pids.length) try { execFileSync('taskkill.exe', [...pids.flatMap(pid => ['/PID', String(pid)]), '/T', '/F'], { stdio: 'ignore' }); } catch { /* gone */ }
+            return reply({ ended: pids.length, left: appProcesses() });
+          }
+          if (url.pathname === '/update/uninstall') {
+            // Uninstall silently, as a person's silent uninstall does; answers whether the data folder is kept.
+            const uninstaller = join(managedFolder(), 'uninstall.exe');
+            if (!existsSync(uninstaller)) throw new Error('no uninstall.exe in the install folder');
+            await runSilently(uninstaller, ['/S']);
+            const until = Date.now() + 120_000;
+            while ((installedVersion() || existsSync(appExe())) && Date.now() < until) await sleep(1_000);
+            return reply({ uninstalled: !installedVersion() && !existsSync(appExe()), dataKept: existsSync(join(managedFolder(), 'data', 'state', 'sessions')), left: existsSync(managedFolder()) ? readdirSync(managedFolder()) : [] });
+          }
+          if (url.pathname === '/update/restore') return reply(restoreAside(saveDir));
+        }
+        if (url.pathname.startsWith('/app/')) {
+          if (!process.env.ABN_APP) throw new Error('ABN_APP is not set: no installed app to start');
+          const name = String(input.name ?? url.searchParams.get('name') ?? 'app').replace(/[^A-Za-z0-9_-]/g, '-');
+          stack.apps ??= new Map();
+          const started = stack.apps.get(name);
+          const processes = () => {
+            if (!started) return { app: null, host: null, runtimes: [], all: [] };
+            const base = process.env.ABN_APP.split(/[\\/]/).pop().slice(0, 15);
+            const tree = descendants(started.group);
+            const app = tree.find(row => row.name === base || row.name.startsWith(base.slice(0, 12)));
+            const host = tree.find(row => /jouzu-host/.test(row.name));
+            return { app: app?.pid ?? null, host: host?.pid ?? null, runtimes: host ? runtimes(host.pid).map(row => row.pid) : [], all: app ? [app.pid, ...descendants(app.pid).map(row => row.pid)] : [] };
+          };
+          if (url.pathname === '/app/start') {
+            if (started) endGroup(started.group);
+            const app = await startApp({ executable: process.env.ABN_APP, root: stack.paths.root, env: cleanEnv(stack.paths.root, {}), name, seed: input.seed ? process.env.ABN_APP_SEED : null });
+            stack.apps.set(name, app);
+            appGroups.add(app.group);
+            return reply({ managed: app.managed, window: app.window });
+          }
+          if (!started) throw new Error(`no app named ${name} was started`);
+          if (url.pathname === '/app/processes') return reply(processes());
+          if (url.pathname === '/app/end') {
+            const now = processes();
+            if (!now.app) return reply({ error: 'the app is not running', left: [] });
+            const how = input.how === 'kill' ? (process.kill(now.app, 'SIGKILL'), 'SIGKILL') : quitApp(started, now.app);
+            const alive = () => { const table = new Map(processTable().map(row => [row.pid, row])); return now.all.filter(pid => table.has(pid)).map(pid => ({ pid, name: table.get(pid).name })); };
+            const limit = input.ms ?? 5_000;
+            const from = Date.now();
+            let left = alive();
+            while (left.length && Date.now() - from < limit) { await sleep(200); left = alive(); }
+            const stoppedMs = Date.now() - from;
+            killAll(left.map(row => row.pid));
+            endGroup(started.group);
+            return reply({ how, before: now.all.length, left, stoppedMs });
+          }
+          if (url.pathname === '/app/file') {
+            const path = resolve(started.managed, input.path ?? url.searchParams.get('path') ?? '');
+            if (!path.startsWith(resolve(started.managed))) throw new Error('outside the app home');
+            if (request.method === 'GET') return reply({ exists: existsSync(path), text: existsSync(path) && statSync(path).isFile() ? readFileSync(path, 'utf8') : null });
+            if (input.remove) rmSync(path, { recursive: true, force: true });
+            return reply({ ok: true, exists: existsSync(path) });
+          }
         }
         response.writeHead(404).end();
       } catch (error) {
@@ -494,8 +599,8 @@ function runPlaybook(env) {
 
 const report = { startedAt: new Date().toISOString(), mode: null, runs: [] };
 const pkg = installed();
-report.mode = pkg?.shell ? `installed app ${pkg.shell}` : pkg ? `installed package's host and UI in a test browser ${pkg.install}` : `source build ${process.env.ABN_HOST}`;
-if (!pkg) for (const name of ['ABN_HOST', 'ABN_DIST', 'ABN_RUNTIME_APP']) if (!process.env[name]) { console.error(`${name} is not set`); process.exit(2); }
+report.mode = updateWorld ? `update world ${process.env.LOCALAPPDATA}` : pkg?.shell ? `installed app ${pkg.shell}` : pkg ? `installed package's host and UI in a test browser ${pkg.install}` : `source build ${process.env.ABN_HOST}`;
+if (!pkg && !updateWorld) for (const name of ['ABN_HOST', 'ABN_DIST', 'ABN_RUNTIME_APP']) if (!process.env[name]) { console.error(`${name} is not set`); process.exit(2); }
 const languages = (process.env.ABN_LANGS ?? 'en,ja').split(',').map(item => item.trim()).filter(Boolean);
 let port = Number(process.env.ABN_PORT ?? 9240);
 try {
@@ -504,7 +609,9 @@ try {
     fixturePortNow = fixture.port;
     const stack = { pkg, paths: makeRoot(fixture.port, pkg) };
     let browser = null;
-    if (pkg?.shell) {
+    if (updateWorld) {
+      // Nothing runs yet: the case installs the earlier version itself (/update/prepare).
+    } else if (pkg?.shell) {
       startShell(stack, port);
       await shellHost(stack);
     } else {
@@ -523,8 +630,10 @@ try {
     await browser?.close();
     world.server.close();
     fixture.server.close();
-    kill(stack.host.pid);
+    if (stack.host) kill(stack.host.pid);
     if (stack.shell) kill(stack.shell.pid);
+    if (stack.aside) { try { restoreAside(stack.aside); } catch (error) { report.runs.push({ error: `could not put the machine's own Jouzu Desktop back: ${error.message}` }); } }
+    for (const app of stack.apps?.values() ?? []) endGroup(app.group);
     try { cpSync(join(stack.paths.home, 'logs'), join(out, `logs-${language}`), { recursive: true }); } catch { /* no logs */ }
     port += 1;
   }
@@ -532,6 +641,7 @@ try {
   report.runs.push({ error: String(error?.stack ?? error) });
 } finally {
   for (const child of children) kill(child.pid);
+  for (const group of appGroups) endGroup(group);
 }
 report.finishedAt = new Date().toISOString();
 report.pass = report.runs.length > 0 && report.runs.every(run => run.result?.pass);

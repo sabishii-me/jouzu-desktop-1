@@ -63,10 +63,13 @@
     - do: Choose the other provider and ask again.
       expect: An image is made.
     - do: Use a key that is not valid.
-      expect: A clear message says what is wrong.
+      expect: A clear message says what is wrong, and the tool's row shows it failed.
+  data: "Runner secrets JOUZU_QA_SHISA_KEY (paid Shisa.AI QA account) and JOUZU_QA_CHATGPT_AUTH (the runtime's openai-codex sign-in entry of a ChatGPT QA account, JSON). The fixture model calls generate_image (prompt IMAGE:provider); the image itself is made by the real service."
+  languages: [en, ja]
   automation:
-    status: planned
-    note: Recorded by hand as acceptance item C-win-image until the QA account's key is available to the harness.
+    status: automated
+    impl: { file: release-playbook.mjs, case: IMG-001 The image tool with a paid account and with ChatGPT }
+    note: The not-valid key step always runs. Without the two secrets the case runs that step and then records no verdict for the rest (ERROR unless the plan declares the skip), so a missing account is never a PASS.
 
 - id: IMG-002
   legacy: [C-mac-image-free]
@@ -84,9 +87,12 @@
       expect: Shisa.AI is the provider and the plan's limit is said.
     - do: Ask for an image.
       expect: A clear message about the plan.
+  data: Runner secret JOUZU_QA_SHISA_FREE_KEY (the free Shisa.AI QA account).
+  languages: [en, ja]
   automation:
-    status: planned
-    note: Recorded by hand as acceptance item C-mac-image-free.
+    status: automated
+    impl: { file: release-playbook.mjs, case: IMG-002 The image tool with a free Shisa.AI account }
+    note: Without the secret the case records no verdict (ERROR unless the plan declares the skip).
 
 - id: SEC-001
   legacy: ["#130"]

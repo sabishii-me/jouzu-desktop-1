@@ -1,9 +1,10 @@
 import { join } from "node:path";
 import {
-  SEL, add, ask, chatSession, control, conversation, conversationText, fault, freshSession, idle, judgeRecovers, lang,
+  SEL, add, allWords, ask, chatSession, control, conversation, conversationText, fault, freshSession, idle, judgeRecovers, lang,
   judgeNoEndlessWait, layout, openSettings, more, named, namedMore, newSession, now, page, problems, redSquarePng, replyArrives, runCases, sendButton,
   shots, sidebar, sleep, slug, stopButton, technical, textbox, typeAndSend, waitRowState, rowState, post, waiting, world, fixture,
 } from "./playbook-kit.mjs";
+import { webDriver } from "../e2e-runtime/app-window.mjs";
 
 /**
  * Release playbook: the paths of the release playbook (P1-P29) and the main user scenarios
@@ -295,6 +296,183 @@ release("N1 A new user's first run", "U1", "A person who never used Jouzu opens 
   const restarts = await marks("host.start");
   if (restarts.length > 1) c.fail(`the host started ${restarts.length} times during the first run`);
 }, ["en", "ja"], "new-user");
+
+// ---- U1: the installed app on macOS and Linux, as a person starts it (ABN_APP) ----
+
+/** The app's own words in its window (i18n.ts, chat-text.ts). */
+const WINDOW = {
+  en: { language: "Interface language", message: "Message Jouzu", send: "Send", prepare: ["Preparing Jouzu…", "Downloading Node…", "Installing packages…", "Runtime files are missing. Install them to continue."] },
+  ja: { language: "表示言語", message: "Jouzu へのメッセージ", send: "送信", prepare: ["Jouzu を準備しています…", "Node をダウンロードしています…", "パッケージをインストールしています…", "ランタイムがありません。続行するにはインストールしてください。"] },
+}[lang];
+const appGet = (path, query) => worldGet(path, query);
+/** The installed app's window over WebDriver (Linux), or null where it has none (macOS). */
+async function appWindow(c, name, seed) {
+  const state = await worldGet("/state");
+  if (!state.app) { c.skip("this case needs the installed app (ABN_APP)"); return null; }
+  const started = await control("/app/start", { name, seed });
+  if (started.error) { c.fail(`the installed app did not start: ${started.error}`); return null; }
+  return { ...started, wd: started.window ? webDriver(started.window) : null };
+}
+/** Wait until the app's host and at least one runtime run (the app is ready to answer). */
+async function appReady(name, timeout) {
+  const until = now() + timeout;
+  let seen = null;
+  while (now() < until) {
+    seen = await appGet("/app/processes", { name });
+    if (seen.host && seen.runtimes.length) return seen;
+    await sleep(1_000);
+  }
+  return seen;
+}
+/** Send one message in the app's window and wait for its answer. */
+async function windowAsk(wd, timeout = 60_000) {
+  const question = ask();
+  await wd.fill(WINDOW.message, question.prompt);
+  if (!await wd.tap("button", WINDOW.send, 10_000)) return { ok: false, why: "no Send button" };
+  const until = now() + timeout;
+  while (now() < until) {
+    const text = await wd.exec("return [...document.querySelectorAll('main *')].filter(el => !el.closest('form') && el.children.length === 0).map(el => el.textContent.trim())", []).catch(() => []);
+    if (text.includes(question.answer)) return { ok: true };
+    await sleep(500);
+  }
+  return { ok: false, why: `no reply "${question.answer}" within ${timeout / 1000} s` };
+}
+const pageText = async wd => (await wd.text().catch(() => "")).replace(/\s+/g, " ").trim();
+
+/** The first run in the app's window, as N1 does it in the browser: languages, the connection page, a custom provider, a reply. */
+async function windowFirstRun(c, wd) {
+  const start = now();
+  const proceed = [FIRST.proceed, "Continue"];
+  let languagePage = false;
+  let switched = lang === "en";
+  let failure = null;
+  const until = now() + 9 * 60_000;
+  while (now() < until) {
+    const text = await pageText(wd);
+    if (text.includes(FIRST.failed) || text.includes("Installation failed")) { failure = text.slice(0, 400); break; }
+    if (await wd.find("button", FIRST.signIn).catch(() => null)) break;
+    if (await wd.find("combobox", WINDOW.language).catch(() => null) || await wd.find("combobox", "Interface language").catch(() => null)) {
+      languagePage = true;
+      if (!switched) {
+        // The person picks their language on the first page; the default follows the system.
+        await wd.tap("combobox", "Interface language", 5_000);
+        switched = await wd.tap("option", "日本語", 5_000);
+        await sleep(500);
+      }
+      for (const word of proceed) if (await wd.tap("button", word, 1_000)) break;
+    }
+    await sleep(500);
+  }
+  if (failure) { c.fail(`the first run failed to prepare: ${failure}`); return false; }
+  if (!await wd.find("button", FIRST.signIn).catch(() => null)) {
+    c.fail(`the first-run pages did not reach the model connection page within 9 min (language page shown: ${languagePage}; the window shows: "${(await pageText(wd)).slice(0, 200)}")`);
+    return false;
+  }
+  c.metric("toConnectPageMs", now() - start);
+  if (!languagePage) c.fail("the first run did not ask for the languages before the model connection");
+  if (!await wd.tap("combobox", FIRST.service)) { c.fail("no service choice on the connection page"); return false; }
+  if (!await wd.tap("option", FIRST.custom)) { c.fail(`no "${FIRST.custom}" in the service list`); return false; }
+  await wd.fill(FIRST.providerId, "first-run");
+  await wd.fill(FIRST.endpoint, `${fixture}/v1`);
+  await wd.fill(FIRST.modelId, "deterministic");
+  await wd.fill(FIRST.apiKey, "fixture-key");
+  const saved = now();
+  await wd.tap("button", FIRST.save);
+  let composer = null;
+  while (!composer && now() < saved + 120_000) { composer = await wd.find("field", WINDOW.message).catch(() => null); if (!composer) await sleep(500); }
+  if (!composer) { c.fail(`after saving the provider the window did not open the chat within 2 min (it shows: "${(await pageText(wd)).slice(0, 200)}")`); return false; }
+  c.metric("saveToChatMs", now() - saved);
+  const answered = await windowAsk(wd);
+  if (!answered.ok) { c.fail(`the first message in the window got no reply: ${answered.why}`); return false; }
+  c.metric("firstRunToFirstReplyMs", now() - start);
+  return true;
+}
+
+release("INST-002 First run of the installed app", "U1", "The installed app (.deb, AppImage, DMG), started on a home that never had Jouzu, installs its runtime by itself, walks the person through the first-run pages, and after a provider is saved a message in its window is answered.", async c => {
+  const app = await appWindow(c, "first-run", false);
+  if (!app) return;
+  if (!app.wd) {
+    // macOS: the window cannot be driven (no WebDriver for WKWebView); the app must still install its runtime and start it.
+    c.note("macOS: the window is not driven; the case checks that the app installs and starts its runtime by itself");
+    const ready = await appReady("first-run", 9 * 60_000);
+    if (!ready?.runtimes.length) c.fail(`the app did not install and start its runtime within 9 min (host ${ready?.host ?? "none"})`);
+    return;
+  }
+  await windowFirstRun(c, app.wd);
+  const ready = await appGet("/app/processes", { name: "first-run" });
+  if (!ready.host) c.fail("the app has no host after the first run");
+  const log = await appGet("/app/file", { name: "first-run", path: "logs/host.log" });
+  const starts = (log.text ?? "").split("\n").filter(line => line.includes('"host.start"')).length;
+  if (starts > 1) c.fail(`the host started ${starts} times during the first run`);
+}, ["en", "ja"], "installed-package");
+
+release("INST-003 Quitting or killing the app leaves nothing running", "U1", "After the person quits the app (the tray's Quit; macOS: the app is asked to end), and after the app's process is killed, no host or runtime of that app is left within 5 s.", async c => {
+  const app = await appWindow(c, "quit", true);
+  if (!app) return;
+  for (const how of ["quit", "kill"]) {
+    if (how === "kill" && !await appWindow(c, "quit", true)) return;
+    const ready = await appReady("quit", 5 * 60_000);
+    if (!ready?.runtimes.length) { c.fail(`before ${how}: the app's host and runtime did not start within 5 min (host ${ready?.host ?? "none"})`); return; }
+    await sleep(2_000);
+    const ended = await control("/app/end", { name: "quit", how, ms: 5_000 });
+    if (ended.error) { c.fail(`could not ${how} the app: ${ended.error}`); continue; }
+    c.note(`${how}: ${ended.how}; ${ended.before} processes before`);
+    c.metric(`${how}StoppedMs`, ended.stoppedMs);
+    if (ended.left.length) c.fail(`after ${how === "quit" ? "Quit" : "killing the app"}, ${ended.left.length} of its processes were still running after 5 s: ${ended.left.map(row => `${row.name} ${row.pid}`).join(", ")}`);
+  }
+}, ["en", "ja"], "installed-package");
+
+release("INST-004 Runtime files deleted while the app runs are reinstalled", "U7", "The runtime's files are deleted while the app runs. Within 60 s the window says it is preparing the runtime again, and a message is then answered.", async c => {
+  const app = await appWindow(c, "repair", true);
+  if (!app) return;
+  if (!app.wd) { c.skip("macOS: the app's window cannot be driven (no WebDriver for WKWebView)"); return; }
+  if (!await windowFirstRun(c, app.wd)) return;
+  const removed = await control("/app/file", { name: "repair", path: "app", remove: true });
+  if (removed.exists) { c.fail("could not delete the runtime's files"); return; }
+  const deleted = now();
+  // The person goes on working: a new session and a message start a runtime.
+  await app.wd.tap("button", allWords[lang].newSession, 5_000).catch(() => {});
+  let seen = null;
+  const until = deleted + 60_000;
+  let sent = false;
+  while (now() < until && !seen) {
+    const text = await pageText(app.wd);
+    seen = WINDOW.prepare.find(word => text.includes(word)) ?? null;
+    if (!seen && !sent && now() > deleted + 5_000) { const question = ask(); await app.wd.fill(WINDOW.message, question.prompt).catch(() => {}); sent = await app.wd.tap("button", WINDOW.send, 2_000); }
+    if (!seen) await sleep(500);
+  }
+  if (!seen) c.fail(`within 60 s of deleting the runtime's files the window never said it was preparing the runtime (it shows: "${(await pageText(app.wd)).slice(0, 200)}")`);
+  else c.metric("deletedToPrepareMs", now() - deleted);
+  const restored = await appGet("/app/file", { name: "repair", path: "app/bootstrap.mjs" });
+  let composerBack = null;
+  const back = now() + 5 * 60_000;
+  while (!composerBack && now() < back) { composerBack = await app.wd.find("field", WINDOW.message).catch(() => null); if (!composerBack) await sleep(1_000); }
+  if (!composerBack) { c.fail("the chat did not come back within 5 min of deleting the runtime's files"); return; }
+  const answered = await windowAsk(app.wd, 180_000);
+  if (!answered.ok) c.fail(`after the runtime's files were deleted, a message got no reply: ${answered.why}`);
+  const after = await appGet("/app/file", { name: "repair", path: "app/bootstrap.mjs" });
+  if (!after.exists) c.fail(`the runtime's files were not put back (before the reply: ${restored.exists})`);
+}, ["en", "ja"], "installed-package");
+
+// ---- U11: folders ----
+
+release("FOLD-001 A folder opened through a symlink is listed once", "U11", "A folder opened by its real path and again through a symlink to it is the same folder: the list shows it once (#239).", async c => {
+  const real = await control("/workspace", { name: "real-folder" });
+  const link = await control("/workspace", { name: "linked-folder", linkTo: real.path });
+  if (!real.path || !link.path) { c.fail(`could not make the folder and its symlink: ${JSON.stringify({ real, link })}`); return; }
+  for (const path of [real.path, link.path]) {
+    const adding = await host("/workspaces", { method: "POST", body: JSON.stringify({ paths: [path] }) });
+    if (adding.status !== 200) c.fail(`the host did not take ${path}: ${adding.status} ${JSON.stringify(adding.body)}`);
+  }
+  await page.reload();
+  await newSession().waitFor({ timeout: 60_000 });
+  const rows = await sidebar().getByText(/^(real-folder|linked-folder)$/).count();
+  if (rows !== 1) { c.fail(`the folder and its symlink are listed ${rows} times in the sidebar`); await shot(c, "folders"); }
+  const listed = await host("/workspaces");
+  const paths = JSON.stringify(listed.body ?? "");
+  const both = ["real-folder", "linked-folder"].filter(name => paths.includes(name));
+  if (both.length > 1) c.fail("the host keeps the folder twice, once by its real path and once through the symlink");
+}, ["en", "ja"]);
 
 // ---- U5: sign-in ----
 
@@ -653,6 +831,92 @@ release("P26 A tool cut off when the runtime ends shows as interrupted", "U7", "
   const shownOld = await toolChips();
   c.note(`the old session's tool shows: ${shownOld.join(" | ") || "(no tool)"}; status line: ${(await page.locator('[role="status"]').allInnerTexts().catch(() => [])).join(" | ") || "(none)"}`);
   if (!shownOld.length) c.fail("the old session's tool call is not shown at all");
+});
+
+// ---- U10: the image tool ----
+// The accounts are dedicated QA test accounts (product owner 2026-11-27). Their credentials come
+// only from the runner's secret store, as environment variables, and are written only into the
+// throwaway home: JOUZU_QA_SHISA_KEY (a paid Shisa.AI account), JOUZU_QA_SHISA_FREE_KEY (a free one),
+// JOUZU_QA_CHATGPT_AUTH (the runtime's "openai-codex" sign-in entry of a ChatGPT test account, as JSON).
+
+/** Put a credential in the runtime's own store, as a sign-in leaves it, and start the app again so every runtime reads it. */
+async function signInWith(entries, image = {}) {
+  const now = await worldGet("/file", { path: "data/agent/auth.json" });
+  let store = {};
+  try { store = JSON.parse(now.text ?? "{}") ?? {}; } catch { store = {}; }
+  await control("/file", { path: "data/agent/auth.json", text: JSON.stringify({ ...store, ...entries }, null, 2) });
+  await control("/file", { path: "data/agent/tools.json", text: JSON.stringify({ image: { enabled: true, ...image } }) });
+  await reopen();
+  await newSession().waitFor({ timeout: 60_000 });
+}
+/** One request for an image in a new session: approve the tool call, wait for the end, and read the tool's result from the saved session. */
+async function askImage(c, prompt) {
+  const before = await sessionFiles();
+  await freshSession();
+  await typeAndSend(prompt);
+  const dialog = page.getByRole("dialog").filter({ hasText: /generate_image|Generate Image|image/i }).first();
+  if (await dialog.waitFor({ timeout: 30_000 }).then(() => true, () => false)) {
+    await dialog.getByRole("button", { name: /^(Approve|承認|批准|核准)$/ }).first().click().catch(() => c.fail("the image tool's approval has no Approve"));
+  }
+  await idle(180_000);
+  const chips = await toolChips();
+  const names = Object.keys(await sessionFiles()).filter(name => !(name in before));
+  for (const name of names) {
+    const file = await worldGet("/file", { path: `data/state/sessions/${name}` });
+    for (const line of (file.text ?? "").split("\n")) {
+      let entry; try { entry = JSON.parse(line); } catch { continue; }
+      const message = entry.message;
+      if (message?.role !== "toolResult" || message.toolName !== "generate_image") continue;
+      const text = (message.content ?? []).filter(part => part.type === "text").map(part => part.text).join(" ");
+      return { found: true, error: Boolean(message.isError), text, images: (message.content ?? []).filter(part => part.type === "image").length, chips };
+    }
+  }
+  return { found: false, chips };
+}
+/** A clear message names the problem in words a person can act on; never a bare status code or stack. */
+const IMAGE_WORDS = /sign in|signed in|plan does not include|out of credit|cannot use image generation|could not be reached|busy/i;
+const rawImageError = /\bHTTP \d{3}\b|^\s*\{|Error:|at .+\.m?js:\d+/;
+
+release("IMG-001 The image tool with a paid account and with ChatGPT", "U10", "With a valid key the image tool makes an image (in each language, with Shisa.AI and with ChatGPT); with a key that is not valid the person gets a clear message.", async c => {
+  // A key that is not valid: needs no account, so it always runs.
+  await signInWith({ shisa: { type: "api_key", key: "jouzu-qa-not-a-valid-key" } }, { provider: "shisa" });
+  const refused = await askImage(c, "IMAGE:shisa draw a red circle");
+  if (!refused.found) c.fail(`with a key that is not valid the image tool never ran (tools shown: ${refused.chips.join(", ") || "none"})`);
+  else if (!refused.error) c.fail(`with a key that is not valid the image tool did not fail: "${refused.text.slice(0, 160)}"`);
+  else if (!IMAGE_WORDS.test(refused.text) || rawImageError.test(refused.text)) c.fail(`with a key that is not valid the message is not clear: "${refused.text.slice(0, 200)}"`);
+  if (refused.found && !refused.chips.some(label => / · failed$/.test(label))) c.fail(`the image tool's failure is not shown on its tool row (rows: ${refused.chips.join(", ")})`);
+  const missing = ["JOUZU_QA_SHISA_KEY", "JOUZU_QA_CHATGPT_AUTH"].filter(name => !process.env[name]);
+  if (process.env.JOUZU_QA_SHISA_KEY) {
+    await signInWith({ shisa: { type: "api_key", key: process.env.JOUZU_QA_SHISA_KEY } }, { provider: "shisa" });
+    const made = await askImage(c, "IMAGE:shisa draw a red circle");
+    if (!made.found || made.error || !made.images) c.fail(`with the paid Shisa.AI account no image was made: ${made.found ? `"${made.text.slice(0, 200)}"` : "the tool never ran"}`);
+  }
+  if (process.env.JOUZU_QA_CHATGPT_AUTH) {
+    let entry = null;
+    try { entry = JSON.parse(process.env.JOUZU_QA_CHATGPT_AUTH); } catch { c.fail("JOUZU_QA_CHATGPT_AUTH is not JSON"); }
+    if (entry) {
+      await signInWith({ "openai-codex": entry }, { provider: "openai-codex" });
+      const made = await askImage(c, "IMAGE:openai-codex draw a red circle");
+      if (!made.found || made.error || !made.images) c.fail(`with the ChatGPT account no image was made: ${made.found ? `"${made.text.slice(0, 200)}"` : "the tool never ran"}`);
+    }
+  }
+  // Without the QA accounts' credentials the valid-key steps cannot run: no verdict for them.
+  if (missing.length) c.skip(`the QA accounts' credentials are not in this runner's secrets (${missing.join(", ")}); only the not-valid key step ran`);
+});
+
+release("IMG-002 The image tool with a free Shisa.AI account", "U10", "With a free Shisa.AI account, Settings > Tools names Shisa.AI and says the plan has no image generation; asking for an image gives that message, not an error.", async c => {
+  if (!process.env.JOUZU_QA_SHISA_FREE_KEY) { c.skip("the free QA account's key is not in this runner's secrets (JOUZU_QA_SHISA_FREE_KEY)"); return; }
+  await signInWith({ shisa: { type: "api_key", key: process.env.JOUZU_QA_SHISA_FREE_KEY } }, { provider: "shisa" });
+  const plan = { en: "This account's plan does not include image generation.", ja: "このアカウントのプランには画像生成が含まれていません。" }[lang];
+  const dialog = await openSettings({ en: "Tools", ja: "ツール" }[lang]);
+  const said = await dialog.getByText(plan, { exact: false }).first().waitFor({ timeout: 60_000 }).then(() => true, () => false);
+  const card = (await dialog.innerText().catch(() => "")).replace(/\s+/g, " ");
+  if (!said) c.fail(`Settings > Tools does not say the plan has no image generation (it shows: "${card.slice(0, 240)}")`);
+  if (!card.includes("Shisa.AI")) c.fail("Settings > Tools does not name Shisa.AI");
+  await page.keyboard.press("Escape");
+  const asked = await askImage(c, "IMAGE:shisa draw a red circle");
+  if (!asked.found) c.fail("the image tool never ran");
+  else if (!/plan does not include image generation/i.test(asked.text)) c.fail(`asking for an image did not give the plan's message: "${asked.text.slice(0, 200)}"`);
 });
 
 release("P13 A question or approval from the agent", "U4", "When the agent needs an approval for a tool call, the app shows it with its choices and the session's row says it waits; the reply continues after Approve, and after Deny the reply ends without running the tool. (The review is switched on for the read tool in the saved tool settings, as the image tool has it by default.)", async c => {

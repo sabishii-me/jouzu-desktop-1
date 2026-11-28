@@ -203,6 +203,14 @@ export function startFixtureServer(port = 0) {
         response.end('data: [DONE]\n\n');
         return;
       }
+      // IMAGE[:provider]: one call of the image tool (generate_image), for the provider named or the one chosen in Settings.
+      const image = /IMAGE(?::(\S+))?/u.exec(text);
+      if (image && messages.at(-1)?.role !== 'tool') {
+        chunk({ tool_calls: [{ index: 0, id: 'fixture-image-1', type: 'function', function: { name: 'generate_image', arguments: JSON.stringify({ prompt: 'A small red circle on a white background', ...(image[1] ? { provider: image[1] } : {}) }) } }] });
+        chunk({}, 'tool_calls');
+        response.end('data: [DONE]\n\n');
+        return;
+      }
       // PHASES: a reply that goes through each phase a status line names, slowly enough to see:
       // the model is waited for (3 s), it reasons (2 s), runs a command (3 s), then writes (3 s).
       if (text.includes('PHASES')) {

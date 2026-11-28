@@ -166,10 +166,12 @@
   steps:
     - do: Open a folder by its real path, then through a symlink to it.
       expect: The sidebar lists it once.
+  languages: [en, ja]
   platforms: [macos, linux]
   automation:
-    status: planned
-    note: Recorded by hand as acceptance item C-mac-239.
+    status: automated
+    impl: { file: release-playbook.mjs, case: FOLD-001 A folder opened through a symlink is listed once }
+    note: The folders are added through the host as the app's folder dialog adds them.
   links: ["#239"]
 
 - id: INPUT-001

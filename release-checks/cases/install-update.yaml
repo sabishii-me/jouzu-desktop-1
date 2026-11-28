@@ -35,19 +35,27 @@
   scenario: U1
   priority: high
   type: install
-  purpose: The DMG app, the AppImage and the .deb, started with a throwaway home, install their runtime on their own and answer a message.
+  purpose: The DMG app, the AppImage and the .deb, started with a throwaway home, install their runtime on their own, walk the person through the first-run pages and answer a message.
   preconditions:
     world: installed-package
-    state: The package of this rc, a throwaway home.
+    state: The package of this rc installed (ABN_APP names its executable), a throwaway home that never had Jouzu.
+  data: The fixture model, entered on the first-run connection page as a custom provider.
   steps:
     - do: Start the installed app with a throwaway home.
-      expect: The start page becomes ready on its own.
-    - do: Open a new session and send a message.
-      expect: A reply arrives.
+      expect: It prepares its runtime by itself, then shows the language page and the model connection page.
+    - do: Pick the language, choose Custom provider and save the fixture model.
+      expect: The chat opens without a restart.
+    - do: Send a message.
+      expect: A reply arrives in the window; the host started once.
+  limits:
+    - { what: "macOS window", line: "WKWebView has no WebDriver: on macOS the case checks only that the app installs and starts its runtime by itself", by: harness }
+  measures: [toConnectPageMs, saveToChatMs, firstRunToFirstReplyMs]
+  languages: [en, ja]
   platforms: [macos, linux]
   automation:
-    status: planned
-    note: Recorded by hand as acceptance items D-mac-1 and D-linux-1 until the harness drives the installed package.
+    status: automated
+    impl: { file: release-playbook.mjs, case: INST-002 First run of the installed app }
+    note: The real app's window is driven through WebKitWebDriver (Linux, package webkit2gtk-driver) on a virtual display. N1 checks the same pages in a test browser on every platform.
   added: 1.1.5
 
 - id: INST-003
@@ -60,15 +68,21 @@
   purpose: After Quit, and after the app process is killed, no host or runtime of that app is left running.
   preconditions:
     world: installed-package
+    state: The installed app (ABN_APP) on a throwaway home; its runtime from an earlier run of the same app (ABN_APP_SEED).
   steps:
-    - do: Quit the app (Cmd+Q, closing the window).
-      expect: No host or runtime process is left.
+    - do: Quit the app (Linux the tray's Quit Jouzu; closing the window only hides it to the tray).
+      expect: Within 5 s no host or runtime process is left.
     - do: Start it again and kill the app process.
       expect: Within 5 s no host or runtime process is left.
+  limits:
+    - { what: "macOS Quit", line: "the menu is not scriptable without accessibility permission, so on macOS Quit is SIGTERM to the app", by: harness }
+  measures: [quitStoppedMs, killStoppedMs]
+  languages: [en, ja]
   platforms: [macos, linux]
   automation:
-    status: planned
-    note: Recorded by hand as acceptance items D-mac-2 and D-linux-1.
+    status: automated
+    impl: { file: release-playbook.mjs, case: INST-003 Quitting or killing the app leaves nothing running }
+    note: On Linux the Quit item is clicked over the app's session bus, as the desktop's tray clicks it.
   added: 1.1.5
 
 - id: INST-004
@@ -81,15 +95,21 @@
   purpose: The app notices its runtime files are gone, says it is reinstalling them, and a session answers afterwards.
   preconditions:
     world: installed-package
+    state: The installed app (ABN_APP) after its first run on a throwaway home.
   steps:
-    - do: With the app running, delete the runtime's files under its home.
-      expect: Within 60 s the app shows that it is reinstalling the runtime.
-    - do: Open a session and send a message.
-      expect: A reply arrives.
-  platforms: [macos, linux]
+    - do: With the app running, delete the runtime's files under its home, open a new session and send a message.
+      expect: Within 60 s the window says it is preparing the runtime.
+    - do: Send a message.
+      expect: A reply arrives within 3 min; the runtime's files are back.
+  limits:
+    - { what: "macOS window", line: "WKWebView has no WebDriver: the case cannot run on macOS and is recorded by hand there", by: harness }
+  measures: [deletedToPrepareMs]
+  languages: [en, ja]
+  platforms: [linux]
   automation:
-    status: planned
-    note: Recorded by hand as acceptance items D-mac-3 and D-linux-1. The source-build form of this path is RT-007.
+    status: automated
+    impl: { file: release-playbook.mjs, case: INST-004 Runtime files deleted while the app runs are reinstalled }
+    note: macOS is recorded by hand as acceptance item D-mac-3 (no WebDriver for the window). The source-build form of this path is RT-007.
   added: 1.1.5
 
 - id: UPD-001
@@ -113,10 +133,16 @@
       expect: Sessions, the changed setting and the sign-in are all there.
     - do: Send a message in an old session.
       expect: A reply arrives.
+  limits:
+    - { what: installer to new window, line: none decided; recorded only, by: nobody decided }
+  measures: [installMs, updateToWindowMs]
+  languages: [en, ja]
   platforms: [windows]
   automation:
-    status: planned
-    note: Needs the installed app on the Windows upgrade machine. Recorded by hand as D-upg-1 until written.
+    status: automated
+    impl: { file: update-playbook.mjs, case: "UPD-001 Update from the last release keeps sessions, settings and sign-ins" }
+    note: "Update world (update-world.mjs): ABN_WORLD=installed-app, ABN_UPDATE_FROM_RELEASE (the last release's installer), ABN_UPDATE_TO (the version under test). The changed setting is the update channel; the sign-ins are the saved providers with their keys (a Shisa.AI account sign-in cannot be made without a person, SIGN-002)."
+
   added: 1.1.5
 
 - id: UPD-002
@@ -135,10 +161,13 @@
       expect: The app restarts on the new version; it does not stop on Preparing.
     - do: Open sessions and Settings, send a message.
       expect: Data and sign-ins are kept; a reply arrives.
+  measures: [installMs, updateToWindowMs]
+  languages: [en]
   platforms: [windows]
   automation:
-    status: planned
-    note: Recorded by hand as D-upg-2.
+    status: automated
+    impl: { file: update-playbook.mjs, case: UPD-002 Update between release candidates keeps data and the runtime }
+    note: Update world with ABN_UPDATE_FROM_RC (the previous release candidate's installer).
   added: 1.1.5
 
 - id: UPD-003
@@ -156,10 +185,12 @@
       expect: The commit has no "-dirty".
     - do: Uninstall silently.
       expect: The data folder is kept.
+  languages: [en]
   platforms: [windows]
   automation:
-    status: planned
-    note: Recorded by hand as D-upg-3.
+    status: automated
+    impl: { file: update-playbook.mjs, case: UPD-003 The install folder after an update is clean }
+    note: Runs its own update from the previous release candidate first (UPD-002's path), so it does not depend on another case.
   added: 1.1.5
 
 - id: UPD-004
@@ -205,6 +236,9 @@
       expect: Data is complete.
     - do: Switch back to the release channel and update.
       expect: Data is complete.
+  languages: [en]
   platforms: [windows]
   automation:
-    status: planned
+    status: automated
+    impl: { file: update-playbook.mjs, case: "UPD-005 Switching the update channel release, QA, release keeps data" }
+    note: Back to Stable is the older stable build the app offers as Install Stable.
